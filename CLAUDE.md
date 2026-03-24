@@ -150,3 +150,15 @@ with coacd_gpu.Context(device=0) as ctx:
                                    all_vertices, all_triangles,
                                    tri_offsets, vert_offsets)
 ```
+
+### Planned: `__cuda_array_interface__` Support
+
+Support the [CUDA Array Interface](https://numba.readthedocs.io/en/stable/cuda/cuda_array_interface.html) protocol for zero-copy GPU memory communication. This eliminates CPU↔GPU round-trips when coacd_gpu is used alongside PyTorch, CuPy, or other GPU libraries.
+
+**Design:**
+
+- **Input path**: All public API methods (`point_mesh_distances`, `hausdorff`, `pairwise_hausdorff`) should detect `__cuda_array_interface__` on input arguments. When present, extract the device pointer directly (`cai['data'][0]`) and skip `cuMemAlloc` + `cuMemcpyHtoD`. Validate dtype/shape/contiguity from the interface metadata (`typestr`, `shape`, `strides`).
+- **Output path**: Provide an option to return GPU-resident results wrapped in a lightweight object exposing `__cuda_array_interface__` (device pointer, shape, typestr), instead of downloading to numpy. This lets downstream GPU code consume results without a device→host copy.
+- **Fallback**: Plain numpy arrays continue to work as before (upload to GPU, compute, download). The interface is additive — no breaking changes.
+- **Memory ownership**: For inputs, coacd_gpu borrows the pointer (caller owns the memory). For GPU outputs, coacd_gpu allocates device memory and the returned wrapper object frees it on garbage collection (via `cuMemFree` pointers stored in the context).
+- **Reference**: See [`gint/host/executor.py`](https://github.com/eliphatfs/gint/blob/main/gint/host/executor.py) `TensorInterface` class for `from_cuda_array_interface` / `__cuda_array_interface__` property patterns.
