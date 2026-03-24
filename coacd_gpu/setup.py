@@ -10,6 +10,7 @@ At runtime: only libcuda.so (the GPU driver). No CUDA toolkit or PyTorch needed.
 """
 
 import os
+import sys
 import subprocess
 
 from setuptools import setup, Extension
@@ -39,10 +40,9 @@ class CMakeBuildExt(build_ext):
         build_dir = os.path.join(self.build_temp, "cmake_build")
         os.makedirs(build_dir, exist_ok=True)
 
-        # Output the .so alongside the Python package
-        ext_dir = os.path.abspath(os.path.dirname(
-            self.get_ext_fullpath(ext.name)))
-        pkg_dir = os.path.join(ext_dir, "coacd_gpu")
+        # Place libcoacd_gpu.so next to python/__init__.py
+        ext_fullpath = os.path.abspath(self.get_ext_fullpath(ext.name))
+        pkg_dir = os.path.dirname(ext_fullpath)
         os.makedirs(pkg_dir, exist_ok=True)
 
         cfg = "Release"
@@ -67,6 +67,18 @@ class CMakeBuildExt(build_ext):
         subprocess.check_call(
             ["cmake", "--build", "."] + build_args,
             cwd=build_dir)
+
+        # setuptools expects the dummy extension file to exist;
+        # create it as a symlink to libcoacd_gpu.so
+        if not os.path.exists(ext_fullpath):
+            lib_name = "libcoacd_gpu.so"
+            if sys.platform == "win32":
+                lib_name = "coacd_gpu.dll"
+            elif sys.platform == "darwin":
+                lib_name = "libcoacd_gpu.dylib"
+            lib_path = os.path.join(pkg_dir, lib_name)
+            if os.path.exists(lib_path):
+                os.symlink(lib_path, ext_fullpath)
 
 
 # Dummy extension to trigger build_ext. Py_LIMITED_API enables abi3 tagging.

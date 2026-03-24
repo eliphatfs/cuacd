@@ -16,19 +16,29 @@ from ctypes import c_int, c_float, c_void_p, POINTER, byref
 # ---------------------------------------------------------------------------
 
 def _find_lib():
-    """Locate libcoacd_gpu.so / coacd_gpu.dll next to this file."""
+    """Locate the coacd_gpu shared library next to this file."""
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
-    if sys.platform == "win32":
-        names = ["coacd_gpu.dll", "libcoacd_gpu.dll"]
-    elif sys.platform == "darwin":
-        names = ["libcoacd_gpu.dylib"]
-    else:
-        names = ["libcoacd_gpu.so"]
 
-    for name in names:
+    # Exact names first (CMake output), then fallback to setuptools-generated names
+    if sys.platform == "win32":
+        candidates = ["coacd_gpu.dll", "libcoacd_gpu.dll"]
+        fallback_ext = ".pyd"
+    elif sys.platform == "darwin":
+        candidates = ["libcoacd_gpu.dylib"]
+        fallback_ext = ".so"
+    else:
+        candidates = ["libcoacd_gpu.so"]
+        fallback_ext = ".so"
+
+    for name in candidates:
         path = os.path.join(pkg_dir, name)
         if os.path.isfile(path):
             return path
+
+    # setuptools editable installs may name it _native.abi3.so or similar
+    for entry in os.listdir(pkg_dir):
+        if entry.startswith("_native") and (entry.endswith(fallback_ext) or ".abi3." in entry):
+            return os.path.join(pkg_dir, entry)
 
     raise RuntimeError(
         f"Cannot find coacd_gpu shared library in {pkg_dir}. "
