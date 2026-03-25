@@ -89,8 +89,8 @@ _dummy_ext = Extension(
 )
 
 setup(
-    packages=["coacd_gpu"],
-    package_dir={"coacd_gpu": "python"},
+    packages=["coacd_gpu", "coacd_gpu.coacd"],
+    package_dir={"coacd_gpu": "python", "coacd_gpu.coacd": "python/coacd"},
     ext_modules=[_dummy_ext],
     cmdclass={"build_ext": CMakeBuildExt, **_extra_cmdclass},
     zip_safe=False,

@@ -8,6 +8,7 @@ This repository contains two projects:
 
 1. **CoACD** (`CoACD/`) — Collision-Aware Approximate Convex Decomposition. Decomposes 3D meshes into approximate convex parts using MCTS-guided plane cutting. Published at SIGGRAPH 2022.
 2. **coacd_gpu** (`coacd_gpu/`) — Standalone GPU acceleration library for CoACD's computational bottlenecks (Hausdorff distance, merge cost matrix). Uses CUDA driver API; no PyTorch or CUDA runtime dependency.
+3. **Pure Python CoACD** (`coacd_gpu/python/coacd/`) — Pure Python reimplementation of the CoACD algorithm. Uses `scipy` (Qhull), `triangle` (CDT), and optionally `coacd_gpu` for GPU-accelerated Hausdorff. No C++ CoACD build required.
 
 ## Build Commands
 
@@ -44,6 +45,24 @@ COACD_GPU_ARCHS="80;86" pip install -e .
 # Run smoke tests
 cd coacd_gpu && python test_extension.py
 ```
+
+### Pure Python CoACD (tests)
+
+```bash
+# Run fast unit tests (geometry, mesh, sampling, cost, clip, mcts helpers)
+cd coacd_gpu && python -m pytest tests/ -v
+
+# Run all tests including slow ones (MCTS search, full pipeline)
+cd coacd_gpu && python -m pytest tests/ -v --slow
+
+# Run a specific test module
+python -m pytest coacd_gpu/tests/test_clip.py -v
+
+# Compare C++ vs Python CoACD on Octocat example
+python compare_octocat.py
+```
+
+Dependencies: `numpy`, `scipy`, `triangle`, `pytest` (test only), `trimesh` (comparison script only).
 
 ## CoACD Architecture
 
@@ -162,3 +181,46 @@ Support the [CUDA Array Interface](https://numba.readthedocs.io/en/stable/cuda/c
 - **Fallback**: Plain numpy arrays continue to work as before (upload to GPU, compute, download). The interface is additive — no breaking changes.
 - **Memory ownership**: For inputs, coacd_gpu borrows the pointer (caller owns the memory). For GPU outputs, coacd_gpu allocates device memory and the returned wrapper object frees it on garbage collection (via `cuMemFree` pointers stored in the context).
 - **Reference**: See [`gint/host/executor.py`](https://github.com/eliphatfs/gint/blob/main/gint/host/executor.py) `TensorInterface` class for `from_cuda_array_interface` / `__cuda_array_interface__` property patterns.
+
+## Pure Python CoACD
+
+### Overview
+
+A pure Python reimplementation of the CoACD decomposition algorithm in `coacd_gpu/python/coacd/`. Removes the dependency on the C++ CoACD build. Uses `scipy` for convex hulls (Qhull), `triangle` for constrained Delaunay triangulation, and optionally `coacd_gpu` for GPU-accelerated Hausdorff distance.
+
+### Module Layout
+
+| File | Role |
+|------|------|
+| `_geometry.py` | `Plane` class, `mesh_volume`, `mesh_area`, `normalize`, `recover`, `pca_align` |
+| `_mesh.py` | `Mesh` class wrapping vertices + triangles + bbox + `convex_hull()` via scipy |
+| `_sampling.py` | Area-weighted surface sampling with mixed random/quasi-random strategy |
+| `_cost.py` | `compute_rv` (volume), `compute_hb`/`hausdorff_cpu` (Hausdorff via KD-tree), `compute_hcost` (combined) |
+| `_clip.py` | Plane-mesh clipping with CDT cap triangulation via `triangle` library |
+| `_mcts.py` | MCTS tree search (Node/State/Part), UCB1 selection, Rv-only rollout, ternary refinement |
+| `_merge.py` | Greedy agglomerative merge with flat upper-triangle cost matrix |
+| `_pipeline.py` | `run_coacd()` orchestration: normalize → [PCA] → MCTS decomposition loop → [merge] → recover |
+| `__init__.py` | Exports `run_coacd`, `Mesh` |
+
+### Usage
+
+```python
+from coacd_gpu.coacd import run_coacd
+parts = run_coacd(vertices, triangles, threshold=0.05)
+# parts is list of (vertices, triangles) numpy arrays — each a convex hull
+```
+
+### Tests
+
+Tests are in `coacd_gpu/tests/`. Slow tests (MCTS search, full pipeline) are marked with `@pytest.mark.slow` and skipped by default. Use `--slow` flag to include them.
+
+```bash
+pytest coacd_gpu/tests/           # fast only (~1s)
+pytest coacd_gpu/tests/ --slow    # all tests (minutes)
+```
+
+### Deferred
+
+- Manifold preprocessing (OpenVDB or CUDA-based)
+- Decimate post-processing (`max_ch_vertex`)
+- Extrude post-processing (push overlapping faces apart)

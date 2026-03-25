@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "GPU-accelerated kernels for approximate convex decomposition (Hausdorff distance, merge costs)"
 license = "MIT"
 requires-python = ">=3.9"
-dependencies = ["numpy"]
+dependencies = ["numpy", "scipy", "triangle"]
 
 [project.urls]
 Repository = "https://github.com/user/coacd_gpu"
