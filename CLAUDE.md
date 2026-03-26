@@ -20,8 +20,9 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   kernels.cu          #   Root compilation unit — includes all modules
   common.cuh          #   Constants, data structures, pool allocator, atomics
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
-  geometry.cuh        #   Edge intersection, point-triangle distance, bbox concavity
-  beam_search.cu      #   Beam search kernels (evaluate, select, apply, compute_costs)
+  geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
+  hull.cuh            #   Incremental convex hull with parallel visibility tests
+  beam_search.cu      #   Beam search kernels + compute_rv_for_tris device function
   hausdorff.cu        #   Hausdorff kernels (point_mesh_distance, reduce_max, pairwise)
   mesh_transform.cu   #   Normalize/recover coordinate kernels
 csrc/                 # C host code
@@ -32,7 +33,8 @@ coacd_gpu/            # Python package (import name)
   beam.py             #   Python API for beam search (imports _gpu extension)
   coacd/              #   Pure Python CoACD implementation
 tests/                # All tests
-  test_extension.py   #   GPU smoke tests (Hausdorff, pairwise, beam)
+  test_extension.py   #   GPU smoke tests (Hausdorff, pairwise — standalone script)
+  test_beam.py        #   GPU beam search tests (cube convexity, L-shape decomposition)
   test_clip.py ...    #   Pure Python CoACD unit tests
 CoACD/                # Reference C++ CoACD (submodule/external)
 ```
@@ -295,7 +297,7 @@ signs[v] = (val > EPS) ? 1 : ((val < -EPS) ? -1 : 0);
 - Cube correctly identified as convex (Rv ≈ 0, 1 part)
 - L-shape decomposed at threshold 0.05 (18 parts), 0.15 (2 parts)
 - Pure Python CoACD (existing, unmodified)
-- All 56 unit tests pass, GPU smoke tests pass
+- All 66 unit tests pass (including 10 GPU beam search tests), GPU smoke tests pass
 
 ### Not Yet Implemented
 - Hausdorff validation in beam loop (kernels exist, not wired in)
