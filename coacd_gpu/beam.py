@@ -5,7 +5,7 @@ High-level Python API wrapping the native _beam CPython extension.
 """
 
 import numpy as np
-from coacd_gpu import _beam
+from coacd_gpu import _gpu
 
 
 class BeamContext:
@@ -24,12 +24,12 @@ class BeamContext:
     """
 
     def __init__(self, device=-1):
-        _beam.init(device)
+        _gpu.init(device)
         self._alive = True
 
     def close(self):
         if self._alive:
-            _beam.destroy()
+            _gpu.destroy()
             self._alive = False
 
     def __del__(self):
@@ -68,7 +68,7 @@ class BeamContext:
         verts = np.ascontiguousarray(vertices, dtype=np.float32)
         tris = np.ascontiguousarray(triangles, dtype=np.int32)
 
-        num_parts = _beam.run(
+        num_parts = _gpu.run(
             verts.ctypes.data, len(verts),
             tris.ctypes.data, len(tris),
             beam_width, cuts_per_axis,
@@ -77,13 +77,13 @@ class BeamContext:
 
         parts = []
         for i in range(num_parts):
-            nv, nt = _beam.get_part_sizes(i)
+            nv, nt = _gpu.get_part_sizes(i)
             if nv <= 0 or nt <= 0:
                 continue
 
             out_v = np.empty((nv, 3), dtype=np.float32)
             out_t = np.empty((nt, 3), dtype=np.int32)
-            actual_nv, actual_nt = _beam.get_part(
+            actual_nv, actual_nt = _gpu.get_part(
                 i, out_v.ctypes.data, nv, out_t.ctypes.data, nt)
             parts.append((out_v[:actual_nv], out_t[:actual_nt]))
 

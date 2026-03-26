@@ -1,4 +1,5 @@
-// C API for GPU beam search convex decomposition.
+// C API for GPU-accelerated convex decomposition.
+// Provides beam search decomposition + Hausdorff distance computation.
 // Uses CUDA driver API internally — no CUDA runtime dependency.
 // Linked into a CPython extension module; not a standalone shared library.
 
@@ -48,6 +49,46 @@ int beam_get_part(
     int*       out_n_tris);
 
 const char* beam_last_error(beam_ctx_t ctx);
+
+// -----------------------------------------------------------------------
+// Hausdorff distance computation
+// -----------------------------------------------------------------------
+
+// Compute per-point minimum distance from points to a triangle mesh.
+// All pointers are HOST memory. The library handles upload/download.
+int beam_point_mesh_distances(
+    beam_ctx_t      ctx,
+    const float*    points,     // [n_points, 3]
+    int             n_points,
+    const float*    vertices,   // [n_verts, 3]
+    int             n_verts,
+    const int*      triangles,  // [n_tris, 3]
+    int             n_tris,
+    float*          distances); // [n_points] output
+
+// Compute Hausdorff distance between two sampled meshes.
+int beam_hausdorff(
+    beam_ctx_t      ctx,
+    const float*    samples_a,    int n_samples_a,
+    const float*    vertices_a,   int n_verts_a,
+    const int*      triangles_a,  int n_tris_a,
+    const float*    samples_b,    int n_samples_b,
+    const float*    vertices_b,   int n_verts_b,
+    const int*      triangles_b,  int n_tris_b,
+    float*          result);
+
+// Compute pairwise Hausdorff cost matrix for merge phase.
+// Parts' data is packed contiguously with prefix-sum offset arrays.
+int beam_pairwise_hausdorff(
+    beam_ctx_t      ctx,
+    const float*    all_samples,
+    const int*      sample_offsets,  // [n_parts + 1]
+    const float*    all_vertices,
+    const int*      all_triangles,
+    const int*      tri_offsets,     // [n_parts + 1]
+    const int*      vert_offsets,    // [n_parts + 1]
+    int             n_parts,
+    float*          cost_matrix);    // [n_parts * n_parts] output
 
 #ifdef __cplusplus
 }

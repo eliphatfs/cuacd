@@ -9,7 +9,7 @@
 #include <math.h>
 
 // Embedded fatbin — generated at build time by setup.py
-#include "beam_kernels_fatbin.h"
+#include "kernels_fatbin.h"
 
 // Must match beam_kernels.cu
 #define BLOCK_SIZE 256
@@ -67,8 +67,9 @@ struct beam_ctx {
     CUfunction fn_normalize_mesh;
     CUfunction fn_recover_coordinates;
     CUfunction fn_sample_surface;
-    CUfunction fn_beam_point_mesh_distance;
-    CUfunction fn_beam_reduce_max;
+    CUfunction fn_point_mesh_distance;
+    CUfunction fn_reduce_max;
+    CUfunction fn_pairwise_hausdorff;
 
     struct MeshPool pool_a, pool_b;
     CUdeviceptr d_parts;
@@ -141,7 +142,7 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
         ctx->owns_context = 1;
     }
 
-    CHECK_CU(cuModuleLoadFatBinary(&ctx->module, beam_kernels_fatbin));
+    CHECK_CU(cuModuleLoadFatBinary(&ctx->module, kernels_fatbin));
 
     // Resolve kernel functions
     CHECK_CU(cuModuleGetFunction(&ctx->fn_evaluate_candidates,   ctx->module, "evaluate_candidates"));
@@ -151,8 +152,9 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
     CHECK_CU(cuModuleGetFunction(&ctx->fn_normalize_mesh,        ctx->module, "normalize_mesh"));
     CHECK_CU(cuModuleGetFunction(&ctx->fn_recover_coordinates,   ctx->module, "recover_coordinates"));
     CHECK_CU(cuModuleGetFunction(&ctx->fn_sample_surface,        ctx->module, "sample_surface"));
-    CHECK_CU(cuModuleGetFunction(&ctx->fn_beam_point_mesh_distance, ctx->module, "beam_point_mesh_distance"));
-    CHECK_CU(cuModuleGetFunction(&ctx->fn_beam_reduce_max,       ctx->module, "beam_reduce_max"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_point_mesh_distance,  ctx->module, "point_mesh_distance"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_reduce_max,           ctx->module, "reduce_max"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_pairwise_hausdorff,   ctx->module, "pairwise_hausdorff"));
 
     return 0;
 }
@@ -250,43 +252,7 @@ static int generate_planes(beam_ctx_t ctx, int cuts_per_axis, CUstream s) {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Helper: multi-pass max reduction
-// ---------------------------------------------------------------------------
 
-static int reduce_max_beam(beam_ctx_t ctx, CUdeviceptr d_data, int N,
-                           float* result, CUstream s) {
-    int n_blocks = (N + BLOCK_SIZE * 2 - 1) / (BLOCK_SIZE * 2);
-    if (n_blocks < 1) n_blocks = 1;
-
-    CUdeviceptr d_tmp;
-    CHECK_CU(cuMemAlloc(&d_tmp, n_blocks * sizeof(float)));
-
-    void* args1[] = { &d_data, &d_tmp, &N };
-    unsigned int smem = BLOCK_SIZE * sizeof(float);
-    CHECK_CU(cuLaunchKernel(ctx->fn_beam_reduce_max,
-        n_blocks, 1, 1, BLOCK_SIZE, 1, 1, smem, s, args1, NULL));
-
-    int remaining = n_blocks;
-    CUdeviceptr d_in = d_tmp, d_out = 0;
-
-    while (remaining > 1) {
-        int nb = (remaining + BLOCK_SIZE * 2 - 1) / (BLOCK_SIZE * 2);
-        if (nb < 1) nb = 1;
-        if (!d_out) CHECK_CU(cuMemAlloc(&d_out, nb * sizeof(float)));
-        void* args[] = { &d_in, &d_out, &remaining };
-        CHECK_CU(cuLaunchKernel(ctx->fn_beam_reduce_max,
-            nb, 1, 1, BLOCK_SIZE, 1, 1, BLOCK_SIZE * sizeof(float), s, args, NULL));
-        remaining = nb;
-        CUdeviceptr t = d_in; d_in = d_out; d_out = t;
-    }
-
-    CHECK_CU(cuMemcpyDtoHAsync(result, d_in, sizeof(float), s));
-    CHECK_CU(cuStreamSynchronize(s));
-    cuMemFree(d_tmp);
-    if (d_out) cuMemFree(d_out);
-    return 0;
-}
 
 // ---------------------------------------------------------------------------
 // Run beam search
@@ -715,5 +681,197 @@ int beam_get_part(
     memcpy(out_triangles, op->triangles, op->n_tris * 3 * sizeof(int));
     *out_n_verts = op->n_verts;
     *out_n_tris = op->n_tris;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Hausdorff distance computation
+// ---------------------------------------------------------------------------
+
+static int reduce_max_host(beam_ctx_t ctx, CUdeviceptr d_data, int N,
+                           float* result, CUstream s) {
+    int n_blocks = (N + BLOCK_SIZE * 2 - 1) / (BLOCK_SIZE * 2);
+    if (n_blocks < 1) n_blocks = 1;
+
+    CUdeviceptr d_tmp;
+    CHECK_CU(cuMemAlloc(&d_tmp, n_blocks * sizeof(float)));
+
+    void* args1[] = { &d_data, &d_tmp, &N };
+    unsigned int smem = BLOCK_SIZE * sizeof(float);
+    CHECK_CU(cuLaunchKernel(ctx->fn_reduce_max,
+        n_blocks, 1, 1, BLOCK_SIZE, 1, 1, smem, s, args1, NULL));
+
+    int remaining = n_blocks;
+    CUdeviceptr d_in = d_tmp, d_out = 0;
+
+    while (remaining > 1) {
+        int nb = (remaining + BLOCK_SIZE * 2 - 1) / (BLOCK_SIZE * 2);
+        if (nb < 1) nb = 1;
+        if (!d_out) CHECK_CU(cuMemAlloc(&d_out, nb * sizeof(float)));
+        void* args[] = { &d_in, &d_out, &remaining };
+        CHECK_CU(cuLaunchKernel(ctx->fn_reduce_max,
+            nb, 1, 1, BLOCK_SIZE, 1, 1, BLOCK_SIZE * sizeof(float), s, args, NULL));
+        remaining = nb;
+        CUdeviceptr t = d_in; d_in = d_out; d_out = t;
+    }
+
+    CHECK_CU(cuMemcpyDtoHAsync(result, d_in, sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+    cuMemFree(d_tmp);
+    if (d_out) cuMemFree(d_out);
+    return 0;
+}
+
+int beam_point_mesh_distances(
+    beam_ctx_t ctx,
+    const float* points, int n_points,
+    const float* vertices, int n_verts,
+    const int* triangles, int n_tris,
+    float* distances)
+{
+    CUstream s = NULL;
+    int vert_offset = 0;
+
+    CUdeviceptr d_points, d_verts, d_tris, d_dist;
+    CHECK_CU(cuMemAlloc(&d_points, n_points * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_verts,  n_verts  * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_tris,   n_tris   * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_dist,   n_points * sizeof(float)));
+
+    CHECK_CU(cuMemcpyHtoDAsync(d_points, points,    n_points * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_verts,  vertices,  n_verts  * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tris,   triangles, n_tris   * 3 * sizeof(int),   s));
+
+    int grid = (n_points + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    void* args[] = { &d_points, &d_verts, &d_tris, &d_dist, &n_points, &n_tris, &vert_offset };
+    CHECK_CU(cuLaunchKernel(ctx->fn_point_mesh_distance,
+        grid, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(distances, d_dist, n_points * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_points);
+    cuMemFree(d_verts);
+    cuMemFree(d_tris);
+    cuMemFree(d_dist);
+    return 0;
+}
+
+int beam_hausdorff(
+    beam_ctx_t ctx,
+    const float* samples_a, int n_sa,
+    const float* vertices_a, int n_va,
+    const int* triangles_a, int n_ta,
+    const float* samples_b, int n_sb,
+    const float* vertices_b, int n_vb,
+    const int* triangles_b, int n_tb,
+    float* result)
+{
+    CUstream s = NULL;
+    int vert_offset = 0;
+
+    CUdeviceptr d_sa, d_va, d_ta, d_sb, d_vb, d_tb, d_dist_a, d_dist_b;
+    CHECK_CU(cuMemAlloc(&d_sa, n_sa * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_va, n_va * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_ta, n_ta * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_sb, n_sb * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_vb, n_vb * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_tb, n_tb * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_dist_a, n_sa * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_dist_b, n_sb * sizeof(float)));
+
+    CHECK_CU(cuMemcpyHtoDAsync(d_sa, samples_a,   n_sa * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_va, vertices_a,  n_va * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_ta, triangles_a, n_ta * 3 * sizeof(int),   s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_sb, samples_b,   n_sb * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_vb, vertices_b,  n_vb * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tb, triangles_b, n_tb * 3 * sizeof(int),   s));
+
+    // B samples → mesh A
+    {
+        int grid = (n_sb + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        void* args[] = { &d_sb, &d_va, &d_ta, &d_dist_b, &n_sb, &n_ta, &vert_offset };
+        CHECK_CU(cuLaunchKernel(ctx->fn_point_mesh_distance,
+            grid, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+    }
+    // A samples → mesh B
+    {
+        int grid = (n_sa + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        void* args[] = { &d_sa, &d_vb, &d_tb, &d_dist_a, &n_sa, &n_tb, &vert_offset };
+        CHECK_CU(cuLaunchKernel(ctx->fn_point_mesh_distance,
+            grid, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+    }
+
+    float max_a, max_b;
+    int r1 = reduce_max_host(ctx, d_dist_b, n_sb, &max_b, s);
+    int r2 = reduce_max_host(ctx, d_dist_a, n_sa, &max_a, s);
+
+    *result = (max_a > max_b) ? max_a : max_b;
+
+    cuMemFree(d_sa);  cuMemFree(d_va);  cuMemFree(d_ta);
+    cuMemFree(d_sb);  cuMemFree(d_vb);  cuMemFree(d_tb);
+    cuMemFree(d_dist_a); cuMemFree(d_dist_b);
+
+    return r1 ? r1 : r2;
+}
+
+int beam_pairwise_hausdorff(
+    beam_ctx_t ctx,
+    const float* all_samples,
+    const int*   sample_offsets,
+    const float* all_vertices,
+    const int*   all_triangles,
+    const int*   tri_offsets,
+    const int*   vert_offsets,
+    int          n_parts,
+    float*       cost_matrix)
+{
+    CUstream s = NULL;
+
+    int total_samples  = sample_offsets[n_parts];
+    int total_verts    = vert_offsets[n_parts];
+    int total_tris     = tri_offsets[n_parts];
+    int n_pairs        = n_parts * (n_parts - 1) / 2;
+
+    if (n_pairs == 0) {
+        memset(cost_matrix, 0, n_parts * n_parts * sizeof(float));
+        return 0;
+    }
+
+    int max_samples = 0;
+    for (int i = 0; i < n_parts; i++) {
+        int ns = sample_offsets[i + 1] - sample_offsets[i];
+        if (ns > max_samples) max_samples = ns;
+    }
+
+    CUdeviceptr d_samples, d_soff, d_verts, d_tris, d_toff, d_voff, d_cost;
+    CHECK_CU(cuMemAlloc(&d_samples, total_samples * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_soff,    (n_parts + 1) * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_verts,   total_verts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_tris,    total_tris * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_toff,    (n_parts + 1) * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_voff,    (n_parts + 1) * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_cost,    n_parts * n_parts * sizeof(float)));
+
+    CHECK_CU(cuMemcpyHtoDAsync(d_samples, all_samples,    total_samples * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_soff,    sample_offsets, (n_parts + 1) * sizeof(int), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_verts,   all_vertices,   total_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tris,    all_triangles,  total_tris * 3 * sizeof(int), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_toff,    tri_offsets,     (n_parts + 1) * sizeof(int), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_voff,    vert_offsets,    (n_parts + 1) * sizeof(int), s));
+    CHECK_CU(cuMemsetD8Async(d_cost, 0, n_parts * n_parts * sizeof(float), s));
+
+    int sample_blocks = (max_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    void* args[] = { &d_samples, &d_soff, &d_verts, &d_tris, &d_toff, &d_voff, &d_cost, &n_parts };
+    CHECK_CU(cuLaunchKernel(ctx->fn_pairwise_hausdorff,
+        n_pairs, sample_blocks, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(cost_matrix, d_cost, n_parts * n_parts * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_samples); cuMemFree(d_soff);
+    cuMemFree(d_verts);   cuMemFree(d_tris);
+    cuMemFree(d_toff);    cuMemFree(d_voff);
+    cuMemFree(d_cost);
     return 0;
 }

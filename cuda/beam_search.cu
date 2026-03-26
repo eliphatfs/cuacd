@@ -1,206 +1,9 @@
-// GPU Beam Search Convex Decomposition — Pure device code.
-// Compiled to fatbin, loaded via CUDA driver API.
-// No host-side includes, no runtime API calls.
-//
-// Concavity metric: bbox concavity = 1 - V_mesh / V_bbox.
-// Zero for axis-aligned convex shapes, positive for non-convex.
-// Fast to compute (no hull needed). Hausdorff validates final parts.
-
-extern "C" {
+// Beam search kernels: evaluate candidates, select top-k, apply cuts,
+// compute part costs.
+// Requires: common.cuh, geometry.cuh
 
 // ============================================================================
-// Constants
-// ============================================================================
-
-#define BLOCK_SIZE 256
-#define MAX_BEAM 16
-#define MAX_PARTS_PER_BEAM 64
-#define EPS 1e-6f
-#define PI_F 3.14159265358979323846f
-
-// ============================================================================
-// Data structures (must match beam.c)
-// ============================================================================
-
-struct PartInfo {
-    int vert_offset, vert_count;
-    int tri_offset, tri_count;
-    float bbox[6];    // xmin,xmax,ymin,ymax,zmin,zmax
-    float rv_cost;
-};
-
-struct BeamItem {
-    int num_parts;
-    int worst_part_idx;
-    float worst_cost;
-    int cut_count;
-};
-
-struct DevicePool {
-    char*         base;
-    unsigned int* offset;
-    unsigned int  capacity;
-};
-
-// ============================================================================
-// Device helpers
-// ============================================================================
-
-__device__ void* pool_alloc(DevicePool* pool, unsigned int size) {
-    size = (size + 15) & ~15;
-    unsigned int old = atomicAdd(pool->offset, size);
-    if (old + size > pool->capacity) return NULL;
-    return pool->base + old;
-}
-
-__device__ float signed_tet_volume(float p0x, float p0y, float p0z,
-                                   float p1x, float p1y, float p1z,
-                                   float p2x, float p2y, float p2z) {
-    // V = p0 . (p1 x p2) / 6
-    float cx = p1y * p2z - p1z * p2y;
-    float cy = p1z * p2x - p1x * p2z;
-    float cz = p1x * p2y - p1y * p2x;
-    return (p0x * cx + p0y * cy + p0z * cz) / 6.0f;
-}
-
-__device__ void intersect_edge(float v0x, float v0y, float v0z,
-                               float v1x, float v1y, float v1z,
-                               float a, float b, float c, float d,
-                               float* ix, float* iy, float* iz) {
-    float d0 = a * v0x + b * v0y + c * v0z + d;
-    float d1 = a * v1x + b * v1y + c * v1z + d;
-    float t = d0 / (d0 - d1);
-    *ix = v0x + t * (v1x - v0x);
-    *iy = v0y + t * (v1y - v0y);
-    *iz = v0z + t * (v1z - v0z);
-}
-
-// Atomic float min/max via CAS
-__device__ float atomicMinF(float* addr, float value) {
-    int* addr_i = (int*)addr;
-    int old = *addr_i, expected;
-    do {
-        expected = old;
-        old = atomicCAS(addr_i, expected,
-                        __float_as_int(fminf(value, __int_as_float(expected))));
-    } while (old != expected);
-    return __int_as_float(old);
-}
-
-__device__ float atomicMaxF(float* addr, float value) {
-    int* addr_i = (int*)addr;
-    int old = *addr_i, expected;
-    do {
-        expected = old;
-        old = atomicCAS(addr_i, expected,
-                        __float_as_int(fmaxf(value, __int_as_float(expected))));
-    } while (old != expected);
-    return __int_as_float(old);
-}
-
-// Shared-memory parallel reduction (sum)
-__device__ float block_reduce_sum(float val, float* smem, int tid) {
-    smem[tid] = val;
-    __syncthreads();
-    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) smem[tid] += smem[tid + s];
-        __syncthreads();
-    }
-    return smem[0];
-}
-
-// Shared-memory parallel reduction (min/max for bbox)
-__device__ void block_reduce_bbox(const float* verts, int n_verts, int vert_offset,
-                                  int tid, float* smem,
-                                  float* out_min, float* out_max) {
-    // Compute bbox per axis
-    for (int axis = 0; axis < 3; axis++) {
-        float lo = 1e30f, hi = -1e30f;
-        for (int i = tid; i < n_verts; i += BLOCK_SIZE) {
-            float v = verts[(vert_offset + i) * 3 + axis];
-            lo = fminf(lo, v);
-            hi = fmaxf(hi, v);
-        }
-        // Reduce min
-        smem[tid] = lo;
-        __syncthreads();
-        for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-            if (tid < s) smem[tid] = fminf(smem[tid], smem[tid + s]);
-            __syncthreads();
-        }
-        if (tid == 0) out_min[axis] = smem[0];
-        // Reduce max
-        smem[tid] = hi;
-        __syncthreads();
-        for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-            if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
-            __syncthreads();
-        }
-        if (tid == 0) out_max[axis] = smem[0];
-        __syncthreads();
-    }
-}
-
-// Compute concavity for a mesh part.
-// Uses bbox max dimension as a proxy: larger parts are "more concave" and
-// need further splitting. The beam search terminates based on Hausdorff.
-// Returns the max bbox dimension of the part (range [0, 2] for normalized mesh).
-__device__ float compute_concavity_tris(
-    const float* verts,      // all vertices (global pool)
-    const int*   tris,       // triangle indices (global)
-    int          n_tris,
-    int          tid,
-    float*       smem)       // [BLOCK_SIZE]
-{
-    // Compute bbox from triangle vertices only (not all part vertices)
-    float lo[3] = {1e30f, 1e30f, 1e30f};
-    float hi[3] = {-1e30f, -1e30f, -1e30f};
-    for (int t = tid; t < n_tris; t += BLOCK_SIZE) {
-        for (int e = 0; e < 3; e++) {
-            int vi = tris[t*3+e];
-            for (int k = 0; k < 3; k++) {
-                float v = verts[vi*3+k];
-                lo[k] = fminf(lo[k], v);
-                hi[k] = fmaxf(hi[k], v);
-            }
-        }
-    }
-
-    // Reduce bbox across threads
-    __shared__ float s_lo[3], s_hi[3];
-    for (int k = 0; k < 3; k++) {
-        smem[tid] = lo[k];
-        __syncthreads();
-        for (int s = BLOCK_SIZE/2; s > 0; s >>= 1) {
-            if (tid < s) smem[tid] = fminf(smem[tid], smem[tid+s]);
-            __syncthreads();
-        }
-        if (tid == 0) s_lo[k] = smem[0];
-
-        smem[tid] = hi[k];
-        __syncthreads();
-        for (int s = BLOCK_SIZE/2; s > 0; s >>= 1) {
-            if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid+s]);
-            __syncthreads();
-        }
-        if (tid == 0) s_hi[k] = smem[0];
-        __syncthreads();
-    }
-
-    __shared__ float result;
-    if (tid == 0) {
-        float dims[3];
-        for (int k = 0; k < 3; k++)
-            dims[k] = fmaxf(s_hi[k] - s_lo[k], 0.0f);
-        float vol = dims[0] * dims[1] * dims[2];
-        result = cbrtf(fmaxf(vol, 0.0f));
-    }
-    __syncthreads();
-    return result;
-}
-
-// ============================================================================
-// Kernel: evaluate_candidates
+// evaluate_candidates
 // ============================================================================
 // Grid: (num_beam_items * num_planes, 1, 1), Block: (BLOCK_SIZE, 1, 1)
 // Each block: clip worst part of a beam item by one plane, compute concavity.
@@ -267,7 +70,7 @@ __global__ void evaluate_candidates(
         return;
     }
 
-    // --- Classify vertices ---
+    // --- Classify vertices (inlined — see CLAUDE.md deviation #4) ---
     for (int v = tid; v < vc; v += BLOCK_SIZE) {
         float vx = vertex_pool[(vo + v) * 3 + 0];
         float vy = vertex_pool[(vo + v) * 3 + 1];
@@ -313,7 +116,6 @@ __global__ void evaluate_candidates(
         int hn = (s0 < 0) | (s1 < 0) | (s2 < 0);
 
         if (!hp || !hn) {
-            // Entirely on one side (or on-plane → positive)
             if (hn) {
                 int ni = atomicAdd(&neg_cnt, 1);
                 neg_tris[ni*3]=li0; neg_tris[ni*3+1]=li1; neg_tris[ni*3+2]=li2;
@@ -345,7 +147,6 @@ __global__ void evaluate_candidates(
                 all_verts[nv1*3]=ix1; all_verts[nv1*3+1]=iy1; all_verts[nv1*3+2]=iz1;
                 all_verts[nv2*3]=ix2; all_verts[nv2*3+1]=iy2; all_verts[nv2*3+2]=iz2;
 
-                // Lone side: 1 tri.  Other side: 2 tris.
                 if (ls > 0) {
                     int pi = atomicAdd(&pos_cnt, 1);
                     pos_tris[pi*3]=lv; pos_tris[pi*3+1]=nv1; pos_tris[pi*3+2]=nv2;
@@ -385,7 +186,6 @@ __global__ void evaluate_candidates(
                         pos_tris[pi*3]=ov; pos_tris[pi*3+1]=nvi; pos_tris[pi*3+2]=b_i;
                     }
                 } else {
-                    // Degenerate — assign to positive
                     int pi = atomicAdd(&pos_cnt, 1);
                     pos_tris[pi*3]=li0; pos_tris[pi*3+1]=li1; pos_tris[pi*3+2]=li2;
                 }
@@ -398,7 +198,6 @@ __global__ void evaluate_candidates(
     int n_pos = pos_cnt;
     int n_neg = neg_cnt;
 
-    // Reject degenerate cuts (one side empty)
     if (n_pos == 0 || n_neg == 0) {
         if (tid == 0) cost_buffer[bid] = 1e30f;
         return;
@@ -413,7 +212,6 @@ __global__ void evaluate_candidates(
     if (tid == 0) {
         float cut_cost = fmaxf(pos_cost, neg_cost);
 
-        // Combine with costs of other (unchanged) parts
         float other_worst = 0.0f;
         for (int p = 0; p < item.num_parts; p++) {
             if (p == worst_part) continue;
@@ -425,7 +223,7 @@ __global__ void evaluate_candidates(
 }
 
 // ============================================================================
-// Kernel: select_top_k
+// select_top_k
 // ============================================================================
 
 __global__ void select_top_k(
@@ -468,7 +266,7 @@ __global__ void select_top_k(
 }
 
 // ============================================================================
-// Kernel: apply_cuts
+// apply_cuts
 // ============================================================================
 // Grid: (beam_width, 1, 1), Block: (BLOCK_SIZE, 1, 1)
 // Each block applies one winning cut to pool_dst.
@@ -541,7 +339,6 @@ __global__ void apply_cuts(
     int vc = wp.vert_count, tc = wp.tri_count;
     int wo = wp.vert_offset, wto = wp.tri_offset;
 
-    // Allocate scratch (thread 0 only, broadcast via shared mem)
     __shared__ int* s_signs;
     __shared__ float* s_av;
     __shared__ int *s_pt, *s_nt;
@@ -567,7 +364,17 @@ __global__ void apply_cuts(
         av[v] = vp_src[wo * 3 + v];
     __syncthreads();
 
-    // Split triangles (same logic as evaluate_candidates)
+    // Classify vertices (inlined)
+    for (int v = tid; v < vc; v += BLOCK_SIZE) {
+        float vx = av[v * 3 + 0];
+        float vy = av[v * 3 + 1];
+        float vz = av[v * 3 + 2];
+        float val = pa * vx + pb * vy + pc * vz + pd;
+        signs[v] = (val > EPS) ? 1 : ((val < -EPS) ? -1 : 0);
+    }
+    __syncthreads();
+
+    // Split triangles
     for (int t = tid; t < tc; t += BLOCK_SIZE) {
         int li0 = tp_src[(wto+t)*3]-wo, li1 = tp_src[(wto+t)*3+1]-wo, li2 = tp_src[(wto+t)*3+2]-wo;
         int s0 = signs[li0], s1 = signs[li1], s2 = signs[li2];
@@ -616,7 +423,7 @@ __global__ void apply_cuts(
 
     int tv = vc + nvc_s;
 
-    // Write positive half to dst pool
+    // Write halves to dst pool
     __shared__ unsigned int pos_vo, pos_to, neg_vo, neg_to;
     __shared__ int pos_pi, neg_pi;
     if (tid == 0) {
@@ -670,10 +477,9 @@ __global__ void apply_cuts(
 }
 
 // ============================================================================
-// Kernel: compute_part_costs
+// compute_part_costs
 // ============================================================================
 // Grid: (num_beam_items, 1, 1), Block: (BLOCK_SIZE, 1, 1)
-// Compute bbox concavity for parts that need it; find worst per beam item.
 
 __global__ void compute_part_costs(
     const float* __restrict__ vertex_pool,
@@ -709,9 +515,7 @@ __global__ void compute_part_costs(
             continue;
         }
 
-        int vc = part.vert_count;
         int tc = part.tri_count;
-        int vo = part.vert_offset;
         int to = part.tri_offset;
 
         if (tc == 0) {
@@ -738,149 +542,3 @@ __global__ void compute_part_costs(
         item.worst_cost = worst_cost;
     }
 }
-
-// ============================================================================
-// Kernel: normalize_mesh
-// ============================================================================
-
-__global__ void normalize_mesh(
-    float* __restrict__ vertices, int n_verts,
-    float* __restrict__ norm_info)   // [7]: cx,cy,cz,scale,...
-{
-    int tid = threadIdx.x;
-    extern __shared__ float smem_norm[];
-    float* s_min = smem_norm;
-    float* s_max = smem_norm + BLOCK_SIZE * 3;
-
-    float lmin[3] = {1e30f, 1e30f, 1e30f};
-    float lmax[3] = {-1e30f, -1e30f, -1e30f};
-    for (int i = tid; i < n_verts; i += BLOCK_SIZE)
-        for (int k = 0; k < 3; k++) {
-            float v = vertices[i*3+k];
-            lmin[k] = fminf(lmin[k], v);
-            lmax[k] = fmaxf(lmax[k], v);
-        }
-    for (int k = 0; k < 3; k++) {
-        s_min[tid*3+k] = lmin[k];
-        s_max[tid*3+k] = lmax[k];
-    }
-    __syncthreads();
-    for (int s = BLOCK_SIZE/2; s > 0; s >>= 1) {
-        if (tid < s) for (int k = 0; k < 3; k++) {
-            s_min[tid*3+k] = fminf(s_min[tid*3+k], s_min[(tid+s)*3+k]);
-            s_max[tid*3+k] = fmaxf(s_max[tid*3+k], s_max[(tid+s)*3+k]);
-        }
-        __syncthreads();
-    }
-
-    __shared__ float center[3], scale;
-    if (tid == 0) {
-        float range = 0.0f;
-        for (int k = 0; k < 3; k++) {
-            center[k] = (s_min[k] + s_max[k]) * 0.5f;
-            float r = s_max[k] - s_min[k];
-            if (r > range) range = r;
-        }
-        scale = (range > 1e-10f) ? (2.0f / range) : 1.0f;
-        norm_info[0]=center[0]; norm_info[1]=center[1]; norm_info[2]=center[2];
-        norm_info[3]=scale;
-    }
-    __syncthreads();
-    for (int i = tid; i < n_verts; i += BLOCK_SIZE)
-        for (int k = 0; k < 3; k++)
-            vertices[i*3+k] = (vertices[i*3+k] - center[k]) * scale;
-}
-
-// ============================================================================
-// Kernel: recover_coordinates
-// ============================================================================
-
-__global__ void recover_coordinates(
-    float* __restrict__ vertices, int n_verts,
-    const float* __restrict__ norm_info)
-{
-    int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    if (idx >= n_verts) return;
-    float inv = 1.0f / norm_info[3];
-    vertices[idx*3+0] = vertices[idx*3+0] * inv + norm_info[0];
-    vertices[idx*3+1] = vertices[idx*3+1] * inv + norm_info[1];
-    vertices[idx*3+2] = vertices[idx*3+2] * inv + norm_info[2];
-}
-
-// ============================================================================
-// Kernel: surface sampling + point-mesh distance + reduction (for Hausdorff)
-// ============================================================================
-
-__global__ void sample_surface(
-    const float* __restrict__ vertices, const int* __restrict__ triangles,
-    int n_tris, int vert_offset,
-    float* __restrict__ samples, int n_samples, unsigned int seed)
-{
-    int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    if (idx >= n_samples) return;
-    unsigned int st = seed ^ (idx * 2654435761u);
-    st ^= st<<13; st ^= st>>17; st ^= st<<5;
-    int tri = st % n_tris;
-    st ^= st<<13; st ^= st>>17; st ^= st<<5;
-    int i0=triangles[tri*3]+vert_offset, i1=triangles[tri*3+1]+vert_offset, i2=triangles[tri*3+2]+vert_offset;
-    float u = (float)(st & 0xFFFF)/65535.0f;
-    st ^= st<<13; st ^= st>>17; st ^= st<<5;
-    float v = (float)(st & 0xFFFF)/65535.0f;
-    if(u+v>1.0f){u=1.0f-u;v=1.0f-v;}
-    float w=1.0f-u-v;
-    samples[idx*3]=w*vertices[i0*3]+u*vertices[i1*3]+v*vertices[i2*3];
-    samples[idx*3+1]=w*vertices[i0*3+1]+u*vertices[i1*3+1]+v*vertices[i2*3+1];
-    samples[idx*3+2]=w*vertices[i0*3+2]+u*vertices[i1*3+2]+v*vertices[i2*3+2];
-}
-
-__device__ float point_triangle_dist_beam(
-    float px,float py,float pz,
-    float v0x,float v0y,float v0z,float v1x,float v1y,float v1z,float v2x,float v2y,float v2z) {
-    float e0x=v1x-v0x,e0y=v1y-v0y,e0z=v1z-v0z;
-    float e1x=v2x-v0x,e1y=v2y-v0y,e1z=v2z-v0z;
-    float dx=v0x-px,dy=v0y-py,dz=v0z-pz;
-    float a=e0x*e0x+e0y*e0y+e0z*e0z, b=e0x*e1x+e0y*e1y+e0z*e1z;
-    float c=e1x*e1x+e1y*e1y+e1z*e1z, d=e0x*dx+e0y*dy+e0z*dz, e=e1x*dx+e1y*dy+e1z*dz;
-    float det=a*c-b*b, s=b*e-c*d, t=b*d-a*e;
-    if(s+t<=det){if(s<0){if(t<0){if(d<0){t=0;s=(-d>=a)?1.0f:-d/a;}else{s=0;t=(e>=0)?0:((-e>=c)?1.0f:-e/c);}}else{s=0;t=(e>=0)?0:((-e>=c)?1.0f:-e/c);}}else if(t<0){t=0;s=(d>=0)?0:((-d>=a)?1.0f:-d/a);}else{float inv=1.0f/det;s*=inv;t*=inv;}}
-    else{if(s<0){float t0=b+d,t1=c+e;if(t1>t0){float nm=t1-t0,dn=a-2*b+c;s=(nm>=dn)?1.0f:nm/dn;t=1-s;}else{s=0;t=(t1<=0)?1.0f:((e>=0)?0:-e/c);}}else if(t<0){float t0=b+e,t1=a+d;if(t1>t0){float nm=t1-t0,dn=a-2*b+c;t=(nm>=dn)?1.0f:nm/dn;s=1-t;}else{t=0;s=(t1<=0)?1.0f:((d>=0)?0:-d/a);}}else{float nm=(c+e)-(b+d);if(nm<=0){s=0;t=1;}else{float dn=a-2*b+c;s=(nm>=dn)?1.0f:nm/dn;t=1-s;}}}
-    float rx=v0x+s*e0x+t*e1x-px,ry=v0y+s*e0y+t*e1y-py,rz=v0z+s*e0z+t*e1z-pz;
-    return sqrtf(rx*rx+ry*ry+rz*rz);
-}
-
-__global__ void beam_point_mesh_distance(
-    const float* __restrict__ points, const float* __restrict__ vertices,
-    const int* __restrict__ triangles, float* __restrict__ distances,
-    int N, int T, int vert_offset)
-{
-    int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    if (idx >= N) return;
-    float px=points[idx*3],py=points[idx*3+1],pz=points[idx*3+2];
-    float md = 1e30f;
-    for (int t = 0; t < T; t++) {
-        int i0=triangles[t*3]+vert_offset, i1=triangles[t*3+1]+vert_offset, i2=triangles[t*3+2]+vert_offset;
-        md = fminf(md, point_triangle_dist_beam(px,py,pz,
-            vertices[i0*3],vertices[i0*3+1],vertices[i0*3+2],
-            vertices[i1*3],vertices[i1*3+1],vertices[i1*3+2],
-            vertices[i2*3],vertices[i2*3+1],vertices[i2*3+2]));
-    }
-    distances[idx] = md;
-}
-
-__global__ void beam_reduce_max(const float* __restrict__ data, float* __restrict__ output, int N) {
-    extern __shared__ float sdata[];
-    int tid = threadIdx.x;
-    int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x;
-    float val = -1e30f;
-    if (idx < N) val = data[idx];
-    if (idx + blockDim.x < N) val = fmaxf(val, data[idx + blockDim.x]);
-    sdata[tid] = val;
-    __syncthreads();
-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid+s]);
-        __syncthreads();
-    }
-    if (tid == 0) output[blockIdx.x] = sdata[0];
-}
-
-} // extern "C"

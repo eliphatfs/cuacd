@@ -7,30 +7,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This repository contains:
 
 1. **CoACD** (`CoACD/`) — Collision-Aware Approximate Convex Decomposition (reference C++ implementation, SIGGRAPH 2022).
-2. **coacd_gpu** — GPU-accelerated convex decomposition. Three components:
-   - **Hausdorff/merge kernels** (`cuda/kernels.cu`, `csrc/coacd_gpu.c`) — GPU Hausdorff distance and pairwise merge cost via CUDA driver API.
-   - **Beam search decomposition** (`cuda/beam_kernels.cu`, `csrc/beam.c`, `csrc/beam_module.c`) — GPU-native beam search replacing MCTS. CPython extension (abi3, cp310+).
+2. **coacd_gpu** — GPU-accelerated convex decomposition. Two components:
+   - **GPU extension** (`cuda/beam_kernels.cu`, `csrc/beam.c`, `csrc/beam_module.c`) — All GPU functionality: beam search decomposition, Hausdorff distance, pairwise merge cost. Single CPython extension (abi3, cp310+) via CUDA driver API.
    - **Pure Python CoACD** (`coacd_gpu/coacd/`) — Pure Python reimplementation using scipy/triangle. No C++ build required.
 
 ## Repository Layout
 
 ```
-setup.py              # Build config: CMake for _native, setuptools for _beam
+setup.py              # Build config: setuptools builds _gpu extension
 pyproject.toml        # PEP 621 metadata
-cuda/                 # CUDA device kernels + CMake for fatbin
-  CMakeLists.txt      #   Builds libcoacd_gpu.so (Hausdorff/merge only)
-  kernels.cu          #   point_mesh_distance, reduce_max, pairwise_hausdorff
-  beam_kernels.cu     #   Beam search: clip, bbox concavity, candidate eval, apply_cuts
+cuda/                 # CUDA device code (compiled to single fatbin)
+  kernels.cu          #   Root compilation unit — includes all modules
+  common.cuh          #   Constants, data structures, pool allocator, atomics
+  reduce.cuh          #   Block-level parallel reductions (sum, bbox)
+  geometry.cuh        #   Edge intersection, point-triangle distance, bbox concavity
+  beam_search.cu      #   Beam search kernels (evaluate, select, apply, compute_costs)
+  hausdorff.cu        #   Hausdorff kernels (point_mesh_distance, reduce_max, pairwise)
+  mesh_transform.cu   #   Normalize/recover coordinate kernels
 csrc/                 # C host code
-  coacd_gpu.h/.c      #   Hausdorff/merge host implementation (CUDA driver API)
-  beam.h/.c           #   Beam search host implementation (CUDA driver API)
+  beam.h/.c           #   Host implementation (CUDA driver API) — beam search + Hausdorff
   beam_module.c       #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
-  __init__.py         #   ctypes wrapper for _native + re-exports BeamContext
-  beam.py             #   Python API for beam search (imports _beam extension)
+  __init__.py         #   Context class (Hausdorff API) + re-exports BeamContext
+  beam.py             #   Python API for beam search (imports _gpu extension)
   coacd/              #   Pure Python CoACD implementation
 tests/                # All tests
-  test_extension.py   #   GPU smoke tests (Hausdorff, pairwise)
+  test_extension.py   #   GPU smoke tests (Hausdorff, pairwise, beam)
   test_clip.py ...    #   Pure Python CoACD unit tests
 CoACD/                # Reference C++ CoACD (submodule/external)
 ```
@@ -38,7 +40,7 @@ CoACD/                # Reference C++ CoACD (submodule/external)
 ## Build Commands
 
 ```bash
-# Install everything (requires: cmake >= 3.24, CUDA toolkit, C compiler)
+# Install everything (requires: CUDA toolkit with nvcc, C compiler)
 pip install -e .
 
 # Override GPU architectures
@@ -75,11 +77,9 @@ cd CoACD && pip install -e .
 
 ### Build System
 
-Two extensions are built by `setup.py`:
+One extension is built by `setup.py`:
 
-1. **`coacd_gpu._native`** — CMake-built shared library (`libcoacd_gpu.so`). CMakeLists.txt in `cuda/` compiles `kernels.cu` → fatbin → bin2c → C array, links with `csrc/coacd_gpu.c`. Python loads via ctypes.
-
-2. **`coacd_gpu._beam`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/beam_kernels.cu` → fatbin → xxd-style C header, then builds `csrc/beam_module.c` + `csrc/beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). No cmake involved for this extension.
+**`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all `.cuh`/`.cu` modules) → fatbin → xxd-style C header, then builds `csrc/beam_module.c` + `csrc/beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). No cmake involved.
 
 ### Design Principles
 
@@ -87,27 +87,35 @@ Two extensions are built by `setup.py`:
 - **Fatbin embedding** — cubins for sm_80/86/89/90 + PTX for forward compat, embedded as C arrays.
 - **abi3 wheel** — `Py_LIMITED_API` targeting Python 3.10+. One wheel per platform.
 - **No PyTorch dependency** — numpy arrays in/out. Reuses existing CUDA context if available.
+- **Single extension** — all GPU functionality (beam search + Hausdorff + merge cost) in one `_gpu` module. No cmake, no ctypes.
 
-### Hausdorff/Merge Kernels (`cuda/kernels.cu`)
+### GPU Kernels (`cuda/`)
 
-- **`point_mesh_distance`** — brute-force point-to-triangle (Eberly's method), one thread per point.
-- **`reduce_max`** — shared-memory parallel max reduction.
-- **`pairwise_hausdorff`** — batch merge cost matrix with `atomicMax` float CAS.
+CUDA device code organized into modular files, compiled as a single fatbin via `cuda/kernels.cu`:
 
-### Beam Search Kernels (`cuda/beam_kernels.cu`)
+- **`common.cuh`** — Constants (`BLOCK_SIZE`, `MAX_BEAM`, etc.), data structures (`PartInfo`, `BeamItem`, `DevicePool`), `pool_alloc`, `atomicMinF`/`atomicMaxF`.
+- **`reduce.cuh`** — `block_reduce_sum`, `block_reduce_bbox`.
+- **`geometry.cuh`** — `signed_tet_volume`, `intersect_edge`, `point_triangle_dist` (Eberly's method), `compute_concavity_tris` (bbox metric).
 
-GPU beam search replacing MCTS. Search space: 3×N axis-aligned cuts per step (default N=10 → 30 planes).
-
-Kernels:
+**Beam search kernels (`beam_search.cu`):**
 - **`evaluate_candidates`** — Grid `(beams × planes)`. Per block: classify vertices against plane (inline, not function call — see implementation notes), split straddling triangles, compute `cbrt(bbox_volume)` for each half as cost proxy.
 - **`select_top_k`** — Single block, thread 0 only. Insertion-sort to pick best `beam_width` candidates.
 - **`apply_cuts`** — Grid `(winners)`. Copy unchanged parts, re-clip worst part, write to double-buffered pool.
 - **`compute_part_costs`** — Grid `(beams)`. Compute `cbrt(bbox_volume)` for parts needing it, find worst per beam item.
+**Hausdorff/merge kernels (`hausdorff.cu`):**
+- **`sample_surface`** — Area-weighted surface sampling (for Hausdorff validation, not yet wired in).
+- **`point_mesh_distance`** — brute-force point-to-triangle (Eberly's method), one thread per point. Has `vert_offset` parameter for pool-based usage.
+- **`reduce_max`** — shared-memory parallel max reduction.
+- **`pairwise_hausdorff`** — batch merge cost matrix with `atomicMaxF` float CAS.
+
+**Mesh transform kernels (`mesh_transform.cu`):**
 - **`normalize_mesh`** / **`recover_coordinates`** — Normalize to [-1,1]³ and recover.
-- **`sample_surface`**, **`beam_point_mesh_distance`**, **`beam_reduce_max`** — Hausdorff support (present but not yet wired into beam loop).
 
-### Beam Search Host Orchestration (`csrc/beam.c`)
+### Host Orchestration (`csrc/beam.c`)
 
+Single context manages both beam search and Hausdorff functionality. All kernel function handles resolved from one fatbin module at init time.
+
+**Beam search flow:**
 ```
 Input mesh → Upload to pool_a → Normalize to [-1,1]³
   → Generate 3×N axis-aligned cutting planes
@@ -157,19 +165,22 @@ If all 256 threads call `pool_alloc`, each gets a different offset (256× memory
 ### Python API
 
 ```python
-# Hausdorff (legacy ctypes wrapper)
+# Hausdorff distance computation
 import coacd_gpu
 with coacd_gpu.Context(device=0) as ctx:
     dists = ctx.point_mesh_distances(points, vertices, triangles)
     h = ctx.hausdorff(sa, va, ta, sb, vb, tb)
+    cost = ctx.pairwise_hausdorff(samples, s_off, verts, tris, t_off, v_off)
 
-# Beam search decomposition (native CPython extension)
+# Beam search decomposition
 from coacd_gpu.beam import BeamContext, run_beam_coacd
 with BeamContext(device=0) as ctx:
     parts = ctx.run(vertices, triangles, threshold=0.5)
 # or:
 parts = run_beam_coacd(vertices, triangles, threshold=0.5)
 ```
+
+Both `Context` and `BeamContext` share the same underlying `_gpu` extension and CUDA context.
 
 ## Pure Python CoACD (`coacd_gpu/coacd/`)
 
@@ -275,23 +286,23 @@ signs[v] = (val > EPS) ? 1 : ((val < -EPS) ? -1 : 0);
 
 **Why changed**: Deferred. The beam search already optimizes for fewest parts at termination (picks beam item with minimum num_parts among those satisfying threshold). Merge would further reduce part count but isn't critical for initial functionality.
 
-### 9. Build System: CPython Extension instead of CMake + ctypes
+### 9. Single CPython Extension (no cmake, no ctypes)
 
 **Plan** (original): CMake builds everything, Python loads via ctypes.CDLL.
 
-**Implementation**: CMake builds only `_native` (Hausdorff/merge). The beam search `_beam` is built directly by setuptools as a CPython extension module (Py_LIMITED_API, slot-based module definition).
+**Implementation**: All GPU functionality (beam search + Hausdorff + merge cost) is built as a single `_gpu` CPython extension module by setuptools. `setup.py` compiles `beam_kernels.cu` → fatbin → C header, then builds `beam_module.c` + `beam.c` with `Py_LIMITED_API` (cp310+, abi3 wheel). No cmake, no ctypes, no separate shared library.
 
-**Why changed**: ctypes has fragile import path resolution (fails when cwd shadows package name), no type safety, no proper Python object lifecycle. The torchoptix pattern (native CPython extension with embedded fatbin) is the standard approach for shipping CUDA-accelerated Python modules.
+**Why changed**: ctypes has fragile import path resolution (fails when cwd shadows package name), no type safety, no proper Python object lifecycle. Having two separate extensions (`_native` via cmake + ctypes, `_beam` via setuptools) was unnecessary complexity — all kernels share the same CUDA context and can live in one fatbin/module. The torchoptix pattern (native CPython extension with embedded fatbin) is the standard approach for shipping CUDA-accelerated Python modules.
 
 ## Current Status
 
 ### Working
 - Full beam search pipeline: init → normalize → evaluate → select → apply → recover → download
 - Multi-iteration decomposition with double-buffered pools
-- CPython extension (abi3 cp310+) builds and loads
+- Single CPython extension (abi3 cp310+) with all GPU functionality
+- Hausdorff distance, pairwise merge cost, beam search in one module
 - Cube correctly identified as convex at appropriate threshold
 - L-shape decomposed into 3 parts
-- Hausdorff/merge kernels (existing, unmodified)
 - Pure Python CoACD (existing, unmodified)
 - All 56 unit tests pass, GPU smoke tests pass
 

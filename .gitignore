@@ -210,7 +210,7 @@ __marimo__/
 *.fatbin
 *.cubin
 *.ptx
-kernels_fatbin.c
-beam_kernels_fatbin.h
+*_fatbin.c
+*_fatbin.h
 *.dll
 *.dylib

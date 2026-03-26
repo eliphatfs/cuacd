@@ -1,11 +1,11 @@
 """
 Build logic for coacd_gpu.
 
-Two extensions are built:
-  1. coacd_gpu._native  — CMake-built shared library for Hausdorff/merge (ctypes, legacy)
-  2. coacd_gpu._beam    — Native CPython extension for beam search decomposition
+One extension is built:
+  coacd_gpu._gpu — Native CPython extension for beam search decomposition,
+                   Hausdorff distance, and pairwise merge cost.
 
-Both embed CUDA fatbins and link only against libcuda (driver API).
+Embeds CUDA fatbin and links only against libcuda (driver API).
 Metadata lives in pyproject.toml.
 
 Requires at build time: cmake >= 3.24, CUDA toolkit (nvcc), a C compiler.
@@ -111,64 +111,27 @@ def _fatbin_to_header(fatbin_file, header_file, symbol_name):
 
 class CoacdBuildExt(build_ext):
     def build_extension(self, ext):
-        if ext.name == "coacd_gpu._native":
-            self._build_cmake(ext)
-        elif ext.name == "coacd_gpu._beam":
-            self._build_beam(ext)
+        if ext.name == "coacd_gpu._gpu":
+            self._build_gpu(ext)
         else:
             super().build_extension(ext)
 
-    def _build_cmake(self, ext):
-        """Build the CMake-based shared library (Hausdorff/merge kernels)."""
-        cmake_src = os.path.join(_ROOT, "cuda")
-        build_dir = os.path.join(self.build_temp, "cmake_build")
-        os.makedirs(build_dir, exist_ok=True)
-
-        ext_fullpath = os.path.abspath(self.get_ext_fullpath(ext.name))
-        pkg_dir = os.path.dirname(ext_fullpath)
-        os.makedirs(pkg_dir, exist_ok=True)
-
-        cfg = "Release"
-        cmake_args = [
-            f"-DCMAKE_BUILD_TYPE={cfg}",
-            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={pkg_dir}",
-            f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={pkg_dir}",
-            f"-DCOACD_GPU_CSRC_DIR={os.path.join(_ROOT, 'csrc')}",
-        ]
-        archs = os.environ.get("COACD_GPU_ARCHS")
-        if archs:
-            cmake_args.append(f"-DFATBIN_ARCHS={archs}")
-
-        build_args = ["--config", cfg]
-        if hasattr(self, "parallel") and self.parallel:
-            build_args += [f"-j{self.parallel}"]
-
-        subprocess.check_call(["cmake", cmake_src] + cmake_args, cwd=build_dir)
-        subprocess.check_call(["cmake", "--build", "."] + build_args, cwd=build_dir)
-
-        if not os.path.exists(ext_fullpath):
-            lib_name = {"win32": "coacd_gpu.dll", "darwin": "libcoacd_gpu.dylib"
-                        }.get(sys.platform, "libcoacd_gpu.so")
-            lib_path = os.path.join(pkg_dir, lib_name)
-            if os.path.exists(lib_path):
-                os.symlink(lib_path, ext_fullpath)
-
-    def _build_beam(self, ext):
-        """Build beam search CPython extension with embedded fatbin."""
+    def _build_gpu(self, ext):
+        """Build the GPU CPython extension with embedded fatbin."""
         cuda_home = _find_cuda_home()
-        build_dir = os.path.join(self.build_temp, "beam_build")
+        build_dir = os.path.join(self.build_temp, "gpu_build")
         os.makedirs(build_dir, exist_ok=True)
 
-        cu_file = os.path.join(_ROOT, "cuda", "beam_kernels.cu")
-        fatbin_file = os.path.join(build_dir, "beam_kernels.fatbin")
-        header_file = os.path.join(build_dir, "beam_kernels_fatbin.h")
+        cu_file = os.path.join(_ROOT, "cuda", "kernels.cu")
+        fatbin_file = os.path.join(build_dir, "kernels.fatbin")
+        header_file = os.path.join(build_dir, "kernels_fatbin.h")
 
         _compile_fatbin(cuda_home, cu_file, fatbin_file, build_dir)
-        _fatbin_to_header(fatbin_file, header_file, "beam_kernels_fatbin")
+        _fatbin_to_header(fatbin_file, header_file, "kernels_fatbin")
 
         ext.include_dirs = [
             os.path.join(_ROOT, "csrc"),              # beam.h
-            build_dir,                                 # beam_kernels_fatbin.h
+            build_dir,                                 # kernels_fatbin.h
             os.path.join(cuda_home, "include"),        # cuda.h
         ]
         ext.library_dirs = [_cuda_stubs_dir(cuda_home)]
@@ -184,14 +147,8 @@ class CoacdBuildExt(build_ext):
 # Extensions
 # ---------------------------------------------------------------------------
 
-_native_ext = Extension(
-    name="coacd_gpu._native",
-    sources=[],
-    py_limited_api=True,
-)
-
-_beam_ext = Extension(
-    name="coacd_gpu._beam",
+_gpu_ext = Extension(
+    name="coacd_gpu._gpu",
     sources=[
         os.path.join("csrc", "beam_module.c"),
         os.path.join("csrc", "beam.c"),
@@ -201,7 +158,7 @@ _beam_ext = Extension(
 
 setup(
     packages=["coacd_gpu", "coacd_gpu.coacd"],
-    ext_modules=[_native_ext, _beam_ext],
+    ext_modules=[_gpu_ext],
     cmdclass={"build_ext": CoacdBuildExt, **_extra_cmdclass},
     zip_safe=False,
 )
