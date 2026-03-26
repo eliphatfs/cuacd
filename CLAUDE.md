@@ -4,223 +4,168 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository contains two projects:
+This repository contains:
 
-1. **CoACD** (`CoACD/`) — Collision-Aware Approximate Convex Decomposition. Decomposes 3D meshes into approximate convex parts using MCTS-guided plane cutting. Published at SIGGRAPH 2022.
-2. **coacd_gpu** (`coacd_gpu/`) — Standalone GPU acceleration library for CoACD's computational bottlenecks (Hausdorff distance, merge cost matrix). Uses CUDA driver API; no PyTorch or CUDA runtime dependency.
-3. **Pure Python CoACD** (`coacd_gpu/python/coacd/`) — Pure Python reimplementation of the CoACD algorithm. Uses `scipy` (Qhull), `triangle` (CDT), and optionally `coacd_gpu` for GPU-accelerated Hausdorff. No C++ CoACD build required.
+1. **CoACD** (`CoACD/`) — Collision-Aware Approximate Convex Decomposition (reference C++ implementation, SIGGRAPH 2022).
+2. **coacd_gpu** — GPU-accelerated convex decomposition. Three components:
+   - **Hausdorff/merge kernels** (`cuda/kernels.cu`, `csrc/coacd_gpu.c`) — GPU Hausdorff distance and pairwise merge cost via CUDA driver API.
+   - **Beam search decomposition** (`cuda/beam_kernels.cu`, `csrc/beam.c`, `csrc/beam_module.c`) — Fully GPU-native beam search replacing MCTS. CPython extension (abi3, cp310+).
+   - **Pure Python CoACD** (`coacd_gpu/coacd/`) — Pure Python reimplementation using scipy/triangle. No C++ build required.
+
+## Repository Layout
+
+```
+setup.py              # Build config: CMake for _native, setuptools for _beam
+pyproject.toml        # PEP 621 metadata
+cuda/                 # CUDA device kernels + CMake for fatbin
+  CMakeLists.txt      #   Builds libcoacd_gpu.so (Hausdorff/merge only)
+  kernels.cu          #   point_mesh_distance, reduce_max, pairwise_hausdorff
+  beam_kernels.cu     #   Beam search: clip, hull, Rv, candidate eval, apply_cuts
+csrc/                 # C host code
+  coacd_gpu.h/.c      #   Hausdorff/merge host implementation (CUDA driver API)
+  beam.h/.c           #   Beam search host implementation (CUDA driver API)
+  beam_module.c       #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
+coacd_gpu/            # Python package (import name)
+  __init__.py         #   ctypes wrapper for _native + re-exports BeamContext
+  beam.py             #   Python API for beam search (imports _beam extension)
+  coacd/              #   Pure Python CoACD implementation
+tests/                # All tests
+  test_extension.py   #   GPU smoke tests (Hausdorff, pairwise)
+  test_clip.py ...    #   Pure Python CoACD unit tests
+CoACD/                # Reference C++ CoACD (submodule/external)
+```
 
 ## Build Commands
+
+```bash
+# Install everything (requires: cmake >= 3.24, CUDA toolkit, C compiler)
+pip install -e .
+
+# Override GPU architectures
+COACD_GPU_ARCHS="80;86" pip install -e .
+
+# Run GPU smoke tests
+python tests/test_extension.py
+
+# Run pure Python CoACD tests (fast)
+python -m pytest tests/ -v
+
+# Run all tests including slow MCTS/pipeline tests
+python -m pytest tests/ -v --slow
+
+# Run a specific test
+python -m pytest tests/test_clip.py -v
+
+# Compare C++ vs Python CoACD on Octocat
+python compare_octocat.py
+```
+
+Dependencies: `numpy`, `scipy`, `triangle`, `pytest` (test only), `trimesh` (comparison only).
 
 ### CoACD (C++ / Python)
 
 ```bash
-# C++ build
 cd CoACD && mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make main -j$(nproc)
-
-# Run CLI
+cmake .. -DCMAKE_BUILD_TYPE=Release && make main -j$(nproc)
 ./build/main -i examples/SnowFlake.obj -o output.obj -t 0.05
-
-# Python package
 cd CoACD && pip install -e .
-
-# Run tests (requires: trimesh, numpy, coacd)
-cd CoACD && python run_tests.py
-
-# Run single test
-python -m unittest run_tests.TestExamples.test_snowflake
 ```
-
-### coacd_gpu (CUDA / Python)
-
-```bash
-# Build and install (requires: cmake >= 3.24, CUDA toolkit, C compiler)
-cd coacd_gpu && pip install -e .
-
-# Override target GPU architectures (default: 80;86;89;90)
-COACD_GPU_ARCHS="80;86" pip install -e .
-
-# Run smoke tests
-cd coacd_gpu && python test_extension.py
-```
-
-### Pure Python CoACD (tests)
-
-```bash
-# Run fast unit tests (geometry, mesh, sampling, cost, clip, mcts helpers)
-cd coacd_gpu && python -m pytest tests/ -v
-
-# Run all tests including slow ones (MCTS search, full pipeline)
-cd coacd_gpu && python -m pytest tests/ -v --slow
-
-# Run a specific test module
-python -m pytest coacd_gpu/tests/test_clip.py -v
-
-# Compare C++ vs Python CoACD on Octocat example
-python compare_octocat.py
-```
-
-Dependencies: `numpy`, `scipy`, `triangle`, `pytest` (test only), `trimesh` (comparison script only).
-
-## CoACD Architecture
-
-### Algorithm Pipeline
-
-```
-Input OBJ → Normalize → Manifold Check/Repair (OpenVDB) → [PCA alignment]
-    → Iterative MCTS Decomposition Loop:
-        For each part with concavity > threshold:
-            1. Compute convex hull
-            2. Calculate cost = max(Rv, Hausdorff)
-            3. MCTS tree search for best cutting plane
-            4. Ternary refinement of plane position
-            5. Clip mesh along plane → two halves
-            6. Recurse on halves
-    → Merge post-processing (greedy agglomerative)
-    → [Decimate] → [Extrude] → Output
-```
-
-### Key Source Files (`CoACD/src/`)
-
-| File | Role |
-|------|------|
-| `process.cpp` | Main decomposition loop, merge, decimate, extrude. Contains OpenMP parallel regions |
-| `mcts.cpp` | MCTS tree search (UCB selection, random rollout, backprop) + ternary plane refinement |
-| `cost.cpp` | Concavity metrics: Rv (volume-based) and Hausdorff distance computation |
-| `hausdorff.h` | KD-tree nearest-neighbor queries via nanoflann for Hausdorff distance |
-| `clip.cpp` | Plane-mesh clipping with CDT (Constrained Delaunay Triangulation) for cap faces |
-| `model_obj.cpp` | `Model` class: mesh I/O, convex hull (QuickHull primary, btConvexHull fallback), PCA |
-| `bvh.cpp` | BVH for triangle self-intersection detection (manifold checking) |
-| `config.h` | `Params` struct holding all algorithm parameters |
-| `preprocess.cpp` | OpenVDB-based manifold repair (compiled only with `WITH_3RD_PARTY_LIBS`) |
-
-### Public API
-
-- `public/coacd.h` / `coacd.cpp` — C/C++ API wrapping the decomposition pipeline
-- `python/package/` — Python bindings via shared library `_coacd`
-
-### Core Data Structures
-
-- **`Model`** (`model_obj.h`): Primary mesh representation (vertices as `vec3d`, triangles as `vec3i`, bbox, rotation matrix). Methods: `ComputeCH()`, `ComputeAPX()`, `IsManifold()`
-- **`Node`/`State`/`Part`** (`mcts.h`): MCTS tree node, decomposition state (list of parts + costs), and individual mesh partition with candidate cutting planes
-- **`Plane`** (`shape.h`): Cutting plane `ax+by+cz+d=0` with intersection/side methods
-
-### Parallelism
-
-OpenMP is used in two places:
-1. **Per-part MCTS search** (`process.cpp`): Each mesh part's decomposition runs in parallel
-2. **Merge cost matrix** (`process.cpp`): Pairwise convex hull merge costs computed in parallel
-
-### Computational Bottlenecks
-
-1. **Hausdorff distance** — KD-tree NN queries over sampled surface points, called per candidate plane per MCTS iteration
-2. **Convex hull computation** — QuickHull per part per MCTS iteration
-3. **Merge phase** — O(p²) pairwise cost computations where p = number of parts
-4. **Mesh clipping** — CDT triangulation of clip boundaries
-
-### CMake Options
-
-- `WITH_3RD_PARTY_LIBS` (default ON): Enables OpenVDB manifold preprocessing + spdlog. When OFF, preprocessing code is excluded and logging is disabled.
-- `CMAKE_BUILD_TYPE`: Use `Release` for optimized builds, `Debug` enables AddressSanitizer on GCC.
 
 ## coacd_gpu Architecture
 
+### Build System
+
+Two extensions are built by `setup.py`:
+
+1. **`coacd_gpu._native`** — CMake-built shared library (`libcoacd_gpu.so`). CMakeLists.txt in `cuda/` compiles `kernels.cu` → fatbin → bin2c → C array, links with `csrc/coacd_gpu.c`. Python loads via ctypes.
+
+2. **`coacd_gpu._beam`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/beam_kernels.cu` → fatbin → header (xxd-style), then builds `csrc/beam_module.c` + `csrc/beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel).
+
 ### Design Principles
 
-- **CUDA driver API only** — links `libcuda.so` (GPU driver), NOT `libcudart.so` (runtime). One binary works across CUDA 11.x–12.x+.
-- **Fatbin embedding** — kernels compiled to fatbin (cubins for sm_80/86/89/90 + PTX for forward compat), converted to a C array via `bin2c`, linked into the shared library. No external files to ship.
-- **Python abi3 wheel** — uses `Py_LIMITED_API` targeting Python 3.9+. One wheel per platform.
-- **No PyTorch dependency** — pure numpy arrays in/out via ctypes. Reuses existing CUDA context if available (e.g. from PyTorch) via `coacd_gpu_init(ctx, -1)`.
+- **CUDA driver API only** — links `libcuda.so`, not `libcudart.so`. One binary across CUDA 11.x–12.x+.
+- **Fatbin embedding** — cubins for sm_80/86/89/90 + PTX for forward compat, embedded as C arrays.
+- **abi3 wheel** — `Py_LIMITED_API` targeting Python 3.10+. One wheel per platform.
+- **No PyTorch dependency** — numpy arrays in/out. Reuses existing CUDA context if available.
 
-### File Layout
+### Hausdorff/Merge Kernels (`cuda/kernels.cu`)
 
-| File | Role |
-|------|------|
-| `kernels.cu` | Pure device code (`extern "C"`): `point_mesh_distance`, `reduce_max`, `pairwise_hausdorff` |
-| `coacd_gpu.h` | Public C API header (ctypes-friendly, `COACD_GPU_API` visibility) |
-| `coacd_gpu.c` | Host implementation: `cuModuleLoadFatBinary`, `cuLaunchKernel`, memory management |
-| `CMakeLists.txt` | `nvcc --fatbin` → `bin2c` → `libcoacd_gpu.so`, links only `CUDA::cuda_driver` |
-| `python/__init__.py` | ctypes wrapper exposing `Context` class with numpy API |
-| `setup.py` | CMake-based build + abi3 wheel tagging |
-| `pyproject.toml` | PEP 621 metadata |
+- **`point_mesh_distance`** — brute-force point-to-triangle (Eberly's method), one thread per point.
+- **`reduce_max`** — shared-memory parallel max reduction.
+- **`pairwise_hausdorff`** — batch merge cost matrix with `atomicMax` float CAS.
 
-### GPU Kernels
+### Beam Search Kernels (`cuda/beam_kernels.cu`)
 
-- **`point_mesh_distance`** — brute-force point-to-triangle distance (Eberly's method). One thread per query point, scans all triangles. Faster than BVH for CoACD's typical part sizes (<50k triangles).
-- **`reduce_max`** — shared-memory parallel max reduction for computing Hausdorff from per-point distances.
-- **`pairwise_hausdorff`** — batch merge cost matrix. Grid maps (pair_idx, sample_block), uses `atomicMax` float CAS to reduce per-point distances into per-pair Hausdorff values.
+GPU beam search replacing MCTS. Search space: 3×N axis-aligned cuts per step.
 
-### Python Usage
+Kernels:
+- **`evaluate_candidates`** — Per (beam_item, plane) block: classify vertices, split triangles, compute mesh volume (signed tets), convex hull volume (incremental), Rv cost.
+- **`select_top_k`** — Pick best beam_width candidates from cost buffer.
+- **`apply_cuts`** — Materialize winning cuts: copy parts to new pool, re-clip worst part.
+- **`compute_part_costs`** — Recompute Rv for all parts, find worst per beam item.
+- **`normalize_mesh`** / **`recover_coordinates`** — Normalize to [-1,1]³ and recover.
+- **`sample_surface`**, **`beam_point_mesh_distance`**, **`beam_reduce_max`** — For Hausdorff validation.
+
+### Beam Search Host (`csrc/beam.c`)
+
+Orchestrates the beam loop via CUDA driver API:
+1. Upload mesh, normalize
+2. Generate axis-aligned cutting planes
+3. Loop: evaluate → select top-K → apply cuts → recompute Rv → check termination
+4. Recover coordinates, download parts
+
+Uses double-buffered mesh pools and a bump-allocated scratch pool.
+
+### Python API
 
 ```python
+# Hausdorff (legacy ctypes wrapper)
 import coacd_gpu
-
 with coacd_gpu.Context(device=0) as ctx:
-    # Per-point distances
     dists = ctx.point_mesh_distances(points, vertices, triangles)
+    h = ctx.hausdorff(sa, va, ta, sb, vb, tb)
 
-    # Hausdorff between two meshes
-    h = ctx.hausdorff(samples_a, verts_a, tris_a, samples_b, verts_b, tris_b)
-
-    # Pairwise merge cost matrix
-    cost = ctx.pairwise_hausdorff(all_samples, sample_offsets,
-                                   all_vertices, all_triangles,
-                                   tri_offsets, vert_offsets)
+# Beam search decomposition (native CPython extension)
+from coacd_gpu.beam import BeamContext, run_beam_coacd
+with BeamContext(device=0) as ctx:
+    parts = ctx.run(vertices, triangles, threshold=0.05)
+# or:
+parts = run_beam_coacd(vertices, triangles, threshold=0.05)
 ```
 
-### Planned: `__cuda_array_interface__` Support
+## Pure Python CoACD (`coacd_gpu/coacd/`)
 
-Support the [CUDA Array Interface](https://numba.readthedocs.io/en/stable/cuda/cuda_array_interface.html) protocol for zero-copy GPU memory communication. This eliminates CPU↔GPU round-trips when coacd_gpu is used alongside PyTorch, CuPy, or other GPU libraries.
-
-**Design:**
-
-- **Input path**: All public API methods (`point_mesh_distances`, `hausdorff`, `pairwise_hausdorff`) should detect `__cuda_array_interface__` on input arguments. When present, extract the device pointer directly (`cai['data'][0]`) and skip `cuMemAlloc` + `cuMemcpyHtoD`. Validate dtype/shape/contiguity from the interface metadata (`typestr`, `shape`, `strides`).
-- **Output path**: Provide an option to return GPU-resident results wrapped in a lightweight object exposing `__cuda_array_interface__` (device pointer, shape, typestr), instead of downloading to numpy. This lets downstream GPU code consume results without a device→host copy.
-- **Fallback**: Plain numpy arrays continue to work as before (upload to GPU, compute, download). The interface is additive — no breaking changes.
-- **Memory ownership**: For inputs, coacd_gpu borrows the pointer (caller owns the memory). For GPU outputs, coacd_gpu allocates device memory and the returned wrapper object frees it on garbage collection (via `cuMemFree` pointers stored in the context).
-- **Reference**: See [`gint/host/executor.py`](https://github.com/eliphatfs/gint/blob/main/gint/host/executor.py) `TensorInterface` class for `from_cuda_array_interface` / `__cuda_array_interface__` property patterns.
-
-## Pure Python CoACD
-
-### Overview
-
-A pure Python reimplementation of the CoACD decomposition algorithm in `coacd_gpu/python/coacd/`. Removes the dependency on the C++ CoACD build. Uses `scipy` for convex hulls (Qhull), `triangle` for constrained Delaunay triangulation, and optionally `coacd_gpu` for GPU-accelerated Hausdorff distance.
-
-### Module Layout
+Pure Python reimplementation of CoACD. Uses `scipy` (Qhull), `triangle` (CDT), optionally `coacd_gpu` for GPU Hausdorff.
 
 | File | Role |
 |------|------|
-| `_geometry.py` | `Plane` class, `mesh_volume`, `mesh_area`, `normalize`, `recover`, `pca_align` |
-| `_mesh.py` | `Mesh` class wrapping vertices + triangles + bbox + `convex_hull()` via scipy |
-| `_sampling.py` | Area-weighted surface sampling with mixed random/quasi-random strategy |
-| `_cost.py` | `compute_rv` (volume), `compute_hb`/`hausdorff_cpu` (Hausdorff via KD-tree), `compute_hcost` (combined) |
-| `_clip.py` | Plane-mesh clipping with CDT cap triangulation via `triangle` library |
-| `_mcts.py` | MCTS tree search (Node/State/Part), UCB1 selection, Rv-only rollout, ternary refinement |
-| `_merge.py` | Greedy agglomerative merge with flat upper-triangle cost matrix |
-| `_pipeline.py` | `run_coacd()` orchestration: normalize → [PCA] → MCTS decomposition loop → [merge] → recover |
-| `__init__.py` | Exports `run_coacd`, `Mesh` |
-
-### Usage
+| `_geometry.py` | `Plane`, `mesh_volume`, `normalize`, `recover`, `pca_align` |
+| `_mesh.py` | `Mesh` class wrapping vertices + triangles + `convex_hull()` via scipy |
+| `_sampling.py` | Area-weighted surface sampling |
+| `_cost.py` | `compute_rv` (volume), `compute_hb` (Hausdorff via KD-tree), `compute_hcost` |
+| `_clip.py` | Plane-mesh clipping with CDT cap triangulation |
+| `_mcts.py` | MCTS search (Node/State/Part), UCB1, Rv-only rollout, ternary refinement |
+| `_merge.py` | Greedy agglomerative merge |
+| `_pipeline.py` | `run_coacd()` orchestration |
 
 ```python
 from coacd_gpu.coacd import run_coacd
 parts = run_coacd(vertices, triangles, threshold=0.05)
-# parts is list of (vertices, triangles) numpy arrays — each a convex hull
 ```
 
-### Tests
+## Beam Search Progress (WIP)
 
-Tests are in `coacd_gpu/tests/`. Slow tests (MCTS search, full pipeline) are marked with `@pytest.mark.slow` and skipped by default. Use `--slow` flag to include them.
+### Working
+- Full pipeline: init → normalize → evaluate candidates → select top-K → apply cuts → recover → download
+- CPython extension builds and loads correctly (abi3, cp310+)
+- End-to-end produces decomposed parts with correct coordinates
 
-```bash
-pytest coacd_gpu/tests/           # fast only (~1s)
-pytest coacd_gpu/tests/ --slow    # all tests (minutes)
-```
+### Known Issues
+- Convex hull volume computation on GPU has accuracy issues (over-estimates Rv for convex meshes like cubes), causing unnecessary decomposition
+- Need to debug/replace incremental hull construction in `convex_hull_volume()` device function
 
-### Deferred
-
-- Manifold preprocessing (OpenVDB or CUDA-based)
-- Decimate post-processing (`max_ch_vertex`)
-- Extrude post-processing (push overlapping faces apart)
+### Not Yet Implemented
+- Hausdorff validation pass (kernel exists but not wired into beam loop)
+- Connected components (treating each clip half as single component for now)
+- Ear-clipping cap triangulation for final output mesh closure
+- Merge post-processing

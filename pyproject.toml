@@ -5,15 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "coacd_gpu"
 version = "0.1.0"
-description = "GPU-accelerated kernels for approximate convex decomposition (Hausdorff distance, merge costs)"
+description = "GPU-accelerated approximate convex decomposition"
 license = "MIT"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = ["numpy", "scipy", "triangle"]
 
 [project.urls]
-Repository = "https://github.com/user/coacd_gpu"
+Repository = "https://github.com/eliphatfs/coacd-gpu"
 
 [tool.setuptools.packages.find]
-# Disable auto-discovery; setup.py handles package_dir mapping
 where = ["."]
-include = []
+include = ["coacd_gpu", "coacd_gpu.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

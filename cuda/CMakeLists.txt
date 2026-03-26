@@ -6,6 +6,10 @@ project(coacd_gpu LANGUAGES C)
 
 find_package(CUDAToolkit REQUIRED)
 
+# C host source directory (passed from setup.py or defaults to ../csrc)
+set(COACD_GPU_CSRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../csrc" CACHE PATH
+    "Path to csrc/ directory containing C host code")
+
 # --------------------------------------------------------------------------
 # Step 1: Compile kernels.cu → fatbin
 # --------------------------------------------------------------------------
@@ -13,7 +17,6 @@ find_package(CUDAToolkit REQUIRED)
 set(FATBIN_ARCHS "80;86;89;90" CACHE STRING
     "SM architectures to embed as cubins in the fatbin")
 
-# Build the nvcc flags: one -gencode per arch, plus PTX for the highest
 set(NVCC_GENCODE_FLAGS "")
 set(_highest_arch "")
 foreach(arch ${FATBIN_ARCHS})
@@ -21,7 +24,6 @@ foreach(arch ${FATBIN_ARCHS})
         -gencode=arch=compute_${arch},code=sm_${arch})
     set(_highest_arch ${arch})
 endforeach()
-# Embed PTX for the highest arch (forward compat with future GPUs)
 list(APPEND NVCC_GENCODE_FLAGS
     -gencode=arch=compute_${_highest_arch},code=compute_${_highest_arch})
 
@@ -41,7 +43,6 @@ add_custom_command(
     VERBATIM
 )
 
-# Step 2: Convert fatbin to a C array so it can be linked into the .so
 add_custom_command(
     OUTPUT ${FATBIN_C}
     COMMAND ${CMAKE_COMMAND} -E echo
@@ -55,32 +56,29 @@ add_custom_command(
 )
 
 # --------------------------------------------------------------------------
-# Step 3: Build shared library
+# Step 2: Build shared library
 # --------------------------------------------------------------------------
 
 add_library(coacd_gpu SHARED
-    coacd_gpu.c
+    ${COACD_GPU_CSRC_DIR}/coacd_gpu.c
     ${FATBIN_C}
 )
 
 target_include_directories(coacd_gpu PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${COACD_GPU_CSRC_DIR}>
     $<INSTALL_INTERFACE:include>
 )
 
-# Link only against the CUDA driver library (libcuda), NOT cudart
 target_link_libraries(coacd_gpu PRIVATE CUDA::cuda_driver)
 
 set_target_properties(coacd_gpu PROPERTIES
     C_STANDARD 11
     POSITION_INDEPENDENT_CODE ON
-    # Version info for soname
     VERSION   0.1.0
     SOVERSION 0
 )
 
 if(NOT WIN32)
-    # Hide all symbols except the COACD_GPU_API ones
     set_target_properties(coacd_gpu PROPERTIES
         C_VISIBILITY_PRESET hidden
     )
@@ -95,4 +93,4 @@ install(TARGETS coacd_gpu
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
 )
-install(FILES coacd_gpu.h DESTINATION include)
+install(FILES ${COACD_GPU_CSRC_DIR}/coacd_gpu.h DESTINATION include)
