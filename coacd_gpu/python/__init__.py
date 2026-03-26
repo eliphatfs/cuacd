@@ -1,8 +1,12 @@
 """
-coacd_gpu — GPU-accelerated Hausdorff distance and merge cost computation.
+coacd_gpu — GPU-accelerated convex decomposition, Hausdorff distance, and merge cost.
 
 Uses CUDA driver API via ctypes. No PyTorch or CUDA runtime dependency.
 Only requires an NVIDIA GPU driver (libcuda.so / nvcuda.dll).
+
+Includes:
+- Hausdorff distance computation (point_mesh_distances, hausdorff, pairwise_hausdorff)
+- GPU beam search convex decomposition (BeamContext, run_beam_coacd)
 """
 
 import ctypes
@@ -248,3 +252,10 @@ class Context:
             n_parts, _fptr(cost), None)
         _check(self._handle, rc)
         return cost
+
+
+# ---------------------------------------------------------------------------
+# Beam search API
+# ---------------------------------------------------------------------------
+
+from coacd_gpu.beam import BeamContext, run_beam_coacd
