@@ -283,9 +283,13 @@ int beam_run(
     // Free previous output
     free_output_parts(ctx);
 
-    // Allocate mesh pools — generous capacity for splitting
-    int vert_cap = n_verts * 32 + 4096;
-    int tri_cap = n_tris * 32 + 4096;
+    // Allocate mesh pools — generous capacity for splitting.
+    // With beam_width items, each having up to max_parts parts, and cap
+    // triangles added at each iteration, capacity must cover all beam items.
+    int vert_cap = (n_verts + 4096) * beam_width * 8;
+    int tri_cap  = (n_tris  + 4096) * beam_width * 8;
+    if (vert_cap < n_verts * 64) vert_cap = n_verts * 64;
+    if (tri_cap  < n_tris  * 64) tri_cap  = n_tris  * 64;
 
     int rc;
     rc = alloc_mesh_pool(ctx, &ctx->pool_a, vert_cap, tri_cap);

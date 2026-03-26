@@ -8,6 +8,7 @@ extern "C" {
 #include "common.cuh"
 #include "reduce.cuh"
 #include "geometry.cuh"
+#include "hull.cuh"
 
 // Kernel modules
 #include "beam_search.cu"

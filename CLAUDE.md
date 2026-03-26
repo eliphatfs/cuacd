@@ -95,13 +95,15 @@ CUDA device code organized into modular files, compiled as a single fatbin via `
 
 - **`common.cuh`** — Constants (`BLOCK_SIZE`, `MAX_BEAM`, etc.), data structures (`PartInfo`, `BeamItem`, `DevicePool`), `pool_alloc`, `atomicMinF`/`atomicMaxF`.
 - **`reduce.cuh`** — `block_reduce_sum`, `block_reduce_bbox`.
-- **`geometry.cuh`** — `signed_tet_volume`, `intersect_edge`, `point_triangle_dist` (Eberly's method), `compute_concavity_tris` (bbox metric).
+- **`geometry.cuh`** — `signed_tet_volume`, `intersect_edge`, `point_triangle_dist` (Eberly's method), `compute_concavity_tris` (legacy bbox metric).
+- **`hull.cuh`** — `HullWorkspace`, `compute_hull_volume` — incremental 3D convex hull with SIMT-parallel visibility tests and thread-0 topology updates. Returns hull volume in ~12KB of shared memory.
 
 **Beam search kernels (`beam_search.cu`):**
-- **`evaluate_candidates`** — Grid `(beams × planes)`. Per block: classify vertices against plane (inline, not function call — see implementation notes), split straddling triangles, compute `cbrt(bbox_volume)` for each half as cost proxy.
+- **`compute_rv_for_tris`** — Device function: full Rv computation. Parallel signed-tet mesh volume + divergence theorem cap volume + parallel convex hull volume → Rv formula.
+- **`evaluate_candidates`** — Grid `(beams × planes)`. Per block: classify vertices against plane, split triangles, collect boundary edges, compute Rv for each half via `compute_rv_for_tris`.
 - **`select_top_k`** — Single block, thread 0 only. Insertion-sort to pick best `beam_width` candidates.
-- **`apply_cuts`** — Grid `(winners)`. Copy unchanged parts, re-clip worst part, write to double-buffered pool.
-- **`compute_part_costs`** — Grid `(beams)`. Compute `cbrt(bbox_volume)` for parts needing it, find worst per beam item.
+- **`apply_cuts`** — Grid `(winners)`. Copy unchanged parts, re-clip worst part, add fan cap triangles to close meshes, compute and cache Rv for new parts, write to double-buffered pool.
+- **`compute_part_costs`** — Grid `(beams)`. Compute Rv (mesh volume + hull volume) for parts needing it (initial mesh), find worst per beam item.
 **Hausdorff/merge kernels (`hausdorff.cu`):**
 - **`sample_surface`** — Area-weighted surface sampling (for Hausdorff validation, not yet wired in).
 - **`point_mesh_distance`** — brute-force point-to-triangle (Eberly's method), one thread per point. Has `vert_offset` parameter for pool-based usage.
@@ -119,14 +121,14 @@ Single context manages both beam search and Hausdorff functionality. All kernel 
 ```
 Input mesh → Upload to pool_a → Normalize to [-1,1]³
   → Generate 3×N axis-aligned cutting planes
-  → Compute initial bbox concavity (compute_part_costs)
+  → Compute initial Rv (compute_part_costs: mesh volume + hull volume)
   → If already below threshold → return single part
   → Beam loop:
-      1. evaluate_candidates: clip worst part of each beam item by each plane
+      1. evaluate_candidates: clip worst part by each plane, compute Rv for both halves
       2. select_top_k: pick best beam_width candidates
-      3. apply_cuts: materialize winning cuts into pool_nxt
+      3. apply_cuts: materialize cuts, add cap triangles, compute+cache Rv
       4. Swap pool_cur ↔ pool_nxt, swap parts/beam buffers
-      5. compute_part_costs: recompute concavity, find worst part per beam item
+      5. compute_part_costs: read cached Rv, find worst part per beam item
       6. If best beam item's worst_cost ≤ threshold → done
   → Recover coordinates → Download parts
 ```
@@ -136,14 +138,15 @@ Input mesh → Upload to pool_a → Normalize to [-1,1]³
 - **Bump-allocated scratch pool**: single large device buffer (~50% of free GPU memory). Reset offset to 0 between kernel launches. Thread-0-only allocation with shared memory broadcast.
 - **Per-iteration alloc/free**: parts and beam metadata arrays are freshly allocated each iteration (old ones freed after swap).
 
-### Concavity Metric: Bbox Cube Root
+### Concavity Metric: Rv (Volume-Ratio)
 
-The beam search uses `cbrt(bbox_volume)` of each part's triangle vertices as the concavity metric. This is a proxy for "part size" — smaller parts have lower cost.
+The beam search uses Rv = `(3 × |V_mesh - V_hull| / (4π))^(1/3) × k` where k = rv_k (default 0.3). This measures the difference between the mesh volume and its convex hull volume.
 
-- **Threshold meaning**: decompose until all parts fit within a box of characteristic length ≤ threshold. For meshes normalized to [-1,1]³, the initial whole-mesh cost is ~2.0 (`cbrt(8)`). A threshold of 0.5 produces moderate decomposition; lower values produce more parts.
-- **Scoring a cut**: `max(cbrt(bbox_vol_positive_half), cbrt(bbox_vol_negative_half))`. The beam search minimizes the worst-case part size across all beam items.
-
-This replaces the planned Rv (volume-ratio) metric which required convex hull computation. See "Design Deviations" below.
+- **Mesh volume**: parallel signed-tetrahedra reduction. For open meshes (after clipping), a cap volume correction is added via the divergence theorem: `V_cap = (d/3) × |A_boundary|`, computed from boundary edge loop shoelace signed area.
+- **Hull volume**: incremental 3D convex hull with parallel visibility tests (all 256 threads test their assigned faces) and thread-0 sequential topology updates (horizon edge finding, face removal/addition). Runs in ~12KB of shared memory (`HullWorkspace`), capped at 256 input vertices.
+- **Cap triangulation**: `apply_cuts` adds fan cap triangles after each clip to close meshes, ensuring correct signed-tet volumes in subsequent iterations.
+- **Threshold meaning**: compatible with original CoACD threshold semantics. For meshes normalized to [-1,1]³, a convex shape has Rv ≈ 0. Threshold 0.05 is typical.
+- **Scoring a cut**: `max(Rv_positive_half, Rv_negative_half)`. The beam search minimizes worst-case concavity.
 
 ### Pool Allocator Pattern
 
@@ -206,41 +209,27 @@ parts = run_coacd(vertices, triangles, threshold=0.05)
 
 The implementation diverges from the original GPU beam search plan in several significant ways. These are intentional engineering decisions made during implementation.
 
-### 1. Concavity Metric: Bbox Cube Root instead of Rv (Volume-Ratio)
+### 1. Concavity Metric: Rv via GPU Convex Hull (Implemented)
 
-**Plan**: Rv = `(3 * |V_mesh - V_hull| / (4π))^(1/3) * k`, requiring per-part convex hull volume computed on GPU via incremental QuickHull within each thread block.
+**Plan**: Rv = `(3 * |V_mesh - V_hull| / (4π))^(1/3) * k`, requiring per-part convex hull volume on GPU.
 
-**Implementation**: `cbrt(bbox_volume)` computed from triangle vertex bounding boxes. No convex hull, no mesh volume.
+**Implementation**: Rv is computed as planned. The key design that made it work:
+- **Parallel visibility, sequential topology**: All 256 threads test face visibility in parallel. Thread 0 alone does horizon edge finding, face removal/addition. This avoids `__syncthreads()` deadlocks in conditional loops.
+- **Shared memory workspace**: ~12KB `HullWorkspace` in shared memory (not pool). Faces stored as SoA (fv0/fv1/fv2 arrays). Capped at 256 input vertices.
+- **Cap volume via divergence theorem**: For open meshes after clipping, `V_cap = (d/3) × |A_boundary|` computed from boundary edge loop shoelace signed area. Non-destructive marking via pool-allocated flag array.
+- **Fan cap triangulation**: `apply_cuts` closes meshes with fan cap triangles after each cut, ensuring correct signed-tet volume in subsequent iterations.
 
-**Why changed**: The GPU incremental convex hull was the single largest source of bugs:
-- `__syncthreads()` inside conditional point-insertion loops caused deadlocks
-- Massive scratch allocations (HullFace arrays, horizon edges, visibility flags) exhausted the pool
-- Even when it didn't crash, it produced inaccurate volumes for simple convex shapes (cubes got Rv=0.37 instead of ~0)
-- The signed-tetrahedra mesh volume is unreliable for open meshes produced by clipping (no cap → volume cancels to ~0)
+### 2. Cap Volume via Divergence Theorem (Implemented)
 
-The bbox metric avoids all of these issues. It's geometrically meaningful for axis-aligned decomposition: a convex part that fills its bbox well has been sufficiently decomposed. The tradeoff is that non-axis-aligned concavity isn't detected — this is acceptable because the cutting planes are also axis-aligned.
+**Plan**: `V_cap = (-d/3) × A_net` from boundary loop signed areas.
 
-### 2. No Cap Volume via Divergence Theorem
+**Implementation**: Implemented as planned. Boundary edges collected during triangle splitting (parallel), loop tracing and shoelace area computed by thread 0 (sequential, O(n_boundary²)). Fan cap triangulation in `apply_cuts` closes meshes for correct volumes in future iterations.
 
-**Plan**: Close open meshes after clipping using `V_cap = (-d/3) × A_net` (divergence theorem with boundary loop signed areas via shoelace formula). This would make signed-tet volume correct for open meshes.
-
-**Implementation**: Caps are not computed. Mesh volume is not used for scoring.
-
-**Why changed**: The divergence theorem approach requires tracing boundary loops from intersection edges — a sequential graph traversal that's hard to parallelize within a block. Since the bbox metric doesn't need volume at all, this became unnecessary.
-
-### 3. No GPU Convex Hull (QuickHull Port Removed)
-
-**Plan**: Port `leomccormack/convhull_3d` (QuickHull) to GPU device functions. Parallel visibility tests, sequential vertex insertion, on-the-fly volume accumulation. Approximate hull limited to 128-256 vertices.
-
-**Implementation**: Convex hull computation removed entirely from GPU path. ~1200 lines of hull code (find_extremes, incremental insertion, horizon edge tracing, HullFace struct) deleted.
-
-**Why changed**: The GPU hull was fundamentally difficult to make correct:
+### 3. GPU Convex Hull: Incremental with Parallel Visibility (Implemented)
 - Incremental hull needs sequential face updates after each vertex insertion
-- Parallel visibility tests help but the insertion itself serializes
-- Floating-point edge cases (coplanar points, degenerate tetrahedra) caused crashes
-- The `__shared__` variable scoping within the per-point loop caused `__syncthreads` issues
+**Plan**: Port QuickHull to GPU.
 
-For future work, hull computation should be done either on CPU (download vertices, scipy qhull) or via a purpose-built parallel hull kernel separate from the evaluation kernel.
+**Implementation**: Incremental hull with SIMT-parallel visibility tests. Not QuickHull. The parallel visibility test (all threads test assigned faces) avoids `__syncthreads()` in conditional loops. Thread 0 handles sequential topology (horizon edges via brute-force search of visible faces, O(9 × n_vis²) per insertion — fast for typical n_vis < 20). Volume accumulated incrementally via signed-tet delta on face removal/addition.
 
 ### 4. Vertex Classification Inlined (Not a Function Call)
 
@@ -270,13 +259,13 @@ signs[v] = (val > EPS) ? 1 : ((val < -EPS) ? -1 : 0);
 
 **Why changed**: Deferred for simplicity. Most axis-aligned cuts of connected meshes produce connected halves. Disconnected pieces would just be over-segmented (functionally correct, just sub-optimal part count).
 
-### 7. Ear-Clipping Cap Triangulation Deferred
+### 7. Fan Cap Triangulation (Simplified from Ear-Clipping)
 
 **Plan**: Bridge holes to outer boundary, ear-clip merged polygon, produce closed mesh output.
 
-**Implementation**: Clipped parts are returned as open meshes (no cap faces on cutting planes).
+**Implementation**: `apply_cuts` adds fan cap triangles (from loop vertex v0, create triangles (v0, v_i, v_{i+1})) after each clip. Winding determined by shoelace signed area. This closes meshes for correct signed-tet volume in subsequent iterations. Fan triangulation is used instead of ear-clipping — it may produce overlapping triangles for non-convex boundary polygons, but the signed volume is still correct (cancellation property).
 
-**Why changed**: Not needed for the bbox concavity metric (which doesn't use volume). Will be needed when Hausdorff validation is wired in (Hausdorff needs closed meshes for accurate surface sampling).
+**Output**: Final parts are returned with cap triangles included. Parts are closed meshes.
 
 ### 8. Merge Post-Processing Not Implemented
 
@@ -298,18 +287,19 @@ signs[v] = (val > EPS) ? 1 : ((val < -EPS) ? -1 : 0);
 
 ### Working
 - Full beam search pipeline: init → normalize → evaluate → select → apply → recover → download
+- **Rv concavity metric**: proper convex hull volume (incremental hull with parallel visibility) + mesh volume (signed tet + divergence theorem cap correction) → Rv formula
+- **Fan cap triangulation**: `apply_cuts` closes meshes after each clip for correct volume in subsequent iterations
 - Multi-iteration decomposition with double-buffered pools
 - Single CPython extension (abi3 cp310+) with all GPU functionality
 - Hausdorff distance, pairwise merge cost, beam search in one module
-- Cube correctly identified as convex at appropriate threshold
-- L-shape decomposed into 3 parts
+- Cube correctly identified as convex (Rv ≈ 0, 1 part)
+- L-shape decomposed at threshold 0.05 (18 parts), 0.15 (2 parts)
 - Pure Python CoACD (existing, unmodified)
 - All 56 unit tests pass, GPU smoke tests pass
 
 ### Not Yet Implemented
 - Hausdorff validation in beam loop (kernels exist, not wired in)
 - Connected components after clipping
-- Cap triangulation for closed mesh output
-- Merge post-processing
+- Merge post-processing (would reduce over-segmentation at low thresholds)
 - Vertex compaction (parts carry superset of vertices, only referenced ones needed)
 - Benchmark on Octocat / larger meshes
