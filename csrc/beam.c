@@ -458,6 +458,7 @@ int beam_run(
             CHECK_CU(cuLaunchKernel(ctx->fn_evaluate_candidates,
                 num_candidates, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
         }
+        CHECK_CU(cuStreamSynchronize(s));
 
         // Step 2: Select top-K candidates
         {
@@ -481,7 +482,7 @@ int beam_run(
 
         // Check if best candidate is valid
         if (h_winner_beam[0] < 0 || h_winner_costs[0] >= 1e29f) {
-            break;  // No valid cuts found
+            break;
         }
 
         // Step 3: Apply cuts — write to pool_nxt
@@ -527,6 +528,8 @@ int beam_run(
             CHECK_CU(cuLaunchKernel(ctx->fn_apply_cuts,
                 actual_winners, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
         }
+
+        CHECK_CU(cuStreamSynchronize(s));
 
         // Swap parts/beam buffers
         cuMemFree(ctx->d_parts);
