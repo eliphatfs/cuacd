@@ -15,6 +15,29 @@ __device__ inline float block_reduce_sum(float val, float* smem, int tid) {
     return smem[0];
 }
 
+// Shared-memory parallel reduction (max).
+__device__ inline float block_reduce_max(float val, float* smem, int tid) {
+    smem[tid] = val;
+    __syncthreads();
+    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        __syncthreads();
+    }
+    return smem[0];
+}
+
+// Shared-memory parallel reduction (count of nonzero flags).
+// Each thread passes its flag (0 or 1). Returns total count.
+__device__ inline int block_reduce_count(int flag, int* smem_i, int tid) {
+    smem_i[tid] = flag;
+    __syncthreads();
+    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) smem_i[tid] += smem_i[tid + s];
+        __syncthreads();
+    }
+    return smem_i[0];
+}
+
 // Shared-memory parallel reduction for 3D bounding box.
 // Computes per-axis min/max across all threads in the block.
 __device__ inline void block_reduce_bbox(

@@ -189,8 +189,8 @@ The beam search kernels should be high-level logic calling these reusable utilit
 |----|----------|--------|------|
 | B1 | `block_reduce_sum(val, smem, tid) -> float` | EXISTS | reduce.cuh |
 | B2 | `block_reduce_bbox(verts, n, offset, tid, smem, out_lo, out_hi)` | EXISTS | reduce.cuh |
-| B3 | `block_reduce_max(val, smem, tid) -> float` | NEEDED | reduce.cuh |
-| B4 | `block_reduce_count(flags, n, tid, smem) -> int` | NEEDED — counting flagged elements, currently inlined | reduce.cuh |
+| B3 | `block_reduce_max(val, smem, tid) -> float` | EXISTS | reduce.cuh |
+| B4 | `block_reduce_count(flag, smem_i, tid) -> int` | EXISTS | reduce.cuh |
 
 ### C. Block-Level Mesh Operations (device functions, all threads, __syncthreads)
 

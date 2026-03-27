@@ -322,6 +322,75 @@ static PyObject* py_batch_rv_from_volumes(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// Test: block_reduce_max
+// ---------------------------------------------------------------------------
+
+static PyObject* py_test_block_reduce_max(PyObject* self, PyObject* args) {
+    unsigned long long data_ptr, out_ptr;
+    int n;
+    if (!PyArg_ParseTuple(args, "KiK", &data_ptr, &n, &out_ptr)) return NULL;
+    REQUIRE_CTX();
+    int rc = beam_test_block_reduce_max(g_state.ctx,
+        (const float*)(uintptr_t)data_ptr, n,
+        (float*)(uintptr_t)out_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Test: block_reduce_count
+// ---------------------------------------------------------------------------
+
+static PyObject* py_test_block_reduce_count(PyObject* self, PyObject* args) {
+    unsigned long long flags_ptr, out_ptr;
+    int n;
+    if (!PyArg_ParseTuple(args, "KiK", &flags_ptr, &n, &out_ptr)) return NULL;
+    REQUIRE_CTX();
+    int rc = beam_test_block_reduce_count(g_state.ctx,
+        (const int*)(uintptr_t)flags_ptr, n,
+        (int*)(uintptr_t)out_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Test: block_reduce_sum
+// ---------------------------------------------------------------------------
+
+static PyObject* py_test_block_reduce_sum(PyObject* self, PyObject* args) {
+    unsigned long long data_ptr, out_ptr;
+    int n;
+    if (!PyArg_ParseTuple(args, "KiK", &data_ptr, &n, &out_ptr)) return NULL;
+    REQUIRE_CTX();
+    int rc = beam_test_block_reduce_sum(g_state.ctx,
+        (const float*)(uintptr_t)data_ptr, n,
+        (float*)(uintptr_t)out_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Test: block_reduce_bbox
+// ---------------------------------------------------------------------------
+
+static PyObject* py_test_block_reduce_bbox(PyObject* self, PyObject* args) {
+    unsigned long long verts_ptr, offsets_ptr, counts_ptr, out_ptr;
+    int total_verts, n_groups;
+    if (!PyArg_ParseTuple(args, "KiKKiK",
+            &verts_ptr, &total_verts,
+            &offsets_ptr, &counts_ptr, &n_groups,
+            &out_ptr)) return NULL;
+    REQUIRE_CTX();
+    int rc = beam_test_block_reduce_bbox(g_state.ctx,
+        (const float*)(uintptr_t)verts_ptr, total_verts,
+        (const int*)(uintptr_t)offsets_ptr,
+        (const int*)(uintptr_t)counts_ptr, n_groups,
+        (float*)(uintptr_t)out_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -339,6 +408,10 @@ static PyMethodDef gpu_methods[] = {
     { "batch_point_triangle_dist",  py_batch_point_triangle_dist,  METH_VARARGS, "Batch point-triangle distance." },
     { "batch_intersect_edge",       py_batch_intersect_edge,       METH_VARARGS, "Batch edge-plane intersection." },
     { "batch_rv_from_volumes",      py_batch_rv_from_volumes,      METH_VARARGS, "Batch Rv from volumes." },
+    { "test_block_reduce_max",      py_test_block_reduce_max,      METH_VARARGS, "Test block reduce max." },
+    { "test_block_reduce_count",    py_test_block_reduce_count,    METH_VARARGS, "Test block reduce count." },
+    { "test_block_reduce_sum",      py_test_block_reduce_sum,      METH_VARARGS, "Test block reduce sum." },
+    { "test_block_reduce_bbox",     py_test_block_reduce_bbox,     METH_VARARGS, "Test block reduce bbox." },
     { NULL, NULL, 0, NULL }
 };
 

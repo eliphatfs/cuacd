@@ -68,6 +68,101 @@ __global__ void batch_intersect_edge(
 }
 
 // --------------------------------------------------------------------------
+// test_block_reduce_sum
+// --------------------------------------------------------------------------
+// Input:  data[N] — N must be multiple of BLOCK_SIZE
+// Output: out[N / BLOCK_SIZE] — sum of each BLOCK_SIZE-element chunk
+__global__ void test_block_reduce_sum(
+    const float* __restrict__ data,    // [N]
+    float* __restrict__ out,           // [N / BLOCK_SIZE]
+    int N)
+{
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * BLOCK_SIZE + tid;
+    __shared__ float smem[BLOCK_SIZE];
+    float val = 0.0f;
+    if (idx < N) val = data[idx];
+    float result = block_reduce_sum(val, smem, tid);
+    if (tid == 0) out[blockIdx.x] = result;
+}
+
+// --------------------------------------------------------------------------
+// test_block_reduce_bbox
+// --------------------------------------------------------------------------
+// One block per vertex group. Each group has n_verts vertices starting at
+// vert_offset in the packed verts array. Output: 6 floats per group
+// (xmin, ymin, zmin, xmax, ymax, zmax).
+//
+// Launch: grid=(n_groups,1,1), block=(BLOCK_SIZE,1,1)
+// Args: verts[total_verts*3], offsets[n_groups], counts[n_groups],
+//       out_bbox[n_groups*6], n_groups
+__global__ void test_block_reduce_bbox(
+    const float* __restrict__ verts,    // [total_verts * 3]
+    const int* __restrict__ offsets,    // [n_groups] — vertex offset per group
+    const int* __restrict__ counts,     // [n_groups] — vertex count per group
+    float* __restrict__ out_bbox,       // [n_groups * 6]: xmin,ymin,zmin,xmax,ymax,zmax
+    int n_groups)
+{
+    int gid = blockIdx.x;
+    if (gid >= n_groups) return;
+    int tid = threadIdx.x;
+    __shared__ float smem[BLOCK_SIZE];
+
+    int vo = offsets[gid];
+    int vc = counts[gid];
+
+    float lo[3], hi[3];
+    block_reduce_bbox(verts, vc, vo, tid, smem, lo, hi);
+
+    if (tid == 0) {
+        out_bbox[gid * 6 + 0] = lo[0];
+        out_bbox[gid * 6 + 1] = lo[1];
+        out_bbox[gid * 6 + 2] = lo[2];
+        out_bbox[gid * 6 + 3] = hi[0];
+        out_bbox[gid * 6 + 4] = hi[1];
+        out_bbox[gid * 6 + 5] = hi[2];
+    }
+}
+
+// --------------------------------------------------------------------------
+// test_block_reduce_max
+// --------------------------------------------------------------------------
+// Input:  data[N] — N must be multiple of BLOCK_SIZE
+// Output: out[N / BLOCK_SIZE] — max of each BLOCK_SIZE-element chunk
+__global__ void test_block_reduce_max(
+    const float* __restrict__ data,    // [N]
+    float* __restrict__ out,           // [N / BLOCK_SIZE]
+    int N)
+{
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * BLOCK_SIZE + tid;
+    __shared__ float smem[BLOCK_SIZE];
+    float val = -1e30f;
+    if (idx < N) val = data[idx];
+    float result = block_reduce_max(val, smem, tid);
+    if (tid == 0) out[blockIdx.x] = result;
+}
+
+// --------------------------------------------------------------------------
+// test_block_reduce_count
+// --------------------------------------------------------------------------
+// Input:  flags[N] — int array of 0/1 values, N must be multiple of BLOCK_SIZE
+// Output: out[N / BLOCK_SIZE] — count of nonzero flags per chunk
+__global__ void test_block_reduce_count(
+    const int* __restrict__ flags,     // [N]
+    int* __restrict__ out,             // [N / BLOCK_SIZE]
+    int N)
+{
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * BLOCK_SIZE + tid;
+    __shared__ int smem_i[BLOCK_SIZE];
+    int flag = 0;
+    if (idx < N) flag = (flags[idx] != 0) ? 1 : 0;
+    int result = block_reduce_count(flag, smem_i, tid);
+    if (tid == 0) out[blockIdx.x] = result;
+}
+
+// --------------------------------------------------------------------------
 // batch_rv_from_volumes
 // --------------------------------------------------------------------------
 // Input:  mesh_vols[N], hull_vols[N], rv_k (scalar)

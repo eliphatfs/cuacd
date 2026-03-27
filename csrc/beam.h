@@ -112,6 +112,33 @@ int beam_batch_rv_from_volumes(beam_ctx_t ctx,
     const float* mesh_vols, const float* hull_vols, int n,
     float rv_k, float* out_rvs);
 
+// ---------------------------------------------------------------------------
+// Test functions for block-level reductions
+// ---------------------------------------------------------------------------
+
+// Reduce max over BLOCK_SIZE-element chunks. n must be multiple of BLOCK_SIZE.
+// out has n/BLOCK_SIZE elements.
+int beam_test_block_reduce_max(beam_ctx_t ctx,
+    const float* data, int n, float* out);
+
+// Count nonzero flags in BLOCK_SIZE-element chunks. n must be multiple of BLOCK_SIZE.
+// out has n/BLOCK_SIZE elements.
+int beam_test_block_reduce_count(beam_ctx_t ctx,
+    const int* flags, int n, int* out);
+
+// Reduce sum over BLOCK_SIZE-element chunks. n must be multiple of BLOCK_SIZE.
+// out has n/BLOCK_SIZE elements.
+int beam_test_block_reduce_sum(beam_ctx_t ctx,
+    const float* data, int n, float* out);
+
+// Reduce 3D bounding box over vertex groups.
+// verts: [total_verts*3], offsets/counts: [n_groups], out_bbox: [n_groups*6]
+// out_bbox layout per group: xmin, ymin, zmin, xmax, ymax, zmax
+int beam_test_block_reduce_bbox(beam_ctx_t ctx,
+    const float* verts, int total_verts,
+    const int* offsets, const int* counts, int n_groups,
+    float* out_bbox);
+
 #ifdef __cplusplus
 }
 #endif

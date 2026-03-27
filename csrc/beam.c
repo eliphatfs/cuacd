@@ -75,6 +75,10 @@ struct beam_ctx {
     CUfunction fn_batch_point_triangle_dist;
     CUfunction fn_batch_intersect_edge;
     CUfunction fn_batch_rv_from_volumes;
+    CUfunction fn_test_block_reduce_max;
+    CUfunction fn_test_block_reduce_count;
+    CUfunction fn_test_block_reduce_sum;
+    CUfunction fn_test_block_reduce_bbox;
 
     struct MeshPool pool_a, pool_b;
     CUdeviceptr d_parts;
@@ -165,6 +169,10 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
     cuModuleGetFunction(&ctx->fn_batch_point_triangle_dist, ctx->module, "batch_point_triangle_dist");
     cuModuleGetFunction(&ctx->fn_batch_intersect_edge, ctx->module, "batch_intersect_edge");
     cuModuleGetFunction(&ctx->fn_batch_rv_from_volumes, ctx->module, "batch_rv_from_volumes");
+    cuModuleGetFunction(&ctx->fn_test_block_reduce_max, ctx->module, "test_block_reduce_max");
+    cuModuleGetFunction(&ctx->fn_test_block_reduce_count, ctx->module, "test_block_reduce_count");
+    cuModuleGetFunction(&ctx->fn_test_block_reduce_sum, ctx->module, "test_block_reduce_sum");
+    cuModuleGetFunction(&ctx->fn_test_block_reduce_bbox, ctx->module, "test_block_reduce_bbox");
 
     return 0;
 }
@@ -1032,5 +1040,126 @@ int beam_batch_rv_from_volumes(beam_ctx_t ctx,
     cuMemFree(d_mv);
     cuMemFree(d_hv);
     cuMemFree(d_rvs);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test: block_reduce_max
+// ---------------------------------------------------------------------------
+
+int beam_test_block_reduce_max(beam_ctx_t ctx,
+    const float* data, int n, float* out) {
+    if (!ctx || !ctx->fn_test_block_reduce_max) return -1;
+    CUstream s = NULL;
+
+    int n_blocks = n / BLOCK_SIZE;
+    if (n_blocks <= 0) return -1;
+
+    CUdeviceptr d_data, d_out;
+    CHECK_CU(cuMemAlloc(&d_data, (size_t)n * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_out, (size_t)n_blocks * sizeof(float)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_data, data, (size_t)n * sizeof(float), s));
+
+    void* args[] = { &d_data, &d_out, &n };
+    CHECK_CU(cuLaunchKernel(ctx->fn_test_block_reduce_max,
+        n_blocks, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out, d_out, (size_t)n_blocks * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_data);
+    cuMemFree(d_out);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test: block_reduce_count
+// ---------------------------------------------------------------------------
+
+int beam_test_block_reduce_count(beam_ctx_t ctx,
+    const int* flags, int n, int* out) {
+    if (!ctx || !ctx->fn_test_block_reduce_count) return -1;
+    CUstream s = NULL;
+
+    int n_blocks = n / BLOCK_SIZE;
+    if (n_blocks <= 0) return -1;
+
+    CUdeviceptr d_flags, d_out;
+    CHECK_CU(cuMemAlloc(&d_flags, (size_t)n * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_out, (size_t)n_blocks * sizeof(int)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_flags, flags, (size_t)n * sizeof(int), s));
+
+    void* args[] = { &d_flags, &d_out, &n };
+    CHECK_CU(cuLaunchKernel(ctx->fn_test_block_reduce_count,
+        n_blocks, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out, d_out, (size_t)n_blocks * sizeof(int), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_flags);
+    cuMemFree(d_out);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test: block_reduce_sum
+// ---------------------------------------------------------------------------
+
+int beam_test_block_reduce_sum(beam_ctx_t ctx,
+    const float* data, int n, float* out) {
+    if (!ctx || !ctx->fn_test_block_reduce_sum) return -1;
+    CUstream s = NULL;
+
+    int n_blocks = n / BLOCK_SIZE;
+    if (n_blocks <= 0) return -1;
+
+    CUdeviceptr d_data, d_out;
+    CHECK_CU(cuMemAlloc(&d_data, (size_t)n * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_out, (size_t)n_blocks * sizeof(float)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_data, data, (size_t)n * sizeof(float), s));
+
+    void* args[] = { &d_data, &d_out, &n };
+    CHECK_CU(cuLaunchKernel(ctx->fn_test_block_reduce_sum,
+        n_blocks, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out, d_out, (size_t)n_blocks * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_data);
+    cuMemFree(d_out);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test: block_reduce_bbox
+// ---------------------------------------------------------------------------
+
+int beam_test_block_reduce_bbox(beam_ctx_t ctx,
+    const float* verts, int total_verts,
+    const int* offsets, const int* counts, int n_groups,
+    float* out_bbox) {
+    if (!ctx || !ctx->fn_test_block_reduce_bbox) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_verts, d_offsets, d_counts, d_out;
+    CHECK_CU(cuMemAlloc(&d_verts, (size_t)total_verts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_offsets, (size_t)n_groups * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_counts, (size_t)n_groups * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_out, (size_t)n_groups * 6 * sizeof(float)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_verts, verts, (size_t)total_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_offsets, offsets, (size_t)n_groups * sizeof(int), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_counts, counts, (size_t)n_groups * sizeof(int), s));
+
+    void* args[] = { &d_verts, &d_offsets, &d_counts, &d_out, &n_groups };
+    CHECK_CU(cuLaunchKernel(ctx->fn_test_block_reduce_bbox,
+        n_groups, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_bbox, d_out, (size_t)n_groups * 6 * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_verts);
+    cuMemFree(d_offsets);
+    cuMemFree(d_counts);
+    cuMemFree(d_out);
     return 0;
 }
