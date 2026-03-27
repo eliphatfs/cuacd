@@ -134,6 +134,24 @@ class TestLShapeDecomposition:
 
 
 # ---------------------------------------------------------------------------
+# Tests: per-part bbox convergence (no midpoint plane)
+# ---------------------------------------------------------------------------
+
+class TestPerPartBboxConvergence:
+    """With cpa=10 (no midpoint), per-part bbox narrowing should still converge."""
+
+    def test_l_shape_cpa10_bw30_threshold_005(self):
+        v, t = _l_shape_mesh()
+        parts = run_beam_coacd(v, t, threshold=0.05, cuts_per_axis=10, beam_width=30)
+        assert len(parts) <= 4
+
+    def test_l_shape_cpa10_bw30_threshold_001(self):
+        v, t = _l_shape_mesh()
+        parts = run_beam_coacd(v, t, threshold=0.01, cuts_per_axis=10, beam_width=30)
+        assert len(parts) <= 8
+
+
+# ---------------------------------------------------------------------------
 # Tests: beam search parameters
 # ---------------------------------------------------------------------------
 

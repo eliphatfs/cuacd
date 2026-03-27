@@ -268,15 +268,17 @@ __global__ void evaluate_candidates(
     int vo = part.vert_offset;
     int to = part.tri_offset;
 
-    // --- Compute per-part bbox → derive cutting plane ---
+    // --- Compute per-part bbox from TRIANGLE vertices (not all vertices) ---
     __shared__ float part_lo[3], part_hi[3];
     {
         __shared__ float bbox_smem[BLOCK_SIZE];
         for (int k = 0; k < 3; k++) {
             float lo = 1e30f, hi = -1e30f;
-            for (int v = tid; v < vc; v += BLOCK_SIZE) {
-                float val = vertex_pool[(vo + v) * 3 + k];
-                lo = fminf(lo, val); hi = fmaxf(hi, val);
+            for (int t = tid; t < tc; t += BLOCK_SIZE) {
+                for (int e = 0; e < 3; e++) {
+                    float val = vertex_pool[triangle_pool[(to + t) * 3 + e] * 3 + k];
+                    lo = fminf(lo, val); hi = fmaxf(hi, val);
+                }
             }
             bbox_smem[tid] = lo;
             __syncthreads();
@@ -603,16 +605,19 @@ __global__ void apply_cuts(
     const BeamItem& si = beam_src[src_beam];
     int worst = si.worst_part_idx;
 
-    // --- Reconstruct per-part cutting plane (same as evaluate_candidates) ---
+    // --- Reconstruct per-part cutting plane from TRIANGLE bbox ---
     const PartInfo& wp_info = parts_src[src_beam * MAX_PARTS_PER_BEAM + worst];
+    int wto_ac = wp_info.tri_offset, wtc_ac = wp_info.tri_count;
     __shared__ float part_lo_ac[3], part_hi_ac[3];
     {
         __shared__ float bbox_sm[BLOCK_SIZE];
         for (int k = 0; k < 3; k++) {
             float lo = 1e30f, hi = -1e30f;
-            for (int v = tid; v < wp_info.vert_count; v += BLOCK_SIZE) {
-                float val = vp_src[(wp_info.vert_offset + v) * 3 + k];
-                lo = fminf(lo, val); hi = fmaxf(hi, val);
+            for (int t = tid; t < wtc_ac; t += BLOCK_SIZE) {
+                for (int e = 0; e < 3; e++) {
+                    float val = vp_src[tp_src[(wto_ac + t) * 3 + e] * 3 + k];
+                    lo = fminf(lo, val); hi = fmaxf(hi, val);
+                }
             }
             bbox_sm[tid] = lo;
             __syncthreads();
