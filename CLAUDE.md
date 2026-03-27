@@ -295,9 +295,9 @@ signs[v] = (val > EPS) ? 1 : ((val < -EPS) ? -1 : 0);
 - Single CPython extension (abi3 cp310+) with all GPU functionality
 - Hausdorff distance, pairwise merge cost, beam search in one module
 - Cube correctly identified as convex (Rv ≈ 0, 1 part)
-- L-shape decomposed at threshold 0.05 (18 parts), 0.15 (2 parts)
+- L-shape decomposed into exactly 2 convex boxes at threshold 0.05
 - Pure Python CoACD (existing, unmodified)
-- All 66 unit tests pass (including 10 GPU beam search tests), GPU smoke tests pass
+- All 67 unit tests pass (including 11 GPU beam search tests), GPU smoke tests pass
 
 ### Not Yet Implemented
 - Hausdorff validation in beam loop (kernels exist, not wired in)

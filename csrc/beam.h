@@ -90,6 +90,11 @@ int beam_pairwise_hausdorff(
     int             n_parts,
     float*          cost_matrix);    // [n_parts * n_parts] output
 
+// Diagnostic: test hull volume computation directly
+int beam_test_hull_volume(beam_ctx_t ctx,
+                          const float* points, int n_points,
+                          float* out_volume, int* out_n_faces);
+
 #ifdef __cplusplus
 }
 #endif

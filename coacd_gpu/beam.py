@@ -42,8 +42,8 @@ class BeamContext:
         self.close()
 
     def run(self, vertices, triangles, *,
-            beam_width=8,
-            cuts_per_axis=10,
+            beam_width=16,
+            cuts_per_axis=15,
             threshold=0.05,
             rv_k=0.3,
             max_parts=64,

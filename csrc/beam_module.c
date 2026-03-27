@@ -240,6 +240,19 @@ static PyObject* py_pairwise_hausdorff(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* py_test_hull_volume(PyObject* self, PyObject* args) {
+    unsigned long long pts_ptr;
+    int n_points;
+    if (!PyArg_ParseTuple(args, "Ki", &pts_ptr, &n_points)) return NULL;
+    REQUIRE_CTX();
+    float volume = 0.0f;
+    int n_faces = 0;
+    int rc = beam_test_hull_volume(g_state.ctx,
+        (const float*)(uintptr_t)pts_ptr, n_points, &volume, &n_faces);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    return Py_BuildValue("fi", volume, n_faces);
+}
+
 // ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
@@ -253,6 +266,7 @@ static PyMethodDef gpu_methods[] = {
     { "point_mesh_distances",   py_point_mesh_distances,   METH_VARARGS, "Compute point-to-mesh distances." },
     { "hausdorff",              py_hausdorff,              METH_VARARGS, "Compute Hausdorff distance." },
     { "pairwise_hausdorff",     py_pairwise_hausdorff,     METH_VARARGS, "Compute pairwise Hausdorff cost matrix." },
+    { "test_hull_volume",       py_test_hull_volume,       METH_VARARGS, "Test hull volume computation." },
     { NULL, NULL, 0, NULL }
 };
 

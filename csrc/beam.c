@@ -70,6 +70,7 @@ struct beam_ctx {
     CUfunction fn_point_mesh_distance;
     CUfunction fn_reduce_max;
     CUfunction fn_pairwise_hausdorff;
+    CUfunction fn_test_hull_volume;
 
     struct MeshPool pool_a, pool_b;
     CUdeviceptr d_parts;
@@ -107,8 +108,8 @@ struct beam_ctx {
 // ---------------------------------------------------------------------------
 
 void beam_params_default(beam_params_t* params) {
-    params->beam_width = 8;
-    params->cuts_per_axis = 10;
+    params->beam_width = 16;
+    params->cuts_per_axis = 15;
     params->threshold = 0.05f;
     params->rv_k = 0.3f;
     params->max_parts = 64;
@@ -155,6 +156,7 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
     CHECK_CU(cuModuleGetFunction(&ctx->fn_point_mesh_distance,  ctx->module, "point_mesh_distance"));
     CHECK_CU(cuModuleGetFunction(&ctx->fn_reduce_max,           ctx->module, "reduce_max"));
     CHECK_CU(cuModuleGetFunction(&ctx->fn_pairwise_hausdorff,   ctx->module, "pairwise_hausdorff"));
+    cuModuleGetFunction(&ctx->fn_test_hull_volume, ctx->module, "test_hull_volume");
 
     return 0;
 }
@@ -877,5 +879,31 @@ int beam_pairwise_hausdorff(
     cuMemFree(d_verts);   cuMemFree(d_tris);
     cuMemFree(d_toff);    cuMemFree(d_voff);
     cuMemFree(d_cost);
+    return 0;
+}
+
+int beam_test_hull_volume(beam_ctx_t ctx,
+                          const float* points, int n_points,
+                          float* out_volume, int* out_n_faces) {
+    if (!ctx || !ctx->fn_test_hull_volume) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_pts, d_res;
+    CHECK_CU(cuMemAlloc(&d_pts, n_points * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_res, 3 * sizeof(float)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_pts, points, n_points * 3 * sizeof(float), s));
+
+    void* args[] = { &d_pts, &n_points, &d_res };
+    CHECK_CU(cuLaunchKernel(ctx->fn_test_hull_volume,
+        1, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+    float h_res[3];
+    CHECK_CU(cuMemcpyDtoHAsync(h_res, d_res, 3 * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    *out_volume = h_res[0];
+    if (out_n_faces) *out_n_faces = (int)h_res[1];
+
+    cuMemFree(d_pts);
+    cuMemFree(d_res);
     return 0;
 }

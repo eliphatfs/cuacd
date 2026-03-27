@@ -98,6 +98,12 @@ class TestCubeConvexity:
 class TestLShapeDecomposition:
     """An L-shape is concave — should be decomposed into multiple parts."""
 
+    def test_two_parts_at_default_threshold(self):
+        """The L-shape should split into exactly 2 convex boxes."""
+        v, t = _l_shape_mesh()
+        parts = run_beam_coacd(v, t, threshold=0.05)
+        assert len(parts) == 2
+
     def test_needs_cutting_at_low_threshold(self):
         """At threshold 0.15, the L-shape Rv (~0.19) exceeds it."""
         v, t = _l_shape_mesh()

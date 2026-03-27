@@ -30,7 +30,8 @@ __device__ float compute_rv_for_tris(
     HullWorkspace* hull_ws,        // shared memory
     float*       smem,             // shared memory [BLOCK_SIZE]
     DevicePool*  scratch,
-    float        rv_k)
+    float        rv_k,
+    int          caller_id = 0)    // 0=eval, 1=apply, 2=compute_costs
 {
     if (n_tris == 0) {
         __syncthreads();
@@ -98,21 +99,38 @@ __device__ float compute_rv_for_tris(
                 float fu = verts[first_v*3+pu], fv_coord = verts[first_v*3+pv];
                 float prev_u = fu, prev_v = fv_coord;
 
+                // Match boundary vertices by POSITION (not index) because
+                // parallel triangle processing duplicates intersection points.
+                float tol = 1e-4f;
+
                 int safety = n_boundary + 2;
-                while (cur != first_v && safety-- > 0) {
+                while (safety-- > 0) {
                     float cu = verts[cur*3+pu], cv = verts[cur*3+pv];
                     loop_area += prev_u * cv - cu * prev_v;
                     prev_u = cu; prev_v = cv;
 
+                    // Check if we've returned to first_v (by position)
+                    float dx = fabsf(verts[cur*3]-verts[first_v*3])
+                             + fabsf(verts[cur*3+1]-verts[first_v*3+1])
+                             + fabsf(verts[cur*3+2]-verts[first_v*3+2]);
+                    if (dx < tol && safety < n_boundary) break;  // loop closed
+
+                    float cx3 = verts[cur*3], cy3 = verts[cur*3+1], cz3 = verts[cur*3+2];
                     int next = -1;
                     for (int i = 0; i < n_boundary; i++) {
                         if (s_be_used[i]) continue;
-                        if (boundary_a[i] == cur) {
+                        float da = fabsf(verts[boundary_a[i]*3]-cx3)
+                                 + fabsf(verts[boundary_a[i]*3+1]-cy3)
+                                 + fabsf(verts[boundary_a[i]*3+2]-cz3);
+                        if (da < tol) {
                             next = boundary_b[i];
                             s_be_used[i] = 1;
                             break;
                         }
-                        if (boundary_b[i] == cur) {
+                        float db = fabsf(verts[boundary_b[i]*3]-cx3)
+                                 + fabsf(verts[boundary_b[i]*3+1]-cy3)
+                                 + fabsf(verts[boundary_b[i]*3+2]-cz3);
+                        if (db < tol) {
                             next = boundary_a[i];
                             s_be_used[i] = 1;
                             break;
@@ -132,8 +150,17 @@ __device__ float compute_rv_for_tris(
     }
     __syncthreads();
 
+    // Cap correction: cap always opposes V_open sign (reduces magnitude).
+    // V_cap_formula is correct for outward normals; flip for inward.
     __shared__ float s_mesh_vol;
-    if (tid == 0) s_mesh_vol = mesh_vol_open + s_cap_vol;
+    if (tid == 0) {
+        if (s_cap_vol != 0.0f && mesh_vol_open != 0.0f) {
+            float cap_corrected = copysignf(fabsf(s_cap_vol), -mesh_vol_open);
+            s_mesh_vol = fabsf(mesh_vol_open + cap_corrected);
+        } else {
+            s_mesh_vol = fabsf(mesh_vol_open);
+        }
+    }
     __syncthreads();
 
     // --- 3. Collect unique vertices from triangles for hull ---
@@ -192,11 +219,9 @@ __device__ float compute_rv_for_tris(
     // --- 5. Rv formula ---
     __shared__ float s_rv;
     if (tid == 0) {
-        float diff = fabsf(s_mesh_vol) - hull_vol;
-        // hull_vol >= |mesh_vol| always (convex hull encloses mesh)
-        // but floating point can invert; take abs of difference
-        if (diff < 0.0f) diff = -diff;
+        float diff = fabsf(s_mesh_vol - hull_vol);
         s_rv = cbrtf(3.0f * diff / (4.0f * PI_F)) * rv_k;
+        (void)caller_id; (void)n_boundary;
     }
     __syncthreads();
     return s_rv;
@@ -243,10 +268,44 @@ __global__ void evaluate_candidates(
     int vo = part.vert_offset;
     int to = part.tri_offset;
 
-    float pa = planes[plane_idx * 4 + 0];
-    float pb = planes[plane_idx * 4 + 1];
-    float pc = planes[plane_idx * 4 + 2];
-    float pd = planes[plane_idx * 4 + 3];
+    // --- Compute per-part bbox → derive cutting plane ---
+    __shared__ float part_lo[3], part_hi[3];
+    {
+        __shared__ float bbox_smem[BLOCK_SIZE];
+        for (int k = 0; k < 3; k++) {
+            float lo = 1e30f, hi = -1e30f;
+            for (int v = tid; v < vc; v += BLOCK_SIZE) {
+                float val = vertex_pool[(vo + v) * 3 + k];
+                lo = fminf(lo, val); hi = fmaxf(hi, val);
+            }
+            bbox_smem[tid] = lo;
+            __syncthreads();
+            for (int s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+                if (tid < s) bbox_smem[tid] = fminf(bbox_smem[tid], bbox_smem[tid+s]);
+                __syncthreads();
+            }
+            if (tid == 0) part_lo[k] = bbox_smem[0];
+            bbox_smem[tid] = hi;
+            __syncthreads();
+            for (int s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+                if (tid < s) bbox_smem[tid] = fmaxf(bbox_smem[tid], bbox_smem[tid+s]);
+                __syncthreads();
+            }
+            if (tid == 0) part_hi[k] = bbox_smem[0];
+            __syncthreads();
+        }
+    }
+
+    int cuts_per_axis = num_planes / 3;
+    int axis = plane_idx / cuts_per_axis;
+    int cut_i = plane_idx % cuts_per_axis;
+    float rlo = part_lo[axis], rhi = part_hi[axis];
+    float pos = rlo + (rhi - rlo) * (float)(cut_i + 1) / (float)(cuts_per_axis + 1);
+
+    float pa = (axis == 0) ? 1.0f : 0.0f;
+    float pb = (axis == 1) ? 1.0f : 0.0f;
+    float pc = (axis == 2) ? 1.0f : 0.0f;
+    float pd = -pos;
 
     // --- Allocate scratch (thread 0 only) ---
     __shared__ int* s_signs;
@@ -324,9 +383,26 @@ __global__ void evaluate_candidates(
             if (hn) {
                 int ni = atomicAdd(&neg_cnt, 1);
                 neg_tris[ni*3]=li0; neg_tris[ni*3+1]=li1; neg_tris[ni*3+2]=li2;
-            } else {
+            } else if (hp) {
                 int pi = atomicAdd(&pos_cnt, 1);
                 pos_tris[pi*3]=li0; pos_tris[pi*3+1]=li1; pos_tris[pi*3+2]=li2;
+            } else {
+                // All vertices on-plane: assign by face normal vs plane normal
+                float e1x = all_verts[li1*3]-all_verts[li0*3];
+                float e1y = all_verts[li1*3+1]-all_verts[li0*3+1];
+                float e1z = all_verts[li1*3+2]-all_verts[li0*3+2];
+                float e2x = all_verts[li2*3]-all_verts[li0*3];
+                float e2y = all_verts[li2*3+1]-all_verts[li0*3+1];
+                float e2z = all_verts[li2*3+2]-all_verts[li0*3+2];
+                float nx = e1y*e2z-e1z*e2y, ny = e1z*e2x-e1x*e2z, nz = e1x*e2y-e1y*e2x;
+                float dot = pa*nx + pb*ny + pc*nz;
+                if (dot > 0) {
+                    int pi = atomicAdd(&pos_cnt, 1);
+                    pos_tris[pi*3]=li0; pos_tris[pi*3+1]=li1; pos_tris[pi*3+2]=li2;
+                } else {
+                    int ni = atomicAdd(&neg_cnt, 1);
+                    neg_tris[ni*3]=li0; neg_tris[ni*3+1]=li1; neg_tris[ni*3+2]=li2;
+                }
             }
         } else {
             // Straddling — find the lone vertex
@@ -445,7 +521,9 @@ __global__ void evaluate_candidates(
             float pc_val = parts[beam_idx * MAX_PARTS_PER_BEAM + p].rv_cost;
             if (pc_val > other_worst) other_worst = pc_val;
         }
-        cost_buffer[bid] = fmaxf(cut_cost, other_worst);
+        float final_cost = fmaxf(cut_cost, other_worst);
+        cost_buffer[bid] = final_cost;
+        (void)0;
     }
 }
 
@@ -524,8 +602,45 @@ __global__ void apply_cuts(
 
     const BeamItem& si = beam_src[src_beam];
     int worst = si.worst_part_idx;
-    float pa = planes[plane_idx*4], pb = planes[plane_idx*4+1];
-    float pc = planes[plane_idx*4+2], pd = planes[plane_idx*4+3];
+
+    // --- Reconstruct per-part cutting plane (same as evaluate_candidates) ---
+    const PartInfo& wp_info = parts_src[src_beam * MAX_PARTS_PER_BEAM + worst];
+    __shared__ float part_lo_ac[3], part_hi_ac[3];
+    {
+        __shared__ float bbox_sm[BLOCK_SIZE];
+        for (int k = 0; k < 3; k++) {
+            float lo = 1e30f, hi = -1e30f;
+            for (int v = tid; v < wp_info.vert_count; v += BLOCK_SIZE) {
+                float val = vp_src[(wp_info.vert_offset + v) * 3 + k];
+                lo = fminf(lo, val); hi = fmaxf(hi, val);
+            }
+            bbox_sm[tid] = lo;
+            __syncthreads();
+            for (int s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+                if (tid < s) bbox_sm[tid] = fminf(bbox_sm[tid], bbox_sm[tid+s]);
+                __syncthreads();
+            }
+            if (tid == 0) part_lo_ac[k] = bbox_sm[0];
+            bbox_sm[tid] = hi;
+            __syncthreads();
+            for (int s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+                if (tid < s) bbox_sm[tid] = fmaxf(bbox_sm[tid], bbox_sm[tid+s]);
+                __syncthreads();
+            }
+            if (tid == 0) part_hi_ac[k] = bbox_sm[0];
+            __syncthreads();
+        }
+    }
+    int cuts_per_axis_ac = num_planes / 3;
+    int axis_ac = plane_idx / cuts_per_axis_ac;
+    int cut_i_ac = plane_idx % cuts_per_axis_ac;
+    float rlo_ac = part_lo_ac[axis_ac], rhi_ac = part_hi_ac[axis_ac];
+    float pos_ac = rlo_ac + (rhi_ac - rlo_ac) * (float)(cut_i_ac + 1) / (float)(cuts_per_axis_ac + 1);
+
+    float pa = (axis_ac == 0) ? 1.0f : 0.0f;
+    float pb = (axis_ac == 1) ? 1.0f : 0.0f;
+    float pc = (axis_ac == 2) ? 1.0f : 0.0f;
+    float pd = -pos_ac;
 
     // --- Copy unchanged parts ---
     __shared__ int out_np;
@@ -616,7 +731,16 @@ __global__ void apply_cuts(
         int hn = (s0<0)|(s1<0)|(s2<0);
         if (!hp || !hn) {
             if (hn) { int ni=atomicAdd(&nc_s,1); nt[ni*3]=li0; nt[ni*3+1]=li1; nt[ni*3+2]=li2; }
-            else    { int pi=atomicAdd(&pc_s,1); pt[pi*3]=li0; pt[pi*3+1]=li1; pt[pi*3+2]=li2; }
+            else if (hp) { int pi=atomicAdd(&pc_s,1); pt[pi*3]=li0; pt[pi*3+1]=li1; pt[pi*3+2]=li2; }
+            else {
+                // All on-plane: assign by face normal vs plane normal
+                float e1x=av[li1*3]-av[li0*3],e1y=av[li1*3+1]-av[li0*3+1],e1z=av[li1*3+2]-av[li0*3+2];
+                float e2x=av[li2*3]-av[li0*3],e2y=av[li2*3+1]-av[li0*3+1],e2z=av[li2*3+2]-av[li0*3+2];
+                float nx=e1y*e2z-e1z*e2y,ny=e1z*e2x-e1x*e2z,nz=e1x*e2y-e1y*e2x;
+                float dot_fn=pa*nx+pb*ny+pc*nz;
+                if(dot_fn>0){ int pi=atomicAdd(&pc_s,1);pt[pi*3]=li0;pt[pi*3+1]=li1;pt[pi*3+2]=li2;}
+                else        { int ni=atomicAdd(&nc_s,1);nt[ni*3]=li0;nt[ni*3+1]=li1;nt[ni*3+2]=li2;}
+            }
         } else {
             int vi_a[3]={li0,li1,li2}; int si_a[3]={s0,s1,s2};
             int lone=-1;
@@ -666,9 +790,41 @@ __global__ void apply_cuts(
     int tv = vc + nvc_s;
     int n_be = be_cnt;
 
-    // --- Fan cap triangulation: close both halves ---
-    // Thread 0: trace boundary loop, add fan triangles to both sides.
-    // Determines winding via shoelace signed area.
+    // --- Compute Rv for new halves (BEFORE cap triangulation) ---
+    // Use divergence theorem on open mesh — winding-independent via |V_open|+|V_cap|
+    __shared__ float smem_ac[BLOCK_SIZE];
+    __shared__ HullWorkspace hull_ws_ac;
+    __shared__ float pos_rv_val, neg_rv_val;
+
+    // Save triangle counts before cap addition
+    int n_pos_open = pc_s;
+    int n_neg_open = nc_s;
+
+    if (n_pos_open > 0) {
+        float prv = compute_rv_for_tris(
+            av, pt, n_pos_open, tv, 0,
+            pa, pb, pc, pd,       // open mesh: use divergence theorem
+            be_a, be_b, n_be,
+            tid, &hull_ws_ac, smem_ac, &scratch, rv_k, 1);
+        if (tid == 0) pos_rv_val = prv;
+    } else {
+        if (tid == 0) pos_rv_val = 0.0f;
+    }
+    __syncthreads();
+
+    if (n_neg_open > 0) {
+        float nrv = compute_rv_for_tris(
+            av, nt, n_neg_open, tv, 0,
+            pa, pb, pc, -pd,      // negate d for negative half
+            be_a, be_b, n_be,
+            tid, &hull_ws_ac, smem_ac, &scratch, rv_k, 1);
+        if (tid == 0) neg_rv_val = nrv;
+    } else {
+        if (tid == 0) neg_rv_val = 0.0f;
+    }
+    __syncthreads();
+
+    // --- Fan cap triangulation: close both halves for output ---
     __shared__ int* s_loop_v;
     if (tid == 0) {
         s_loop_v = (n_be > 0) ? (int*)pool_alloc(&scratch, 512 * sizeof(int)) : NULL;
@@ -678,16 +834,15 @@ __global__ void apply_cuts(
     if (tid == 0 && n_be > 0 && s_loop_v) {
         int* loop_v = s_loop_v;
 
-        // Choose projection axes
         int pu, pv;
         float anx = fabsf(pa), any = fabsf(pb), anz = fabsf(pc);
         if (anx >= any && anx >= anz)      { pu = 1; pv = 2; }
         else if (any >= anz)               { pu = 0; pv = 2; }
         else                               { pu = 0; pv = 1; }
 
-        // Trace boundary loop(s)
+        float tol_ac = 1e-4f;
         for (int start_e = 0; start_e < n_be; start_e++) {
-            if (be_a[start_e] < 0) continue;  // used
+            if (be_a[start_e] < 0) continue;
             int loop_len = 0;
             int first_v = be_a[start_e];
             int cur = be_b[start_e];
@@ -695,13 +850,22 @@ __global__ void apply_cuts(
             loop_v[loop_len++] = first_v;
 
             int safety = n_be + 2;
-            while (cur != first_v && loop_len < 510 && safety-- > 0) {
+            while (loop_len < 510 && safety-- > 0) {
+                // Check if cur matches first_v by position
+                float dx = fabsf(av[cur*3]-av[first_v*3])
+                         + fabsf(av[cur*3+1]-av[first_v*3+1])
+                         + fabsf(av[cur*3+2]-av[first_v*3+2]);
+                if (dx < tol_ac && loop_len > 1) break;  // loop closed
+
                 loop_v[loop_len++] = cur;
+                float cx3=av[cur*3], cy3=av[cur*3+1], cz3=av[cur*3+2];
                 int next = -1;
                 for (int i = 0; i < n_be; i++) {
                     if (be_a[i] < 0) continue;
-                    if (be_a[i] == cur) { next = be_b[i]; be_a[i] = -1; break; }
-                    if (be_b[i] == cur) { next = be_a[i]; be_a[i] = -1; break; }
+                    float da = fabsf(av[be_a[i]*3]-cx3)+fabsf(av[be_a[i]*3+1]-cy3)+fabsf(av[be_a[i]*3+2]-cz3);
+                    if (da < tol_ac) { next = be_b[i]; be_a[i] = -1; break; }
+                    float db = fabsf(av[be_b[i]*3]-cx3)+fabsf(av[be_b[i]*3+1]-cy3)+fabsf(av[be_b[i]*3+2]-cz3);
+                    if (db < tol_ac) { next = be_a[i]; be_a[i] = -1; break; }
                 }
                 if (next < 0) break;
                 cur = next;
@@ -709,7 +873,6 @@ __global__ void apply_cuts(
 
             if (loop_len < 3) continue;
 
-            // Compute shoelace signed area (from +n direction)
             float area2 = 0.0f;
             for (int i = 0; i < loop_len; i++) {
                 int j = (i + 1) % loop_len;
@@ -717,13 +880,8 @@ __global__ void apply_cuts(
                 float uj = av[loop_v[j]*3+pu], vj = av[loop_v[j]*3+pv];
                 area2 += ui * vj - uj * vi_c;
             }
-            // area2 > 0 => CCW from +n => fan normal is +n
-            // Positive half cap needs normal -n, negative needs +n
 
-            // Add fan cap triangles
             for (int i = 1; i < loop_len - 1; i++) {
-                // Positive half: need normal -n
-                // If area2 > 0 (CCW/+n), flip winding
                 int pi_idx = atomicAdd(&pc_s, 1);
                 if (area2 > 0) {
                     pt[pi_idx*3+0]=loop_v[0]; pt[pi_idx*3+1]=loop_v[i+1]; pt[pi_idx*3+2]=loop_v[i];
@@ -731,7 +889,6 @@ __global__ void apply_cuts(
                     pt[pi_idx*3+0]=loop_v[0]; pt[pi_idx*3+1]=loop_v[i]; pt[pi_idx*3+2]=loop_v[i+1];
                 }
 
-                // Negative half: need normal +n (opposite of positive)
                 int ni_idx = atomicAdd(&nc_s, 1);
                 if (area2 > 0) {
                     nt[ni_idx*3+0]=loop_v[0]; nt[ni_idx*3+1]=loop_v[i]; nt[ni_idx*3+2]=loop_v[i+1];
@@ -742,36 +899,6 @@ __global__ void apply_cuts(
         }
     }
     __syncthreads();
-
-    // --- Compute Rv for new halves ---
-    __shared__ float smem_ac[BLOCK_SIZE];
-    __shared__ HullWorkspace hull_ws_ac;
-    __shared__ float pos_rv_val, neg_rv_val;
-
-    // Positive half Rv (mesh is now closed thanks to cap tris)
-    if (pc_s > 0) {
-        float prv = compute_rv_for_tris(
-            av, pt, pc_s, tv, 0,
-            0,0,0,0,  // closed mesh — no cap correction needed
-            (int*)0, (int*)0, 0,
-            tid, &hull_ws_ac, smem_ac, &scratch, rv_k);
-        if (tid == 0) pos_rv_val = prv;
-    } else {
-        if (tid == 0) pos_rv_val = 0.0f;
-    }
-    __syncthreads();
-
-    // Negative half Rv
-    if (nc_s > 0) {
-        float nrv = compute_rv_for_tris(
-            av, nt, nc_s, tv, 0,
-            0,0,0,0,
-            (int*)0, (int*)0, 0,
-            tid, &hull_ws_ac, smem_ac, &scratch, rv_k);
-        if (tid == 0) neg_rv_val = nrv;
-    } else {
-        if (tid == 0) neg_rv_val = 0.0f;
-    }
     __syncthreads();
 
     // Write halves to dst pool
@@ -884,7 +1011,7 @@ __global__ void compute_part_costs(
             part.vert_offset,  // subtract from global indices for local flags
             0, 0, 0, 0,        // closed mesh, no cap
             (int*)0, (int*)0, 0,
-            tid, &hull_ws, smem, &scratch, rv_k);
+            tid, &hull_ws, smem, &scratch, rv_k, 2);
 
         if (tid == 0) {
             part.rv_cost = fmaxf(rv, EPS);
@@ -899,5 +1026,27 @@ __global__ void compute_part_costs(
     if (tid == 0) {
         item.worst_part_idx = worst_idx;
         item.worst_cost = worst_cost;
+    }
+}
+
+// ============================================================================
+// test_hull_volume — diagnostic kernel
+// ============================================================================
+// Grid: (1), Block: (BLOCK_SIZE)
+// Computes hull volume of the given points and writes result.
+
+__global__ void test_hull_volume(
+    const float* __restrict__ points, int n_points,
+    float* __restrict__ result)  // [3]: mesh_vol_placeholder, hull_vol, n_pts
+{
+    int tid = threadIdx.x;
+    __shared__ HullWorkspace hull_ws;
+
+    float vol = compute_hull_volume(points, n_points, tid, &hull_ws);
+
+    if (tid == 0) {
+        result[0] = vol;
+        result[1] = (float)hull_ws.n_faces;
+        result[2] = (float)n_points;
     }
 }
