@@ -322,9 +322,10 @@ int beam_run(
     // Allocate scratch pool (use available GPU memory)
     size_t free_mem = 0, total_mem = 0;
     cuMemGetInfo(&free_mem, &total_mem);
-    size_t scratch_size = (size_t)(free_mem * 0.5);
-    if (scratch_size < 64 * 1024 * 1024) scratch_size = 64 * 1024 * 1024;  // minimum 64MB
-    if (scratch_size > 2ULL * 1024 * 1024 * 1024) scratch_size = 2ULL * 1024 * 1024 * 1024;  // cap 2GB
+    size_t scratch_size = (size_t)(free_mem * 0.7);
+    if (scratch_size < 64 * 1024 * 1024) scratch_size = 64 * 1024 * 1024;
+    // Cap at 4GB — DevicePool.capacity is unsigned int (32-bit)
+    if (scratch_size > 4000000000ULL) scratch_size = 4000000000ULL;
 
     CUdeviceptr d_scratch_base;
     CHECK_CU(cuMemAlloc(&d_scratch_base, scratch_size));

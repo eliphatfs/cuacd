@@ -157,7 +157,7 @@ _gpu_ext = Extension(
 )
 
 setup(
-    packages=["coacd_gpu", "coacd_gpu.coacd"],
+    packages=["coacd_gpu"],
     ext_modules=[_gpu_ext],
     cmdclass={"build_ext": CoacdBuildExt, **_extra_cmdclass},
     zip_safe=False,

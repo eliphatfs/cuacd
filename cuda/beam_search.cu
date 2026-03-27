@@ -163,29 +163,30 @@ __device__ float compute_rv_for_tris(
     }
     __syncthreads();
 
-    // --- 3. Collect unique vertices from triangles for hull ---
+    // --- 3. Collect vertices from triangles for hull ---
+    // Flag used vertices, count them, then collect with uniform stride
+    // so that large meshes are evenly sampled (not biased by index order).
     __shared__ int* s_flags;
     __shared__ float* s_hull_pts;
     __shared__ int s_hull_n;
+    __shared__ int s_flagged_count;
 
     if (tid == 0) {
         s_flags = (int*)pool_alloc(scratch, total_verts * sizeof(int));
         s_hull_pts = (float*)pool_alloc(scratch, MAX_HULL_VERTS * 3 * sizeof(float));
         s_hull_n = 0;
+        s_flagged_count = 0;
     }
     __syncthreads();
     if (!s_flags || !s_hull_pts) {
-        // Pool exhausted — fall back to 0
         __syncthreads();
         return 0.0f;
     }
 
-    // Clear flags
     for (int v = tid; v < total_verts; v += BLOCK_SIZE)
         s_flags[v] = 0;
     __syncthreads();
 
-    // Mark vertices referenced by triangles (use local index = global - vert_offset)
     for (int t = tid; t < n_tris; t += BLOCK_SIZE) {
         int i0 = tris[t*3+0] - vert_offset;
         int i1 = tris[t*3+1] - vert_offset;
@@ -196,22 +197,41 @@ __device__ float compute_rv_for_tris(
     }
     __syncthreads();
 
-    // Gather marked vertices (capped at MAX_HULL_VERTS)
-    for (int v = tid; v < total_verts; v += BLOCK_SIZE) {
-        if (s_flags[v]) {
-            int idx = atomicAdd(&s_hull_n, 1);
-            if (idx < MAX_HULL_VERTS) {
+    // Count flagged (parallel reduction)
+    {
+        int lc = 0;
+        for (int v = tid; v < total_verts; v += BLOCK_SIZE) lc += s_flags[v];
+        smem[tid] = (float)lc;
+        __syncthreads();
+        for (int s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+            if (tid < s) smem[tid] += smem[tid+s];
+            __syncthreads();
+        }
+        if (tid == 0) s_flagged_count = (int)smem[0];
+        __syncthreads();
+    }
+
+    // Thread 0: collect strided sample from flagged vertices
+    if (tid == 0) {
+        int total_flagged = s_flagged_count;
+        int stride = (total_flagged > MAX_HULL_VERTS)
+                   ? (total_flagged / MAX_HULL_VERTS) : 1;
+        int nth = 0;
+        for (int v = 0; v < total_verts && s_hull_n < MAX_HULL_VERTS; v++) {
+            if (!s_flags[v]) continue;
+            if ((nth % stride) == 0) {
                 int gv = vert_offset + v;
-                s_hull_pts[idx*3+0] = verts[gv*3+0];
-                s_hull_pts[idx*3+1] = verts[gv*3+1];
-                s_hull_pts[idx*3+2] = verts[gv*3+2];
+                s_hull_pts[s_hull_n*3+0] = verts[gv*3+0];
+                s_hull_pts[s_hull_n*3+1] = verts[gv*3+1];
+                s_hull_pts[s_hull_n*3+2] = verts[gv*3+2];
+                s_hull_n++;
             }
+            nth++;
         }
     }
     __syncthreads();
 
     int n_hull = s_hull_n;
-    if (n_hull > MAX_HULL_VERTS) n_hull = MAX_HULL_VERTS;
 
     // --- 4. Convex hull volume ---
     float hull_vol = compute_hull_volume(s_hull_pts, n_hull, tid, hull_ws);
@@ -984,7 +1004,6 @@ __global__ void compute_part_costs(
     __shared__ float worst_cost;
     __shared__ int worst_idx;
     __shared__ float smem[BLOCK_SIZE];
-    __shared__ HullWorkspace hull_ws;
     if (tid == 0) { worst_cost = 0.0f; worst_idx = 0; }
     __syncthreads();
 
@@ -1002,6 +1021,8 @@ __global__ void compute_part_costs(
 
         int tc = part.tri_count;
         int to = part.tri_offset;
+        int tvc = part.vert_count;
+        int tvo = part.vert_offset;
 
         if (tc == 0) {
             if (tid == 0) part.rv_cost = EPS;
@@ -1009,16 +1030,102 @@ __global__ void compute_part_costs(
             continue;
         }
 
-        // Compute Rv for this part (mesh is closed — initial mesh or capped)
-        float rv = compute_rv_for_tris(
-            vertex_pool, &triangle_pool[to * 3], tc,
-            part.vert_count,   // total_verts for flag array
-            part.vert_offset,  // subtract from global indices for local flags
-            0, 0, 0, 0,        // closed mesh, no cap
-            (int*)0, (int*)0, 0,
-            tid, &hull_ws, smem, &scratch, rv_k, 2);
+        // --- Full-precision Rv: mesh volume + full-vertex hull ---
+
+        // 1. Mesh volume (parallel signed-tet reduction)
+        float local_vol = 0.0f;
+        for (int t = tid; t < tc; t += BLOCK_SIZE) {
+            int v0 = triangle_pool[(to+t)*3], v1 = triangle_pool[(to+t)*3+1], v2 = triangle_pool[(to+t)*3+2];
+            local_vol += signed_tet_volume(
+                vertex_pool[v0*3],vertex_pool[v0*3+1],vertex_pool[v0*3+2],
+                vertex_pool[v1*3],vertex_pool[v1*3+1],vertex_pool[v1*3+2],
+                vertex_pool[v2*3],vertex_pool[v2*3+1],vertex_pool[v2*3+2]);
+        }
+        float mesh_vol = fabsf(block_reduce_sum(local_vol, smem, tid));
+
+        // 2. Collect ALL unique vertices from triangles
+        __shared__ int* s_flags_cp;
+        __shared__ float* s_pts_cp;
+        __shared__ int s_count_cp;
 
         if (tid == 0) {
+            s_flags_cp = (int*)pool_alloc(&scratch, tvc * sizeof(int));
+            s_count_cp = 0;
+        }
+        __syncthreads();
+
+        if (!s_flags_cp) {
+            if (tid == 0) { part.rv_cost = EPS; }
+            __syncthreads();
+            continue;
+        }
+
+        for (int v = tid; v < tvc; v += BLOCK_SIZE) s_flags_cp[v] = 0;
+        __syncthreads();
+
+        for (int t = tid; t < tc; t += BLOCK_SIZE) {
+            int i0 = triangle_pool[(to+t)*3]-tvo, i1 = triangle_pool[(to+t)*3+1]-tvo, i2 = triangle_pool[(to+t)*3+2]-tvo;
+            if (i0>=0&&i0<tvc) s_flags_cp[i0]=1;
+            if (i1>=0&&i1<tvc) s_flags_cp[i1]=1;
+            if (i2>=0&&i2<tvc) s_flags_cp[i2]=1;
+        }
+        __syncthreads();
+
+        // Count (parallel reduction)
+        {
+            int lc=0;
+            for(int v=tid;v<tvc;v+=BLOCK_SIZE) lc+=s_flags_cp[v];
+            smem[tid]=(float)lc;
+            __syncthreads();
+            for(int s=BLOCK_SIZE/2;s>0;s>>=1){if(tid<s)smem[tid]+=smem[tid+s];__syncthreads();}
+            if(tid==0) s_count_cp=(int)smem[0];
+            __syncthreads();
+        }
+
+        // Allocate hull points + workspace from pool
+        int n_hull_pts = s_count_cp;
+        int max_faces = 2 * n_hull_pts + 4;
+
+        __shared__ float* s_hull_pts_cp;
+        __shared__ int *s_hfv0,*s_hfv1,*s_hfv2,*s_hvis,*s_hha,*s_hhb;
+
+        if (tid == 0) {
+            s_hull_pts_cp = (float*)pool_alloc(&scratch, n_hull_pts * 3 * sizeof(float));
+            s_hfv0 = (int*)pool_alloc(&scratch, max_faces * sizeof(int));
+            s_hfv1 = (int*)pool_alloc(&scratch, max_faces * sizeof(int));
+            s_hfv2 = (int*)pool_alloc(&scratch, max_faces * sizeof(int));
+            s_hvis  = (int*)pool_alloc(&scratch, max_faces * sizeof(int));
+            s_hha  = (int*)pool_alloc(&scratch, max_faces * sizeof(int));
+            s_hhb  = (int*)pool_alloc(&scratch, max_faces * sizeof(int));
+        }
+        __syncthreads();
+
+        float hull_vol = 0.0f;
+        if (s_hull_pts_cp && s_hfv0) {
+            // Collect all flagged vertices (thread 0, sequential)
+            if (tid == 0) {
+                int idx = 0;
+                for (int v = 0; v < tvc && idx < n_hull_pts; v++) {
+                    if (!s_flags_cp[v]) continue;
+                    int gv = tvo + v;
+                    s_hull_pts_cp[idx*3+0] = vertex_pool[gv*3+0];
+                    s_hull_pts_cp[idx*3+1] = vertex_pool[gv*3+1];
+                    s_hull_pts_cp[idx*3+2] = vertex_pool[gv*3+2];
+                    idx++;
+                }
+                s_count_cp = idx;
+            }
+            __syncthreads();
+
+            hull_vol = compute_hull_volume_pool(
+                s_hull_pts_cp, s_count_cp, tid,
+                s_hfv0, s_hfv1, s_hfv2, s_hvis, s_hha, s_hhb, max_faces);
+        }
+
+        // 3. Rv
+        if (tid == 0) {
+            float diff = fabsf(mesh_vol - hull_vol);
+            float rv = cbrtf(3.0f * diff / (4.0f * PI_F)) * rv_k;
             part.rv_cost = fmaxf(rv, EPS);
             if (part.rv_cost > worst_cost) {
                 worst_cost = part.rv_cost;

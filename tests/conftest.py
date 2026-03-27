@@ -4,23 +4,6 @@ import numpy as np
 import pytest
 
 
-def pytest_addoption(parser):
-    parser.addoption("--slow", action="store_true", default=False,
-                     help="run slow tests (MCTS/pipeline)")
-
-
-def pytest_configure(config):
-    config.addinivalue_line("markers", "slow: mark test as slow (MCTS/pipeline)")
-
-
-def pytest_collection_modifyitems(config, items):
-    if not config.getoption("--slow"):
-        skip_slow = pytest.mark.skip(reason="use --slow to run")
-        for item in items:
-            if "slow" in item.keywords:
-                item.add_marker(skip_slow)
-
-
 def _box_mesh(lo, hi):
     """Create a box mesh from (lo) to (hi) corners."""
     x0, y0, z0 = lo

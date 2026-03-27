@@ -7,9 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This repository contains:
 
 1. **CoACD** (`CoACD/`) — Collision-Aware Approximate Convex Decomposition (reference C++ implementation, SIGGRAPH 2022).
-2. **coacd_gpu** — GPU-accelerated convex decomposition. Two components:
-   - **GPU extension** (`cuda/beam_kernels.cu`, `csrc/beam.c`, `csrc/beam_module.c`) — All GPU functionality: beam search decomposition, Hausdorff distance, pairwise merge cost. Single CPython extension (abi3, cp310+) via CUDA driver API.
-   - **Pure Python CoACD** (`coacd_gpu/coacd/`) — Pure Python reimplementation using scipy/triangle. No C++ build required.
+2. **coacd_gpu** — GPU-accelerated convex decomposition via beam search. Single CPython extension (abi3, cp310+) via CUDA driver API. Includes beam search decomposition, Hausdorff distance, pairwise merge cost.
 
 ## Repository Layout
 
@@ -31,11 +29,9 @@ csrc/                 # C host code
 coacd_gpu/            # Python package (import name)
   __init__.py         #   Context class (Hausdorff API) + re-exports BeamContext
   beam.py             #   Python API for beam search (imports _gpu extension)
-  coacd/              #   Pure Python CoACD implementation
 tests/                # All tests
   test_extension.py   #   GPU smoke tests (Hausdorff, pairwise — standalone script)
   test_beam.py        #   GPU beam search tests (cube convexity, L-shape decomposition)
-  test_clip.py ...    #   Pure Python CoACD unit tests
 CoACD/                # Reference C++ CoACD (submodule/external)
 ```
 
@@ -51,20 +47,11 @@ COACD_GPU_ARCHS="80;86" pip install -e .
 # Run GPU smoke tests
 python tests/test_extension.py
 
-# Run pure Python CoACD tests (fast)
+# Run GPU beam search tests
 python -m pytest tests/ -v
-
-# Run all tests including slow MCTS/pipeline tests
-python -m pytest tests/ -v --slow
-
-# Run a specific test
-python -m pytest tests/test_clip.py -v
-
-# Compare C++ vs Python CoACD on Octocat
-python compare_octocat.py
 ```
 
-Dependencies: `numpy`, `scipy`, `triangle`, `pytest` (test only), `trimesh` (comparison only).
+Dependencies: `numpy`, `pytest` (test only), `trimesh` (comparison only).
 
 ### CoACD (C++ / Python)
 
@@ -81,91 +68,16 @@ cd CoACD && pip install -e .
 
 One extension is built by `setup.py`:
 
-**`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all `.cuh`/`.cu` modules) → fatbin → xxd-style C header, then builds `csrc/beam_module.c` + `csrc/beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). No cmake involved.
+**`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all `.cuh`/`.cu` modules) -> fatbin -> xxd-style C header, then builds `csrc/beam_module.c` + `csrc/beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). No cmake involved.
 
 ### Design Principles
 
-- **CUDA driver API only** — links `libcuda.so`, not `libcudart.so`. One binary across CUDA 11.x–12.x+.
+- **CUDA driver API only** — links `libcuda.so`, not `libcudart.so`. One binary across CUDA 11.x-12.x+.
 - **Fatbin embedding** — cubins for sm_80/86/89/90 + PTX for forward compat, embedded as C arrays.
 - **abi3 wheel** — `Py_LIMITED_API` targeting Python 3.10+. One wheel per platform.
 - **No PyTorch dependency** — numpy arrays in/out. Reuses existing CUDA context if available.
 - **Single extension** — all GPU functionality (beam search + Hausdorff + merge cost) in one `_gpu` module. No cmake, no ctypes.
-
-### GPU Kernels (`cuda/`)
-
-CUDA device code organized into modular files, compiled as a single fatbin via `cuda/kernels.cu`:
-
-- **`common.cuh`** — Constants (`BLOCK_SIZE`, `MAX_BEAM`, etc.), data structures (`PartInfo`, `BeamItem`, `DevicePool`), `pool_alloc`, `atomicMinF`/`atomicMaxF`.
-- **`reduce.cuh`** — `block_reduce_sum`, `block_reduce_bbox`.
-- **`geometry.cuh`** — `signed_tet_volume`, `intersect_edge`, `point_triangle_dist` (Eberly's method), `compute_concavity_tris` (legacy bbox metric).
-- **`hull.cuh`** — `HullWorkspace`, `compute_hull_volume` — incremental 3D convex hull with SIMT-parallel visibility tests and thread-0 topology updates. Returns hull volume in ~12KB of shared memory.
-
-**Beam search kernels (`beam_search.cu`):**
-- **`compute_rv_for_tris`** — Device function: full Rv computation. Parallel signed-tet mesh volume + divergence theorem cap volume + parallel convex hull volume → Rv formula.
-- **`evaluate_candidates`** — Grid `(beams × planes)`. Per block: classify vertices against plane, split triangles, collect boundary edges, compute Rv for each half via `compute_rv_for_tris`.
-- **`select_top_k`** — Single block, thread 0 only. Insertion-sort to pick best `beam_width` candidates.
-- **`apply_cuts`** — Grid `(winners)`. Copy unchanged parts, re-clip worst part, add fan cap triangles to close meshes, compute and cache Rv for new parts, write to double-buffered pool.
-- **`compute_part_costs`** — Grid `(beams)`. Compute Rv (mesh volume + hull volume) for parts needing it (initial mesh), find worst per beam item.
-**Hausdorff/merge kernels (`hausdorff.cu`):**
-- **`sample_surface`** — Area-weighted surface sampling (for Hausdorff validation, not yet wired in).
-- **`point_mesh_distance`** — brute-force point-to-triangle (Eberly's method), one thread per point. Has `vert_offset` parameter for pool-based usage.
-- **`reduce_max`** — shared-memory parallel max reduction.
-- **`pairwise_hausdorff`** — batch merge cost matrix with `atomicMaxF` float CAS.
-
-**Mesh transform kernels (`mesh_transform.cu`):**
-- **`normalize_mesh`** / **`recover_coordinates`** — Normalize to [-1,1]³ and recover.
-
-### Host Orchestration (`csrc/beam.c`)
-
-Single context manages both beam search and Hausdorff functionality. All kernel function handles resolved from one fatbin module at init time.
-
-**Beam search flow:**
-```
-Input mesh → Upload to pool_a → Normalize to [-1,1]³
-  → Generate 3×N axis-aligned cutting planes
-  → Compute initial Rv (compute_part_costs: mesh volume + hull volume)
-  → If already below threshold → return single part
-  → Beam loop:
-      1. evaluate_candidates: clip worst part by each plane, compute Rv for both halves
-      2. select_top_k: pick best beam_width candidates
-      3. apply_cuts: materialize cuts, add cap triangles, compute+cache Rv
-      4. Swap pool_cur ↔ pool_nxt, swap parts/beam buffers
-      5. compute_part_costs: read cached Rv, find worst part per beam item
-      6. If best beam item's worst_cost ≤ threshold → done
-  → Recover coordinates → Download parts
-```
-
-**Memory management:**
-- **Double-buffered mesh pools**: pool_a and pool_b alternate each iteration. Read from current, write to next, swap.
-- **Bump-allocated scratch pool**: single large device buffer (~50% of free GPU memory). Reset offset to 0 between kernel launches. Thread-0-only allocation with shared memory broadcast.
-- **Per-iteration alloc/free**: parts and beam metadata arrays are freshly allocated each iteration (old ones freed after swap).
-
-### Concavity Metric: Rv (Volume-Ratio)
-
-The beam search uses Rv = `(3 × |V_mesh - V_hull| / (4π))^(1/3) × k` where k = rv_k (default 0.3). This measures the difference between the mesh volume and its convex hull volume.
-
-- **Mesh volume**: parallel signed-tetrahedra reduction. For open meshes (after clipping), a cap volume correction is added via the divergence theorem: `V_cap = (d/3) × |A_boundary|`, computed from boundary edge loop shoelace signed area.
-- **Hull volume**: incremental 3D convex hull with parallel visibility tests (all 256 threads test their assigned faces) and thread-0 sequential topology updates (horizon edge finding, face removal/addition). Runs in ~12KB of shared memory (`HullWorkspace`), capped at 256 input vertices.
-- **Cap triangulation**: `apply_cuts` adds fan cap triangles after each clip to close meshes, ensuring correct signed-tet volumes in subsequent iterations.
-- **Threshold meaning**: compatible with original CoACD threshold semantics. For meshes normalized to [-1,1]³, a convex shape has Rv ≈ 0. Threshold 0.05 is typical.
-- **Scoring a cut**: `max(Rv_positive_half, Rv_negative_half)`. The beam search minimizes worst-case concavity.
-
-### Pool Allocator Pattern
-
-All scratch memory in kernels is allocated from a global bump pool. **Critical pattern**: only thread 0 calls `pool_alloc()`, stores the pointer in `__shared__` memory, then all threads read it after `__syncthreads()`:
-
-```cuda
-__shared__ int* s_signs;
-__shared__ float* s_verts;
-if (tid == 0) {
-    s_signs = (int*)pool_alloc(&scratch, n * sizeof(int));
-    s_verts = (float*)pool_alloc(&scratch, m * sizeof(float));
-}
-__syncthreads();
-int* signs = s_signs;  // all threads see same pointer
-```
-
-If all 256 threads call `pool_alloc`, each gets a different offset (256× memory waste) and threads write to different arrays, causing data corruption. This was a critical bug that was fixed.
+- **Native CPython extension, not ctypes** — ctypes has fragile import path resolution, no type safety, no proper Python object lifecycle. The torchoptix pattern (native CPython extension with embedded fatbin) is the standard approach.
 
 ### Python API
 
@@ -187,121 +99,287 @@ parts = run_beam_coacd(vertices, triangles, threshold=0.5)
 
 Both `Context` and `BeamContext` share the same underlying `_gpu` extension and CUDA context.
 
-## Pure Python CoACD (`coacd_gpu/coacd/`)
+## Beam Search Algorithm Design
 
-Pure Python reimplementation of CoACD. Uses `scipy` (Qhull), `triangle` (CDT), optionally `coacd_gpu` for GPU Hausdorff.
+### Overview
 
-| File | Role |
-|------|------|
-| `_geometry.py` | `Plane`, `mesh_volume`, `normalize`, `recover`, `pca_align` |
-| `_mesh.py` | `Mesh` class wrapping vertices + triangles + `convex_hull()` via scipy |
-| `_sampling.py` | Area-weighted surface sampling |
-| `_cost.py` | `compute_rv` (volume), `compute_hb` (Hausdorff via KD-tree), `compute_hcost` |
-| `_clip.py` | Plane-mesh clipping with CDT cap triangulation |
-| `_mcts.py` | MCTS search (Node/State/Part), UCB1, Rv-only rollout, ternary refinement |
-| `_merge.py` | Greedy agglomerative merge |
-| `_pipeline.py` | `run_coacd()` orchestration |
+Replace MCTS with beam search over decomposition states. Search space: 3xN axis-aligned cuts (N per axis, default N=10 -> 30 total candidates). Beam width X (default 8). Each kernel does one job, with maximum SIMT parallelism within blocks.
 
-```python
-from coacd_gpu.coacd import run_coacd
-parts = run_coacd(vertices, triangles, threshold=0.05)
-```
+### Algorithm Steps
 
-## Design Deviations from Original Plan
+**Step 0 — Initialize:**
+Upload mesh, normalize to [-1,1]^3. Generate 3xN cutting planes. Start with all 30 cuts in work list.
 
-The implementation diverges from the original GPU beam search plan in several significant ways. These are intentional engineering decisions made during implementation.
+**Step 1 — Connected Components (1 kernel):**
+For each item in the work list, scan and compute connected components. 1 candidate per block. Uses parallel union-find with path compression via atomicMin.
 
-### 1. Concavity Metric: Rv via GPU Convex Hull (Implemented)
+**Step 2 — Compute Rv per component (1 kernel):**
+Compute Rv for each component in each candidate, with 1 component per block. Use atomic operations to build an index of components satisfying Rv < epsilon.
 
-**Plan**: Rv = `(3 * |V_mesh - V_hull| / (4π))^(1/3) * k`, requiring per-part convex hull volume on GPU.
+**Step 3 — Hausdorff validation (1 kernel):**
+Compute Hausdorff distance for components with Rv < epsilon. Build an index of components where max(Rv, Hausdorff) < epsilon.
 
-**Implementation**: Rv is computed as planned. The key design that made it work:
-- **Parallel visibility, sequential topology**: All 256 threads test face visibility in parallel. Thread 0 alone does horizon edge finding, face removal/addition. This avoids `__syncthreads()` deadlocks in conditional loops.
-- **Shared memory workspace**: ~12KB `HullWorkspace` in shared memory (not pool). Faces stored as SoA (fv0/fv1/fv2 arrays). Capped at 256 input vertices.
-- **Cap volume via divergence theorem**: For open meshes after clipping, `V_cap = (d/3) × |A_boundary|` computed from boundary edge loop shoelace signed area. Non-destructive marking via pool-allocated flag array.
-- **Fan cap triangulation**: `apply_cuts` closes meshes with fan cap triangles after each cut, ensuring correct signed-tet volume in subsequent iterations.
+**Step 4 — Worst selection + termination check (1 kernel):**
+For each work list item, choose the component with the worst metric max(Rv, Hausdorff). If all components in all candidates satisfy -> pick the one with fewest components and terminate.
 
-### 2. Cap Volume via Divergence Theorem (Implemented)
+**Step 5 — Beam expansion (1 kernel):**
+For X items in the work list, the worst part leads to 30 next-step candidates -> 30X total. Each thread block handles one candidate: clip, compute Rv, record cost scalar. Block 0 waits via atomic counter and selects the best X candidates.
 
-**Plan**: `V_cap = (-d/3) × A_net` from boundary loop signed areas.
+Memory strategy: Keep at most max(30, X) meshes in global memory. Use references and only add 'cut plane intersection' to memory if needed. Trade recomputation for memory. Rv can be computed without storing convex hull (hull volume accumulated incrementally, only scalar kept). Hull approximated to ~256 vertices during search.
 
-**Implementation**: Implemented as planned. Boundary edges collected during triangle splitting (parallel), loop tracing and shoelace area computed by thread 0 (sequential, O(n_boundary²)). Fan cap triangulation in `apply_cuts` closes meshes for correct volumes in future iterations.
+**Step 6 — Apply cuts + update (1 kernel):**
+Track the indices to find which cuts were taken. Update meshes with the cuts. The work list now contains X items. Update bounding boxes and other metadata. Repeat from step 1.
 
-### 3. GPU Convex Hull: Incremental with Parallel Visibility (Implemented)
-- Incremental hull needs sequential face updates after each vertex insertion
-**Plan**: Port QuickHull to GPU.
+### Concavity Metric: Rv (Volume-Ratio)
 
-**Implementation**: Incremental hull with SIMT-parallel visibility tests. Not QuickHull. The parallel visibility test (all threads test assigned faces) avoids `__syncthreads()` in conditional loops. Thread 0 handles sequential topology (horizon edges via brute-force search of visible faces, O(9 × n_vis²) per insertion — fast for typical n_vis < 20). Volume accumulated incrementally via signed-tet delta on face removal/addition.
+Rv = `(3 * |V_mesh - V_hull| / (4*pi))^(1/3) * k` where k = rv_k (default 0.3).
 
-### 4. Vertex Classification Inlined (Not a Function Call)
+- **Mesh volume**: parallel signed-tetrahedra reduction `V = (1/6) * sum p0.(p1 x p2)`. For open meshes after clipping, cap volume correction via divergence theorem: `V_cap = (d/3) * |A_boundary|` from boundary edge loop shoelace signed area.
+- **Hull volume**: incremental 3D convex hull with parallel visibility tests (all 256 threads test assigned faces) and thread-0 sequential topology updates. ~12KB shared memory workspace, capped at 256 input vertices for search. Full vertex count for termination checks only when approximate Rv is near threshold.
+- **Cap triangulation**: fan cap triangles close meshes after each clip for correct signed-tet volumes in subsequent iterations.
+- **Threshold**: compatible with CoACD semantics. Convex shape -> Rv ~ 0. Threshold 0.05 typical.
+- **Scoring a cut**: `max(Rv_positive_half, Rv_negative_half)`. Beam search minimizes worst-case concavity.
+- **Per-part bounding box planes**: cutting planes uniformly distributed within each part's triangle-vertex bbox (not all-vertex bbox, not global). Odd cuts_per_axis (e.g., 15) ensures midpoint is always a candidate. No snapping to vertex coordinates.
 
-**Plan**: `classify_vertex()` device function.
+### Hyperparameters
 
-**Implementation**: Vertex classification is inlined at each call site:
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `beam_width` (X) | 8 | Number of beam items to keep |
+| `cuts_per_axis` (N) | 10 | Planes per axis direction (30 total) |
+| `threshold` | 0.05 | Concavity threshold for termination |
+| `rv_k` | 0.3 | Scaling factor in Rv formula |
+| `max_parts` | 64 | Max parts per beam item |
+| `max_iterations` | 64 | Max decomposition steps |
+| `hausdorff_samples` | 1000 | Samples for Hausdorff validation |
+
+### Pool Allocator Pattern
+
+All scratch memory in kernels is allocated from a global bump pool. **Critical pattern**: only thread 0 calls `pool_alloc()`, stores pointer in `__shared__` memory, then all threads read after `__syncthreads()`:
+
 ```cuda
-float val = pa * vx + pb * vy + pc * vz + pd;
-signs[v] = (val > EPS) ? 1 : ((val < -EPS) ? -1 : 0);
+__shared__ int* s_signs;
+__shared__ float* s_verts;
+if (tid == 0) {
+    s_signs = (int*)pool_alloc(&scratch, n * sizeof(int));
+    s_verts = (float*)pool_alloc(&scratch, m * sizeof(float));
+}
+__syncthreads();
+int* signs = s_signs;  // all threads see same pointer
 ```
 
-**Why changed**: The `classify_vertex()` function call produced incorrect results in the `apply_cuts` kernel context — returning 0 (on-plane) for vertices clearly not on the plane (val=1.45). Root cause unconfirmed (suspected nvcc optimization issue with function parameter passing in complex kernels). Inlining resolved it immediately.
+If all 256 threads call `pool_alloc`, each gets a different offset (256x memory waste) and threads write to different arrays, causing data corruption.
 
-### 5. Pool Allocator: Thread-0-Only Pattern
+## Utility Function Inventory
 
-**Plan**: `pool_alloc()` callable from any thread, with atomic bump pointer.
+The beam search kernels should be high-level logic calling these reusable utilities. Each utility is a clean device function or kernel with a well-defined interface.
 
-**Implementation**: `pool_alloc()` is only called by thread 0 within each block. Pointers are broadcast to all threads via `__shared__` memory.
+### A. Scalar Device Functions (per-thread, no sync)
 
-**Why changed**: When all 256 threads called `pool_alloc`, each atomically bumped the offset and received a *different* pointer. Thread 0 wrote data to its allocation, thread 1 wrote to a different allocation, etc. Later when the block cooperatively processed the data, threads read from thread 0's allocation, seeing uninitialized memory for indices > 0. This was the root cause of the signs corruption bug (7 of 8 vertices classified as zero).
+| ID | Function | Status | File |
+|----|----------|--------|------|
+| A1 | `signed_tet_volume(p0, p1, p2) -> float` | EXISTS | geometry.cuh |
+| A2 | `intersect_edge(v0, v1, plane) -> (ix, iy, iz)` | EXISTS | geometry.cuh |
+| A3 | `point_triangle_dist(point, v0, v1, v2) -> float` | EXISTS | geometry.cuh |
+| A4 | `rv_from_volumes(mesh_vol, hull_vol, rv_k) -> float` | EXTRACT — inlined as `cbrtf(3*|diff|/(4*pi))*k` in 3 places | beam_search.cu |
 
-### 6. Connected Components Not Implemented
+### B. Block-Level Reductions (all threads call, __syncthreads)
 
-**Plan**: Parallel union-find with path compression in per-block scratch memory to find disconnected pieces after clipping.
+| ID | Function | Status | File |
+|----|----------|--------|------|
+| B1 | `block_reduce_sum(val, smem, tid) -> float` | EXISTS | reduce.cuh |
+| B2 | `block_reduce_bbox(verts, n, offset, tid, smem, out_lo, out_hi)` | EXISTS | reduce.cuh |
+| B3 | `block_reduce_max(val, smem, tid) -> float` | NEEDED | reduce.cuh |
+| B4 | `block_reduce_count(flags, n, tid, smem) -> int` | NEEDED — counting flagged elements, currently inlined | reduce.cuh |
 
-**Implementation**: Each clip half is treated as a single part regardless of connectivity.
+### C. Block-Level Mesh Operations (device functions, all threads, __syncthreads)
 
-**Why changed**: Deferred for simplicity. Most axis-aligned cuts of connected meshes produce connected halves. Disconnected pieces would just be over-segmented (functionally correct, just sub-optimal part count).
+| ID | Function | Status | Signature |
+|----|----------|--------|-----------|
+| C1 | `classify_vertices` | EXTRACT — inlined identically in evaluate_candidates and apply_cuts | `(verts, vo, vc, plane_abcd, signs, tid)` -> writes `signs[0..vc)` as +1/0/-1 |
+| C2 | `split_triangles` | EXTRACT — ~110 lines duplicated in evaluate_candidates and apply_cuts | `(vp, tp, to, tc, vo, signs, plane, av, pos_tris, neg_tris, be_a, be_b, &pos_cnt, &neg_cnt, &new_v_cnt, &be_cnt, tid)` -> classifies + splits straddling triangles + collects boundary edges |
+| C3 | `compute_tri_bbox` | EXTRACT — ~25 lines duplicated in evaluate_candidates and apply_cuts | `(vp, tp, tri_offset, tri_count, tid, smem, out_lo[3], out_hi[3])` -> per-part bbox from triangle vertex references |
+| C4 | `compute_mesh_volume` | EXTRACT — embedded in compute_rv_for_tris and compute_part_costs | `(verts, tris, n_tris, tid, smem) -> float` — parallel signed-tet reduction, returns absolute volume |
+| C5 | `collect_hull_vertices` | EXTRACT — flag + count + strided sample, ~50 lines in compute_rv_for_tris | `(verts, tris, n_tris, vert_offset, total_verts, flags, out_pts, max_pts, tid, smem, scratch) -> int n_hull` — flags triangle-referenced vertices, strides to <=MAX_HULL_VERTS |
+| C6 | `compute_hull_volume` (shared memory) | EXISTS | hull.cuh — `(points, n_points, tid, ws) -> float`, <=256 verts, ~12KB shared memory |
+| C7 | `compute_hull_volume_pool` (pool memory) | EXISTS | hull.cuh — `(points, n_points, tid, fv0..., max_faces) -> float`, unlimited verts, pool-allocated face arrays |
 
-### 7. Fan Cap Triangulation (Simplified from Ear-Clipping)
+### D. Block-Level Boundary / Cap Operations (device functions)
 
-**Plan**: Bridge holes to outer boundary, ear-clip merged polygon, produce closed mesh output.
+| ID | Function | Status | Signature |
+|----|----------|--------|-----------|
+| D1 | `compute_cap_volume` | EXTRACT — thread-0 loop tracing + shoelace, ~70 lines in compute_rv_for_tris | `(verts, be_a, be_b, n_be, plane, tid, scratch) -> float` — divergence theorem cap volume. Uses pool-allocated `used` flags for non-destructive tracing. Position-based matching (L1 tol 1e-4) |
+| D2 | `trace_boundary_loops` | WRITE — currently loop tracing is embedded in D1 and D3, duplicated with differences | `(verts, be_a, be_b, n_be, out_loops, out_loop_lens, tid) -> int n_loops` — clean loop tracer by position matching. Consumable by both cap volume and fan cap |
+| D3 | `fan_cap_triangulate` | EXTRACT — ~60 lines in apply_cuts | `(verts, be_a, be_b, n_be, plane, pos_tris, neg_tris, &pc, &nc, tid)` — traces loops, adds fan triangles to both halves with correct winding |
 
-**Implementation**: `apply_cuts` adds fan cap triangles (from loop vertex v0, create triangles (v0, v_i, v_{i+1})) after each clip. Winding determined by shoelace signed area. This closes meshes for correct signed-tet volume in subsequent iterations. Fan triangulation is used instead of ear-clipping — it may produce overlapping triangles for non-convex boundary polygons, but the signed volume is still correct (cancellation property).
+### E. Connected Components (device functions, all threads)
 
-**Output**: Final parts are returned with cap triangles included. Parts are closed meshes.
+| ID | Function | Status | Signature |
+|----|----------|--------|-----------|
+| E1 | `build_edge_adjacency` | WRITE | `(tris, n_tris, edge_table, table_size, tid)` — hash table: canonical edge -> (tri_a, tri_b). Parallel insert via atomicCAS |
+| E2 | `union_find_init` | WRITE | `(labels, n, tid)` — `labels[i] = i` for all i |
+| E3 | `union_find_iterate` | WRITE | `(labels, tris, n_tris, edge_table, tid) -> bool changed` — one pass of parallel union with path compression via atomicMin |
+| E4 | `compact_components` | WRITE | `(labels, n_tris, comp_offsets, comp_counts, tid) -> int n_components` — per-component triangle index lists |
 
-### 8. Merge Post-Processing Not Implemented
+### F. Rv Computation (composite device functions)
 
-**Plan**: Greedy agglomerative merge using the existing `pairwise_hausdorff` kernel to combine over-segmented parts.
+| ID | Function | Status | Signature |
+|----|----------|--------|-----------|
+| F1 | `compute_rv_closed` | WRITE — for closed meshes (no cap) | `(verts, tris, n_tris, vert_offset, total_verts, tid, hull_ws, smem, scratch, rv_k) -> float` — composes C4 + C5 + C6 + A4 |
+| F2 | `compute_rv_open` | REFACTOR — current `compute_rv_for_tris` | `(verts, tris, n_tris, total_verts, vert_offset, plane, be_a, be_b, n_be, tid, hull_ws, smem, scratch, rv_k) -> float` — composes C4 + D1 + C5 + C6 + A4 |
 
-**Implementation**: Not implemented. Raw beam search output is returned.
+### G. Hausdorff (kernels + host helpers)
 
-**Why changed**: Deferred. The beam search already optimizes for fewest parts at termination (picks beam item with minimum num_parts among those satisfying threshold). Merge would further reduce part count but isn't critical for initial functionality.
+| ID | Function | Status | File |
+|----|----------|--------|------|
+| G1 | `sample_surface` kernel | EXISTS | hausdorff.cu — area-weighted surface sampling |
+| G2 | `point_mesh_distance` kernel | EXISTS | hausdorff.cu — brute-force point-to-triangle, one thread per point |
+| G3 | `reduce_max` kernel | EXISTS | hausdorff.cu — shared-memory parallel max reduction |
+| G4 | `compute_hausdorff_pair` (host orchestration) | WRITE — wire G1+G2+G3 into beam loop for step 3 | Bidirectional: sample A->mesh B, sample B->mesh A, take max |
+| G5 | `pairwise_hausdorff` kernel | EXISTS | hausdorff.cu — batch merge cost matrix |
 
-### 9. Single CPython Extension (no cmake, no ctypes)
+### H. Mesh Transform (kernels)
 
-**Plan** (original): CMake builds everything, Python loads via ctypes.CDLL.
+| ID | Function | Status | File |
+|----|----------|--------|------|
+| H1 | `normalize_mesh` kernel | EXISTS | mesh_transform.cu |
+| H2 | `recover_coordinates` kernel | EXISTS | mesh_transform.cu |
 
-**Implementation**: All GPU functionality (beam search + Hausdorff + merge cost) is built as a single `_gpu` CPython extension module by setuptools. `setup.py` compiles `beam_kernels.cu` → fatbin → C header, then builds `beam_module.c` + `beam.c` with `Py_LIMITED_API` (cp310+, abi3 wheel). No cmake, no ctypes, no separate shared library.
+### I. Selection / Search
 
-**Why changed**: ctypes has fragile import path resolution (fails when cwd shadows package name), no type safety, no proper Python object lifecycle. Having two separate extensions (`_native` via cmake + ctypes, `_beam` via setuptools) was unnecessary complexity — all kernels share the same CUDA context and can live in one fatbin/module. The torchoptix pattern (native CPython extension with embedded fatbin) is the standard approach for shipping CUDA-accelerated Python modules.
+| ID | Function | Status | Signature |
+|----|----------|--------|-----------|
+| I1 | `select_top_k` kernel | EXISTS | beam_search.cu — thread-0 insertion sort, single block |
+| I2 | `block_select_top_k` | NEEDED if fusing into expansion kernel | Block-0 selection pattern for step 5 |
+
+### J. Memory / Infrastructure
+
+| ID | Function | Status | File |
+|----|----------|--------|------|
+| J1 | `pool_alloc(pool, size) -> void*` | EXISTS | common.cuh |
+| J2 | `atomicMinF / atomicMaxF` | EXISTS | common.cuh |
+
+### K. Legacy / Dead Code (to remove)
+
+| ID | What | Why dead |
+|----|------|----------|
+| K1 | `compute_concavity_tris` in geometry.cuh | Bbox cube-root proxy, superseded by Rv |
+| K2 | Global `planes` array generation + upload in beam.c | Planes derived from per-part bbox; global array allocated/uploaded but never read |
+| K3 | `test_hull_volume` kernel + Python wiring | Debug-only diagnostic |
+
+### Kernel Composition from Utilities
+
+**Step 1 kernel** (CC): `E1 -> E2 -> repeat(E3) -> E4`
+
+**Step 2 kernel** (Rv per component): `F1` (one block per component)
+
+**Step 3 kernel** (Hausdorff): `G1 -> G2 -> G3` per component (host orchestration via G4)
+
+**Step 4 kernel** (worst + termination): `B3` reduction over components per item
+
+**Step 5 kernel** (expand): `C3 -> C1 -> C2 -> F2(pos) -> F2(neg) -> write cost` + block-0 `I2`
+
+**Step 6 kernel** (apply cuts): `C3 -> C1 -> C2 -> D3 -> copy to pool`
+
+## Current Implementation vs. Design Discrepancies
+
+### 1. No Connected Components (design step 1)
+
+**Design**: Dedicated kernel — for each item, compute CC. 1 candidate per block.
+
+**Current**: Completely absent. Each clip half is one part regardless of connectivity.
+
+### 2. Rv is per-half, not per-component (design step 2)
+
+**Design**: Separate kernel — Rv for each connected component, 1 component per block.
+
+**Current**: Rv computed per clip-half (fused into `evaluate_candidates`), not per component.
+
+### 3. No Hausdorff in beam loop (design step 3)
+
+**Design**: Dedicated kernel — Hausdorff for components where Rv < eps.
+
+**Current**: Hausdorff kernels exist but are not wired into the beam loop. Termination uses Rv alone.
+
+### 4. Worst selection / termination (design step 4)
+
+**Design**: Per-item worst component based on max(Rv, Hausdorff). Single kernel.
+
+**Current**: `compute_part_costs` finds worst per beam item (Rv only, sequential per-part loop, 1 block per beam item). Termination on host.
+
+### 5. Expansion kernel architecture (design step 5)
+
+**Design**: Single fused kernel — 30X blocks, block-0 selects top X.
+
+**Current**: Three separate kernels with host sync: evaluate_candidates, select_top_k, apply_cuts.
+
+### 6. Memory model (design step 5)
+
+**Design**: Keep at most max(30, X) meshes. Use references. Trade recomputation for memory.
+
+**Current**: Double-buffered pools with full vertex/triangle copies per part. Each part copies ALL parent vertices (superset). Scratch materializes full clipped meshes for all 30X candidates.
+
+### 7. Global planes array is dead code
+
+`generate_planes()` uploads a global planes array. Both `evaluate_candidates` and `apply_cuts` reconstruct planes from per-part bounding boxes and ignore the global array. The plane_idx is used only to derive axis + cut index for the per-part bbox formula.
+
+### 8. compute_part_costs hangs on large meshes
+
+`evaluate_candidates` uses 256-vert approximate hull (correct). `compute_part_costs` attempts full-precision hull with ALL vertices unconditionally — hangs on 20K+ vertices because thread-0 sequential hull is O(N^2 * F).
+
+Design intent: approximate (256 verts) during search, full precision only when approximate Rv is near threshold for termination check.
+
+## Implementation Lessons
+
+### Vertex Classification Must Be Inlined
+
+The `classify_vertex()` function call produced incorrect results in `apply_cuts` context — returning 0 (on-plane) for vertices clearly not on the plane (val=1.45). Root cause unconfirmed (suspected nvcc optimization issue). Inlining resolved it. Keep classification inlined at call sites rather than extracting to C1.
+
+### Position-Based Boundary Edge Matching
+
+Parallel triangle processing creates duplicate intersection points for shared edges — same 3D position but different vertex indices. Boundary loop tracing must match by 3D position (L1 distance < 1e-4f tolerance), not vertex index.
+
+### Cap Volume Sign Correction
+
+Cap always reduces V_open magnitude (closes a hole). Must oppose V_open sign: `|V_open + copysignf(|V_cap|, -V_open)|`. Using `|V_open| + |V_cap|` double-counts.
+
+### On-Plane Triangle Assignment
+
+When cutting plane passes through vertices (sign=0), triangles with ALL vertices on-plane must be assigned by `dot(face_normal, plane_normal)`, not defaulting to positive half.
+
+### Per-Part Bbox from Triangle Vertices
+
+After apply_cuts, parts carry ALL parent vertices including unreferenced ones. Bbox must iterate over triangle vertex references `triangle_pool[(to+t)*3+e]`, not all vertices `vertex_pool[(vo+v)*3+k]`.
+
+### DevicePool Capacity is 32-bit
+
+`DevicePool.capacity` is `unsigned int`. With >4GB free GPU memory, 70% exceeds 4GB and wraps. Cap scratch at 4GB.
+
+### Convex Hull: Shared vs Pool Memory
+
+Shared-memory hull (`compute_hull_volume`): ~12KB, capped at 256 verts, fast. Pool-memory hull (`compute_hull_volume_pool`): unlimited verts, slower due to global memory latency. Use shared-memory version for search, pool version only for final validation of borderline cases.
+
+### Strided Hull Vertex Sampling
+
+First-256-by-atomicAdd is biased by thread order, missing extreme vertices. Strided sampling (count flagged, compute stride = total/MAX_HULL_VERTS, collect every K-th) gives uniform spatial coverage.
 
 ## Current Status
 
 ### Working
-- Full beam search pipeline: init → normalize → evaluate → select → apply → recover → download
-- **Rv concavity metric**: proper convex hull volume (incremental hull with parallel visibility) + mesh volume (signed tet + divergence theorem cap correction) → Rv formula
-- **Fan cap triangulation**: `apply_cuts` closes meshes after each clip for correct volume in subsequent iterations
+- Full beam search pipeline: init -> normalize -> evaluate -> select -> apply -> recover -> download
+- Rv concavity metric with GPU convex hull (incremental hull, parallel visibility)
+- Fan cap triangulation closes meshes after each clip
 - Multi-iteration decomposition with double-buffered pools
 - Single CPython extension (abi3 cp310+) with all GPU functionality
-- Hausdorff distance, pairwise merge cost, beam search in one module
-- Cube correctly identified as convex (Rv ≈ 0, 1 part)
+- Cube correctly identified as convex (Rv ~ 0, 1 part)
 - L-shape decomposed into exactly 2 convex boxes at threshold 0.05
-- Pure Python CoACD (existing, unmodified)
-- All 67 unit tests pass (including 11 GPU beam search tests), GPU smoke tests pass
+- GPU beam search tests pass (cube convexity, L-shape decomposition, beam params)
 
 ### Not Yet Implemented
-- Hausdorff validation in beam loop (kernels exist, not wired in)
-- Connected components after clipping
-- Merge post-processing (would reduce over-segmentation at low thresholds)
-- Vertex compaction (parts carry superset of vertices, only referenced ones needed)
-- Benchmark on Octocat / larger meshes
+- Connected components after clipping (design step 1)
+- Hausdorff validation in beam loop (design step 3; kernels exist, not wired in)
+- Fused expansion kernel with block-0 selection (design step 5)
+- Merge post-processing
+- Vertex compaction (parts carry superset of vertices)
+- Large mesh support (compute_part_costs hangs on 20K+ vertices)
+- Utility function extraction (C1-C5, D1-D3 still inlined/duplicated in monolithic kernels)
