@@ -239,8 +239,7 @@ __device__ float compute_rv_for_tris(
     // --- 5. Rv formula ---
     __shared__ float s_rv;
     if (tid == 0) {
-        float diff = fabsf(s_mesh_vol - hull_vol);
-        s_rv = cbrtf(3.0f * diff / (4.0f * PI_F)) * rv_k;
+        s_rv = rv_from_volumes(s_mesh_vol, hull_vol, rv_k);
         (void)caller_id; (void)n_boundary;
     }
     __syncthreads();
@@ -1124,8 +1123,7 @@ __global__ void compute_part_costs(
 
         // 3. Rv
         if (tid == 0) {
-            float diff = fabsf(mesh_vol - hull_vol);
-            float rv = cbrtf(3.0f * diff / (4.0f * PI_F)) * rv_k;
+            float rv = rv_from_volumes(mesh_vol, hull_vol, rv_k);
             part.rv_cost = fmaxf(rv, EPS);
             if (part.rv_cost > worst_cost) {
                 worst_cost = part.rv_cost;

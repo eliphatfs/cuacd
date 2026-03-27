@@ -71,6 +71,10 @@ struct beam_ctx {
     CUfunction fn_reduce_max;
     CUfunction fn_pairwise_hausdorff;
     CUfunction fn_test_hull_volume;
+    CUfunction fn_batch_signed_tet_volume;
+    CUfunction fn_batch_point_triangle_dist;
+    CUfunction fn_batch_intersect_edge;
+    CUfunction fn_batch_rv_from_volumes;
 
     struct MeshPool pool_a, pool_b;
     CUdeviceptr d_parts;
@@ -157,6 +161,10 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
     CHECK_CU(cuModuleGetFunction(&ctx->fn_reduce_max,           ctx->module, "reduce_max"));
     CHECK_CU(cuModuleGetFunction(&ctx->fn_pairwise_hausdorff,   ctx->module, "pairwise_hausdorff"));
     cuModuleGetFunction(&ctx->fn_test_hull_volume, ctx->module, "test_hull_volume");
+    cuModuleGetFunction(&ctx->fn_batch_signed_tet_volume, ctx->module, "batch_signed_tet_volume");
+    cuModuleGetFunction(&ctx->fn_batch_point_triangle_dist, ctx->module, "batch_point_triangle_dist");
+    cuModuleGetFunction(&ctx->fn_batch_intersect_edge, ctx->module, "batch_intersect_edge");
+    cuModuleGetFunction(&ctx->fn_batch_rv_from_volumes, ctx->module, "batch_rv_from_volumes");
 
     return 0;
 }
@@ -906,5 +914,123 @@ int beam_test_hull_volume(beam_ctx_t ctx,
 
     cuMemFree(d_pts);
     cuMemFree(d_res);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Batch test: signed_tet_volume
+// ---------------------------------------------------------------------------
+
+int beam_batch_signed_tet_volume(beam_ctx_t ctx,
+    const float* tets, int n, float* out_volumes) {
+    if (!ctx || !ctx->fn_batch_signed_tet_volume) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_tets, d_vols;
+    CHECK_CU(cuMemAlloc(&d_tets, (size_t)n * 9 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_vols, (size_t)n * sizeof(float)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tets, tets, (size_t)n * 9 * sizeof(float), s));
+
+    int grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    void* args[] = { &d_tets, &d_vols, &n };
+    CHECK_CU(cuLaunchKernel(ctx->fn_batch_signed_tet_volume,
+        grid, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_volumes, d_vols, (size_t)n * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_tets);
+    cuMemFree(d_vols);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Batch test: point_triangle_dist
+// ---------------------------------------------------------------------------
+
+int beam_batch_point_triangle_dist(beam_ctx_t ctx,
+    const float* points, const float* triangles, int n, float* out_dists) {
+    if (!ctx || !ctx->fn_batch_point_triangle_dist) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_pts, d_tris, d_dists;
+    CHECK_CU(cuMemAlloc(&d_pts, (size_t)n * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_tris, (size_t)n * 9 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_dists, (size_t)n * sizeof(float)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_pts, points, (size_t)n * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tris, triangles, (size_t)n * 9 * sizeof(float), s));
+
+    int grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    void* args[] = { &d_pts, &d_tris, &d_dists, &n };
+    CHECK_CU(cuLaunchKernel(ctx->fn_batch_point_triangle_dist,
+        grid, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_dists, d_dists, (size_t)n * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_pts);
+    cuMemFree(d_tris);
+    cuMemFree(d_dists);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Batch test: intersect_edge
+// ---------------------------------------------------------------------------
+
+int beam_batch_intersect_edge(beam_ctx_t ctx,
+    const float* segments, const float* planes, int n, float* out_results) {
+    if (!ctx || !ctx->fn_batch_intersect_edge) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_segs, d_planes, d_res;
+    CHECK_CU(cuMemAlloc(&d_segs, (size_t)n * 6 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_planes, (size_t)n * 4 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_res, (size_t)n * 3 * sizeof(float)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_segs, segments, (size_t)n * 6 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_planes, planes, (size_t)n * 4 * sizeof(float), s));
+
+    int grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    void* args[] = { &d_segs, &d_planes, &d_res, &n };
+    CHECK_CU(cuLaunchKernel(ctx->fn_batch_intersect_edge,
+        grid, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_results, d_res, (size_t)n * 3 * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_segs);
+    cuMemFree(d_planes);
+    cuMemFree(d_res);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Batch test: rv_from_volumes
+// ---------------------------------------------------------------------------
+
+int beam_batch_rv_from_volumes(beam_ctx_t ctx,
+    const float* mesh_vols, const float* hull_vols, int n,
+    float rv_k, float* out_rvs) {
+    if (!ctx || !ctx->fn_batch_rv_from_volumes) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_mv, d_hv, d_rvs;
+    CHECK_CU(cuMemAlloc(&d_mv, (size_t)n * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_hv, (size_t)n * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_rvs, (size_t)n * sizeof(float)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_mv, mesh_vols, (size_t)n * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_hv, hull_vols, (size_t)n * sizeof(float), s));
+
+    int grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    void* args[] = { &d_mv, &d_hv, &d_rvs, &rv_k, &n };
+    CHECK_CU(cuLaunchKernel(ctx->fn_batch_rv_from_volumes,
+        grid, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_rvs, d_rvs, (size_t)n * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_mv);
+    cuMemFree(d_hv);
+    cuMemFree(d_rvs);
     return 0;
 }

@@ -10,6 +10,9 @@ license = "MIT"
 requires-python = ">=3.10"
 dependencies = ["numpy"]
 
+[project.optional-dependencies]
+dev = ["pytest", "trimesh", "scipy", "rtree"]
+
 [project.urls]
 Repository = "https://github.com/eliphatfs/coacd-gpu"
 

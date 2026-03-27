@@ -14,5 +14,6 @@ extern "C" {
 #include "beam_search.cu"
 #include "mesh_transform.cu"
 #include "hausdorff.cu"
+#include "test_kernels.cu"
 
 } // extern "C"

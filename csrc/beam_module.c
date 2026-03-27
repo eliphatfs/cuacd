@@ -254,6 +254,74 @@ static PyObject* py_test_hull_volume(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// Batch test: signed_tet_volume
+// ---------------------------------------------------------------------------
+
+static PyObject* py_batch_signed_tet_volume(PyObject* self, PyObject* args) {
+    unsigned long long tets_ptr, out_ptr;
+    int n;
+    if (!PyArg_ParseTuple(args, "KiK", &tets_ptr, &n, &out_ptr)) return NULL;
+    REQUIRE_CTX();
+    int rc = beam_batch_signed_tet_volume(g_state.ctx,
+        (const float*)(uintptr_t)tets_ptr, n,
+        (float*)(uintptr_t)out_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Batch test: point_triangle_dist
+// ---------------------------------------------------------------------------
+
+static PyObject* py_batch_point_triangle_dist(PyObject* self, PyObject* args) {
+    unsigned long long pts_ptr, tris_ptr, out_ptr;
+    int n;
+    if (!PyArg_ParseTuple(args, "KKiK", &pts_ptr, &tris_ptr, &n, &out_ptr)) return NULL;
+    REQUIRE_CTX();
+    int rc = beam_batch_point_triangle_dist(g_state.ctx,
+        (const float*)(uintptr_t)pts_ptr,
+        (const float*)(uintptr_t)tris_ptr, n,
+        (float*)(uintptr_t)out_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Batch test: intersect_edge
+// ---------------------------------------------------------------------------
+
+static PyObject* py_batch_intersect_edge(PyObject* self, PyObject* args) {
+    unsigned long long segs_ptr, planes_ptr, out_ptr;
+    int n;
+    if (!PyArg_ParseTuple(args, "KKiK", &segs_ptr, &planes_ptr, &n, &out_ptr)) return NULL;
+    REQUIRE_CTX();
+    int rc = beam_batch_intersect_edge(g_state.ctx,
+        (const float*)(uintptr_t)segs_ptr,
+        (const float*)(uintptr_t)planes_ptr, n,
+        (float*)(uintptr_t)out_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Batch test: rv_from_volumes
+// ---------------------------------------------------------------------------
+
+static PyObject* py_batch_rv_from_volumes(PyObject* self, PyObject* args) {
+    unsigned long long mv_ptr, hv_ptr, out_ptr;
+    int n;
+    float rv_k;
+    if (!PyArg_ParseTuple(args, "KKifK", &mv_ptr, &hv_ptr, &n, &rv_k, &out_ptr)) return NULL;
+    REQUIRE_CTX();
+    int rc = beam_batch_rv_from_volumes(g_state.ctx,
+        (const float*)(uintptr_t)mv_ptr,
+        (const float*)(uintptr_t)hv_ptr, n, rv_k,
+        (float*)(uintptr_t)out_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -267,6 +335,10 @@ static PyMethodDef gpu_methods[] = {
     { "hausdorff",              py_hausdorff,              METH_VARARGS, "Compute Hausdorff distance." },
     { "pairwise_hausdorff",     py_pairwise_hausdorff,     METH_VARARGS, "Compute pairwise Hausdorff cost matrix." },
     { "test_hull_volume",       py_test_hull_volume,       METH_VARARGS, "Test hull volume computation." },
+    { "batch_signed_tet_volume",    py_batch_signed_tet_volume,    METH_VARARGS, "Batch signed tet volume." },
+    { "batch_point_triangle_dist",  py_batch_point_triangle_dist,  METH_VARARGS, "Batch point-triangle distance." },
+    { "batch_intersect_edge",       py_batch_intersect_edge,       METH_VARARGS, "Batch edge-plane intersection." },
+    { "batch_rv_from_volumes",      py_batch_rv_from_volumes,      METH_VARARGS, "Batch Rv from volumes." },
     { NULL, NULL, 0, NULL }
 };
 

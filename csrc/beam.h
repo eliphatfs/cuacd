@@ -95,6 +95,23 @@ int beam_test_hull_volume(beam_ctx_t ctx,
                           const float* points, int n_points,
                           float* out_volume, int* out_n_faces);
 
+// ---------------------------------------------------------------------------
+// Batch test functions for scalar device functions
+// ---------------------------------------------------------------------------
+
+int beam_batch_signed_tet_volume(beam_ctx_t ctx,
+    const float* tets, int n, float* out_volumes);
+
+int beam_batch_point_triangle_dist(beam_ctx_t ctx,
+    const float* points, const float* triangles, int n, float* out_dists);
+
+int beam_batch_intersect_edge(beam_ctx_t ctx,
+    const float* segments, const float* planes, int n, float* out_results);
+
+int beam_batch_rv_from_volumes(beam_ctx_t ctx,
+    const float* mesh_vols, const float* hull_vols, int n,
+    float rv_k, float* out_rvs);
+
 #ifdef __cplusplus
 }
 #endif

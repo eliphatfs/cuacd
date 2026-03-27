@@ -1,11 +1,14 @@
-"""
-Smoke test for coacd_gpu.
+"""Smoke tests for coacd_gpu Hausdorff / distance API."""
 
-    pip install -e .
-    python test_extension.py
-"""
 import numpy as np
+import pytest
 import coacd_gpu
+
+
+@pytest.fixture(scope="module")
+def ctx():
+    with coacd_gpu.Context(device=0) as c:
+        yield c
 
 
 def make_triangle():
@@ -27,7 +30,6 @@ def test_point_mesh_distances(ctx):
     np.testing.assert_allclose(dists[0], 0.0, atol=1e-5)
     np.testing.assert_allclose(dists[1], 1.0, atol=1e-5)
     np.testing.assert_allclose(dists[2], 0.0, atol=1e-5)
-    print("PASS: point_mesh_distances")
 
 
 def test_hausdorff(ctx):
@@ -39,7 +41,6 @@ def test_hausdorff(ctx):
 
     h = ctx.hausdorff(sa, va, ta, sb, vb, tb)
     np.testing.assert_allclose(h, 0.5, atol=1e-5)
-    print("PASS: hausdorff")
 
 
 def test_pairwise_hausdorff(ctx):
@@ -59,12 +60,3 @@ def test_pairwise_hausdorff(ctx):
         vert_offsets=np.array([0, 3, 6], dtype=np.int32),
     )
     np.testing.assert_allclose(cost[1, 0], 1.0, atol=1e-4)
-    print("PASS: pairwise_hausdorff")
-
-
-if __name__ == "__main__":
-    with coacd_gpu.Context(device=0) as ctx:
-        test_point_mesh_distances(ctx)
-        test_hausdorff(ctx)
-        test_pairwise_hausdorff(ctx)
-    print("\nAll tests passed!")

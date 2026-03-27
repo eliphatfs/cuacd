@@ -109,6 +109,13 @@ __device__ inline float point_triangle_dist(
     return sqrtf(cx * cx + cy * cy + cz * cz);
 }
 
+// Rv (volume-ratio concavity) from mesh and hull volumes.
+// Rv = (3 * |V_mesh - V_hull| / (4*pi))^(1/3) * k
+__device__ inline float rv_from_volumes(float mesh_vol, float hull_vol, float rv_k) {
+    float diff = fabsf(mesh_vol - hull_vol);
+    return cbrtf(3.0f * diff / (4.0f * PI_F)) * rv_k;
+}
+
 // Bbox concavity metric: cbrt(bbox_volume) of triangle vertices.
 // Uses block-level reduction. All threads must call this.
 __device__ inline float compute_concavity_tris(
