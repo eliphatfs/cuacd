@@ -373,9 +373,9 @@ With single-face assignment (each point assigned to the face with maximum positi
 
 `if (n_faces >= max_faces - WARP_SIZE) break` with WARP_SIZE=32: for small n (e.g., n=8: max_faces=24, 24-32=-8), this evaluates as n_faces >= negative number — always true — causing immediate loop exit after the initial tetrahedron. Fix: use `max_faces` directly.
 
-### D&C: Interior Edge Deletion Is Required
+### D&C: Ported from Bullet's btConvexHullComputer
 
-The Preparata-Hong bottom-up D&C merge builds the seam but never deletes the hull edges that become interior after merging. These accumulate across O(log n) levels, exhausting `max_e` and returning error=1 for all inputs. The algorithm cannot be fixed by just adjusting `max_e` — `dnc_delete_edge` calls must be added at each seam step for edges that are now interior.
+The D&C algorithm was rewritten by porting from Bullet's `btConvexHullComputer` (Ole Kniemeyer, MAXON). Key elements: int32 coordinates with exact Int128/Rational64 predicates, `mergeProjection` for 2D bridge finding, `findMaxAngle` with exact cotangent comparison, `findEdgeForCoplanarFaces` for coplanar handling, and the full `merge` function with interior edge deletion via `removeEdgePair`. The iterative bottom-up structure was kept (no recursion on GPU).
 
 ### pyproject.toml license Field Format
 
@@ -393,8 +393,8 @@ PEP 621 requires `license = {text = "MIT"}` or `license = {file = "LICENSE"}`. T
 - L-shape decomposed into exactly 2 convex boxes at threshold 0.05
 - GPU beam search tests pass (cube convexity, L-shape decomposition, beam params)
 - `batch_mesh_volume` GPU kernel (divergence theorem, watertight meshes) — tested
-- `batch_hull_volume` algo=0 (incremental, ≤256 pts) and algo=1 (QuickHull warp) — tested and passing
-- Full pytest suite: 98 passed, 8 xfailed (algo=2 D&C known-broken)
+- `batch_hull_volume` algo=0 (incremental, ≤256 pts), algo=1 (QuickHull warp), algo=2 (D&C warp) — all tested and passing
+- Full pytest suite: 106 passed
 
 ### Not Yet Implemented
 - Connected components after clipping (design step 1)
@@ -404,4 +404,3 @@ PEP 621 requires `license = {text = "MIT"}` or `license = {file = "LICENSE"}`. T
 - Vertex compaction (parts carry superset of vertices)
 - Large mesh support (compute_part_costs hangs on 20K+ vertices)
 - Utility function extraction (C1-C5, D1-D3 still inlined/duplicated in monolithic kernels)
-- `batch_hull_volume` algo=2 (D&C): Preparata-Hong merge is missing interior edge deletion; seam adds edges but never removes old sub-hull edges, causing OOM (error=1) for all inputs. Tests xfailed.

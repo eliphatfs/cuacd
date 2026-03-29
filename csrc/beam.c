@@ -1213,7 +1213,9 @@ int beam_batch_hull_volume(
                                 BLOCK_SIZE, 1, 1, 0, s, args, NULL));
     } else {
         // Warp kernels: 8 warps per block (BLOCK_SIZE=256), need scratch
-        size_t scratch_per = (size_t)max_pts_per_hull * 256 + 4096;
+        // D&C hull needs ~408 bytes/point (7 edge arrays × 12n, vertex arrays, etc.)
+        // QuickHull needs ~256 bytes/point. Use larger of the two.
+        size_t scratch_per = (size_t)max_pts_per_hull * 512 + 8192;
         size_t total_scratch = (size_t)n_hulls * scratch_per;
         CHECK_CU(cuMemAlloc(&d_scratch, total_scratch));
         CHECK_CU(cuMemsetD8Async(d_scratch, 0, total_scratch, s));

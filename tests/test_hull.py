@@ -539,8 +539,7 @@ class TestHullVolumeGPU:
     @pytest.mark.parametrize("algo", [0, 1, 2])
     def test_unit_cube_vertices(self, ctx, algo):
         """Convex hull of the 8 unit-cube vertices must equal 1.0."""
-        if algo == 2:
-            pytest.xfail("D&C (algo=2): Preparata-Hong merge missing edge deletion — always OOM")
+
         verts, _ = make_unit_cube()
         vols, errs = ctx.batch_hull_volume([verts], algo=algo)
         assert errs[0] == 0, f"algo={algo}: error code {errs[0]}"
@@ -554,8 +553,7 @@ class TestHullVolumeGPU:
     ])
     def test_sphere_shell_vs_scipy(self, ctx, algo, n_pts, seed):
         """GPU hull volume must match scipy to within 5% on sphere-shell points."""
-        if algo == 2:
-            pytest.xfail("D&C (algo=2): Preparata-Hong merge missing edge deletion — always OOM")
+
         rng = np.random.default_rng(seed)
         pts = make_sphere_shell(n_pts, rng)
         vols, errs = ctx.batch_hull_volume([pts], algo=algo)
@@ -571,8 +569,7 @@ class TestHullVolumeGPU:
     ])
     def test_cube_interior_vs_scipy(self, ctx, algo, n_pts, seed):
         """GPU hull of cube-interior points must match scipy to within 5%."""
-        if algo == 2:
-            pytest.xfail("D&C (algo=2): Preparata-Hong merge missing edge deletion — always OOM")
+
         rng = np.random.default_rng(seed)
         pts = make_cube_interior(n_pts, rng)
         vols, errs = ctx.batch_hull_volume([pts], algo=algo)
@@ -586,8 +583,7 @@ class TestHullVolumeGPU:
     @pytest.mark.parametrize("algo", [1, 2])
     def test_batch_sphere_hulls_vs_scipy(self, ctx, algo):
         """Batch of 10 sphere-shell hulls must all match scipy to within 5%."""
-        if algo == 2:
-            pytest.xfail("D&C (algo=2): Preparata-Hong merge missing edge deletion — always OOM")
+
         rng = np.random.default_rng(42)
         n_hulls = 10
         pts_list = [make_sphere_shell(50, rng) for _ in range(n_hulls)]
@@ -605,8 +601,7 @@ class TestHullVolumeGPU:
 
         The icosphere is convex so hull volume ≈ mesh volume.
         """
-        if algo == 2:
-            pytest.xfail("D&C (algo=2): Preparata-Hong merge missing edge deletion — always OOM")
+
         verts, tris = make_icosphere(3)
         mesh_vol = mesh_volume_cpu(verts, tris)
         vols, errs = ctx.batch_hull_volume([verts], algo=algo)
@@ -618,8 +613,7 @@ class TestHullVolumeGPU:
     @pytest.mark.parametrize("algo", [1, 2])
     def test_volume_scales_cubically(self, ctx, algo):
         """Scaling a point cloud by s must scale GPU hull volume by s^3."""
-        if algo == 2:
-            pytest.xfail("D&C (algo=2): Preparata-Hong merge missing edge deletion — always OOM")
+
         rng = np.random.default_rng(17)
         pts = make_sphere_shell(80, rng)
         vols1, errs1 = ctx.batch_hull_volume([pts], algo=algo)
