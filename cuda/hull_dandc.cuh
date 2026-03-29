@@ -1,33 +1,68 @@
-// hull_dandc.cuh — Warp-based Preparata-Hong D&C convex hull volume.
+// hull_dandc.cuh — Warp-based D&C convex hull volume.
 //
-// Ported from btConvexHullComputer by Ole Kniemeyer (MAXON, zlib license).
-// Adapted for GPU: array-based half-edge structure, iterative bottom-up merge,
-// all scratch in WarpPool. Uses int32 coordinates with exact int64/int128
-// predicates for robustness.
-//
-// Points are sorted along the longest AABB axis and merged pairwise.
-// The half-edge graph is allocated entirely in pool scratch.
+// Faithful port of btConvexHullComputer by Ole Kniemeyer (MAXON, zlib license).
+// Runs entirely on lane 0 of the warp; other lanes idle.
+// All memory allocated from WarpPool bump allocator.
+// Uses int32 coordinates with exact int64/int128 predicates.
 //
 // All 32 threads must call with the same arguments.
 // Returns hull volume (>= 0) or -1.0f on error.
 //
-// Requires: hull_warp_common.cuh, geometry.cuh (signed_tet_volume, EPS)
+// Requires: hull_warp_common.cuh
 
 #ifndef HULL_DANDC_CUH
 #define HULL_DANDC_CUH
 
 #include "hull_warp_common.cuh"
 
-// ---------------------------------------------------------------------------
-// Int128 — 128-bit signed integer for exact geometric predicates
-// ---------------------------------------------------------------------------
+// ============================================================================
+// Exact arithmetic types (ported from Bullet)
+// ============================================================================
 
-struct GpuInt128 {
+struct BtInt128 {
     unsigned long long low;
     unsigned long long high;
 };
 
-__device__ inline GpuInt128 int128_umul(unsigned long long a, unsigned long long b) {
+__device__ inline BtInt128 bt128_make(unsigned long long lo, unsigned long long hi) {
+    BtInt128 r; r.low = lo; r.high = hi; return r;
+}
+__device__ inline BtInt128 bt128_from_i64(long long v) {
+    BtInt128 r; r.low = (unsigned long long)v; r.high = (v >= 0) ? 0ULL : ~0ULL; return r;
+}
+__device__ inline BtInt128 bt128_from_u64(unsigned long long v) {
+    BtInt128 r; r.low = v; r.high = 0; return r;
+}
+__device__ inline BtInt128 bt128_neg(BtInt128 a) {
+    BtInt128 r;
+    r.low = (unsigned long long)(-(long long)a.low);
+    r.high = ~a.high + (a.low == 0);
+    return r;
+}
+__device__ inline BtInt128 bt128_add(BtInt128 a, BtInt128 b) {
+    unsigned long long lo = a.low + b.low;
+    BtInt128 r; r.low = lo; r.high = a.high + b.high + (lo < a.low);
+    return r;
+}
+__device__ inline BtInt128 bt128_sub(BtInt128 a, BtInt128 b) {
+    return bt128_add(a, bt128_neg(b));
+}
+__device__ inline int bt128_sign(BtInt128 a) {
+    return ((long long)a.high < 0) ? -1 : (a.high || a.low) ? 1 : 0;
+}
+__device__ inline int bt128_ucmp(BtInt128 a, BtInt128 b) {
+    if (a.high < b.high) return -1;
+    if (a.high > b.high) return 1;
+    if (a.low < b.low) return -1;
+    if (a.low > b.low) return 1;
+    return 0;
+}
+__device__ inline bool bt128_lt(BtInt128 a, BtInt128 b) {
+    return (a.high < b.high) || ((a.high == b.high) && (a.low < b.low));
+}
+
+// Unsigned 64x64 -> 128 multiply
+__device__ inline BtInt128 bt128_umul(unsigned long long a, unsigned long long b) {
     unsigned long long a_lo = a & 0xffffffffULL, a_hi = a >> 32;
     unsigned long long b_lo = b & 0xffffffffULL, b_hi = b >> 32;
     unsigned long long p00 = a_lo * b_lo;
@@ -35,1024 +70,1192 @@ __device__ inline GpuInt128 int128_umul(unsigned long long a, unsigned long long
     unsigned long long p10 = a_hi * b_lo;
     unsigned long long p11 = a_hi * b_hi;
     unsigned long long mid = (p00 >> 32) + (p01 & 0xffffffffULL) + (p10 & 0xffffffffULL);
-    GpuInt128 r;
+    BtInt128 r;
     r.low = (p00 & 0xffffffffULL) | ((mid & 0xffffffffULL) << 32);
     r.high = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
     return r;
 }
 
-__device__ inline int int128_ucmp(GpuInt128 a, GpuInt128 b) {
-    if (a.high < b.high) return -1;
-    if (a.high > b.high) return 1;
-    if (a.low < b.low) return -1;
-    if (a.low > b.low) return 1;
-    return 0;
+// Signed 64x64 -> 128 multiply
+__device__ inline BtInt128 bt128_smul(long long a, long long b) {
+    bool neg = (a < 0);
+    if (neg) a = -a;
+    if (b < 0) { neg = !neg; b = -b; }
+    BtInt128 r = bt128_umul((unsigned long long)a, (unsigned long long)b);
+    return neg ? bt128_neg(r) : r;
 }
 
-// ---------------------------------------------------------------------------
-// Rational64 — exact rational comparison for cotangent
-// ---------------------------------------------------------------------------
+// 128 * 64 -> 128
+__device__ inline BtInt128 bt128_mul_i64(BtInt128 a, long long b) {
+    bool neg = ((long long)a.high < 0);
+    if (neg) a = bt128_neg(a);
+    if (b < 0) { neg = !neg; b = -b; }
+    BtInt128 r = bt128_umul(a.low, (unsigned long long)b);
+    r.high += a.high * (unsigned long long)b;
+    return neg ? bt128_neg(r) : r;
+}
 
-struct GpuRational64 {
-    unsigned long long numerator;
-    unsigned long long denominator;
+__device__ inline float bt128_to_float(BtInt128 a) {
+    return ((long long)a.high >= 0)
+        ? (float)((double)a.high * 18446744073709551616.0 + (double)a.low)
+        : -(float)((double)(bt128_neg(a)).high * 18446744073709551616.0 + (double)(bt128_neg(a)).low);
+}
+
+// ============================================================================
+// Point types
+// ============================================================================
+
+struct BtPoint32 {
+    int x, y, z, index;
+};
+__device__ inline BtPoint32 bp32(int x, int y, int z) {
+    BtPoint32 p; p.x = x; p.y = y; p.z = z; p.index = -1; return p;
+}
+__device__ inline bool bp32_eq(BtPoint32 a, BtPoint32 b) { return a.x==b.x && a.y==b.y && a.z==b.z; }
+__device__ inline bool bp32_ne(BtPoint32 a, BtPoint32 b) { return !bp32_eq(a,b); }
+__device__ inline BtPoint32 bp32_add(BtPoint32 a, BtPoint32 b) { return bp32(a.x+b.x, a.y+b.y, a.z+b.z); }
+__device__ inline BtPoint32 bp32_sub(BtPoint32 a, BtPoint32 b) { return bp32(a.x-b.x, a.y-b.y, a.z-b.z); }
+__device__ inline bool bp32_isZero(BtPoint32 a) { return a.x==0 && a.y==0 && a.z==0; }
+
+struct BtPoint64 {
+    long long x, y, z;
+};
+__device__ inline BtPoint64 bp64(long long x, long long y, long long z) {
+    BtPoint64 p; p.x = x; p.y = y; p.z = z; return p;
+}
+__device__ inline bool bp64_isZero(BtPoint64 a) { return a.x==0 && a.y==0 && a.z==0; }
+__device__ inline long long bp64_dot64(BtPoint64 a, BtPoint64 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+
+// Point32 cross -> Point64
+__device__ inline BtPoint64 bp32_cross(BtPoint32 a, BtPoint32 b) {
+    return bp64((long long)a.y*b.z - (long long)a.z*b.y,
+                (long long)a.z*b.x - (long long)a.x*b.z,
+                (long long)a.x*b.y - (long long)a.y*b.x);
+}
+// Point32 cross Point64
+__device__ inline BtPoint64 bp32_cross64(BtPoint32 a, BtPoint64 b) {
+    return bp64((long long)a.y*b.z - (long long)a.z*b.y,
+                (long long)a.z*b.x - (long long)a.x*b.z,
+                (long long)a.x*b.y - (long long)a.y*b.x);
+}
+// Point32 dot Point32 -> int64
+__device__ inline long long bp32_dot(BtPoint32 a, BtPoint32 b) {
+    return (long long)a.x*b.x + (long long)a.y*b.y + (long long)a.z*b.z;
+}
+// Point32 dot Point64 -> int64
+__device__ inline long long bp32_dot64(BtPoint32 a, BtPoint64 b) {
+    return (long long)a.x*b.x + (long long)a.y*b.y + (long long)a.z*b.z;
+}
+// Point32 dot Point32 as int64 (shorthand matching bt original's dot calls)
+__device__ inline long long bp32_dot64_32(BtPoint32 a, BtPoint32 b) {
+    return (long long)a.x*b.x + (long long)a.y*b.y + (long long)a.z*b.z;
+}
+
+// ============================================================================
+// Rational types for exact comparisons
+// ============================================================================
+
+struct BtRational64 {
+    unsigned long long num;
+    unsigned long long den;
     int sign;
 };
 
-__device__ inline GpuRational64 rational64_make(long long num, long long den) {
-    GpuRational64 r;
-    r.sign = (num > 0) ? 1 : (num < 0) ? -1 : 0;
-    r.numerator = (r.sign >= 0) ? (unsigned long long)num : (unsigned long long)(-num);
-    if (den > 0) { r.denominator = (unsigned long long)den; }
-    else if (den < 0) { r.sign = -r.sign; r.denominator = (unsigned long long)(-den); }
-    else { r.denominator = 0; }
+__device__ inline BtRational64 br64_make(long long numerator, long long denominator) {
+    BtRational64 r;
+    if (numerator > 0) { r.sign = 1; r.num = (unsigned long long)numerator; }
+    else if (numerator < 0) { r.sign = -1; r.num = (unsigned long long)(-numerator); }
+    else { r.sign = 0; r.num = 0; }
+    if (denominator > 0) { r.den = (unsigned long long)denominator; }
+    else if (denominator < 0) { r.sign = -r.sign; r.den = (unsigned long long)(-denominator); }
+    else { r.den = 0; }
+    return r;
+}
+__device__ inline bool br64_isNegInf(BtRational64 r) { return (r.sign < 0) && (r.den == 0); }
+__device__ inline bool br64_isNaN(BtRational64 r) { return (r.sign == 0) && (r.den == 0); }
+
+__device__ inline int br64_cmp(BtRational64 a, BtRational64 b) {
+    if (a.sign != b.sign) return a.sign - b.sign;
+    if (a.sign == 0) return 0;
+    return a.sign * bt128_ucmp(bt128_umul(a.num, b.den), bt128_umul(a.den, b.num));
+}
+
+// ============================================================================
+// PointR128 for intersection vertices
+// ============================================================================
+
+struct BtPointR128 {
+    BtInt128 x, y, z, den;
+};
+
+__device__ inline float bpr128_xval(BtPointR128 p) { return bt128_to_float(p.x) / bt128_to_float(p.den); }
+__device__ inline float bpr128_yval(BtPointR128 p) { return bt128_to_float(p.y) / bt128_to_float(p.den); }
+__device__ inline float bpr128_zval(BtPointR128 p) { return bt128_to_float(p.z) / bt128_to_float(p.den); }
+
+// ============================================================================
+// Rational128 for exact vertex dot products
+// ============================================================================
+
+struct BtRational128 {
+    BtInt128 num;
+    BtInt128 den;
+    int sign;
+    bool isInt64;
+};
+
+__device__ inline BtRational128 br128_from_i64(long long val) {
+    BtRational128 r;
+    if (val > 0) { r.sign = 1; r.num = bt128_from_i64(val); }
+    else if (val < 0) { r.sign = -1; r.num = bt128_from_i64(-val); }
+    else { r.sign = 0; r.num = bt128_from_u64(0); }
+    r.den = bt128_from_u64(1);
+    r.isInt64 = true;
     return r;
 }
 
-__device__ inline bool rational64_is_nan(GpuRational64 r) {
-    return (r.sign == 0) && (r.denominator == 0);
+__device__ inline BtRational128 br128_from_128(BtInt128 num, BtInt128 den) {
+    BtRational128 r;
+    r.sign = bt128_sign(num);
+    r.num = (r.sign >= 0) ? num : bt128_neg(num);
+    int dsign = bt128_sign(den);
+    if (dsign >= 0) { r.den = den; }
+    else { r.sign = -r.sign; r.den = bt128_neg(den); }
+    r.isInt64 = false;
+    return r;
 }
 
-__device__ inline bool rational64_is_neg_inf(GpuRational64 r) {
-    return (r.sign < 0) && (r.denominator == 0);
+// DMul<Int128, uint64_t>::mul — 128x128 -> (256 bits as) low128, high128
+__device__ inline void bt_dmul_128(BtInt128 a, BtInt128 b, BtInt128* lo, BtInt128* hi) {
+    BtInt128 p00 = bt128_umul(a.low, b.low);
+    BtInt128 p01 = bt128_umul(a.low, b.high);
+    BtInt128 p10 = bt128_umul(a.high, b.low);
+    BtInt128 p11 = bt128_umul(a.high, b.high);
+    BtInt128 p0110 = bt128_add(bt128_from_u64(p01.low), bt128_from_u64(p10.low));
+    p11 = bt128_add(p11, bt128_from_u64(p01.high));
+    p11 = bt128_add(p11, bt128_from_u64(p10.high));
+    p11 = bt128_add(p11, bt128_from_u64(p0110.high));
+    // shlHalf(p0110): p0110.high = p0110.low; p0110.low = 0;
+    BtInt128 p0110s = bt128_make(0, p0110.low);
+    BtInt128 sum = bt128_add(p00, p0110s);
+    // carry: if sum < p00
+    if (bt128_lt(sum, p00)) p11 = bt128_add(p11, bt128_from_u64(1));
+    *lo = sum;
+    *hi = p11;
 }
 
-__device__ inline int rational64_compare(GpuRational64 a, GpuRational64 b) {
+__device__ inline int br128_cmp_i64(BtRational128 a, long long b);
+
+__device__ inline int br128_cmp(BtRational128 a, BtRational128 b) {
     if (a.sign != b.sign) return a.sign - b.sign;
     if (a.sign == 0) return 0;
-    return a.sign * int128_ucmp(int128_umul(a.numerator, b.denominator),
-                                 int128_umul(a.denominator, b.numerator));
+    if (a.isInt64) return -br128_cmp_i64(b, a.sign * (long long)a.num.low);
+    BtInt128 nbdLo, nbdHi, dbnLo, dbnHi;
+    bt_dmul_128(a.num, b.den, &nbdLo, &nbdHi);
+    bt_dmul_128(a.den, b.num, &dbnLo, &dbnHi);
+    int c = bt128_ucmp(nbdHi, dbnHi);
+    if (c) return c * a.sign;
+    return bt128_ucmp(nbdLo, dbnLo) * a.sign;
 }
 
-// ---------------------------------------------------------------------------
-// Half-edge data structure helpers (SOA in pool memory, thread 0 only)
-// ---------------------------------------------------------------------------
-
-// Edge e goes from source vertex src(e) to target vertex e_target[e].
-// src(e) = e_target[e_reverse[e]]  (implicit)
-// Ring around source vertex: e, e_next[e], ... (circular doubly-linked list)
-
-__device__ inline int dnc_alloc_edge(int* e_free, int* n_free, int* n_alloc, int max_e) {
-    if (*n_free > 0) return e_free[--(*n_free)];
-    if (*n_alloc >= max_e) return -1;
-    return (*n_alloc)++;
+__device__ inline int br128_cmp_i64(BtRational128 a, long long b) {
+    if (a.isInt64) {
+        long long av = a.sign * (long long)a.num.low;
+        return (av > b) ? 1 : (av < b) ? -1 : 0;
+    }
+    if (b > 0) { if (a.sign <= 0) return -1; }
+    else if (b < 0) { if (a.sign >= 0) return 1; b = -b; }
+    else return a.sign;
+    return bt128_ucmp(a.num, bt128_mul_i64(a.den, b)) * a.sign;
 }
 
-// Link: a->next = b, b->prev = a  (Bullet's Edge::link)
-__device__ inline void dnc_edge_link(int* e_next, int* e_prev, int a, int b) {
-    e_next[a] = b;
-    e_prev[b] = a;
+// ============================================================================
+// Graph types
+// ============================================================================
+
+struct BtVertex;
+struct BtEdge;
+struct BtFace;
+
+struct BtFace {
+    BtFace* next;
+    BtVertex* nearbyVertex;
+    BtFace* nextWithSameNearbyVertex;
+    BtPoint32 origin;
+    BtPoint32 dir0;
+    BtPoint32 dir1;
+};
+
+struct BtEdge {
+    BtEdge* next;
+    BtEdge* prev;
+    BtEdge* reverse;
+    BtVertex* target;
+    BtFace* face;
+    int copy;
+};
+
+struct BtVertex {
+    BtVertex* next;
+    BtVertex* prev;
+    BtEdge* edges;
+    BtFace* firstNearbyFace;
+    BtFace* lastNearbyFace;
+    BtPointR128 point128;
+    BtPoint32 point;
+    int copy;
+};
+
+struct BtIntermediateHull {
+    BtVertex* minXy;
+    BtVertex* maxXy;
+    BtVertex* minYx;
+    BtVertex* maxYx;
+};
+
+// Vertex operations
+__device__ inline BtPoint32 bv_sub(BtVertex* a, BtVertex* b) { return bp32_sub(a->point, b->point); }
+
+// Vertex dot with Point64 -> Rational128
+__device__ inline BtRational128 bv_dot(BtVertex* v, BtPoint64 b) {
+    if (v->point.index >= 0) {
+        return br128_from_i64(bp32_dot64(v->point, b));
+    }
+    BtInt128 sum = bt128_add(
+        bt128_add(bt128_mul_i64(v->point128.x, b.x), bt128_mul_i64(v->point128.y, b.y)),
+        bt128_mul_i64(v->point128.z, b.z));
+    return br128_from_128(sum, v->point128.den);
 }
 
-// Create edge pair (no ring linking — caller links into rings).
-// Returns forward edge index; reverse is e_reverse[returned].
-__device__ inline int dnc_new_edge_pair(
-    int* e_target, int* e_reverse, int* e_next, int* e_prev, int* e_copy,
-    int* e_free, int* n_free, int* n_alloc, int max_e,
-    int from, int to, int stamp)
-{
-    int e = dnc_alloc_edge(e_free, n_free, n_alloc, max_e);
-    int r = dnc_alloc_edge(e_free, n_free, n_alloc, max_e);
-    if (e < 0 || r < 0) return -1;
-    e_target[e] = to;   e_target[r] = from;
-    e_reverse[e] = r;   e_reverse[r] = e;
-    e_copy[e] = stamp;  e_copy[r] = stamp;
-    e_next[e] = -1; e_prev[e] = -1;
-    e_next[r] = -1; e_prev[r] = -1;
+__device__ inline float bv_xval(BtVertex* v) {
+    return (v->point.index >= 0) ? (float)v->point.x : bpr128_xval(v->point128);
+}
+__device__ inline float bv_yval(BtVertex* v) {
+    return (v->point.index >= 0) ? (float)v->point.y : bpr128_yval(v->point128);
+}
+__device__ inline float bv_zval(BtVertex* v) {
+    return (v->point.index >= 0) ? (float)v->point.z : bpr128_zval(v->point128);
+}
+
+__device__ inline void bv_receiveNearbyFaces(BtVertex* dst, BtVertex* src) {
+    if (dst->lastNearbyFace) {
+        dst->lastNearbyFace->nextWithSameNearbyVertex = src->firstNearbyFace;
+    } else {
+        dst->firstNearbyFace = src->firstNearbyFace;
+    }
+    if (src->lastNearbyFace) {
+        dst->lastNearbyFace = src->lastNearbyFace;
+    }
+    for (BtFace* f = src->firstNearbyFace; f; f = f->nextWithSameNearbyVertex) {
+        f->nearbyVertex = dst;
+    }
+    src->firstNearbyFace = NULL;
+    src->lastNearbyFace = NULL;
+}
+
+__device__ inline void bt_edge_link(BtEdge* a, BtEdge* n) {
+    a->next = n;
+    n->prev = a;
+}
+
+__device__ inline void bt_face_init(BtFace* f, BtVertex* a, BtVertex* b, BtVertex* c) {
+    f->nearbyVertex = a;
+    f->nextWithSameNearbyVertex = NULL;
+    f->origin = a->point;
+    f->dir0 = bp32_sub(b->point, a->point);
+    f->dir1 = bp32_sub(c->point, a->point);
+    if (a->lastNearbyFace) {
+        a->lastNearbyFace->nextWithSameNearbyVertex = f;
+    } else {
+        a->firstNearbyFace = f;
+    }
+    a->lastNearbyFace = f;
+}
+
+__device__ inline BtPoint64 bt_face_normal(BtFace* f) {
+    return bp32_cross(f->dir0, f->dir1);
+}
+
+// ============================================================================
+// Pool allocator backed by WarpPool (no templates for extern "C" compat)
+// ============================================================================
+
+// Generic pool: stores void* free list, object size, block size
+struct BtPool {
+    void* freeList;
+    WarpPool* wp;
+    int blockSize;
+    int objSize;
+};
+
+__device__ inline void btpool_init(BtPool* p, WarpPool* wp, int blockSize, int objSize) {
+    p->freeList = NULL;
+    p->wp = wp;
+    p->blockSize = blockSize;
+    p->objSize = objSize;
+}
+
+__device__ inline void* btpool_new(BtPool* p) {
+    if (p->freeList) {
+        void* obj = p->freeList;
+        p->freeList = *(void**)obj;
+        // Zero-init
+        char* c = (char*)obj;
+        for (int i = 0; i < p->objSize; i++) c[i] = 0;
+        return obj;
+    }
+    int bytes = p->blockSize * p->objSize;
+    int aligned = (bytes + 15) & ~15;
+    if (p->wp->offset + aligned > p->wp->capacity) {
+        p->wp->error = 1;
+        return NULL;
+    }
+    char* block = p->wp->base + p->wp->offset;
+    p->wp->offset += aligned;
+    // Chain all but first into free list
+    for (int i = p->blockSize - 1; i >= 1; i--) {
+        void* slot = block + i * p->objSize;
+        *(void**)slot = p->freeList;
+        p->freeList = slot;
+    }
+    char* first = block;
+    for (int i = 0; i < p->objSize; i++) first[i] = 0;
+    return first;
+}
+
+__device__ inline void btpool_free(BtPool* p, void* obj) {
+    *(void**)obj = p->freeList;
+    p->freeList = obj;
+}
+
+// Typed wrappers
+__device__ inline BtVertex* btpool_new_vertex(BtPool* p) { return (BtVertex*)btpool_new(p); }
+__device__ inline BtEdge*   btpool_new_edge(BtPool* p)   { return (BtEdge*)btpool_new(p); }
+__device__ inline BtFace*   btpool_new_face(BtPool* p)   { return (BtFace*)btpool_new(p); }
+
+// Simple alloc from WarpPool (lane 0 only)
+__device__ inline void* bt_alloc(WarpPool* wp, int bytes) {
+    int aligned = (bytes + 15) & ~15;
+    if (wp->offset + aligned > wp->capacity) { wp->error = 1; return NULL; }
+    void* ptr = wp->base + wp->offset;
+    wp->offset += aligned;
+    return ptr;
+}
+
+// ============================================================================
+// State struct (replaces btConvexHullInternal class members)
+// ============================================================================
+
+struct BtHullState {
+    float scaling[3];
+    float center[3];
+    BtPool vertexPool;
+    BtPool edgePool;
+    BtPool facePool;
+    BtVertex** originalVertices;
+    int mergeStamp;
+    int minAxis, medAxis, maxAxis;
+    int usedEdgePairs;
+    BtVertex* vertexList;
+    WarpPool* wp;
+};
+
+// ============================================================================
+// Core algorithm functions
+// ============================================================================
+
+__device__ inline BtEdge* bt_newEdgePair(BtHullState* s, BtVertex* from, BtVertex* to) {
+    BtEdge* e = btpool_new_edge(&s->edgePool);
+    BtEdge* r = btpool_new_edge(&s->edgePool);
+    if (!e || !r) return NULL;
+    e->reverse = r;
+    r->reverse = e;
+    e->copy = s->mergeStamp;
+    r->copy = s->mergeStamp;
+    e->target = to;
+    r->target = from;
+    e->face = NULL;
+    r->face = NULL;
+    e->next = NULL; e->prev = NULL;
+    r->next = NULL; r->prev = NULL;
+    s->usedEdgePairs++;
     return e;
 }
 
-// Remove edge pair (Bullet's removeEdgePair): unlinks from both vertex rings, frees.
-__device__ inline void dnc_remove_edge_pair(
-    int* e_target, int* e_reverse, int* e_next, int* e_prev,
-    int* v_edge, int* e_free, int* n_free, int edge)
-{
-    int n = e_next[edge];
-    int r = e_reverse[edge];
-    int src = e_target[r];
-    int tgt = e_target[edge];
-
+__device__ inline void bt_removeEdgePair(BtHullState* s, BtEdge* edge) {
+    BtEdge* n = edge->next;
+    BtEdge* r = edge->reverse;
     if (n != edge) {
-        e_prev[n] = e_prev[edge];
-        e_next[e_prev[edge]] = n;
-        v_edge[src] = n;
+        n->prev = edge->prev;
+        edge->prev->next = n;
+        r->target->edges = n;
     } else {
-        v_edge[src] = -1;
+        r->target->edges = NULL;
     }
-
-    n = e_next[r];
+    n = r->next;
     if (n != r) {
-        e_prev[n] = e_prev[r];
-        e_next[e_prev[r]] = n;
-        v_edge[tgt] = n;
+        n->prev = r->prev;
+        r->prev->next = n;
+        edge->target->edges = n;
     } else {
-        v_edge[tgt] = -1;
+        edge->target->edges = NULL;
     }
-
-    e_target[edge] = -1; e_target[r] = -1;
-    e_free[(*n_free)++] = edge;
-    e_free[(*n_free)++] = r;
+    btpool_free(&s->edgePool, edge);
+    btpool_free(&s->edgePool, r);
+    s->usedEdgePairs--;
 }
 
-// ---------------------------------------------------------------------------
-// getOrientation — determines CW/CCW/NONE relationship between two edges
-// ---------------------------------------------------------------------------
-// Returns: 1=CCW, -1=CW, 0=NONE
-// s, t define a reference plane via n = t cross s.
+enum BtOrientation { BT_NONE, BT_CLOCKWISE, BT_COUNTER_CLOCKWISE };
 
-__device__ int dnc_get_orientation(
-    int prev_e, int next_e,
-    const int* e_next, const int* e_prev, const int* e_reverse, const int* e_target,
-    const int* pts,
-    int sx, int sy, int sz,
-    int tx, int ty, int tz)
-{
-    if (e_next[prev_e] == next_e) {
-        if (e_prev[prev_e] == next_e) {
-            // Only 2 edges: use face normal test
-            long long nx = (long long)ty*sz - (long long)tz*sy;
-            long long ny = (long long)tz*sx - (long long)tx*sz;
-            long long nz = (long long)tx*sy - (long long)ty*sx;
-            int src = e_target[e_reverse[next_e]];
-            int pt = e_target[prev_e], nt = e_target[next_e];
-            int ax = pts[pt*3]-pts[src*3], ay = pts[pt*3+1]-pts[src*3+1], az = pts[pt*3+2]-pts[src*3+2];
-            int bx = pts[nt*3]-pts[src*3], by = pts[nt*3+1]-pts[src*3+1], bz = pts[nt*3+2]-pts[src*3+2];
-            long long mx = (long long)ay*bz - (long long)az*by;
-            long long my = (long long)az*bx - (long long)ax*bz;
-            long long mz = (long long)ax*by - (long long)ay*bx;
-            long long dot = nx*mx + ny*my + nz*mz;
-            return (dot > 0) ? 1 : -1;
+__device__ inline BtOrientation bt_getOrientation(BtEdge* prev_e, BtEdge* next_e, BtPoint32 s_dir, BtPoint32 t_dir) {
+    if (prev_e->next == next_e) {
+        if (prev_e->prev == next_e) {
+            BtPoint64 n = bp32_cross(t_dir, s_dir);
+            BtPoint64 m = bp32_cross(
+                bp32_sub(prev_e->target->point, next_e->reverse->target->point),
+                bp32_sub(next_e->target->point, next_e->reverse->target->point));
+            long long dot = bp64_dot64(n, m);
+            return (dot > 0) ? BT_COUNTER_CLOCKWISE : BT_CLOCKWISE;
         }
-        return 1; // CCW
+        return BT_COUNTER_CLOCKWISE;
     }
-    if (e_prev[prev_e] == next_e) return -1; // CW
-    return 0; // NONE
+    else if (prev_e->prev == next_e) {
+        return BT_CLOCKWISE;
+    }
+    return BT_NONE;
 }
 
-// ---------------------------------------------------------------------------
-// findMaxAngle — find edge with largest dihedral angle from vertex
-// ---------------------------------------------------------------------------
-// ccw: false for c0 side, true for c1 side.
-// Returns edge index or -1.
-
-__device__ int dnc_find_max_angle(
-    bool ccw, int start_v,
-    int sx, int sy, int sz,
-    long long rxsx, long long rxsy, long long rxsz,
-    long long sxrxsx, long long sxrxsy, long long sxrxsz,
-    const int* pts,
-    const int* v_edge, const int* e_next, const int* e_prev,
-    const int* e_reverse, const int* e_target, const int* e_copy,
-    int merge_stamp, GpuRational64* out_min_cot)
+__device__ inline BtEdge* bt_findMaxAngle(BtHullState* s, bool ccw, BtVertex* start,
+    BtPoint32 s_dir, BtPoint64 rxs, BtPoint64 sxrxs, BtRational64* minCot)
 {
-    int min_edge = -1;
-    int e_start = v_edge[start_v];
-    if (e_start < 0) return -1;
-
-    int e = e_start;
+    BtEdge* minEdge = NULL;
+    BtEdge* e = start->edges;
+    if (!e) return NULL;
     do {
-        if (e_copy[e] > merge_stamp) {  // old edge (not from current merge)
-            int w = e_target[e];
-            int tx = pts[w*3]-pts[start_v*3];
-            int ty = pts[w*3+1]-pts[start_v*3+1];
-            int tz = pts[w*3+2]-pts[start_v*3+2];
-            long long num = (long long)tx*sxrxsx + (long long)ty*sxrxsy + (long long)tz*sxrxsz;
-            long long den = (long long)tx*rxsx   + (long long)ty*rxsy   + (long long)tz*rxsz;
-            GpuRational64 cot = rational64_make(num, den);
-            if (!rational64_is_nan(cot)) {
-                if (min_edge < 0) {
-                    *out_min_cot = cot;
-                    min_edge = e;
+        if (e->copy > s->mergeStamp) {
+            BtPoint32 t = bp32_sub(e->target->point, start->point);
+            BtRational64 cot = br64_make(bp32_dot64(t, sxrxs), bp32_dot64(t, rxs));
+            if (!br64_isNaN(cot)) {
+                if (minEdge == NULL) {
+                    *minCot = cot;
+                    minEdge = e;
                 } else {
-                    int cmp = rational64_compare(cot, *out_min_cot);
-                    if (cmp < 0) {
-                        *out_min_cot = cot;
-                        min_edge = e;
-                    } else if (cmp == 0) {
-                        int orient = dnc_get_orientation(min_edge, e,
-                            e_next, e_prev, e_reverse, e_target, pts,
-                            sx, sy, sz, tx, ty, tz);
-                        if (ccw == (orient == 1))
-                            min_edge = e;
+                    int c = br64_cmp(cot, *minCot);
+                    if (c < 0) {
+                        *minCot = cot;
+                        minEdge = e;
+                    } else if (c == 0 && (ccw == (bt_getOrientation(minEdge, e, s_dir, t) == BT_COUNTER_CLOCKWISE))) {
+                        minEdge = e;
                     }
                 }
             }
         }
-        e = e_next[e];
-    } while (e != e_start);
-
-    return min_edge;
+        e = e->next;
+    } while (e != start->edges);
+    return minEdge;
 }
 
-// ---------------------------------------------------------------------------
-// findEdgeForCoplanarFaces — advance edges along coplanar face
-// ---------------------------------------------------------------------------
-
-__device__ void dnc_find_edge_coplanar(
-    int c0, int c1, int* e0_io, int* e1_io, int stop0, int stop1,
-    const int* pts,
-    const int* v_edge, int* e_next, int* e_prev, int* e_reverse,
-    int* e_target, const int* e_copy, int merge_stamp)
+__device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0, BtVertex* c1,
+    BtEdge** e0, BtEdge** e1, BtVertex* stop0, BtVertex* stop1)
 {
-    int start0 = *e0_io, start1 = *e1_io;
-    int et0 = (start0 >= 0) ? e_target[start0] : c0;
-    int et1 = (start1 >= 0) ? e_target[start1] : c1;
+    BtEdge* start0 = *e0;
+    BtEdge* start1 = *e1;
+    BtPoint32 et0 = start0 ? start0->target->point : c0->point;
+    BtPoint32 et1 = start1 ? start1->target->point : c1->point;
+    BtPoint32 s_dir = bp32_sub(c1->point, c0->point);
+    BtPoint64 normal = bp32_cross(bp32(0,0,-1), s_dir);
+    // Use whichever start edge exists to define the coplanar normal
+    if (start0 || start1) {
+        BtVertex* ref = (start0 ? start0 : start1)->target;
+        normal = bp32_cross(bp32_sub(ref->point, c0->point), s_dir);
+    }
+    long long dist = bp32_dot64(c0->point, normal);
+    BtPoint64 perp = bp32_cross64(s_dir, normal);
 
-    int sx = pts[c1*3]-pts[c0*3], sy = pts[c1*3+1]-pts[c0*3+1], sz = pts[c1*3+2]-pts[c0*3+2];
-    int ref = (start0 >= 0) ? e_target[start0] : e_target[start1];
-    int dx = pts[ref*3]-pts[c0*3], dy = pts[ref*3+1]-pts[c0*3+1], dz = pts[ref*3+2]-pts[c0*3+2];
-    long long nx = (long long)dy*sz-(long long)dz*sy;
-    long long ny = (long long)dz*sx-(long long)dx*sz;
-    long long nz = (long long)dx*sy-(long long)dy*sx;
-    long long dist = (long long)pts[c0*3]*nx + (long long)pts[c0*3+1]*ny + (long long)pts[c0*3+2]*nz;
-    long long px = (long long)sy*nz-(long long)sz*ny;
-    long long py = (long long)sz*nx-(long long)sx*nz;
-    long long pz = (long long)sx*ny-(long long)sy*nx;
-
-    // Advance e0 along coplanar face
-    long long maxDot0 = (long long)pts[et0*3]*px + (long long)pts[et0*3+1]*py + (long long)pts[et0*3+2]*pz;
-    if (*e0_io >= 0) {
-        for (int iter = 0; iter < 1000; iter++) {
-            if (e_target[*e0_io] == stop0) break;
-            int e = e_prev[e_reverse[*e0_io]];
-            int w = e_target[e];
-            long long dn = (long long)pts[w*3]*nx+(long long)pts[w*3+1]*ny+(long long)pts[w*3+2]*nz;
-            if (dn < dist) break;
-            if (e_copy[e] == merge_stamp) break;
-            long long dot = (long long)pts[w*3]*px+(long long)pts[w*3+1]*py+(long long)pts[w*3+2]*pz;
+    long long maxDot0 = bp32_dot64(et0, perp);
+    if (*e0) {
+        while ((*e0)->target != stop0) {
+            BtEdge* e = (*e0)->reverse->prev;
+            if (bp32_dot64(e->target->point, normal) < dist) break;
+            if (e->copy == s->mergeStamp) break;
+            long long dot = bp32_dot64(e->target->point, perp);
             if (dot <= maxDot0) break;
-            maxDot0 = dot; *e0_io = e; et0 = w;
+            maxDot0 = dot;
+            *e0 = e;
+            et0 = e->target->point;
         }
     }
 
-    // Advance e1 along coplanar face
-    long long maxDot1 = (long long)pts[et1*3]*px + (long long)pts[et1*3+1]*py + (long long)pts[et1*3+2]*pz;
-    if (*e1_io >= 0) {
-        for (int iter = 0; iter < 1000; iter++) {
-            if (e_target[*e1_io] == stop1) break;
-            int e = e_next[e_reverse[*e1_io]];
-            int w = e_target[e];
-            long long dn = (long long)pts[w*3]*nx+(long long)pts[w*3+1]*ny+(long long)pts[w*3+2]*nz;
-            if (dn < dist) break;
-            if (e_copy[e] == merge_stamp) break;
-            long long dot = (long long)pts[w*3]*px+(long long)pts[w*3+1]*py+(long long)pts[w*3+2]*pz;
+    long long maxDot1 = bp32_dot64(et1, perp);
+    if (*e1) {
+        while ((*e1)->target != stop1) {
+            BtEdge* e = (*e1)->reverse->next;
+            if (bp32_dot64(e->target->point, normal) < dist) break;
+            if (e->copy == s->mergeStamp) break;
+            long long dot = bp32_dot64(e->target->point, perp);
             if (dot <= maxDot1) break;
-            maxDot1 = dot; *e1_io = e; et1 = w;
+            maxDot1 = dot;
+            *e1 = e;
+            et1 = e->target->point;
         }
     }
 
-    // Tangent finding within coplanar face
-    long long dxp = maxDot1 - maxDot0;
-    if (dxp > 0) {
-        for (int iter = 0; iter < 1000; iter++) {
-            long long dyp = (long long)(pts[et1*3]-pts[et0*3])*sx
-                          + (long long)(pts[et1*3+1]-pts[et0*3+1])*sy
-                          + (long long)(pts[et1*3+2]-pts[et0*3+2])*sz;
-            bool advanced = false;
-            if (*e0_io >= 0 && e_target[*e0_io] != stop0) {
-                int f0 = e_reverse[e_next[*e0_io]];
-                if (e_copy[f0] > merge_stamp) {
-                    int w = e_target[f0];
-                    long long dx0 = (long long)(pts[w*3]-pts[et0*3])*px
-                                  + (long long)(pts[w*3+1]-pts[et0*3+1])*py
-                                  + (long long)(pts[w*3+2]-pts[et0*3+2])*pz;
-                    long long dy0 = (long long)(pts[w*3]-pts[et0*3])*sx
-                                  + (long long)(pts[w*3+1]-pts[et0*3+1])*sy
-                                  + (long long)(pts[w*3+2]-pts[et0*3+2])*sz;
-                    if ((dx0 == 0) ? (dy0 < 0) : ((dx0 < 0) && (rational64_compare(rational64_make(dy0,dx0), rational64_make(dyp,dxp)) >= 0))) {
-                        et0 = w;
-                        long long newDot0 = (long long)pts[et0*3]*px+(long long)pts[et0*3+1]*py+(long long)pts[et0*3+2]*pz;
-                        dxp = maxDot1 - newDot0;
-                        *e0_io = (*e0_io == start0) ? -1 : f0;
-                        advanced = true;
+    long long dx = maxDot1 - maxDot0;
+    if (dx > 0) {
+        while (true) {
+            long long dy = bp32_dot64_32(bp32_sub(et1, et0), s_dir);
+            if (*e0 && ((*e0)->target != stop0)) {
+                BtEdge* f0 = (*e0)->next->reverse;
+                if (f0->copy > s->mergeStamp) {
+                    long long dx0 = bp32_dot64(bp32_sub(f0->target->point, et0), perp);
+                    long long dy0 = bp32_dot64_32(bp32_sub(f0->target->point, et0), s_dir);
+                    if ((dx0 == 0) ? (dy0 < 0) : ((dx0 < 0) && (br64_cmp(br64_make(dy0, dx0), br64_make(dy, dx)) >= 0))) {
+                        et0 = f0->target->point;
+                        dx = bp32_dot64(bp32_sub(et1, et0), perp);
+                        *e0 = (*e0 == start0) ? NULL : f0;
+                        continue;
                     }
                 }
             }
-            if (!advanced && *e1_io >= 0 && e_target[*e1_io] != stop1) {
-                int f1 = e_next[e_reverse[*e1_io]];
-                if (e_copy[f1] > merge_stamp) {
-                    int w = e_target[f1];
-                    long long dn = (long long)(pts[w*3]-pts[et1*3])*nx
-                                 + (long long)(pts[w*3+1]-pts[et1*3+1])*ny
-                                 + (long long)(pts[w*3+2]-pts[et1*3+2])*nz;
-                    if (dn == 0) {
-                        long long dx1 = (long long)(pts[w*3]-pts[et1*3])*px
-                                      + (long long)(pts[w*3+1]-pts[et1*3+1])*py
-                                      + (long long)(pts[w*3+2]-pts[et1*3+2])*pz;
-                        long long dy1 = (long long)(pts[w*3]-pts[et1*3])*sx
-                                      + (long long)(pts[w*3+1]-pts[et1*3+1])*sy
-                                      + (long long)(pts[w*3+2]-pts[et1*3+2])*sz;
-                        long long dxn = (long long)(pts[w*3]-pts[et0*3])*px
-                                      + (long long)(pts[w*3+1]-pts[et0*3+1])*py
-                                      + (long long)(pts[w*3+2]-pts[et0*3+2])*pz;
-                        if ((dxn > 0) && ((dx1 == 0) ? (dy1 < 0) : ((dx1 < 0) && (rational64_compare(rational64_make(dy1,dx1), rational64_make(dyp,dxp)) > 0)))) {
-                            *e1_io = f1; et1 = w; dxp = dxn;
-                            advanced = true;
+            if (*e1 && ((*e1)->target != stop1)) {
+                BtEdge* f1 = (*e1)->reverse->next;
+                if (f1->copy > s->mergeStamp) {
+                    BtPoint32 d1 = bp32_sub(f1->target->point, et1);
+                    if (bp32_dot64(d1, normal) == 0) {
+                        long long dx1 = bp32_dot64(d1, perp);
+                        long long dy1 = bp32_dot64_32(d1, s_dir);
+                        long long dxn = bp32_dot64(bp32_sub(f1->target->point, et0), perp);
+                        if ((dxn > 0) && ((dx1 == 0) ? (dy1 < 0) : ((dx1 < 0) && (br64_cmp(br64_make(dy1, dx1), br64_make(dy, dx)) > 0)))) {
+                            *e1 = f1;
+                            et1 = (*e1)->target->point;
+                            dx = dxn;
+                            continue;
                         }
                     }
                 }
             }
-            if (!advanced) break;
+            break;
         }
-    } else if (dxp < 0) {
-        for (int iter = 0; iter < 1000; iter++) {
-            long long dyp = (long long)(pts[et1*3]-pts[et0*3])*sx
-                          + (long long)(pts[et1*3+1]-pts[et0*3+1])*sy
-                          + (long long)(pts[et1*3+2]-pts[et0*3+2])*sz;
-            bool advanced = false;
-            if (*e1_io >= 0 && e_target[*e1_io] != stop1) {
-                int f1 = e_prev[e_reverse[*e1_io]];
-                if (e_copy[f1] > merge_stamp) {
-                    int w = e_target[f1];
-                    long long dx1 = (long long)(pts[w*3]-pts[et1*3])*px
-                                  + (long long)(pts[w*3+1]-pts[et1*3+1])*py
-                                  + (long long)(pts[w*3+2]-pts[et1*3+2])*pz;
-                    long long dy1 = (long long)(pts[w*3]-pts[et1*3])*sx
-                                  + (long long)(pts[w*3+1]-pts[et1*3+1])*sy
-                                  + (long long)(pts[w*3+2]-pts[et1*3+2])*sz;
-                    if ((dx1 == 0) ? (dy1 > 0) : ((dx1 < 0) && (rational64_compare(rational64_make(dy1,dx1), rational64_make(dyp,dxp)) <= 0))) {
-                        et1 = w;
-                        long long newDot1 = (long long)pts[et1*3]*px+(long long)pts[et1*3+1]*py+(long long)pts[et1*3+2]*pz;
-                        dxp = newDot1 - maxDot0;
-                        *e1_io = (*e1_io == start1) ? -1 : f1;
-                        advanced = true;
+    } else if (dx < 0) {
+        while (true) {
+            long long dy = bp32_dot64_32(bp32_sub(et1, et0), s_dir);
+            if (*e1 && ((*e1)->target != stop1)) {
+                BtEdge* f1 = (*e1)->prev->reverse;
+                if (f1->copy > s->mergeStamp) {
+                    long long dx1 = bp32_dot64(bp32_sub(f1->target->point, et1), perp);
+                    long long dy1 = bp32_dot64_32(bp32_sub(f1->target->point, et1), s_dir);
+                    if ((dx1 == 0) ? (dy1 > 0) : ((dx1 < 0) && (br64_cmp(br64_make(dy1, dx1), br64_make(dy, dx)) <= 0))) {
+                        et1 = f1->target->point;
+                        dx = bp32_dot64(bp32_sub(et1, et0), perp);
+                        *e1 = (*e1 == start1) ? NULL : f1;
+                        continue;
                     }
                 }
             }
-            if (!advanced && *e0_io >= 0 && e_target[*e0_io] != stop0) {
-                int f0 = e_prev[e_reverse[*e0_io]];
-                if (e_copy[f0] > merge_stamp) {
-                    int w = e_target[f0];
-                    long long dn = (long long)(pts[w*3]-pts[et0*3])*nx
-                                 + (long long)(pts[w*3+1]-pts[et0*3+1])*ny
-                                 + (long long)(pts[w*3+2]-pts[et0*3+2])*nz;
-                    if (dn == 0) {
-                        long long dx0 = (long long)(pts[w*3]-pts[et0*3])*px
-                                      + (long long)(pts[w*3+1]-pts[et0*3+1])*py
-                                      + (long long)(pts[w*3+2]-pts[et0*3+2])*pz;
-                        long long dy0 = (long long)(pts[w*3]-pts[et0*3])*sx
-                                      + (long long)(pts[w*3+1]-pts[et0*3+1])*sy
-                                      + (long long)(pts[w*3+2]-pts[et0*3+2])*sz;
-                        long long dxn = (long long)(pts[et1*3]-pts[w*3])*px
-                                      + (long long)(pts[et1*3+1]-pts[w*3+1])*py
-                                      + (long long)(pts[et1*3+2]-pts[w*3+2])*pz;
-                        if ((dxn < 0) && ((dx0 == 0) ? (dy0 > 0) : ((dx0 < 0) && (rational64_compare(rational64_make(dy0,dx0), rational64_make(dyp,dxp)) < 0)))) {
-                            *e0_io = f0; et0 = w; dxp = dxn;
-                            advanced = true;
+            if (*e0 && ((*e0)->target != stop0)) {
+                BtEdge* f0 = (*e0)->reverse->prev;
+                if (f0->copy > s->mergeStamp) {
+                    BtPoint32 d0 = bp32_sub(f0->target->point, et0);
+                    if (bp32_dot64(d0, normal) == 0) {
+                        long long dx0 = bp32_dot64(d0, perp);
+                        long long dy0 = bp32_dot64_32(d0, s_dir);
+                        long long dxn = bp32_dot64(bp32_sub(et1, f0->target->point), perp);
+                        if ((dxn < 0) && ((dx0 == 0) ? (dy0 > 0) : ((dx0 < 0) && (br64_cmp(br64_make(dy0, dx0), br64_make(dy, dx)) < 0)))) {
+                            *e0 = f0;
+                            et0 = (*e0)->target->point;
+                            dx = dxn;
+                            continue;
                         }
                     }
                 }
             }
-            if (!advanced) break;
+            break;
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// mergeProjection — find initial bridge via 2D convex hull merge
-// ---------------------------------------------------------------------------
-// Returns true (normal case) or false (degenerate same-x,y case).
-// h0 is updated to the merged 2D hull.
-
-__device__ bool dnc_merge_projection(
-    const int* pts, int* v_next, int* v_prev, const int* v_edge,
-    const int* e_next, const int* e_target,
-    int* h0_minXy, int* h0_maxXy, int* h0_minYx, int* h0_maxYx,
-    int h1_minXy, int h1_maxXy, int h1_minYx, int h1_maxYx,
-    int* c0_out, int* c1_out)
-{
-    int v0 = *h0_maxYx;
-    int v1 = h1_minYx;
-
-    if (pts[v0*3] == pts[v1*3] && pts[v0*3+1] == pts[v1*3+1]) {
-        // Degenerate: same (x,y)
-        int v1p = v_prev[v1];
+__device__ inline bool bt_mergeProjection(BtHullState* s, BtIntermediateHull* h0, BtIntermediateHull* h1, BtVertex** c0, BtVertex** c1) {
+    BtVertex* v0 = h0->maxYx;
+    BtVertex* v1 = h1->minYx;
+    if ((v0->point.x == v1->point.x) && (v0->point.y == v1->point.y)) {
+        BtVertex* v1p = v1->prev;
         if (v1p == v1) {
-            *c0_out = v0;
-            if (v_edge[v1] >= 0) v1 = e_target[v_edge[v1]];
-            *c1_out = v1;
+            *c0 = v0;
+            if (v1->edges) {
+                v1 = v1->edges->target;
+            }
+            *c1 = v1;
             return false;
         }
-        int v1n = v_next[v1];
-        v_next[v1p] = v1n;
-        v_prev[v1n] = v1p;
-        if (v1 == h1_minXy) {
-            h1_minXy = ((pts[v1n*3] < pts[v1p*3]) || (pts[v1n*3]==pts[v1p*3] && pts[v1n*3+1]<pts[v1p*3+1])) ? v1n : v1p;
+        BtVertex* v1n = v1->next;
+        v1p->next = v1n;
+        v1n->prev = v1p;
+        if (v1 == h1->minXy) {
+            h1->minXy = ((v1n->point.x < v1p->point.x) || ((v1n->point.x == v1p->point.x) && (v1n->point.y < v1p->point.y))) ? v1n : v1p;
         }
-        if (v1 == h1_maxXy) {
-            h1_maxXy = ((pts[v1n*3] > pts[v1p*3]) || (pts[v1n*3]==pts[v1p*3] && pts[v1n*3+1]>pts[v1p*3+1])) ? v1n : v1p;
+        if (v1 == h1->maxXy) {
+            h1->maxXy = ((v1n->point.x > v1p->point.x) || ((v1n->point.x == v1p->point.x) && (v1n->point.y > v1p->point.y))) ? v1n : v1p;
         }
     }
 
-    v0 = *h0_maxXy;
-    v1 = h1_maxXy;
-    int v00 = -1, v10 = -1;
+    v0 = h0->maxXy;
+    v1 = h1->maxXy;
+    BtVertex* v00 = NULL;
+    BtVertex* v10 = NULL;
     int sign = 1;
 
     for (int side = 0; side <= 1; side++) {
-        int dxv = (pts[v1*3] - pts[v0*3]) * sign;
-        if (dxv > 0) {
-            for (int iter = 0; iter < 10000; iter++) {
-                int dy = pts[v1*3+1] - pts[v0*3+1];
-                int w0 = side ? v_next[v0] : v_prev[v0];
+        int dx = (v1->point.x - v0->point.x) * sign;
+        if (dx > 0) {
+            while (true) {
+                int dy = v1->point.y - v0->point.y;
+                BtVertex* w0 = side ? v0->next : v0->prev;
                 if (w0 != v0) {
-                    int dx0 = (pts[w0*3]-pts[v0*3])*sign;
-                    int dy0 = pts[w0*3+1]-pts[v0*3+1];
-                    if ((dy0<=0)&&((dx0==0)||((dx0<0)&&((long long)dy0*dxv<=(long long)dy*dx0)))) {
-                        v0=w0; dxv=(pts[v1*3]-pts[v0*3])*sign; continue;
+                    int dx0 = (w0->point.x - v0->point.x) * sign;
+                    int dy0 = w0->point.y - v0->point.y;
+                    if ((dy0 <= 0) && ((dx0 == 0) || ((dx0 < 0) && ((long long)dy0 * dx <= (long long)dy * dx0)))) {
+                        v0 = w0; dx = (v1->point.x - v0->point.x) * sign; continue;
                     }
                 }
-                int w1 = side ? v_next[v1] : v_prev[v1];
+                BtVertex* w1 = side ? v1->next : v1->prev;
                 if (w1 != v1) {
-                    int dx1=(pts[w1*3]-pts[v1*3])*sign;
-                    int dy1=pts[w1*3+1]-pts[v1*3+1];
-                    int dxn=(pts[w1*3]-pts[v0*3])*sign;
-                    if ((dxn>0)&&(dy1<0)&&((dx1==0)||((dx1<0)&&((long long)dy1*dxv<(long long)dy*dx1)))) {
-                        v1=w1; dxv=dxn; continue;
+                    int dx1 = (w1->point.x - v1->point.x) * sign;
+                    int dy1 = w1->point.y - v1->point.y;
+                    int dxn = (w1->point.x - v0->point.x) * sign;
+                    if ((dxn > 0) && (dy1 < 0) && ((dx1 == 0) || ((dx1 < 0) && ((long long)dy1 * dx < (long long)dy * dx1)))) {
+                        v1 = w1; dx = dxn; continue;
                     }
                 }
                 break;
             }
-        } else if (dxv < 0) {
-            for (int iter = 0; iter < 10000; iter++) {
-                int dy = pts[v1*3+1] - pts[v0*3+1];
-                int w1 = side ? v_prev[v1] : v_next[v1];
+        } else if (dx < 0) {
+            while (true) {
+                int dy = v1->point.y - v0->point.y;
+                BtVertex* w1 = side ? v1->prev : v1->next;
                 if (w1 != v1) {
-                    int dx1=(pts[w1*3]-pts[v1*3])*sign;
-                    int dy1=pts[w1*3+1]-pts[v1*3+1];
-                    if ((dy1>=0)&&((dx1==0)||((dx1<0)&&((long long)dy1*dxv<=(long long)dy*dx1)))) {
-                        v1=w1; dxv=(pts[v1*3]-pts[v0*3])*sign; continue;
+                    int dx1 = (w1->point.x - v1->point.x) * sign;
+                    int dy1 = w1->point.y - v1->point.y;
+                    if ((dy1 >= 0) && ((dx1 == 0) || ((dx1 < 0) && ((long long)dy1 * dx <= (long long)dy * dx1)))) {
+                        v1 = w1; dx = (v1->point.x - v0->point.x) * sign; continue;
                     }
                 }
-                int w0 = side ? v_prev[v0] : v_next[v0];
+                BtVertex* w0 = side ? v0->prev : v0->next;
                 if (w0 != v0) {
-                    int dx0=(pts[w0*3]-pts[v0*3])*sign;
-                    int dy0=pts[w0*3+1]-pts[v0*3+1];
-                    int dxn=(pts[v1*3]-pts[w0*3])*sign;
-                    if ((dxn<0)&&(dy0>0)&&((dx0==0)||((dx0<0)&&((long long)dy0*dxv<(long long)dy*dx0)))) {
-                        v0=w0; dxv=dxn; continue;
+                    int dx0 = (w0->point.x - v0->point.x) * sign;
+                    int dy0 = w0->point.y - v0->point.y;
+                    int dxn = (v1->point.x - w0->point.x) * sign;
+                    if ((dxn < 0) && (dy0 > 0) && ((dx0 == 0) || ((dx0 < 0) && ((long long)dy0 * dx < (long long)dy * dx0)))) {
+                        v0 = w0; dx = dxn; continue;
                     }
                 }
                 break;
             }
         } else {
-            int x = pts[v0*3];
-            int y0 = pts[v0*3+1];
-            for (int iter = 0; iter < 10000; iter++) {
-                int t = side ? v_next[v0] : v_prev[v0];
-                if (t==v0 || pts[t*3]!=x || pts[t*3+1]>y0) break;
-                v0=t; y0=pts[t*3+1];
+            int x = v0->point.x;
+            int y0 = v0->point.y;
+            BtVertex* w0 = v0;
+            BtVertex* t;
+            while (((t = side ? w0->next : w0->prev) != v0) && (t->point.x == x) && (t->point.y <= y0)) {
+                w0 = t; y0 = t->point.y;
             }
-            int y1 = pts[v1*3+1];
-            for (int iter = 0; iter < 10000; iter++) {
-                int t = side ? v_prev[v1] : v_next[v1];
-                if (t==v1 || pts[t*3]!=x || pts[t*3+1]<y1) break;
-                v1=t; y1=pts[t*3+1];
+            v0 = w0;
+            int y1 = v1->point.y;
+            BtVertex* w1 = v1;
+            while (((t = side ? w1->prev : w1->next) != v1) && (t->point.x == x) && (t->point.y >= y1)) {
+                w1 = t; y1 = t->point.y;
             }
+            v1 = w1;
         }
-
         if (side == 0) {
             v00 = v0; v10 = v1;
-            v0 = *h0_minXy; v1 = h1_minXy;
-            sign = -1;
+            v0 = h0->minXy; v1 = h1->minXy; sign = -1;
         }
     }
 
-    // Connect circular lists
-    v_prev[v0] = v1; v_next[v1] = v0;
-    v_next[v00] = v10; v_prev[v10] = v00;
+    v0->prev = v1;
+    v1->next = v0;
+    v00->next = v10;
+    v10->prev = v00;
 
-    // Update h0 extremes
-    if (pts[h1_minXy*3] < pts[(*h0_minXy)*3] ||
-        (pts[h1_minXy*3]==pts[(*h0_minXy)*3] && pts[h1_minXy*3+1]<pts[(*h0_minXy)*3+1]))
-        *h0_minXy = h1_minXy;
-    if (pts[h1_maxXy*3] > pts[(*h0_maxXy)*3] ||
-        (pts[h1_maxXy*3]==pts[(*h0_maxXy)*3] && pts[h1_maxXy*3+1]>=pts[(*h0_maxXy)*3+1]))
-        *h0_maxXy = h1_maxXy;
-    *h0_maxYx = h1_maxYx;
+    if (h1->minXy->point.x < h0->minXy->point.x) h0->minXy = h1->minXy;
+    if (h1->maxXy->point.x >= h0->maxXy->point.x) h0->maxXy = h1->maxXy;
+    h0->maxYx = h1->maxYx;
 
-    *c0_out = v00;
-    *c1_out = v10;
+    *c0 = v00;
+    *c1 = v10;
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// merge — full 3D Preparata-Hong merge with interior edge deletion
-// ---------------------------------------------------------------------------
+__device__ void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtIntermediateHull* h1) {
+    if (!h1->maxXy) return;
+    if (!h0->maxXy) { *h0 = *h1; return; }
 
-__device__ void dnc_merge(
-    const int* pts, int* v_next, int* v_prev, int* v_edge,
-    int* e_target, int* e_reverse, int* e_next, int* e_prev, int* e_copy,
-    int* e_free, int* n_free, int* n_alloc, int max_e,
-    int* h0_minXy, int* h0_maxXy, int* h0_minYx, int* h0_maxYx,
-    int h1_minXy, int h1_maxXy, int h1_minYx, int h1_maxYx,
-    int merge_stamp, int* out_error)
-{
-    if (h1_maxXy < 0) return;
-    if (*h0_maxXy < 0) {
-        *h0_minXy=h1_minXy; *h0_maxXy=h1_maxXy;
-        *h0_minYx=h1_minYx; *h0_maxYx=h1_maxYx;
-        return;
-    }
+    s->mergeStamp--;
 
-    int c0, c1;
-    int toPrev0=-1, firstNew0=-1, pendingHead0=-1, pendingTail0=-1;
-    int toPrev1=-1, firstNew1=-1, pendingHead1=-1, pendingTail1=-1;
-    int prevPt_x, prevPt_y, prevPt_z;
+    BtVertex* c0 = NULL;
+    BtEdge* toPrev0 = NULL;
+    BtEdge* firstNew0 = NULL;
+    BtEdge* pendingHead0 = NULL;
+    BtEdge* pendingTail0 = NULL;
+    BtVertex* c1 = NULL;
+    BtEdge* toPrev1 = NULL;
+    BtEdge* firstNew1 = NULL;
+    BtEdge* pendingHead1 = NULL;
+    BtEdge* pendingTail1 = NULL;
+    BtPoint32 prevPoint;
 
-    bool proj_ok = dnc_merge_projection(pts, v_next, v_prev, v_edge, e_next, e_target,
-                                         h0_minXy, h0_maxXy, h0_minYx, h0_maxYx,
-                                         h1_minXy, h1_maxXy, h1_minYx, h1_maxYx,
-                                         &c0, &c1);
+    if (bt_mergeProjection(s, h0, h1, &c0, &c1)) {
+        BtPoint32 sd = bp32_sub(c1->point, c0->point);
+        BtPoint64 normal = bp32_cross(bp32(0,0,-1), sd);
+        BtPoint64 t = bp32_cross64(sd, normal);
 
-    if (proj_ok) {
-        // Check for coplanar start edges on the bottom face
-        int sx=pts[c1*3]-pts[c0*3], sy=pts[c1*3+1]-pts[c0*3+1], sz=pts[c1*3+2]-pts[c0*3+2];
-        // normal = (0,0,-1) cross s = (sy, -sx, 0)
-        long long bnx=sy, bny=-sx, bnz=0;
-        // t = s cross normal
-        long long btx=(long long)sz*sx, bty=(long long)sz*sy, btz=-((long long)sx*sx+(long long)sy*sy);
-
-        int start0=-1;
-        if (v_edge[c0]>=0) {
-            int e_st=v_edge[c0], e=e_st;
+        BtEdge* e = c0->edges;
+        BtEdge* start0 = NULL;
+        if (e) {
             do {
-                int w=e_target[e];
-                long long dn=(long long)(pts[w*3]-pts[c0*3])*bnx
-                            +(long long)(pts[w*3+1]-pts[c0*3+1])*bny;
-                if (dn==0) {
-                    long long dt=(long long)(pts[w*3]-pts[c0*3])*btx
-                                +(long long)(pts[w*3+1]-pts[c0*3+1])*bty
-                                +(long long)(pts[w*3+2]-pts[c0*3+2])*btz;
-                    if (dt>0) {
-                        if (start0<0) { start0=e; }
-                        else {
-                            int orient=dnc_get_orientation(start0,e,e_next,e_prev,e_reverse,e_target,pts,
-                                sx,sy,sz,0,0,-1);
-                            if (orient==-1) start0=e; // CLOCKWISE
-                        }
-                    }
+                long long dot = bp32_dot64(bp32_sub(e->target->point, c0->point), normal);
+                if ((dot == 0) && (bp32_dot64(bp32_sub(e->target->point, c0->point), t) > 0)) {
+                    if (!start0 || (bt_getOrientation(start0, e, sd, bp32(0,0,-1)) == BT_CLOCKWISE))
+                        start0 = e;
                 }
-                e=e_next[e];
-            } while (e!=e_st);
+                e = e->next;
+            } while (e != c0->edges);
         }
 
-        int start1=-1;
-        if (v_edge[c1]>=0) {
-            int e_st=v_edge[c1], e=e_st;
+        e = c1->edges;
+        BtEdge* start1 = NULL;
+        if (e) {
             do {
-                int w=e_target[e];
-                long long dn=(long long)(pts[w*3]-pts[c1*3])*bnx
-                            +(long long)(pts[w*3+1]-pts[c1*3+1])*bny;
-                if (dn==0) {
-                    long long dt=(long long)(pts[w*3]-pts[c1*3])*btx
-                                +(long long)(pts[w*3+1]-pts[c1*3+1])*bty
-                                +(long long)(pts[w*3+2]-pts[c1*3+2])*btz;
-                    if (dt>0) {
-                        if (start1<0) { start1=e; }
-                        else {
-                            int orient=dnc_get_orientation(start1,e,e_next,e_prev,e_reverse,e_target,pts,
-                                sx,sy,sz,0,0,-1);
-                            if (orient==1) start1=e; // CCW
-                        }
-                    }
+                long long dot = bp32_dot64(bp32_sub(e->target->point, c1->point), normal);
+                if ((dot == 0) && (bp32_dot64(bp32_sub(e->target->point, c1->point), t) > 0)) {
+                    if (!start1 || (bt_getOrientation(start1, e, sd, bp32(0,0,-1)) == BT_COUNTER_CLOCKWISE))
+                        start1 = e;
                 }
-                e=e_next[e];
-            } while (e!=e_st);
+                e = e->next;
+            } while (e != c1->edges);
         }
 
-        if (start0>=0 || start1>=0) {
-            dnc_find_edge_coplanar(c0,c1,&start0,&start1,-1,-1,
-                pts,v_edge,e_next,e_prev,e_reverse,e_target,e_copy,merge_stamp);
-            if (start0>=0) c0=e_target[start0];
-            if (start1>=0) c1=e_target[start1];
+        if (start0 || start1) {
+            bt_findEdgeForCoplanarFaces(s, c0, c1, &start0, &start1, NULL, NULL);
+            if (start0) c0 = start0->target;
+            if (start1) c1 = start1->target;
         }
-
-        prevPt_x=pts[c1*3]; prevPt_y=pts[c1*3+1]; prevPt_z=pts[c1*3+2]+1;
+        prevPoint = c1->point;
+        prevPoint.z++;
     } else {
-        prevPt_x=pts[c1*3]+1; prevPt_y=pts[c1*3+1]; prevPt_z=pts[c1*3+2];
+        prevPoint = c1->point;
+        prevPoint.x++;
     }
 
-    int first0=c0, first1=c1;
-    bool firstRun=true;
+    BtVertex* first0 = c0;
+    BtVertex* first1 = c1;
+    bool firstRun = true;
 
-    for (int mainIter=0; mainIter<10000; mainIter++) {
-        int sx=pts[c1*3]-pts[c0*3], sy=pts[c1*3+1]-pts[c0*3+1], sz=pts[c1*3+2]-pts[c0*3+2];
-        int rx=prevPt_x-pts[c0*3], ry=prevPt_y-pts[c0*3+1], rz=prevPt_z-pts[c0*3+2];
-        long long rxsx=(long long)ry*sz-(long long)rz*sy;
-        long long rxsy=(long long)rz*sx-(long long)rx*sz;
-        long long rxsz=(long long)rx*sy-(long long)ry*sx;
-        long long sxrxsx=(long long)sy*rxsz-(long long)sz*rxsy;
-        long long sxrxsy=(long long)sz*rxsx-(long long)sx*rxsz;
-        long long sxrxsz=(long long)sx*rxsy-(long long)sy*rxsx;
+    while (true) {
+        BtPoint32 sd = bp32_sub(c1->point, c0->point);
+        BtPoint32 r = bp32_sub(prevPoint, c0->point);
+        BtPoint64 rxs = bp32_cross(r, sd);
+        BtPoint64 sxrxs = bp32_cross64(sd, rxs);
 
-        GpuRational64 minCot0={0,0,0};
-        int min0=dnc_find_max_angle(false,c0,sx,sy,sz,rxsx,rxsy,rxsz,sxrxsx,sxrxsy,sxrxsz,
-            pts,v_edge,e_next,e_prev,e_reverse,e_target,e_copy,merge_stamp,&minCot0);
-        GpuRational64 minCot1={0,0,0};
-        int min1=dnc_find_max_angle(true,c1,sx,sy,sz,rxsx,rxsy,rxsz,sxrxsx,sxrxsy,sxrxsz,
-            pts,v_edge,e_next,e_prev,e_reverse,e_target,e_copy,merge_stamp,&minCot1);
+        BtRational64 minCot0 = br64_make(0, 0);
+        BtEdge* min0 = bt_findMaxAngle(s, false, c0, sd, rxs, sxrxs, &minCot0);
+        BtRational64 minCot1 = br64_make(0, 0);
+        BtEdge* min1 = bt_findMaxAngle(s, true, c1, sd, rxs, sxrxs, &minCot1);
 
-        if (min0<0 && min1<0) {
-            // Both have no old edges — create simple edge pair
-            int e=dnc_new_edge_pair(e_target,e_reverse,e_next,e_prev,e_copy,
-                                     e_free,n_free,n_alloc,max_e,c0,c1,merge_stamp);
-            if (e<0) { *out_error=1; return; }
-            int r=e_reverse[e];
-            e_next[e]=e; e_prev[e]=e; v_edge[c0]=e;
-            e_next[r]=r; e_prev[r]=r; v_edge[c1]=r;
+        if (!min0 && !min1) {
+            BtEdge* e = bt_newEdgePair(s, c0, c1);
+            if (!e) return;
+            bt_edge_link(e, e);
+            c0->edges = e;
+            e = e->reverse;
+            bt_edge_link(e, e);
+            c1->edges = e;
             return;
         }
 
-        int cmp = (min0<0) ? 1 : (min1<0) ? -1 : rational64_compare(minCot0,minCot1);
+        int cmp = !min0 ? 1 : !min1 ? -1 : br64_cmp(minCot0, minCot1);
 
-        if (firstRun || ((cmp>=0) ? !rational64_is_neg_inf(minCot1) : !rational64_is_neg_inf(minCot0))) {
-            int e=dnc_new_edge_pair(e_target,e_reverse,e_next,e_prev,e_copy,
-                                     e_free,n_free,n_alloc,max_e,c0,c1,merge_stamp);
-            if (e<0) { *out_error=1; return; }
-            int r=e_reverse[e];
-            // Add e to pending0 (backward: tail→...→head via next)
-            if (pendingTail0>=0) e_prev[pendingTail0]=e; else pendingHead0=e;
-            e_next[e]=pendingTail0; pendingTail0=e;
-            // Add r to pending1 (forward: head→...→tail via next)
-            if (pendingTail1>=0) e_next[pendingTail1]=r; else pendingHead1=r;
-            e_prev[r]=pendingTail1; pendingTail1=r;
+        if (firstRun || ((cmp >= 0) ? !br64_isNegInf(minCot1) : !br64_isNegInf(minCot0))) {
+            BtEdge* e = bt_newEdgePair(s, c0, c1);
+            if (!e) return;
+            if (pendingTail0) pendingTail0->prev = e;
+            else pendingHead0 = e;
+            e->next = pendingTail0;
+            pendingTail0 = e;
+
+            e = e->reverse;
+            if (pendingTail1) pendingTail1->next = e;
+            else pendingHead1 = e;
+            e->prev = pendingTail1;
+            pendingTail1 = e;
         }
 
-        int e0=min0, e1=min1;
-        if (cmp==0) {
-            dnc_find_edge_coplanar(c0,c1,&e0,&e1,-1,-1,
-                pts,v_edge,e_next,e_prev,e_reverse,e_target,e_copy,merge_stamp);
+        BtEdge* e0 = min0;
+        BtEdge* e1 = min1;
+
+        if (cmp == 0) {
+            bt_findEdgeForCoplanarFaces(s, c0, c1, &e0, &e1, NULL, NULL);
         }
 
-        // Advance c1 side
-        if ((cmp>=0) && e1>=0) {
-            if (toPrev1>=0) {
-                int e=e_next[toPrev1];
-                while (e!=min1) { int n=e_next[e]; dnc_remove_edge_pair(e_target,e_reverse,e_next,e_prev,v_edge,e_free,n_free,e); e=n; }
-            }
-            if (pendingTail1>=0) {
-                if (toPrev1>=0) { dnc_edge_link(e_next,e_prev,toPrev1,pendingHead1); }
-                else { dnc_edge_link(e_next,e_prev,e_prev[min1],pendingHead1); firstNew1=pendingHead1; }
-                dnc_edge_link(e_next,e_prev,pendingTail1,min1);
-                pendingHead1=-1; pendingTail1=-1;
-            } else if (toPrev1<0) { firstNew1=min1; }
-            prevPt_x=pts[c1*3]; prevPt_y=pts[c1*3+1]; prevPt_z=pts[c1*3+2];
-            c1=e_target[e1]; toPrev1=e_reverse[e1];
-        }
-
-        // Advance c0 side
-        if ((cmp<=0) && e0>=0) {
-            if (toPrev0>=0) {
-                int e=e_prev[toPrev0];
-                while (e!=min0) { int n=e_prev[e]; dnc_remove_edge_pair(e_target,e_reverse,e_next,e_prev,v_edge,e_free,n_free,e); e=n; }
-            }
-            if (pendingTail0>=0) {
-                if (toPrev0>=0) { dnc_edge_link(e_next,e_prev,pendingHead0,toPrev0); }
-                else { dnc_edge_link(e_next,e_prev,pendingHead0,e_next[min0]); firstNew0=pendingHead0; }
-                dnc_edge_link(e_next,e_prev,min0,pendingTail0);
-                pendingHead0=-1; pendingTail0=-1;
-            } else if (toPrev0<0) { firstNew0=min0; }
-            prevPt_x=pts[c0*3]; prevPt_y=pts[c0*3+1]; prevPt_z=pts[c0*3+2];
-            c0=e_target[e0]; toPrev0=e_reverse[e0];
-        }
-
-        // Termination: seam closed
-        if (c0==first0 && c1==first1) {
-            if (toPrev0<0) {
-                dnc_edge_link(e_next,e_prev,pendingHead0,pendingTail0);
-                v_edge[c0]=pendingTail0;
-            } else {
-                int e=e_prev[toPrev0];
-                while (e!=firstNew0) { int n=e_prev[e]; dnc_remove_edge_pair(e_target,e_reverse,e_next,e_prev,v_edge,e_free,n_free,e); e=n; }
-                if (pendingTail0>=0) {
-                    dnc_edge_link(e_next,e_prev,pendingHead0,toPrev0);
-                    dnc_edge_link(e_next,e_prev,firstNew0,pendingTail0);
+        if ((cmp >= 0) && e1) {
+            if (toPrev1) {
+                for (BtEdge *e = toPrev1->next, *n = NULL; e != min1; e = n) {
+                    n = e->next;
+                    bt_removeEdgePair(s, e);
                 }
             }
-            if (toPrev1<0) {
-                dnc_edge_link(e_next,e_prev,pendingTail1,pendingHead1);
-                v_edge[c1]=pendingTail1;
+            if (pendingTail1) {
+                if (toPrev1) bt_edge_link(toPrev1, pendingHead1);
+                else { bt_edge_link(min1->prev, pendingHead1); firstNew1 = pendingHead1; }
+                bt_edge_link(pendingTail1, min1);
+                pendingHead1 = NULL; pendingTail1 = NULL;
+            } else if (!toPrev1) {
+                firstNew1 = min1;
+            }
+            prevPoint = c1->point;
+            c1 = e1->target;
+            toPrev1 = e1->reverse;
+        }
+
+        if ((cmp <= 0) && e0) {
+            if (toPrev0) {
+                for (BtEdge *e = toPrev0->prev, *n = NULL; e != min0; e = n) {
+                    n = e->prev;
+                    bt_removeEdgePair(s, e);
+                }
+            }
+            if (pendingTail0) {
+                if (toPrev0) bt_edge_link(pendingHead0, toPrev0);
+                else { bt_edge_link(pendingHead0, min0->next); firstNew0 = pendingHead0; }
+                bt_edge_link(min0, pendingTail0);
+                pendingHead0 = NULL; pendingTail0 = NULL;
+            } else if (!toPrev0) {
+                firstNew0 = min0;
+            }
+            prevPoint = c0->point;
+            c0 = e0->target;
+            toPrev0 = e0->reverse;
+        }
+
+        if ((c0 == first0) && (c1 == first1)) {
+            if (toPrev0 == NULL) {
+                bt_edge_link(pendingHead0, pendingTail0);
+                c0->edges = pendingTail0;
             } else {
-                int e=e_next[toPrev1];
-                while (e!=firstNew1) { int n=e_next[e]; dnc_remove_edge_pair(e_target,e_reverse,e_next,e_prev,v_edge,e_free,n_free,e); e=n; }
-                if (pendingTail1>=0) {
-                    dnc_edge_link(e_next,e_prev,toPrev1,pendingHead1);
-                    dnc_edge_link(e_next,e_prev,pendingTail1,firstNew1);
+                for (BtEdge *e = toPrev0->prev, *n = NULL; e != firstNew0; e = n) {
+                    n = e->prev;
+                    bt_removeEdgePair(s, e);
+                }
+                if (pendingTail0) {
+                    bt_edge_link(pendingHead0, toPrev0);
+                    bt_edge_link(firstNew0, pendingTail0);
+                }
+            }
+            if (toPrev1 == NULL) {
+                bt_edge_link(pendingTail1, pendingHead1);
+                c1->edges = pendingTail1;
+            } else {
+                for (BtEdge *e = toPrev1->next, *n = NULL; e != firstNew1; e = n) {
+                    n = e->next;
+                    bt_removeEdgePair(s, e);
+                }
+                if (pendingTail1) {
+                    bt_edge_link(toPrev1, pendingHead1);
+                    bt_edge_link(pendingTail1, firstNew1);
                 }
             }
             return;
         }
-
         firstRun = false;
     }
 }
 
-// ---------------------------------------------------------------------------
-// hull_dandc_warp — main entry point
-// ---------------------------------------------------------------------------
+// ============================================================================
+// computeInternal — recursive D&C
+// ============================================================================
 
-__device__ float hull_dandc_warp(
-    const float* pts,
-    int          n_pts,
-    int          lane,
-    WarpPool*    pool,
-    int*         error)
-{
-    *error = 0;
-    if (n_pts < 4) { *error = 2; return -1.0f; }
-
-    // Step 1: AABB (warp-parallel)
-    float lo[3]={1e30f,1e30f,1e30f}, hi[3]={-1e30f,-1e30f,-1e30f};
-    for (int i=lane; i<n_pts; i+=WARP_SIZE) {
-        float x=pts[i*3],y=pts[i*3+1],z=pts[i*3+2];
-        lo[0]=fminf(lo[0],x); hi[0]=fmaxf(hi[0],x);
-        lo[1]=fminf(lo[1],y); hi[1]=fmaxf(hi[1],y);
-        lo[2]=fminf(lo[2],z); hi[2]=fmaxf(hi[2],z);
-    }
-    for (int k=0;k<3;k++) {
-        for (int off=16;off>0;off>>=1) {
-            lo[k]=fminf(lo[k],__shfl_xor_sync(WARP_MASK,lo[k],off));
-            hi[k]=fmaxf(hi[k],__shfl_xor_sync(WARP_MASK,hi[k],off));
-        }
-    }
-    __syncwarp(WARP_MASK);
-
-    // Thread 0 picks axes
-    int max_ax=0, med_ax=1, min_ax=2;
-    if (lane==0) {
-        int order[3]={0,1,2};
-        float exts[3]={hi[0]-lo[0],hi[1]-lo[1],hi[2]-lo[2]};
-        for (int a=1;a<3;a++)
-            for (int b=a; b>0 && exts[order[b]]>exts[order[b-1]]; b--)
-                { int t=order[b]; order[b]=order[b-1]; order[b-1]=t; }
-        max_ax=order[0]; med_ax=order[1]; min_ax=order[2];
-    }
-    max_ax=warp_bcast_i(max_ax); med_ax=warp_bcast_i(med_ax); min_ax=warp_bcast_i(min_ax);
-
-    // Step 2: Allocate
-    int max_e = n_pts*12+32;
-
-    float* sorted_pts=(float*)warp_pool_alloc(pool,n_pts*3*(int)sizeof(float),lane);
-    int*   int_pts   =(int*)  warp_pool_alloc(pool,n_pts*3*(int)sizeof(int),lane);
-    float* temp_pts  =(float*)warp_pool_alloc(pool,n_pts*3*(int)sizeof(float),lane);
-    int*   sort_idx  =(int*)  warp_pool_alloc(pool,n_pts*(int)sizeof(int),lane);
-    int*   temp_idx  =(int*)  warp_pool_alloc(pool,n_pts*(int)sizeof(int),lane);
-    int*   v_edge    =(int*)  warp_pool_alloc(pool,n_pts*(int)sizeof(int),lane);
-    int*   v_next    =(int*)  warp_pool_alloc(pool,n_pts*(int)sizeof(int),lane);
-    int*   v_prev    =(int*)  warp_pool_alloc(pool,n_pts*(int)sizeof(int),lane);
-    int*   e_target  =(int*)  warp_pool_alloc(pool,max_e*(int)sizeof(int),lane);
-    int*   e_reverse =(int*)  warp_pool_alloc(pool,max_e*(int)sizeof(int),lane);
-    int*   e_next    =(int*)  warp_pool_alloc(pool,max_e*(int)sizeof(int),lane);
-    int*   e_prev    =(int*)  warp_pool_alloc(pool,max_e*(int)sizeof(int),lane);
-    int*   e_copy    =(int*)  warp_pool_alloc(pool,max_e*(int)sizeof(int),lane);
-    int*   e_free    =(int*)  warp_pool_alloc(pool,max_e*(int)sizeof(int),lane);
-    // IntermediateHull: [minXy, maxXy, minYx, maxYx] * n_pts
-    int*   hull_data =(int*)  warp_pool_alloc(pool,n_pts*4*(int)sizeof(int),lane);
-    int*   e_visited =(int*)  warp_pool_alloc(pool,max_e*(int)sizeof(int),lane);
-    // scalars[0..7] ints, scalars[8..10] floats (scale factors)
-    int*   scalars   =(int*)  warp_pool_alloc(pool,16*(int)sizeof(int),lane);
-
-    __syncwarp(WARP_MASK);
-    if (pool->error) { *error=1; return -1.0f; }
-
-    // Step 3: Convert to int32, sort (thread 0)
-    if (lane==0) {
-        float center[3], inv_scale[3], scale_f[3];
-        for (int k=0;k<3;k++) {
-            center[k]=(lo[k]+hi[k])*0.5f;
-            float ext=hi[k]-lo[k];
-            scale_f[k] = (ext>0.0f) ? ext/10216.0f : 1.0f;
-            inv_scale[k] = (ext>0.0f) ? 10216.0f/ext : 1.0f;
-        }
-        ((float*)scalars)[8]=scale_f[0];
-        ((float*)scalars)[9]=scale_f[1];
-        ((float*)scalars)[10]=scale_f[2];
-
-        // Bullet sign flip: ensure right-handed (x=med, y=max, z=min) system.
-        // If (medAxis+1)%3 != maxAxis, negate all axes to preserve orientation.
-        float sign_flip = (((med_ax+1)%3) != max_ax) ? -1.0f : 1.0f;
-
-        for (int i=0;i<n_pts;i++) {
-            sorted_pts[i*3]=pts[i*3]; sorted_pts[i*3+1]=pts[i*3+1]; sorted_pts[i*3+2]=pts[i*3+2];
-            // Bullet layout: x=med, y=max, z=min
-            int_pts[i*3]  =(int)(sign_flip*(pts[i*3+med_ax]-center[med_ax])*inv_scale[med_ax]);
-            int_pts[i*3+1]=(int)(sign_flip*(pts[i*3+max_ax]-center[max_ax])*inv_scale[max_ax]);
-            int_pts[i*3+2]=(int)(sign_flip*(pts[i*3+min_ax]-center[min_ax])*inv_scale[min_ax]);
-            sort_idx[i]=i;
-        }
-
-        // Merge sort by (y=max, x=med, z=min)
-        for (int width=1; width<n_pts; width*=2) {
-            for (int lo_i=0; lo_i<n_pts; lo_i+=2*width) {
-                int mid=lo_i+width; if(mid>n_pts) mid=n_pts;
-                int hi_i=lo_i+2*width; if(hi_i>n_pts) hi_i=n_pts;
-                int i=lo_i, j=mid, k=lo_i;
-                while (i<mid && j<hi_i) {
-                    int a=sort_idx[i], b=sort_idx[j];
-                    bool af;
-                    if (int_pts[a*3+1]!=int_pts[b*3+1]) af=(int_pts[a*3+1]<int_pts[b*3+1]);
-                    else if (int_pts[a*3]!=int_pts[b*3]) af=(int_pts[a*3]<int_pts[b*3]);
-                    else af=(int_pts[a*3+2]<=int_pts[b*3+2]);
-                    temp_idx[k++] = af ? sort_idx[i++] : sort_idx[j++];
+__device__ void bt_computeInternal(BtHullState* s, int start, int end, BtIntermediateHull* result) {
+    int n = end - start;
+    switch (n) {
+    case 0:
+        result->minXy = NULL; result->maxXy = NULL;
+        result->minYx = NULL; result->maxYx = NULL;
+        return;
+    case 2: {
+        BtVertex* v = s->originalVertices[start];
+        BtVertex* w = v + 1;
+        if (bp32_ne(v->point, w->point)) {
+            int dx = v->point.x - w->point.x;
+            int dy = v->point.y - w->point.y;
+            if ((dx == 0) && (dy == 0)) {
+                if (v->point.z > w->point.z) { BtVertex* t = w; w = v; v = t; }
+                v->next = v; v->prev = v;
+                result->minXy = v; result->maxXy = v;
+                result->minYx = v; result->maxYx = v;
+            } else {
+                v->next = w; v->prev = w; w->next = v; w->prev = v;
+                if ((dx < 0) || ((dx == 0) && (dy < 0))) {
+                    result->minXy = v; result->maxXy = w;
+                } else {
+                    result->minXy = w; result->maxXy = v;
                 }
-                while (i<mid) temp_idx[k++]=sort_idx[i++];
-                while (j<hi_i) temp_idx[k++]=sort_idx[j++];
-            }
-            for (int i=0;i<n_pts;i++) sort_idx[i]=temp_idx[i];
-        }
-
-        // Rearrange sorted_pts by sort order
-        for (int i=0;i<n_pts;i++) {
-            int s=sort_idx[i];
-            temp_pts[i*3]=sorted_pts[s*3]; temp_pts[i*3+1]=sorted_pts[s*3+1]; temp_pts[i*3+2]=sorted_pts[s*3+2];
-        }
-        for (int i=0;i<n_pts*3;i++) sorted_pts[i]=temp_pts[i];
-
-        // Rearrange int_pts (reuse temp_pts as int scratch — same size)
-        int* ti=(int*)temp_pts;
-        for (int i=0;i<n_pts;i++) {
-            int s=sort_idx[i];
-            ti[i*3]=int_pts[s*3]; ti[i*3+1]=int_pts[s*3+1]; ti[i*3+2]=int_pts[s*3+2];
-        }
-        for (int i=0;i<n_pts*3;i++) int_pts[i]=ti[i];
-
-        // Deduplicate: remove points with identical int32 coords (sorted, so dupes are adjacent).
-        // Keep first occurrence; compact both int_pts and sorted_pts in-place.
-        {
-            int w = 0;
-            for (int i = 0; i < n_pts; i++) {
-                if (i > 0 && int_pts[i*3]==int_pts[(i-1)*3] &&
-                    int_pts[i*3+1]==int_pts[(i-1)*3+1] &&
-                    int_pts[i*3+2]==int_pts[(i-1)*3+2])
-                    continue;
-                if (w != i) {
-                    int_pts[w*3]=int_pts[i*3]; int_pts[w*3+1]=int_pts[i*3+1]; int_pts[w*3+2]=int_pts[i*3+2];
-                    sorted_pts[w*3]=sorted_pts[i*3]; sorted_pts[w*3+1]=sorted_pts[i*3+1]; sorted_pts[w*3+2]=sorted_pts[i*3+2];
+                if ((dy < 0) || ((dy == 0) && (dx < 0))) {
+                    result->minYx = v; result->maxYx = w;
+                } else {
+                    result->minYx = w; result->maxYx = v;
                 }
-                w++;
             }
-            n_pts = w;
-            if (n_pts < 4) { scalars[0] = 2; }
+            BtEdge* e = bt_newEdgePair(s, v, w);
+            if (!e) return;
+            bt_edge_link(e, e); v->edges = e;
+            e = e->reverse;
+            bt_edge_link(e, e); w->edges = e;
+            return;
         }
-
-        if (scalars[0]) { // degenerate after dedup
-            scalars[1] = 0;
-        } else {
-
-        // Initialize half-edge arrays
-        for (int i=0;i<max_e;i++) {
-            e_target[i]=-1; e_reverse[i]=-1; e_next[i]=-1; e_prev[i]=-1; e_copy[i]=0;
-        }
-
-        // Initialize per-vertex: single-vertex hulls
-        for (int i=0;i<n_pts;i++) {
-            v_edge[i]=-1;
-            v_next[i]=i; v_prev[i]=i; // circular self-loop
-            hull_data[i*4+0]=i; // minXy
-            hull_data[i*4+1]=i; // maxXy
-            hull_data[i*4+2]=i; // minYx
-            hull_data[i*4+3]=i; // maxYx
-        }
-
-        // Step 4: Bottom-up pairwise merge
-        int n_hulls=n_pts;
-        int merge_stamp=0;
-        int n_free_val=0, n_alloc_val=0;
-        int err_flag=0;
-
-        while (n_hulls>1 && !err_flag) {
-            int new_n=0;
-            for (int h=0; h+1<n_hulls; h+=2) {
-                merge_stamp--;
-                int h0m=hull_data[h*4+0], h0M=hull_data[h*4+1];
-                int h0y=hull_data[h*4+2], h0Y=hull_data[h*4+3];
-                int h1m=hull_data[(h+1)*4+0], h1M=hull_data[(h+1)*4+1];
-                int h1y=hull_data[(h+1)*4+2], h1Y=hull_data[(h+1)*4+3];
-
-                dnc_merge(int_pts, v_next, v_prev, v_edge,
-                    e_target, e_reverse, e_next, e_prev, e_copy,
-                    e_free, &n_free_val, &n_alloc_val, max_e,
-                    &h0m, &h0M, &h0y, &h0Y,
-                    h1m, h1M, h1y, h1Y,
-                    merge_stamp, &err_flag);
-
-                hull_data[new_n*4+0]=h0m; hull_data[new_n*4+1]=h0M;
-                hull_data[new_n*4+2]=h0y; hull_data[new_n*4+3]=h0Y;
-                new_n++;
-            }
-            if (n_hulls&1) {
-                hull_data[new_n*4+0]=hull_data[(n_hulls-1)*4+0];
-                hull_data[new_n*4+1]=hull_data[(n_hulls-1)*4+1];
-                hull_data[new_n*4+2]=hull_data[(n_hulls-1)*4+2];
-                hull_data[new_n*4+3]=hull_data[(n_hulls-1)*4+3];
-                new_n++;
-            }
-            n_hulls=new_n;
-        }
-
-        scalars[0]=err_flag;
-        scalars[1]=n_alloc_val;
-        } // end else (non-degenerate)
     }
-    __syncwarp(WARP_MASK);
+    // fallthrough
+    case 1: {
+        BtVertex* v = s->originalVertices[start];
+        v->edges = NULL;
+        v->next = v; v->prev = v;
+        result->minXy = v; result->maxXy = v;
+        result->minYx = v; result->maxYx = v;
+        return;
+    }
+    }
 
-    if (warp_bcast_i(scalars[0])) { *error=1; return -1.0f; }
+    int split0 = start + n / 2;
+    BtPoint32 p = s->originalVertices[split0 - 1]->point;
+    int split1 = split0;
+    while ((split1 < end) && bp32_eq(s->originalVertices[split1]->point, p)) split1++;
 
-    // Step 5: Compute volume from half-edge graph (thread 0)
-    // Only traverse edges reachable from a known hull vertex (minXy).
-    // Interior vertices (not on hull surface) retain edges from sub-hull
-    // merges but must be excluded — same as Bullet's output conversion.
-    float total_vol=0.0f;
-    if (lane==0) {
-        int n_alloc_val=scalars[1];
+    bt_computeInternal(s, start, split0, result);
+    BtIntermediateHull hull1;
+    bt_computeInternal(s, split1, end, &hull1);
+    bt_merge(s, result, &hull1);
+}
 
-        // BFS to find all hull-surface edges, starting from minXy's edge
-        int start_v = hull_data[0]; // minXy vertex
-        for (int e=0;e<n_alloc_val;e++) e_visited[e]=0;
+// ============================================================================
+// Point sorting (insertion sort, fine for n <= a few thousand)
+// ============================================================================
 
-        if (v_edge[start_v] >= 0) {
-            // Use temp_idx as BFS queue of edge indices
-            int q_head=0, q_tail=0;
-            // Seed: all edges from start vertex
-            int se = v_edge[start_v];
-            int e_it = se;
-            do {
-                if (e_it>=0 && e_it<n_alloc_val && !e_visited[e_it]) {
-                    e_visited[e_it] = 1;
-                    temp_idx[q_tail++] = e_it;
-                    // Also mark reverse
-                    int r=e_reverse[e_it];
-                    if (r>=0 && r<n_alloc_val && !e_visited[r]) {
-                        e_visited[r] = 1;
-                        temp_idx[q_tail++] = r;
-                    }
+__device__ inline bool bt_pointCmp(BtPoint32 p, BtPoint32 q) {
+    return (p.y < q.y) || ((p.y == q.y) && ((p.x < q.x) || ((p.x == q.x) && (p.z < q.z))));
+}
+
+__device__ inline void bt_insertionSort(BtPoint32* arr, int n) {
+    for (int i = 1; i < n; i++) {
+        BtPoint32 key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && bt_pointCmp(key, arr[j])) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+// ============================================================================
+// Volume extraction from half-edge hull
+// ============================================================================
+
+__device__ inline float bt_computeVolume(BtHullState* s) {
+    if (!s->vertexList) return 0.0f;
+
+    int stamp = --s->mergeStamp;
+
+    // Use pool for DFS stack
+    // Count vertices first (traverse linked list)
+    int vcount = 0;
+    {
+        BtVertex* v = s->vertexList;
+        v->copy = stamp;
+        vcount = 1;
+        // Walk edges to count reachable vertices
+        // We'll use a simple DFS with a pre-allocated stack
+    }
+
+    // Allocate a stack of vertex pointers (generous size)
+    int maxStack = 4096;
+    BtVertex** stack = (BtVertex**)bt_alloc(s->wp, maxStack * (int)sizeof(BtVertex*));
+    if (!stack) return -1.0f;
+
+    s->vertexList->copy = stamp;
+    stack[0] = s->vertexList;
+    int stackSize = 1;
+
+    BtPoint32 ref = s->vertexList->point;
+    BtInt128 volume = bt128_from_u64(0);
+
+    while (stackSize > 0) {
+        BtVertex* v = stack[--stackSize];
+        BtEdge* e = v->edges;
+        if (!e) continue;
+        do {
+            if (e->target->copy != stamp) {
+                e->target->copy = stamp;
+                if (stackSize < maxStack) {
+                    stack[stackSize++] = e->target;
                 }
-                e_it = e_next[e_it];
-            } while (e_it != se && e_it>=0);
-
-            // BFS: for each edge, follow its target vertex's edge ring
-            while (q_head < q_tail) {
-                int edge = temp_idx[q_head++];
-                int tgt = e_target[edge];
-                if (tgt<0 || tgt>=n_pts || v_edge[tgt]<0) continue;
-                int te = v_edge[tgt];
-                int t_it = te;
+            }
+            if (e->copy != stamp) {
+                // Walk face: fan-triangulate from first vertex
+                BtVertex* a = NULL;
+                BtVertex* b = NULL;
+                BtEdge* f = e;
                 do {
-                    if (t_it>=0 && t_it<n_alloc_val && !e_visited[t_it]) {
-                        e_visited[t_it] = 1;
-                        temp_idx[q_tail++] = t_it;
-                        int r=e_reverse[t_it];
-                        if (r>=0 && r<n_alloc_val && !e_visited[r]) {
-                            e_visited[r] = 1;
-                            temp_idx[q_tail++] = r;
-                        }
+                    if (a && b) {
+                        // Triangle: (v, a, b) — compute signed tet volume with ref
+                        BtPoint32 va = bp32_sub(v->point, ref);
+                        BtPoint32 pa = bp32_sub(a->point, ref);
+                        BtPoint32 pb = bp32_sub(b->point, ref);
+                        long long vol = bp32_dot64(va, bp32_cross(pa, pb));
+                        volume = bt128_add(volume, bt128_from_i64(vol));
                     }
-                    t_it = e_next[t_it];
-                } while (t_it != te && t_it>=0);
+                    f->copy = stamp;
+                    f->face = NULL; // reuse face field
+                    a = b;
+                    b = f->target;
+                    f = f->reverse->prev;
+                } while (f != e);
             }
+            e = e->next;
+        } while (e != v->edges);
+    }
+
+    // Volume is in integer coordinates.
+    // Convert: float_volume = |volume_sum| * |sx * sy * sz| / 6.0
+    // where scaling = (max-min)/10216 with axis permutation.
+    float sv = bt128_to_float(volume);
+    float scale = s->scaling[0] * s->scaling[1] * s->scaling[2];
+    float vol = fabsf(sv * scale) / 6.0f;
+    return vol;
+}
+
+// ============================================================================
+// Main entry: compute hull and return volume
+// ============================================================================
+
+__device__ inline void bt_compute(BtHullState* s, const float* pts, int count) {
+    // Find AABB
+    float mn[3] = {1e30f, 1e30f, 1e30f};
+    float mx[3] = {-1e30f, -1e30f, -1e30f};
+    for (int i = 0; i < count; i++) {
+        for (int k = 0; k < 3; k++) {
+            float v = pts[i * 3 + k];
+            if (v < mn[k]) mn[k] = v;
+            if (v > mx[k]) mx[k] = v;
         }
+    }
 
-        // Now e_visited marks only hull-surface edges.
-        // Reset visited for face tracing, but only consider marked edges.
-        // Use a second pass: mark edges as "surface" in e_visited (value=1),
-        // then trace faces only from surface edges, marking traced as 2.
-        for (int e0=0; e0<n_alloc_val; e0++) {
-            if (e_visited[e0] != 1) continue; // not surface or already traced
+    float span[3] = {mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]};
+    int maxAx = (span[0] >= span[1]) ? ((span[0] >= span[2]) ? 0 : 2) : ((span[1] >= span[2]) ? 1 : 2);
+    int minAx = (span[0] <= span[1]) ? ((span[0] <= span[2]) ? 0 : 2) : ((span[1] <= span[2]) ? 1 : 2);
+    if (minAx == maxAx) minAx = (maxAx + 1) % 3;
+    int medAx = 3 - maxAx - minAx;
 
-            // Trace face cycle: face_next(e) = e_next[e_reverse[e]]
-            int face_verts[64];
-            int nfv=0;
-            int e_cur=e0;
-            do {
-                if (e_reverse[e_cur]<0 || e_reverse[e_cur]>=n_alloc_val) break;
-                int src_v=e_target[e_reverse[e_cur]];
-                if (nfv<62) face_verts[nfv++]=src_v;
-                e_visited[e_cur]=2; // mark as traced
-                int rev=e_reverse[e_cur];
-                if (e_next[rev]<0 || e_next[rev]>=n_alloc_val) break;
-                e_cur=e_next[rev];
-                if (nfv>62) break;
-            } while (e_cur!=e0);
+    s->maxAxis = maxAx;
+    s->minAxis = minAx;
+    s->medAxis = medAx;
 
-            if (nfv<3) continue;
+    float sc[3];
+    sc[0] = span[0] / 10216.0f;
+    sc[1] = span[1] / 10216.0f;
+    sc[2] = span[2] / 10216.0f;
+    if (((medAx + 1) % 3) != maxAx) {
+        sc[0] = -sc[0]; sc[1] = -sc[1]; sc[2] = -sc[2];
+    }
+    s->scaling[0] = sc[0];
+    s->scaling[1] = sc[1];
+    s->scaling[2] = sc[2];
 
-            // Fan-triangulate using FLOAT coordinates
-            float* p0=sorted_pts+face_verts[0]*3;
-            for (int k=1;k<nfv-1;k++) {
-                float* p1=sorted_pts+face_verts[k]*3;
-                float* p2=sorted_pts+face_verts[k+1]*3;
-                total_vol+=signed_tet_volume(
-                    p0[0],p0[1],p0[2],
-                    p1[0],p1[1],p1[2],
-                    p2[0],p2[1],p2[2]);
+    float inv[3];
+    inv[0] = (sc[0] != 0.0f) ? 1.0f / sc[0] : 0.0f;
+    inv[1] = (sc[1] != 0.0f) ? 1.0f / sc[1] : 0.0f;
+    inv[2] = (sc[2] != 0.0f) ? 1.0f / sc[2] : 0.0f;
+
+    s->center[0] = (mn[0] + mx[0]) * 0.5f;
+    s->center[1] = (mn[1] + mx[1]) * 0.5f;
+    s->center[2] = (mn[2] + mx[2]) * 0.5f;
+
+    // Allocate and fill Point32 array
+    BtPoint32* points = (BtPoint32*)bt_alloc(s->wp, count * (int)sizeof(BtPoint32));
+    if (!points) return;
+    for (int i = 0; i < count; i++) {
+        float p[3];
+        for (int k = 0; k < 3; k++)
+            p[k] = (pts[i*3+k] - s->center[k]) * inv[k];
+        points[i].x = (int)p[medAx];
+        points[i].y = (int)p[maxAx];
+        points[i].z = (int)p[minAx];
+        points[i].index = i;
+    }
+
+    bt_insertionSort(points, count);
+
+    // Allocate vertices
+    btpool_init(&s->vertexPool, s->wp, count, (int)sizeof(BtVertex));
+    s->originalVertices = (BtVertex**)bt_alloc(s->wp, count * (int)sizeof(BtVertex*));
+    if (!s->originalVertices) return;
+
+    // Pre-allocate vertex block contiguously so v+1 works for case 2
+    BtVertex* vblock = (BtVertex*)bt_alloc(s->wp, count * (int)sizeof(BtVertex));
+    if (!vblock) return;
+    for (int i = 0; i < count; i++) {
+        BtVertex* v = &vblock[i];
+        v->edges = NULL;
+        v->next = NULL; v->prev = NULL;
+        v->firstNearbyFace = NULL; v->lastNearbyFace = NULL;
+        v->point = points[i];
+        v->copy = -1;
+        v->point128.x = bt128_from_u64(0);
+        v->point128.y = bt128_from_u64(0);
+        v->point128.z = bt128_from_u64(0);
+        v->point128.den = bt128_from_u64(1);
+        s->originalVertices[i] = v;
+    }
+
+    btpool_init(&s->edgePool, s->wp, 6 * count, (int)sizeof(BtEdge));
+    btpool_init(&s->facePool, s->wp, 2 * count, (int)sizeof(BtFace));
+
+    s->usedEdgePairs = 0;
+    s->mergeStamp = -3;
+
+    BtIntermediateHull hull;
+    bt_computeInternal(s, 0, count, &hull);
+    s->vertexList = hull.minXy;
+}
+
+// ============================================================================
+// Warp entry point
+// ============================================================================
+
+__device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* pool, int* err) {
+    float vol = 0.0f;
+    if (lane == 0) {
+        *err = 0;
+        if (n < 4) {
+            vol = 0.0f;
+        } else {
+            BtHullState state;
+            state.wp = pool;
+            state.vertexList = NULL;
+
+            bt_compute(&state, pts, n);
+
+            if (pool->error) {
+                *err = 1;
+                vol = -1.0f;
+            } else {
+                vol = bt_computeVolume(&state);
+                if (pool->error) { *err = 1; vol = -1.0f; }
             }
         }
     }
-    __syncwarp(WARP_MASK);
-
-    total_vol=warp_bcast_f(total_vol);
-    return fabsf(total_vol);
+    // Broadcast result from lane 0
+    vol = __shfl_sync(WARP_MASK, vol, 0);
+    int e = __shfl_sync(WARP_MASK, *err, 0);
+    *err = e;
+    return vol;
 }
 
 #endif // HULL_DANDC_CUH

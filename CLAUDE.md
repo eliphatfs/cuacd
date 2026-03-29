@@ -23,7 +23,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   hull_warp.cuh       #   Umbrella include for warp-parallel hull algorithms
   hull_warp_common.cuh#   WarpPool allocator + warp reductions (shared by QuickHull & D&C)
   hull_quickhull.cuh  #   QuickHull warp algorithm (algo=1)
-  hull_dandc.cuh      #   Preparata-Hong D&C warp algorithm (algo=2, broken)
+  hull_dandc.cuh      #   Preparata-Hong D&C hull volume (algo=2, Bullet btConvexHullComputer port, lane-0 only)
   hull_batch.cu       #   batch_hull_volume kernel dispatcher (algo 0/1/2)
   beam_search.cu      #   Beam search kernels + compute_rv_for_tris device function
   hausdorff.cu        #   Hausdorff kernels (point_mesh_distance, reduce_max, pairwise)
@@ -376,9 +376,9 @@ With single-face assignment (each point assigned to the face with maximum positi
 
 `if (n_faces >= max_faces - WARP_SIZE) break` with WARP_SIZE=32: for small n (e.g., n=8: max_faces=24, 24-32=-8), this evaluates as n_faces >= negative number — always true — causing immediate loop exit after the initial tetrahedron. Fix: use `max_faces` directly.
 
-### D&C: Ported from Bullet's btConvexHullComputer
+### D&C: Faithful Port of Bullet's btConvexHullComputer
 
-The D&C algorithm was rewritten by porting from Bullet's `btConvexHullComputer` (Ole Kniemeyer, MAXON). Key elements: int32 coordinates with exact Int128/Rational64 predicates, `mergeProjection` for 2D bridge finding, `findMaxAngle` with exact cotangent comparison, `findEdgeForCoplanarFaces` for coplanar handling, and the full `merge` function with interior edge deletion via `removeEdgePair`. The iterative bottom-up structure was kept (no recursion on GPU).
+The D&C algorithm is a faithful port of Bullet's `btConvexHullComputer` (Ole Kniemeyer, MAXON, zlib license). Runs entirely on lane 0 of each warp (no GPU parallelism within the algorithm). Key elements: int32 coordinates with exact Int128/Rational64/Rational128 predicates, recursive `computeInternal` D&C, `mergeProjection` for 2D bridge finding, `findMaxAngle` with exact cotangent comparison, `findEdgeForCoplanarFaces` for coplanar handling, and the full `merge` function with interior edge deletion via `removeEdgePair`. Memory is allocated from WarpPool bump allocator with free-list recycling for edges. Volume is extracted by walking the half-edge graph and summing signed tetrahedra in integer coordinates, then converting back via the scaling factor. Requires 2MB scratch per hull and 32KB thread stack (set via `cuCtxSetLimit`).
 
 ### pyproject.toml license Field Format
 
@@ -397,7 +397,7 @@ PEP 621 requires `license = {text = "MIT"}` or `license = {file = "LICENSE"}`. T
 - GPU beam search tests pass (cube convexity, L-shape decomposition, beam params)
 - `batch_mesh_volume` GPU kernel (divergence theorem, watertight meshes) — tested
 - `batch_hull_volume` algo=0 (incremental, ≤256 pts), algo=1 (QuickHull warp), algo=2 (D&C warp) — all tested and passing
-- Full pytest suite: 106 passed
+- Full pytest suite: 121 passed (2 pre-existing failures in algo=0/1 gaussian)
 
 ### Not Yet Implemented
 - Connected components after clipping (design step 1)

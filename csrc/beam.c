@@ -1213,9 +1213,15 @@ int beam_batch_hull_volume(
                                 BLOCK_SIZE, 1, 1, 0, s, args, NULL));
     } else {
         // Warp kernels: 8 warps per block (BLOCK_SIZE=256), need scratch
-        // D&C hull needs ~408 bytes/point (7 edge arrays × 12n, vertex arrays, etc.)
-        // QuickHull needs ~256 bytes/point. Use larger of the two.
-        size_t scratch_per = (size_t)max_pts_per_hull * 512 + 8192;
+        // D&C hull (Bullet port) needs large structs (~1KB/vertex + edge/face pools).
+        // QuickHull needs ~256 bytes/point.
+        size_t scratch_per;
+        if (algo == 2) {
+            // D&C: generous 2MB per hull
+            scratch_per = 2 * 1024 * 1024;
+        } else {
+            scratch_per = (size_t)max_pts_per_hull * 512 + 8192;
+        }
         size_t total_scratch = (size_t)n_hulls * scratch_per;
         CHECK_CU(cuMemAlloc(&d_scratch, total_scratch));
         CHECK_CU(cuMemsetD8Async(d_scratch, 0, total_scratch, s));
@@ -1223,6 +1229,11 @@ int beam_batch_hull_volume(
         int warps_per_block = BLOCK_SIZE / 32;
         int n_blocks = (n_hulls + warps_per_block - 1) / warps_per_block;
         int scratch_per_i = (int)scratch_per;
+
+        // D&C uses recursion — increase thread stack size
+        if (algo == 2) {
+            CHECK_CU(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, 32 * 1024));
+        }
 
         void* args[] = { &d_pts, &d_off, &d_vols, &d_errs,
                          &d_scratch, &scratch_per_i, &n_hulls };
