@@ -15,5 +15,6 @@ extern "C" {
 #include "mesh_transform.cu"
 #include "hausdorff.cu"
 #include "test_kernels.cu"
+#include "hull_batch.cu"
 
 } // extern "C"

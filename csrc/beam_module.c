@@ -391,6 +391,55 @@ static PyObject* py_test_block_reduce_bbox(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// batch_hull_volume(pts_ptr, total_pts, offsets_ptr, n_hulls, algo,
+//                  max_pts_per_hull, vols_ptr, errs_ptr) -> None
+// ---------------------------------------------------------------------------
+
+static PyObject* py_batch_hull_volume(PyObject* self, PyObject* args) {
+    unsigned long long pts_ptr, offsets_ptr, vols_ptr, errs_ptr;
+    int total_pts, n_hulls, algo, max_pts_per_hull;
+    if (!PyArg_ParseTuple(args, "KiKiiiKK",
+            &pts_ptr, &total_pts, &offsets_ptr, &n_hulls,
+            &algo, &max_pts_per_hull, &vols_ptr, &errs_ptr))
+        return NULL;
+    REQUIRE_CTX();
+    int rc = beam_batch_hull_volume(g_state.ctx,
+        (const float*)(uintptr_t)pts_ptr, total_pts,
+        (const int*)  (uintptr_t)offsets_ptr, n_hulls,
+        algo, max_pts_per_hull,
+        (float*)(uintptr_t)vols_ptr,
+        (int*)  (uintptr_t)errs_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// batch_mesh_volume(verts_ptr, total_verts, tris_ptr, total_tris,
+//                  tri_off_ptr, vert_off_ptr, n_meshes, vols_ptr) -> None
+// ---------------------------------------------------------------------------
+
+static PyObject* py_batch_mesh_volume(PyObject* self, PyObject* args) {
+    unsigned long long verts_ptr, tris_ptr, toff_ptr, voff_ptr, vols_ptr;
+    int total_verts, total_tris, n_meshes;
+    if (!PyArg_ParseTuple(args, "KiKiKKiK",
+            &verts_ptr, &total_verts,
+            &tris_ptr,  &total_tris,
+            &toff_ptr, &voff_ptr,
+            &n_meshes, &vols_ptr))
+        return NULL;
+    REQUIRE_CTX();
+    int rc = beam_batch_mesh_volume(g_state.ctx,
+        (const float*)(uintptr_t)verts_ptr, total_verts,
+        (const int*)  (uintptr_t)tris_ptr,  total_tris,
+        (const int*)  (uintptr_t)toff_ptr,
+        voff_ptr ? (const int*)(uintptr_t)voff_ptr : NULL,
+        n_meshes,
+        (float*)(uintptr_t)vols_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -412,6 +461,8 @@ static PyMethodDef gpu_methods[] = {
     { "test_block_reduce_count",    py_test_block_reduce_count,    METH_VARARGS, "Test block reduce count." },
     { "test_block_reduce_sum",      py_test_block_reduce_sum,      METH_VARARGS, "Test block reduce sum." },
     { "test_block_reduce_bbox",     py_test_block_reduce_bbox,     METH_VARARGS, "Test block reduce bbox." },
+    { "batch_hull_volume",          py_batch_hull_volume,          METH_VARARGS, "Batch hull volume (three algorithms)." },
+    { "batch_mesh_volume",          py_batch_mesh_volume,          METH_VARARGS, "Batch mesh volume (divergence theorem)." },
     { NULL, NULL, 0, NULL }
 };
 

@@ -19,7 +19,9 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   common.cuh          #   Constants, data structures, pool allocator, atomics
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
-  hull.cuh            #   Incremental convex hull with parallel visibility tests
+  hull.cuh            #   Incremental convex hull (shared mem, ≤256 verts, used by beam search)
+  hull_warp.cuh       #   Warp-parallel hull algorithms: QuickHull (algo=1) + D&C (algo=2, broken)
+  hull_batch.cu       #   batch_hull_volume kernel dispatcher (algo 0/1/2)
   beam_search.cu      #   Beam search kernels + compute_rv_for_tris device function
   hausdorff.cu        #   Hausdorff kernels (point_mesh_distance, reduce_max, pairwise)
   mesh_transform.cu   #   Normalize/recover coordinate kernels
@@ -363,6 +365,22 @@ Shared-memory hull (`compute_hull_volume`): ~12KB, capped at 256 verts, fast. Po
 
 First-256-by-atomicAdd is biased by thread order, missing extreme vertices. Strided sampling (count flagged, compute stride = total/MAX_HULL_VERTS, collect every K-th) gives uniform spatial coverage.
 
+### QuickHull: Dead Point Redistribution Must Check All Faces
+
+With single-face assignment (each point assigned to the face with maximum positive distance), dead points from visible faces may still be above old non-visible faces after apex insertion. Checking only new faces (the "optimization") incorrectly discards those points, producing a significantly smaller hull volume. Fix: check all faces during redistribution, then rebuild the entire face stack by scanning all faces.
+
+### QuickHull: `max_faces - WARP_SIZE` Guard Underflows for Small n
+
+`if (n_faces >= max_faces - WARP_SIZE) break` with WARP_SIZE=32: for small n (e.g., n=8: max_faces=24, 24-32=-8), this evaluates as n_faces >= negative number — always true — causing immediate loop exit after the initial tetrahedron. Fix: use `max_faces` directly.
+
+### D&C: Interior Edge Deletion Is Required
+
+The Preparata-Hong bottom-up D&C merge builds the seam but never deletes the hull edges that become interior after merging. These accumulate across O(log n) levels, exhausting `max_e` and returning error=1 for all inputs. The algorithm cannot be fixed by just adjusting `max_e` — `dnc_delete_edge` calls must be added at each seam step for edges that are now interior.
+
+### pyproject.toml license Field Format
+
+PEP 621 requires `license = {text = "MIT"}` or `license = {file = "LICENSE"}`. The bare string form `license = "MIT"` fails `setuptools` validation and prevents `build_ext` from running.
+
 ## Current Status
 
 ### Working
@@ -374,6 +392,9 @@ First-256-by-atomicAdd is biased by thread order, missing extreme vertices. Stri
 - Cube correctly identified as convex (Rv ~ 0, 1 part)
 - L-shape decomposed into exactly 2 convex boxes at threshold 0.05
 - GPU beam search tests pass (cube convexity, L-shape decomposition, beam params)
+- `batch_mesh_volume` GPU kernel (divergence theorem, watertight meshes) — tested
+- `batch_hull_volume` algo=0 (incremental, ≤256 pts) and algo=1 (QuickHull warp) — tested and passing
+- Full pytest suite: 98 passed, 8 xfailed (algo=2 D&C known-broken)
 
 ### Not Yet Implemented
 - Connected components after clipping (design step 1)
@@ -383,3 +404,4 @@ First-256-by-atomicAdd is biased by thread order, missing extreme vertices. Stri
 - Vertex compaction (parts carry superset of vertices)
 - Large mesh support (compute_part_costs hangs on 20K+ vertices)
 - Utility function extraction (C1-C5, D1-D3 still inlined/duplicated in monolithic kernels)
+- `batch_hull_volume` algo=2 (D&C): Preparata-Hong merge is missing interior edge deletion; seam adds edges but never removes old sub-hull edges, causing OOM (error=1) for all inputs. Tests xfailed.

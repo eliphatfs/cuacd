@@ -5,8 +5,8 @@
 //   1. Thread 0: find 4 non-coplanar extreme points -> initial tetrahedron
 //   2. For each remaining point:
 //      a. ALL threads: visibility test on assigned faces (parallel)
-//      b. Thread 0: if any visible -> find horizon edges, remove visible faces,
-//         add new faces, update volume incrementally
+//      b. Thread 0: if any visible -> find horizon edges via adjacency (O(F)),
+//         remove visible faces, add new faces, recompute adjacency, update volume
 //   3. Return |volume|
 //
 // Requires: common.cuh (BLOCK_SIZE), geometry.cuh (signed_tet_volume)
@@ -28,8 +28,51 @@ struct HullWorkspace {
     int n_horizon;
     float volume;
     int any_visible;                 // block-level OR reduction
+    // adjacency arrays add 4*512*4 = 8KB, total ~20KB shared memory
+    int fadj0[MAX_HULL_FACES];       // adjacent face index across edge (fv0->fv1)
+    int fadj1[MAX_HULL_FACES];       // adjacent face index across edge (fv1->fv2)
+    int fadj2[MAX_HULL_FACES];       // adjacent face index across edge (fv2->fv0)
+    int horizon_nbr[MAX_HULL_FACES]; // for each horizon edge: the non-visible neighbor face
 };
-// sizeof(HullWorkspace) ~ 6*512*4 + 16 = 12304 bytes
+
+// ---- Adjacency helper device functions (thread 0 only) ----
+
+__device__ inline int hull_face_v(HullWorkspace* ws, int f, int i) {
+    return i==0 ? ws->fv0[f] : i==1 ? ws->fv1[f] : ws->fv2[f];
+}
+
+__device__ inline int hull_face_adj(HullWorkspace* ws, int f, int e) {
+    return e==0 ? ws->fadj0[f] : e==1 ? ws->fadj1[f] : ws->fadj2[f];
+}
+
+__device__ inline void hull_set_adj(HullWorkspace* ws, int f, int e, int nb) {
+    if      (e==0) ws->fadj0[f]=nb;
+    else if (e==1) ws->fadj1[f]=nb;
+    else           ws->fadj2[f]=nb;
+}
+
+// Find edge e in face f where (fv[e], fv[(e+1)%3]) == (va, vb). Returns -1 if not found.
+__device__ inline int hull_find_edge(HullWorkspace* ws, int f, int va, int vb) {
+    for (int e = 0; e < 3; e++)
+        if (hull_face_v(ws,f,e)==va && hull_face_v(ws,f,(e+1)%3)==vb) return e;
+    return -1;
+}
+
+// Compute adjacency from scratch for faces [0..nf). O(nf²). Thread 0 only.
+__device__ inline void hull_recompute_adj(HullWorkspace* ws, int nf) {
+    for (int f = 0; f < nf; f++) ws->fadj0[f]=ws->fadj1[f]=ws->fadj2[f]=-1;
+    for (int f = 0; f < nf; f++) {
+        for (int e = 0; e < 3; e++) {
+            if (hull_face_adj(ws,f,e) >= 0) continue;
+            int ea = hull_face_v(ws,f,e), eb = hull_face_v(ws,f,(e+1)%3);
+            for (int g = 0; g < nf; g++) {
+                if (g == f) continue;
+                int e2 = hull_find_edge(ws,g,eb,ea);
+                if (e2 >= 0) { hull_set_adj(ws,f,e,g); hull_set_adj(ws,g,e2,f); }
+            }
+        }
+    }
+}
 
 // Compute convex hull volume of a point set.
 // points:   [n_points * 3] float coords (global or pool memory)
@@ -132,6 +175,8 @@ __device__ float compute_hull_volume(
                         points[c*3],points[c*3+1],points[c*3+2]);
                 }
                 ws->volume = vol;
+
+                hull_recompute_adj(ws, 4);
             }
         }
     }
@@ -165,31 +210,19 @@ __device__ float compute_hull_volume(
 
         if (!ws->any_visible) continue;  // interior point
 
-        // -- Thread 0: horizon edges + topology update --
+        // -- Thread 0: horizon edges via adjacency (O(F)) + topology update --
         if (tid == 0) {
+            // Horizon edges: for each visible face, check each edge's adjacent face.
+            // If the adjacent face is non-visible, this edge is a horizon edge.
             ws->n_horizon = 0;
-
-            // Horizon edges: edges of visible faces whose reverse is NOT
-            // in any other visible face (=> neighbor is non-visible).
             for (int f = 0; f < nf; f++) {
                 if (!ws->visible[f]) continue;
-                int fv[3] = {ws->fv0[f], ws->fv1[f], ws->fv2[f]};
                 for (int e = 0; e < 3; e++) {
-                    int ea = fv[e], eb = fv[(e+1)%3];
-                    int is_interior = 0;
-                    for (int g = 0; g < nf; g++) {
-                        if (g == f || !ws->visible[g]) continue;
-                        int gv[3] = {ws->fv0[g], ws->fv1[g], ws->fv2[g]};
-                        for (int e2 = 0; e2 < 3; e2++) {
-                            if (gv[e2] == eb && gv[(e2+1)%3] == ea) {
-                                is_interior = 1; break;
-                            }
-                        }
-                        if (is_interior) break;
-                    }
-                    if (!is_interior && ws->n_horizon < MAX_HULL_FACES) {
-                        ws->horizon_a[ws->n_horizon] = ea;
-                        ws->horizon_b[ws->n_horizon] = eb;
+                    int nb = hull_face_adj(ws, f, e);
+                    if (nb >= 0 && !ws->visible[nb]) {
+                        ws->horizon_a[ws->n_horizon]   = hull_face_v(ws, f, e);
+                        ws->horizon_b[ws->n_horizon]   = hull_face_v(ws, f, (e+1)%3);
+                        ws->horizon_nbr[ws->n_horizon] = nb;
                         ws->n_horizon++;
                     }
                 }
@@ -229,6 +262,11 @@ __device__ float compute_hull_volume(
             }
             ws->n_faces = dst;
             ws->volume += vol_delta;
+
+            // Recompute full adjacency for the updated face set.
+            // O(F_new²) but F_new is small (typically <100) and avoids
+            // all index-remapping complexity from face compaction.
+            hull_recompute_adj(ws, dst);
         }
         __syncthreads();
     }

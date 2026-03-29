@@ -80,6 +80,11 @@ struct beam_ctx {
     CUfunction fn_test_block_reduce_sum;
     CUfunction fn_test_block_reduce_bbox;
 
+    CUfunction fn_batch_hull_incremental;
+    CUfunction fn_batch_hull_quickhull;
+    CUfunction fn_batch_hull_dandc;
+    CUfunction fn_batch_mesh_volume;
+
     struct MeshPool pool_a, pool_b;
     CUdeviceptr d_parts;
     CUdeviceptr d_beam;
@@ -173,6 +178,10 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
     cuModuleGetFunction(&ctx->fn_test_block_reduce_count, ctx->module, "test_block_reduce_count");
     cuModuleGetFunction(&ctx->fn_test_block_reduce_sum, ctx->module, "test_block_reduce_sum");
     cuModuleGetFunction(&ctx->fn_test_block_reduce_bbox, ctx->module, "test_block_reduce_bbox");
+    cuModuleGetFunction(&ctx->fn_batch_hull_incremental, ctx->module, "batch_hull_incremental");
+    cuModuleGetFunction(&ctx->fn_batch_hull_quickhull,   ctx->module, "batch_hull_quickhull");
+    cuModuleGetFunction(&ctx->fn_batch_hull_dandc,       ctx->module, "batch_hull_dandc");
+    cuModuleGetFunction(&ctx->fn_batch_mesh_volume,      ctx->module, "batch_mesh_volume");
 
     return 0;
 }
@@ -1161,5 +1170,113 @@ int beam_test_block_reduce_bbox(beam_ctx_t ctx,
     cuMemFree(d_offsets);
     cuMemFree(d_counts);
     cuMemFree(d_out);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// beam_batch_hull_volume
+// ---------------------------------------------------------------------------
+// algo: 0=incremental (block, max 256 pts), 1=quickhull (warp), 2=dandc (warp)
+
+int beam_batch_hull_volume(
+    beam_ctx_t   ctx,
+    const float* pts,
+    int          total_pts,
+    const int*   offsets,
+    int          n_hulls,
+    int          algo,
+    int          max_pts_per_hull,
+    float*       out_volumes,
+    int*         out_errors)
+{
+    if (!ctx) return -1;
+    CUfunction fn = NULL;
+    if      (algo == 0) fn = ctx->fn_batch_hull_incremental;
+    else if (algo == 1) fn = ctx->fn_batch_hull_quickhull;
+    else if (algo == 2) fn = ctx->fn_batch_hull_dandc;
+    if (!fn) { snprintf(ctx->last_error, sizeof(ctx->last_error),
+                        "batch_hull_volume: algo %d not loaded", algo); return -1; }
+
+    CUstream s = NULL;
+    CUdeviceptr d_pts, d_off, d_vols, d_errs, d_scratch = 0;
+    CHECK_CU(cuMemAlloc(&d_pts,  (size_t)total_pts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_off,  (size_t)(n_hulls + 1) * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_vols, (size_t)n_hulls * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_errs, (size_t)n_hulls * sizeof(int)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_pts, pts, (size_t)total_pts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_off, offsets, (size_t)(n_hulls + 1) * sizeof(int), s));
+
+    if (algo == 0) {
+        // Incremental: 1 block per hull, shared-memory workspace
+        void* args[] = { &d_pts, &d_off, &d_vols, &d_errs, &n_hulls };
+        CHECK_CU(cuLaunchKernel(fn, n_hulls, 1, 1,
+                                BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+    } else {
+        // Warp kernels: 8 warps per block (BLOCK_SIZE=256), need scratch
+        size_t scratch_per = (size_t)max_pts_per_hull * 256 + 4096;
+        size_t total_scratch = (size_t)n_hulls * scratch_per;
+        CHECK_CU(cuMemAlloc(&d_scratch, total_scratch));
+        CHECK_CU(cuMemsetD8Async(d_scratch, 0, total_scratch, s));
+
+        int warps_per_block = BLOCK_SIZE / 32;
+        int n_blocks = (n_hulls + warps_per_block - 1) / warps_per_block;
+        int scratch_per_i = (int)scratch_per;
+
+        void* args[] = { &d_pts, &d_off, &d_vols, &d_errs,
+                         &d_scratch, &scratch_per_i, &n_hulls };
+        CHECK_CU(cuLaunchKernel(fn, n_blocks, 1, 1,
+                                BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+    }
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_volumes, d_vols, (size_t)n_hulls * sizeof(float), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_errors,  d_errs, (size_t)n_hulls * sizeof(int),   s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_pts); cuMemFree(d_off); cuMemFree(d_vols); cuMemFree(d_errs);
+    if (d_scratch) cuMemFree(d_scratch);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// beam_batch_mesh_volume
+// ---------------------------------------------------------------------------
+
+int beam_batch_mesh_volume(
+    beam_ctx_t   ctx,
+    const float* verts,
+    int          total_verts,
+    const int*   tris,
+    int          total_tris,
+    const int*   tri_offsets,
+    const int*   vert_offsets,
+    int          n_meshes,
+    float*       out_volumes)
+{
+    if (!ctx || !ctx->fn_batch_mesh_volume) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_verts, d_tris, d_toff, d_voff = 0, d_vols;
+    CHECK_CU(cuMemAlloc(&d_verts, (size_t)total_verts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_tris,  (size_t)total_tris  * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_toff,  (size_t)(n_meshes + 1) * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_vols,  (size_t)n_meshes * sizeof(float)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_verts, verts, (size_t)total_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tris,  tris,  (size_t)total_tris  * 3 * sizeof(int),   s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_toff,  tri_offsets, (size_t)(n_meshes + 1) * sizeof(int), s));
+
+    if (vert_offsets) {
+        CHECK_CU(cuMemAlloc(&d_voff, (size_t)(n_meshes + 1) * sizeof(int)));
+        CHECK_CU(cuMemcpyHtoDAsync(d_voff, vert_offsets, (size_t)(n_meshes + 1) * sizeof(int), s));
+    }
+
+    void* args[] = { &d_verts, &d_tris, &d_toff, &d_voff, &d_vols, &n_meshes };
+    CHECK_CU(cuLaunchKernel(ctx->fn_batch_mesh_volume,
+        n_meshes, 1, 1, BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_volumes, d_vols, (size_t)n_meshes * sizeof(float), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_verts); cuMemFree(d_tris); cuMemFree(d_toff); cuMemFree(d_vols);
+    if (d_voff) cuMemFree(d_voff);
     return 0;
 }

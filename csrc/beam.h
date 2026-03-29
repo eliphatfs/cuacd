@@ -139,6 +139,45 @@ int beam_test_block_reduce_bbox(beam_ctx_t ctx,
     const int* offsets, const int* counts, int n_groups,
     float* out_bbox);
 
+// ---------------------------------------------------------------------------
+// Batch hull volume (three algorithms)
+// ---------------------------------------------------------------------------
+// algo: 0=incremental (max 256 pts), 1=quickhull(warp), 2=dandc(warp)
+// pts:     [total_pts * 3] float32  — all point clouds packed
+// offsets: [n_hulls + 1]  int32    — point index boundaries
+// max_pts_per_hull: used to compute per-warp scratch (algo 1/2 only)
+// out_volumes: [n_hulls] float32 output
+// out_errors:  [n_hulls] int32   0=ok 1=OOM 2=degenerate 3=too_large
+int beam_batch_hull_volume(
+    beam_ctx_t   ctx,
+    const float* pts,
+    int          total_pts,
+    const int*   offsets,
+    int          n_hulls,
+    int          algo,
+    int          max_pts_per_hull,
+    float*       out_volumes,
+    int*         out_errors);
+
+// ---------------------------------------------------------------------------
+// Batch mesh volume (divergence theorem on watertight meshes)
+// ---------------------------------------------------------------------------
+// verts:        [total_V * 3] float32 — packed vertex positions
+// tris:         [total_T * 3] int32   — packed triangles, RELATIVE per-mesh indices
+// tri_offsets:  [n_meshes + 1] int32  — triangle index boundaries
+// vert_offsets: [n_meshes + 1] int32  — vertex index boundaries (for rebasing)
+// out_volumes:  [n_meshes] float32 output
+int beam_batch_mesh_volume(
+    beam_ctx_t   ctx,
+    const float* verts,
+    int          total_verts,
+    const int*   tris,
+    int          total_tris,
+    const int*   tri_offsets,
+    const int*   vert_offsets,
+    int          n_meshes,
+    float*       out_volumes);
+
 #ifdef __cplusplus
 }
 #endif
