@@ -20,7 +20,10 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
   hull.cuh            #   Incremental convex hull (shared mem, ≤256 verts, used by beam search)
-  hull_warp.cuh       #   Warp-parallel hull algorithms: QuickHull (algo=1) + D&C (algo=2, broken)
+  hull_warp.cuh       #   Umbrella include for warp-parallel hull algorithms
+  hull_warp_common.cuh#   WarpPool allocator + warp reductions (shared by QuickHull & D&C)
+  hull_quickhull.cuh  #   QuickHull warp algorithm (algo=1)
+  hull_dandc.cuh      #   Preparata-Hong D&C warp algorithm (algo=2, broken)
   hull_batch.cu       #   batch_hull_volume kernel dispatcher (algo 0/1/2)
   beam_search.cu      #   Beam search kernels + compute_rv_for_tris device function
   hausdorff.cu        #   Hausdorff kernels (point_mesh_distance, reduce_max, pairwise)

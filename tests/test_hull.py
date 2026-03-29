@@ -580,6 +580,56 @@ class TestHullVolumeGPU:
         assert rel_err < 0.05, \
             f"algo={algo}, n={n_pts}: gpu={gpu_vol:.4f} scipy={scipy_vol:.4f} err={rel_err:.3%}"
 
+    @pytest.mark.parametrize("algo,n_pts,seed", [
+        (0, 20, 0), (0, 50, 7),
+        (1, 20, 0), (1, 100, 123), (1, 200, 99),
+        (2, 20, 0), (2, 100, 123), (2, 200, 99),
+    ])
+    def test_gaussian_vs_scipy(self, ctx, algo, n_pts, seed):
+        """GPU hull volume of Gaussian points must match scipy to within 5%."""
+
+        rng = np.random.default_rng(seed)
+        pts = make_gaussian(n_pts, rng)
+        vols, errs = ctx.batch_hull_volume([pts], algo=algo)
+        assert errs[0] == 0, f"algo={algo}, n={n_pts}: error {errs[0]}"
+        gpu_vol = float(vols[0])
+        scipy_vol = compute_hull_volume_scipy(pts)
+        rel_err = abs(gpu_vol - scipy_vol) / max(scipy_vol, 1e-12)
+        assert rel_err < 0.05, \
+            f"algo={algo}, n={n_pts}: gpu={gpu_vol:.4f} scipy={scipy_vol:.4f} err={rel_err:.3%}"
+
+    @pytest.mark.parametrize("algo,n_pts,seed,dist_fn", [
+        # D&C accuracy at high point counts
+        (2, 2000, 0, "sphere_shell"),
+        (2, 2000, 0, "cube_interior"),
+        (2, 2000, 0, "gaussian"),
+        # QuickHull at moderate point counts
+        (1, 200, 0, "sphere_shell"),
+        (1, 200, 0, "cube_interior"),
+        (1, 200, 0, "gaussian"),
+        # Incremental at its limit (256)
+        (0, 200, 0, "sphere_shell"),
+        (0, 200, 0, "cube_interior"),
+        (0, 200, 0, "gaussian"),
+    ])
+    def test_large_pointcloud_vs_scipy(self, ctx, algo, n_pts, seed, dist_fn):
+        """GPU hull volume must match scipy within 5% on larger point clouds."""
+
+        dist_fns = {
+            "sphere_shell": make_sphere_shell,
+            "cube_interior": make_cube_interior,
+            "gaussian": make_gaussian,
+        }
+        rng = np.random.default_rng(seed)
+        pts = dist_fns[dist_fn](n_pts, rng)
+        vols, errs = ctx.batch_hull_volume([pts], algo=algo)
+        assert errs[0] == 0, f"algo={algo}, n={n_pts}, {dist_fn}: error {errs[0]}"
+        gpu_vol = float(vols[0])
+        scipy_vol = compute_hull_volume_scipy(pts)
+        rel_err = abs(gpu_vol - scipy_vol) / max(scipy_vol, 1e-12)
+        assert rel_err < 0.05, \
+            f"algo={algo}, n={n_pts}, {dist_fn}: gpu={gpu_vol:.4f} scipy={scipy_vol:.4f} err={rel_err:.3%}"
+
     @pytest.mark.parametrize("algo", [1, 2])
     def test_batch_sphere_hulls_vs_scipy(self, ctx, algo):
         """Batch of 10 sphere-shell hulls must all match scipy to within 5%."""
@@ -737,6 +787,8 @@ def benchmark_hull_volumes_gpu():
                 pts_list = [dist_fn(n_pts, rng) for _ in range(n_hulls)]
                 for algo_id, algo_name in algos:
                     if algo_id == 0 and n_pts > 256:
+                        continue
+                    if algo_id in (0, 1) and n_pts >= 2000:
                         continue
                     try:
                         # warm up
