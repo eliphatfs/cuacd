@@ -37,6 +37,7 @@ coacd_gpu/            # Python package (import name)
 tests/                # All tests
   test_extension.py   #   GPU smoke tests (Hausdorff, pairwise — standalone script)
   test_beam.py        #   GPU beam search tests (cube convexity, L-shape decomposition)
+  bench_dandc.py      #   D&C hull benchmark for NCU profiling (gaussian points)
 CoACD/                # Reference C++ CoACD (submodule/external)
 ```
 
@@ -54,6 +55,12 @@ python tests/test_extension.py
 
 # Run GPU beam search tests
 python -m pytest tests/ -v
+
+# D&C hull benchmark (standalone, for profiling)
+python tests/bench_dandc.py --n_pts 200 --n_hulls 8
+
+# Profile D&C hull with NCU
+ncu --set full -o dandc_profile python tests/bench_dandc.py --n_pts 200 --n_hulls 8
 ```
 
 Dependencies: `numpy`, `pytest` (test only), `trimesh` (comparison only).
