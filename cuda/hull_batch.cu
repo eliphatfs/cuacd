@@ -11,9 +11,9 @@
 
 // ---------------------------------------------------------------------------
 // batch_hull_dandc
-// Uses block size 64 (2 warps/block) for better occupancy with deep stacks.
+// Uses 1 warp per block (32 threads) — register pressure is the occupancy bottleneck.
 // ---------------------------------------------------------------------------
-#define DANDC_BLOCK_SIZE 64
+#define DANDC_BLOCK_SIZE 32
 
 __global__ void batch_hull_dandc(
     const float* __restrict__ pts,
