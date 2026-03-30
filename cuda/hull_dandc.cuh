@@ -395,7 +395,7 @@ __device__ inline void btpool_init(BtPool* p, WarpPool* wp, int blockSize, int o
     p->freeList = NULL;
     p->wp = wp;
     p->blockSize = blockSize;
-    p->objSize = objSize;
+    p->objSize = (objSize + 3) & ~3;  // pad to multiple of 4
 }
 
 __device__ inline void* btpool_new(BtPool* p) {
@@ -403,8 +403,8 @@ __device__ inline void* btpool_new(BtPool* p) {
         void* obj = p->freeList;
         p->freeList = *(void**)obj;
         // Zero-init
-        char* c = (char*)obj;
-        for (int i = 0; i < p->objSize; i++) c[i] = 0;
+        int* c = (int*)obj;
+        for (int i = 0; i < p->objSize / 4; i++) c[i] = 0;
         return obj;
     }
     int bytes = p->blockSize * p->objSize;
@@ -421,8 +421,8 @@ __device__ inline void* btpool_new(BtPool* p) {
         *(void**)slot = p->freeList;
         p->freeList = slot;
     }
-    char* first = block;
-    for (int i = 0; i < p->objSize; i++) first[i] = 0;
+    int* first = (int*)block;
+    for (int i = 0; i < p->objSize / 4; i++) first[i] = 0;
     return first;
 }
 

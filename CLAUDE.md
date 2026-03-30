@@ -394,6 +394,10 @@ The D&C algorithm is a faithful port of Bullet's `btConvexHullComputer` (Ole Kni
 
 Warp-cooperative quicksort for BtPoint32 arrays. All 32 lanes participate. Uses a global-memory workspace of the same size as the input. Segments ≤32 elements use a bitonic sorting network; larger segments use quicksort partitioning with a median-of-32-samples pivot. Three-way partition via `ws_cmp` (returns -1/0/1): items < pivot go left, items > pivot go right, items == pivot are filled in the middle gap by warp-parallel fill. This avoids worst-case O(n²) on all-equal or many-duplicate inputs. Uses `__ballot_sync`/`__popc` for warp-wide prefix sums. Explicit stack (max depth 2048) in global memory, `sp` in lane-0 register broadcast via `__shfl_sync`.
 
+### btpool_new: int* Zero-Init and objSize Padding
+
+`btpool_init` pads `objSize` to the next multiple of 4 with `(objSize + 3) & ~3`. The two zero-init loops in `btpool_new` (free-list path and fresh-block path) use `int*` with `objSize/4` iterations instead of `char*` with `objSize` iterations. All three pool object types (BtVertex=96B, BtEdge=48B, BtFace=56B) are already multiples of 4, so padding has no effect on sizes or `dandc_scratch_bytes`.
+
 ### pyproject.toml license Field Format
 
 PEP 621 requires `license = {text = "MIT"}` or `license = {file = "LICENSE"}`. The bare string form `license = "MIT"` fails `setuptools` validation and prevents `build_ext` from running.
@@ -411,7 +415,7 @@ PEP 621 requires `license = {text = "MIT"}` or `license = {file = "LICENSE"}`. T
 - GPU beam search tests pass (cube convexity, L-shape decomposition, beam params)
 - `batch_mesh_volume` GPU kernel (divergence theorem, watertight meshes) — tested
 - `batch_hull_volume` algo=0 (incremental, ≤256 pts), algo=1 (QuickHull warp), algo=2 (D&C warp) — all tested and passing
-- Full pytest suite: 121 passed (2 pre-existing failures in algo=0/1 gaussian)
+- Full pytest suite: 139 passed (2 pre-existing failures in algo=0/1 gaussian at 200 pts)
 
 ### Not Yet Implemented
 - Connected components after clipping (design step 1)
