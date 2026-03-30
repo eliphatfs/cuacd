@@ -11,10 +11,9 @@ except ImportError:
 
 
 def _bp32_sort_key(arr):
-    """NumPy sort key matching ws_less: sort by (y, x, z)."""
+    """NumPy sort key matching ws_less: sort by (y, x, z, index)."""
     # arr shape: (N, 4) int32 columns: x, y, z, index
-    # Sort by y first, then x, then z
-    order = np.lexsort((arr[:, 2], arr[:, 0], arr[:, 1]))
+    order = np.lexsort((arr[:, 3], arr[:, 2], arr[:, 0], arr[:, 1]))
     return arr[order]
 
 
@@ -130,7 +129,7 @@ class TestWarpSort:
         np.testing.assert_array_equal(result[:, :3], arr[:, :3])
 
     def test_duplicates(self, ctx):
-        """Many duplicate keys — sort is unstable so only check key columns."""
+        """Many duplicate keys — index is tiebreaker so sort is deterministic."""
         rng = np.random.default_rng(7)
         n = 200
         arr = np.empty((n, 4), dtype=np.int32)
@@ -140,7 +139,4 @@ class TestWarpSort:
         arr[:, 3] = np.arange(n)
         [result] = _run_gpu_sort(ctx, [arr])
         expected = _bp32_sort_key(arr)
-        # Compare only (x, y, z) — index column order may differ for equal keys
-        np.testing.assert_array_equal(result[:, :3], expected[:, :3])
-        # But the set of indices must be preserved
-        assert sorted(result[:, 3].tolist()) == sorted(expected[:, 3].tolist())
+        np.testing.assert_array_equal(result, expected)

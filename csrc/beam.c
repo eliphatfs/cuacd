@@ -1188,19 +1188,36 @@ int beam_test_warp_sort(beam_ctx_t ctx,
     if (!ctx || !ctx->fn_test_warp_sort) return -1;
     CUstream s = NULL;
 
-    CUdeviceptr d_pts, d_off, d_scratch;
+    // Compute per-array scratch sizes and offsets
+    // Each array needs: n * sizeof(BtPoint32) + WS_MAX_STACK * 2 * sizeof(int)
+    const int stack_bytes = 2048 * 2 * (int)sizeof(int);  // WS_MAX_STACK = 2048
+    int* scratch_offsets = (int*)malloc((size_t)(n_arrays + 1) * sizeof(int));
+    if (!scratch_offsets) return -1;
+    scratch_offsets[0] = 0;
+    for (int i = 0; i < n_arrays; i++) {
+        int n_pts = offsets[i + 1] - offsets[i];
+        int sz = n_pts * 4 * (int)sizeof(int) + stack_bytes;
+        sz = (sz + 15) & ~15;  // align to 16
+        scratch_offsets[i + 1] = scratch_offsets[i] + sz;
+    }
+    size_t total_scratch = (size_t)scratch_offsets[n_arrays];
+
+    CUdeviceptr d_pts, d_off, d_scratch, d_soff;
     size_t pts_bytes = (size_t)total_pts * 4 * sizeof(int);
     CHECK_CU(cuMemAlloc(&d_pts,     pts_bytes));
     CHECK_CU(cuMemAlloc(&d_off,     (size_t)(n_arrays + 1) * sizeof(int)));
-    CHECK_CU(cuMemAlloc(&d_scratch, pts_bytes));
+    CHECK_CU(cuMemAlloc(&d_scratch, total_scratch));
+    CHECK_CU(cuMemAlloc(&d_soff,    (size_t)(n_arrays + 1) * sizeof(int)));
     CHECK_CU(cuMemcpyHtoDAsync(d_pts, points, pts_bytes, s));
     CHECK_CU(cuMemcpyHtoDAsync(d_off, offsets, (size_t)(n_arrays + 1) * sizeof(int), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_soff, scratch_offsets, (size_t)(n_arrays + 1) * sizeof(int), s));
+    free(scratch_offsets);
 
     int block_size = 64;
     int warps_per_block = block_size / 32;
     int n_blocks = (n_arrays + warps_per_block - 1) / warps_per_block;
 
-    void* args[] = { &d_pts, &d_off, &d_scratch, &n_arrays };
+    void* args[] = { &d_pts, &d_off, &d_scratch, &d_soff, &n_arrays };
     CHECK_CU(cuLaunchKernel(ctx->fn_test_warp_sort,
         n_blocks, 1, 1, block_size, 1, 1, 0, s, args, NULL));
 
@@ -1210,6 +1227,7 @@ int beam_test_warp_sort(beam_ctx_t ctx,
     cuMemFree(d_pts);
     cuMemFree(d_off);
     cuMemFree(d_scratch);
+    cuMemFree(d_soff);
     return 0;
 }
 

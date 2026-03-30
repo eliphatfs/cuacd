@@ -1239,29 +1239,31 @@ __device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* po
     // --- Phase 1: pre-sort (lane 0) ---
     BtHullState state;
     BtPoint32* points = NULL;
-    BtPoint32* sort_tmp = NULL;
+    char* sort_scratch = NULL;
     if (lane == 0) {
         state.wp = pool;
         state.vertexList = NULL;
         points = bt_compute_presort(&state, pts, n);
-        if (points)
-            sort_tmp = (BtPoint32*)bt_alloc(pool, n * (int)sizeof(BtPoint32));
+        if (points) {
+            int scratch_bytes = n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int);
+            sort_scratch = (char*)bt_alloc(pool, scratch_bytes);
+        }
     }
     __syncwarp();
 
     // Broadcast pointers from lane 0
     {
         long long pp = (lane == 0) ? (long long)points : 0LL;
-        long long tp = (lane == 0) ? (long long)sort_tmp : 0LL;
+        long long sp = (lane == 0) ? (long long)sort_scratch : 0LL;
         pp = __shfl_sync(WARP_MASK, pp, 0);
-        tp = __shfl_sync(WARP_MASK, tp, 0);
+        sp = __shfl_sync(WARP_MASK, sp, 0);
         points = (BtPoint32*)pp;
-        sort_tmp = (BtPoint32*)tp;
+        sort_scratch = (char*)sp;
     }
-    if (!points || !sort_tmp) { *err = 1; return -1.0f; }
+    if (!points || !sort_scratch) { *err = 1; return -1.0f; }
 
     // --- Phase 2: warp-cooperative sort (all lanes) ---
-    warp_sort_bp32(points, sort_tmp, n, lane);
+    warp_sort_bp32(points, sort_scratch, n, lane);
     __syncwarp();
 
     // --- Phase 3: post-sort D&C + volume (lane 0) ---

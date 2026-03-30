@@ -1,22 +1,21 @@
 // test_warp_sort.cu — Test kernel for warp_sort_bp32.
 //
-// Launched outside extern "C" (warp_sort.cuh uses __shfl intrinsics only,
-// no templates, but hull_dandc.cuh which defines BtPoint32 is also outside).
-//
 // Kernel: test_warp_sort_kernel
 //   One warp per array. Sorts each array in-place.
 //   points: packed [total_pts * 4] ints (x,y,z,index)
 //   offsets: [n_arrays + 1]
-//   scratch: [total_pts * 4] ints workspace
+//   scratch: per-warp scratch (n_pts * sizeof(BtPoint32) + stack overhead)
+//   scratch_offsets: [n_arrays + 1] byte offsets into scratch
 
 #include "warp_sort.cuh"
 
 #define TEST_SORT_BLOCK 64
 
 __global__ void test_warp_sort_kernel(
-    int*       __restrict__ points,   // packed BtPoint32 as int[4] per point
-    const int* __restrict__ offsets,  // [n_arrays + 1]
-    int*       __restrict__ scratch,  // same size as points
+    int*       __restrict__ points,           // packed BtPoint32 as int[4] per point
+    const int* __restrict__ offsets,          // [n_arrays + 1] point offsets
+    char*      __restrict__ scratch,          // total scratch buffer
+    const int* __restrict__ scratch_offsets,  // [n_arrays + 1] byte offsets
     int                     n_arrays)
 {
     int warps_per_block = TEST_SORT_BLOCK / WARP_SIZE;
@@ -28,7 +27,7 @@ __global__ void test_warp_sort_kernel(
     int count = offsets[warp_id + 1] - start;
 
     BtPoint32* pts = (BtPoint32*)(points + start * 4);
-    BtPoint32* tmp = (BtPoint32*)(scratch + start * 4);
+    char* scr = scratch + scratch_offsets[warp_id];
 
-    warp_sort_bp32(pts, tmp, count, lane);
+    warp_sort_bp32(pts, scr, count, lane);
 }

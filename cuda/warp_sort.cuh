@@ -1,7 +1,7 @@
 // warp_sort.cuh — Warp-cooperative quicksort for BtPoint32 arrays.
 //
-// All 32 lanes must call. Uses a global-memory workspace of the same size
-// as the input for partitioning scratch. Segments <= 32 elements are
+// All 32 lanes must call. Uses a global-memory workspace (same size as input
+// + 4KB for stack) for partitioning scratch. Segments <= 32 elements are
 // sorted via a bitonic network; larger segments use quicksort partitioning
 // with a median-of-samples pivot.
 //
@@ -22,11 +22,14 @@ struct BtPoint32 {
 #endif
 
 // ============================================================================
-// Comparison
+// Comparison — includes index as final tiebreaker for total ordering
 // ============================================================================
 
 __device__ inline bool ws_less(BtPoint32 a, BtPoint32 b) {
-    return (a.y < b.y) || ((a.y == b.y) && ((a.x < b.x) || ((a.x == b.x) && (a.z < b.z))));
+    if (a.y != b.y) return a.y < b.y;
+    if (a.x != b.x) return a.x < b.x;
+    if (a.z != b.z) return a.z < b.z;
+    return a.index < b.index;
 }
 
 // min/max for bitonic network
@@ -40,21 +43,16 @@ __device__ inline BtPoint32 ws_max(BtPoint32 a, BtPoint32 b) { return ws_less(a,
 __device__ inline BtPoint32 ws_bitonic32(BtPoint32 val, int n, int lane) {
     // Inactive lanes get a sentinel that sorts to the end
     BtPoint32 oob;
-    oob.x = 0x7fffffff; oob.y = 0x7fffffff; oob.z = 0x7fffffff; oob.index = -1;
+    oob.x = 0x7fffffff; oob.y = 0x7fffffff; oob.z = 0x7fffffff; oob.index = 0x7fffffff;
     if (lane >= n) val = oob;
 
     for (int k = 1; k <= 16; k <<= 1) {
         for (int j = k; j >= 1; j >>= 1) {
-            // Exchange with partner
             BtPoint32 other;
-            {
-                // __shfl_xor on 4 ints
-                int ox = __shfl_xor_sync(WARP_MASK, val.x, j);
-                int oy = __shfl_xor_sync(WARP_MASK, val.y, j);
-                int oz = __shfl_xor_sync(WARP_MASK, val.z, j);
-                int oi = __shfl_xor_sync(WARP_MASK, val.index, j);
-                other.x = ox; other.y = oy; other.z = oz; other.index = oi;
-            }
+            other.x = __shfl_xor_sync(WARP_MASK, val.x, j);
+            other.y = __shfl_xor_sync(WARP_MASK, val.y, j);
+            other.z = __shfl_xor_sync(WARP_MASK, val.z, j);
+            other.index = __shfl_xor_sync(WARP_MASK, val.index, j);
             bool asc = ((lane & (k << 1)) == 0);
             if ((lane & j) == 0)
                 val = asc ? ws_min(val, other) : ws_max(val, other);
@@ -69,19 +67,21 @@ __device__ inline BtPoint32 ws_bitonic32(BtPoint32 val, int n, int lane) {
 // Warp quicksort
 // ============================================================================
 
-// Max recursion depth — log2(N) for N up to millions; 64 is very generous
-#define WS_MAX_STACK 64
+#define WS_MAX_STACK 2048
 
-// Sort points[0..n) in-place. tmp must be n elements of scratch space.
+// Sort points[0..n) in-place.
+// scratch must be (n * sizeof(BtPoint32) + WS_MAX_STACK * 2 * sizeof(int)) bytes.
 // All 32 lanes must call with identical arguments.
-__device__ inline void warp_sort_bp32(BtPoint32* points, BtPoint32* tmp, int n, int lane) {
+__device__ inline void warp_sort_bp32(BtPoint32* points, char* scratch, int n, int lane) {
     if (n <= 1) return;
 
-    // --- Stack lives in lane-0 registers, broadcast via shfl ---
-    int stack_lo[WS_MAX_STACK];
-    int stack_hi[WS_MAX_STACK];
-    int sp = 0; // stack pointer (lane 0 only)
+    BtPoint32* tmp = (BtPoint32*)scratch;
+    // Stack lives in global memory after the tmp array
+    int* stack_lo = (int*)(scratch + n * (int)sizeof(BtPoint32));
+    int* stack_hi = stack_lo + WS_MAX_STACK;
 
+    // sp lives in lane-0 register, broadcast via shfl
+    int sp = 0;
     if (lane == 0) {
         stack_lo[0] = 0;
         stack_hi[0] = n;
@@ -89,29 +89,23 @@ __device__ inline void warp_sort_bp32(BtPoint32* points, BtPoint32* tmp, int n, 
     }
 
     while (true) {
-        // Broadcast stack pointer
+        // Broadcast sp from lane 0
         int cur_sp = __shfl_sync(WARP_MASK, sp, 0);
-        if (cur_sp == 0) break;
-
-        // Pop
-        int seg_lo, seg_hi;
-        if (lane == 0) {
-            sp--;
-            seg_lo = stack_lo[sp];
-            seg_hi = stack_hi[sp];
-        }
-        seg_lo = __shfl_sync(WARP_MASK, seg_lo, 0);
-        seg_hi = __shfl_sync(WARP_MASK, seg_hi, 0);
+        if (cur_sp <= 0) break;
+        // Pop — lane 0 decrements, all threads read stack from global mem
+        if (lane == 0) sp--;
+        cur_sp--;
+        int seg_lo = stack_lo[cur_sp];
+        int seg_hi = stack_hi[cur_sp];
         int seg_len = seg_hi - seg_lo;
 
         if (seg_len <= 1) continue;
 
         if (seg_len <= 32) {
             // Bitonic sort this small segment
-            BtPoint32 val;
             BtPoint32 oob;
-            oob.x = 0x7fffffff; oob.y = 0x7fffffff; oob.z = 0x7fffffff; oob.index = -1;
-            val = (lane < seg_len) ? points[seg_lo + lane] : oob;
+            oob.x = 0x7fffffff; oob.y = 0x7fffffff; oob.z = 0x7fffffff; oob.index = 0x7fffffff;
+            BtPoint32 val = (lane < seg_len) ? points[seg_lo + lane] : oob;
             val = ws_bitonic32(val, seg_len, lane);
             if (lane < seg_len)
                 points[seg_lo + lane] = val;
@@ -122,10 +116,8 @@ __device__ inline void warp_sort_bp32(BtPoint32* points, BtPoint32* tmp, int n, 
         // --- Pick pivot: sample 32 elements uniformly, bitonic sort, take median ---
         BtPoint32 sample;
         {
-            // Compute strided sample indices covering [seg_lo, seg_hi)
-            // l % 32 threads step by (l/32+1), rest step by (l/32)
             int base_step = seg_len / 32;
-            int remainder = seg_len - base_step * 32; // = seg_len % 32
+            int remainder = seg_len - base_step * 32;
             int idx;
             if (lane < remainder)
                 idx = seg_lo + lane * (base_step + 1);
@@ -181,7 +173,7 @@ __device__ inline void warp_sort_bp32(BtPoint32* points, BtPoint32* tmp, int n, 
             points[seg_lo + i] = tmp[seg_lo + i];
         __syncwarp();
 
-        // --- Push sub-segments onto stack (lane 0) ---
+        // --- Push sub-segments onto stack (lane 0 only) ---
         // [seg_lo, split) are < pivot, [split, seg_hi) are >= pivot.
         // Only push if strictly smaller than parent to guarantee progress.
         if (lane == 0) {
