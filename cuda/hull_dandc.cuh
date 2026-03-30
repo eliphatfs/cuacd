@@ -14,6 +14,7 @@
 #define HULL_DANDC_CUH
 
 #include "hull_warp_common.cuh"
+#include "warp_sort.cuh"
 
 // ============================================================================
 // Exact arithmetic types (ported from Bullet)
@@ -105,9 +106,12 @@ __device__ inline float bt128_to_float(BtInt128 a) {
 // Point types
 // ============================================================================
 
+#ifndef BT_POINT32_DEFINED
+#define BT_POINT32_DEFINED
 struct BtPoint32 {
     int x, y, z, index;
 };
+#endif
 __device__ inline BtPoint32 bp32(int x, int y, int z) {
     BtPoint32 p; p.x = x; p.y = y; p.z = z; p.index = -1; return p;
 }
@@ -1035,24 +1039,16 @@ __device__ void bt_computeInternal(BtHullState* s, int start, int end, BtInterme
 }
 
 // ============================================================================
-// Point sorting (insertion sort, fine for n <= a few thousand)
+// Point sorting
 // ============================================================================
 
-__device__ inline bool bt_pointCmp(BtPoint32 p, BtPoint32 q) {
-    return (p.y < q.y) || ((p.y == q.y) && ((p.x < q.x) || ((p.x == q.x) && (p.z < q.z))));
-}
-
-__device__ inline void bt_insertionSort(BtPoint32* arr, int n) {
-    for (int i = 1; i < n; i++) {
-        BtPoint32 key = arr[i];
-        int j = i - 1;
-        while (j >= 0 && bt_pointCmp(key, arr[j])) {
-            arr[j + 1] = arr[j];
-            j--;
-        }
-        arr[j + 1] = key;
+struct BtPointCmp {
+    __device__ bool operator()(const BtPoint32& p, const BtPoint32& q) const {
+        return (p.y < q.y) || ((p.y == q.y) && ((p.x < q.x) || ((p.x == q.x) && (p.z < q.z))));
     }
-}
+};
+
+// Sort is handled by warp_sort.cuh (warp_sort_bp32) — no CUB dependency.
 
 // ============================================================================
 // Volume extraction from half-edge hull
@@ -1135,7 +1131,9 @@ __device__ inline float bt_computeVolume(BtHullState* s) {
 // Main entry: compute hull and return volume
 // ============================================================================
 
-__device__ inline void bt_compute(BtHullState* s, const float* pts, int count) {
+// Pre-sort phase (lane 0): AABB, scaling, fill Point32 array, allocate pool memory.
+// Returns pointer to the unsorted BtPoint32 array (in pool), or NULL on error.
+__device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts, int count) {
     // Find AABB
     float mn[3] = {1e30f, 1e30f, 1e30f};
     float mx[3] = {-1e30f, -1e30f, -1e30f};
@@ -1179,7 +1177,7 @@ __device__ inline void bt_compute(BtHullState* s, const float* pts, int count) {
 
     // Allocate and fill Point32 array
     BtPoint32* points = (BtPoint32*)bt_alloc(s->wp, count * (int)sizeof(BtPoint32));
-    if (!points) return;
+    if (!points) return NULL;
     for (int i = 0; i < count; i++) {
         float p[3];
         for (int k = 0; k < 3; k++)
@@ -1189,10 +1187,11 @@ __device__ inline void bt_compute(BtHullState* s, const float* pts, int count) {
         points[i].z = (int)p[minAx];
         points[i].index = i;
     }
+    return points;
+}
 
-    bt_insertionSort(points, count);
-
-    // Allocate vertices
+// Post-sort phase (lane 0): build vertex/edge/face pools, run D&C, extract volume.
+__device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count) {
     btpool_init(&s->vertexPool, s->wp, count, (int)sizeof(BtVertex));
     s->originalVertices = (BtVertex**)bt_alloc(s->wp, count * (int)sizeof(BtVertex*));
     if (!s->originalVertices) return;
@@ -1231,27 +1230,54 @@ __device__ inline void bt_compute(BtHullState* s, const float* pts, int count) {
 
 __device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* pool, int* err) {
     float vol = 0.0f;
+    *err = 0;
+
+    if (n < 4) {
+        return 0.0f;
+    }
+
+    // --- Phase 1: pre-sort (lane 0) ---
+    BtHullState state;
+    BtPoint32* points = NULL;
+    BtPoint32* sort_tmp = NULL;
     if (lane == 0) {
-        *err = 0;
-        if (n < 4) {
-            vol = 0.0f;
+        state.wp = pool;
+        state.vertexList = NULL;
+        points = bt_compute_presort(&state, pts, n);
+        if (points)
+            sort_tmp = (BtPoint32*)bt_alloc(pool, n * (int)sizeof(BtPoint32));
+    }
+    __syncwarp();
+
+    // Broadcast pointers from lane 0
+    {
+        long long pp = (lane == 0) ? (long long)points : 0LL;
+        long long tp = (lane == 0) ? (long long)sort_tmp : 0LL;
+        pp = __shfl_sync(WARP_MASK, pp, 0);
+        tp = __shfl_sync(WARP_MASK, tp, 0);
+        points = (BtPoint32*)pp;
+        sort_tmp = (BtPoint32*)tp;
+    }
+    if (!points || !sort_tmp) { *err = 1; return -1.0f; }
+
+    // --- Phase 2: warp-cooperative sort (all lanes) ---
+    warp_sort_bp32(points, sort_tmp, n, lane);
+    __syncwarp();
+
+    // --- Phase 3: post-sort D&C + volume (lane 0) ---
+    if (lane == 0) {
+        bt_compute_postsort(&state, points, n);
+
+        if (pool->error) {
+            *err = 1;
+            vol = -1.0f;
         } else {
-            BtHullState state;
-            state.wp = pool;
-            state.vertexList = NULL;
-
-            bt_compute(&state, pts, n);
-
-            if (pool->error) {
-                *err = 1;
-                vol = -1.0f;
-            } else {
-                vol = bt_computeVolume(&state);
-                if (pool->error) { *err = 1; vol = -1.0f; }
-            }
+            vol = bt_computeVolume(&state);
+            if (pool->error) { *err = 1; vol = -1.0f; }
         }
     }
-    // Broadcast result from lane 0
+
+    // Broadcast results from lane 0
     vol = __shfl_sync(WARP_MASK, vol, 0);
     int e = __shfl_sync(WARP_MASK, *err, 0);
     *err = e;

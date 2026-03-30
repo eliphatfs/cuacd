@@ -23,8 +23,10 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   hull_warp.cuh       #   Umbrella include for warp-parallel hull algorithms
   hull_warp_common.cuh#   WarpPool allocator + warp reductions (shared by QuickHull & D&C)
   hull_quickhull.cuh  #   QuickHull warp algorithm (algo=1)
-  hull_dandc.cuh      #   Preparata-Hong D&C hull volume (algo=2, Bullet btConvexHullComputer port, lane-0 only)
+  hull_dandc.cuh      #   Preparata-Hong D&C hull volume (algo=2, Bullet port, warp sort + lane-0 D&C)
+  warp_sort.cuh       #   Warp-cooperative quicksort for BtPoint32 (bitonic ≤32, partitioned >32)
   hull_batch.cu       #   batch_hull_volume kernel dispatcher (algo 0/1/2)
+  test_warp_sort.cu   #   Test kernel for warp_sort_bp32
   beam_search.cu      #   Beam search kernels + compute_rv_for_tris device function
   hausdorff.cu        #   Hausdorff kernels (point_mesh_distance, reduce_max, pairwise)
   mesh_transform.cu   #   Normalize/recover coordinate kernels
@@ -38,6 +40,7 @@ tests/                # All tests
   test_extension.py   #   GPU smoke tests (Hausdorff, pairwise — standalone script)
   test_beam.py        #   GPU beam search tests (cube convexity, L-shape decomposition)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling (gaussian points)
+  test_warp_sort.py   #   Tests for warp_sort_bp32 (bitonic + quicksort paths)
 CoACD/                # Reference C++ CoACD (submodule/external)
 ```
 
@@ -385,7 +388,11 @@ With single-face assignment (each point assigned to the face with maximum positi
 
 ### D&C: Faithful Port of Bullet's btConvexHullComputer
 
-The D&C algorithm is a faithful port of Bullet's `btConvexHullComputer` (Ole Kniemeyer, MAXON, zlib license). Runs entirely on lane 0 of each warp (no GPU parallelism within the algorithm). Key elements: int32 coordinates with exact Int128/Rational64/Rational128 predicates, recursive `computeInternal` D&C, `mergeProjection` for 2D bridge finding, `findMaxAngle` with exact cotangent comparison, `findEdgeForCoplanarFaces` for coplanar handling, and the full `merge` function with interior edge deletion via `removeEdgePair`. Memory is allocated from WarpPool bump allocator with free-list recycling for edges. Volume is extracted by walking the half-edge graph and summing signed tetrahedra in integer coordinates, then converting back via the scaling factor. Requires 2MB scratch per hull and 32KB thread stack (set via `cuCtxSetLimit`).
+The D&C algorithm is a faithful port of Bullet's `btConvexHullComputer` (Ole Kniemeyer, MAXON, zlib license). Three phases: (1) pre-sort on lane 0 (AABB, scaling, Point32 conversion), (2) warp-cooperative sort via `warp_sort_bp32` (all 32 lanes), (3) D&C merge + volume extraction on lane 0. Key elements: int32 coordinates with exact Int128/Rational64/Rational128 predicates, recursive `computeInternal` D&C, `mergeProjection` for 2D bridge finding, `findMaxAngle` with exact cotangent comparison, `findEdgeForCoplanarFaces` for coplanar handling, and the full `merge` function with interior edge deletion via `removeEdgePair`. Memory is allocated from WarpPool bump allocator with free-list recycling for edges. Volume is extracted by walking the half-edge graph and summing signed tetrahedra in integer coordinates, then converting back via the scaling factor. Requires 2MB scratch per hull, 32KB thread stack (via `cuCtxSetLimit`), and block size 64 (DANDC_BLOCK_SIZE).
+
+### Warp Sort (warp_sort.cuh)
+
+Warp-cooperative quicksort for BtPoint32 arrays. All 32 lanes participate. Uses a global-memory workspace of the same size as the input. Segments ≤32 elements use a bitonic sorting network; larger segments use quicksort partitioning with a median-of-32-samples pivot. Two-way partition: items < pivot go left, items >= pivot go right, using `__ballot_sync`/`__popc` for warp-wide prefix sums. Explicit stack (max depth 64) avoids recursion. Known issue: bitonic sort for equal-key elements is not stable (index column may be reordered for ties). This is acceptable since the D&C hull algorithm only uses (y,x,z) ordering.
 
 ### pyproject.toml license Field Format
 

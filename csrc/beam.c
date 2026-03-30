@@ -79,6 +79,7 @@ struct beam_ctx {
     CUfunction fn_test_block_reduce_count;
     CUfunction fn_test_block_reduce_sum;
     CUfunction fn_test_block_reduce_bbox;
+    CUfunction fn_test_warp_sort;
 
     CUfunction fn_batch_hull_incremental;
     CUfunction fn_batch_hull_quickhull;
@@ -178,6 +179,7 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
     cuModuleGetFunction(&ctx->fn_test_block_reduce_count, ctx->module, "test_block_reduce_count");
     cuModuleGetFunction(&ctx->fn_test_block_reduce_sum, ctx->module, "test_block_reduce_sum");
     cuModuleGetFunction(&ctx->fn_test_block_reduce_bbox, ctx->module, "test_block_reduce_bbox");
+    cuModuleGetFunction(&ctx->fn_test_warp_sort,        ctx->module, "test_warp_sort_kernel");
     cuModuleGetFunction(&ctx->fn_batch_hull_incremental, ctx->module, "batch_hull_incremental");
     cuModuleGetFunction(&ctx->fn_batch_hull_quickhull,   ctx->module, "batch_hull_quickhull");
     cuModuleGetFunction(&ctx->fn_batch_hull_dandc,       ctx->module, "batch_hull_dandc");
@@ -1174,6 +1176,44 @@ int beam_test_block_reduce_bbox(beam_ctx_t ctx,
 }
 
 // ---------------------------------------------------------------------------
+// Test: warp_sort
+// ---------------------------------------------------------------------------
+// points: packed int[total_pts * 4] (x,y,z,index)
+// offsets: int[n_arrays + 1]
+// Sorts each sub-array in-place.
+
+int beam_test_warp_sort(beam_ctx_t ctx,
+    int* points, int total_pts, const int* offsets, int n_arrays)
+{
+    if (!ctx || !ctx->fn_test_warp_sort) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_pts, d_off, d_scratch;
+    size_t pts_bytes = (size_t)total_pts * 4 * sizeof(int);
+    CHECK_CU(cuMemAlloc(&d_pts,     pts_bytes));
+    CHECK_CU(cuMemAlloc(&d_off,     (size_t)(n_arrays + 1) * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_scratch, pts_bytes));
+    CHECK_CU(cuMemcpyHtoDAsync(d_pts, points, pts_bytes, s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_off, offsets, (size_t)(n_arrays + 1) * sizeof(int), s));
+
+    int block_size = 64;
+    int warps_per_block = block_size / 32;
+    int n_blocks = (n_arrays + warps_per_block - 1) / warps_per_block;
+
+    void* args[] = { &d_pts, &d_off, &d_scratch, &n_arrays };
+    CHECK_CU(cuLaunchKernel(ctx->fn_test_warp_sort,
+        n_blocks, 1, 1, block_size, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(points, d_pts, pts_bytes, s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_pts);
+    cuMemFree(d_off);
+    cuMemFree(d_scratch);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // beam_batch_hull_volume
 // ---------------------------------------------------------------------------
 // algo: 0=incremental (block, max 256 pts), 1=quickhull (warp), 2=dandc (warp)
@@ -1226,7 +1266,8 @@ int beam_batch_hull_volume(
         CHECK_CU(cuMemAlloc(&d_scratch, total_scratch));
         CHECK_CU(cuMemsetD8Async(d_scratch, 0, total_scratch, s));
 
-        int warps_per_block = BLOCK_SIZE / 32;
+        int block_size = (algo == 2) ? 64 : BLOCK_SIZE;
+        int warps_per_block = block_size / 32;
         int n_blocks = (n_hulls + warps_per_block - 1) / warps_per_block;
         int scratch_per_i = (int)scratch_per;
 
@@ -1238,7 +1279,7 @@ int beam_batch_hull_volume(
         void* args[] = { &d_pts, &d_off, &d_vols, &d_errs,
                          &d_scratch, &scratch_per_i, &n_hulls };
         CHECK_CU(cuLaunchKernel(fn, n_blocks, 1, 1,
-                                BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+                                block_size, 1, 1, 0, s, args, NULL));
     }
 
     CHECK_CU(cuMemcpyDtoHAsync(out_volumes, d_vols, (size_t)n_hulls * sizeof(float), s));

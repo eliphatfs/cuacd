@@ -139,6 +139,12 @@ int beam_test_block_reduce_bbox(beam_ctx_t ctx,
     const int* offsets, const int* counts, int n_groups,
     float* out_bbox);
 
+// Test: warp_sort — sort BtPoint32 sub-arrays in-place
+// points: packed int[total_pts * 4] (x,y,z,index), modified in-place
+// offsets: [n_arrays + 1]
+int beam_test_warp_sort(beam_ctx_t ctx,
+    int* points, int total_pts, const int* offsets, int n_arrays);
+
 // ---------------------------------------------------------------------------
 // Batch hull volume (three algorithms)
 // ---------------------------------------------------------------------------

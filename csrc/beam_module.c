@@ -391,6 +391,23 @@ static PyObject* py_test_block_reduce_bbox(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// test_warp_sort(pts_ptr, total_pts, offsets_ptr, n_arrays) -> None
+// ---------------------------------------------------------------------------
+
+static PyObject* py_test_warp_sort(PyObject* self, PyObject* args) {
+    unsigned long long pts_ptr, offsets_ptr;
+    int total_pts, n_arrays;
+    if (!PyArg_ParseTuple(args, "KiKi",
+            &pts_ptr, &total_pts, &offsets_ptr, &n_arrays)) return NULL;
+    REQUIRE_CTX();
+    int rc = beam_test_warp_sort(g_state.ctx,
+        (int*)(uintptr_t)pts_ptr, total_pts,
+        (const int*)(uintptr_t)offsets_ptr, n_arrays);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
 // batch_hull_volume(pts_ptr, total_pts, offsets_ptr, n_hulls, algo,
 //                  max_pts_per_hull, vols_ptr, errs_ptr) -> None
 // ---------------------------------------------------------------------------
@@ -461,6 +478,7 @@ static PyMethodDef gpu_methods[] = {
     { "test_block_reduce_count",    py_test_block_reduce_count,    METH_VARARGS, "Test block reduce count." },
     { "test_block_reduce_sum",      py_test_block_reduce_sum,      METH_VARARGS, "Test block reduce sum." },
     { "test_block_reduce_bbox",     py_test_block_reduce_bbox,     METH_VARARGS, "Test block reduce bbox." },
+    { "test_warp_sort",             py_test_warp_sort,             METH_VARARGS, "Test warp sort BtPoint32." },
     { "batch_hull_volume",          py_batch_hull_volume,          METH_VARARGS, "Batch hull volume (three algorithms)." },
     { "batch_mesh_volume",          py_batch_mesh_volume,          METH_VARARGS, "Batch mesh volume (divergence theorem)." },
     { NULL, NULL, 0, NULL }

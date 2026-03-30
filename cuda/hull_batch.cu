@@ -99,8 +99,10 @@ __global__ void batch_hull_quickhull(
 
 // ---------------------------------------------------------------------------
 // batch_hull_dandc
-// Same structure as batch_hull_quickhull but uses D&C algorithm.
+// Uses block size 64 (2 warps/block) for better occupancy with deep stacks.
 // ---------------------------------------------------------------------------
+#define DANDC_BLOCK_SIZE 64
+
 __global__ void batch_hull_dandc(
     const float* __restrict__ pts,
     const int*   __restrict__ offsets,
@@ -110,7 +112,7 @@ __global__ void batch_hull_dandc(
     int                       scratch_per_hull,
     int                       n_hulls)
 {
-    int warps_per_block = blockDim.x / WARP_SIZE;
+    int warps_per_block = DANDC_BLOCK_SIZE / WARP_SIZE;
     int warp_id = blockIdx.x * warps_per_block + (threadIdx.x / WARP_SIZE);
     int lane    = threadIdx.x & (WARP_SIZE - 1);
     if (warp_id >= n_hulls) return;
