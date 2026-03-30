@@ -86,6 +86,7 @@ def _compile_fatbin(cuda_home, cu_file, fatbin_file, build_dir):
     os.makedirs(build_dir, exist_ok=True)
     subprocess.check_call([
         nvcc, cu_file, "--fatbin", "-O3", "--use_fast_math",
+        "--generate-line-info",
         *_fatbin_gencode_flags(), "-o", fatbin_file,
     ], cwd=build_dir)
 
