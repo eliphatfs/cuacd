@@ -1278,8 +1278,8 @@ int beam_batch_hull_volume(
     size_t total_scratch = (size_t)n_hulls * scratch_per;
     CHECK_CU(cuMemAlloc(&d_scratch, total_scratch));
 
-    // D&C uses recursion — increase thread stack size
-    CHECK_CU(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, 32 * 1024));
+    // D&C uses iterative stack — moderate thread stack for bt_merge call depth
+    CHECK_CU(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, 8 * 1024));
 
     int block_size = 64;  // DANDC_BLOCK_SIZE
     int warps_per_block = block_size / 32;

@@ -316,6 +316,16 @@ struct BtIntermediateHull {
     BtVertex* maxYx;
 };
 
+// D&C stack item for iterative computeInternal
+struct BtDCStackItem {
+    int start;
+    int end;
+    int stage;                   // 0 = descend, 1 = merge
+    BtIntermediateHull left_hull;
+    BtIntermediateHull right_hull;
+    BtIntermediateHull* result;  // where to write the merged hull
+};
+
 // Vertex operations
 __device__ inline BtPoint32 bv_sub(BtVertex* a, BtVertex* b) { return bp32_sub(a->point, b->point); }
 
@@ -450,6 +460,7 @@ __device__ inline void* bt_alloc(WarpPool* wp, int bytes) {
 // ============================================================================
 
 #define BT_DFS_MAX_STACK 4096
+#define BT_DC_MAX_STACK  4096
 
 // Error codes (distinct from pool OOM = 1)
 #define BT_ERR_SORT_STACK  2
@@ -482,6 +493,8 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
     total += BT_ALIGN16(2 * n * (int)sizeof(BtFace));
     // bt_computeVolume: DFS stack
     total += BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
+    // bt_computeInternal: iterative D&C stack
+    total += BT_ALIGN16(BT_DC_MAX_STACK * (int)sizeof(BtDCStackItem));
     // alignment padding headroom
     total += 32 * 1024;
     return total;
@@ -831,7 +844,7 @@ __device__ inline bool bt_mergeProjection(BtHullState* s, BtIntermediateHull* h0
     return true;
 }
 
-__device__ void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtIntermediateHull* h1) {
+__device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtIntermediateHull* h1) {
     if (!h1->maxXy) return;
     if (!h0->maxXy) { *h0 = *h1; return; }
 
@@ -1016,10 +1029,10 @@ __device__ void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtIntermediateH
 }
 
 // ============================================================================
-// computeInternal — recursive D&C
+// computeInternal base case — handles n <= 2
 // ============================================================================
 
-__device__ void bt_computeInternal(BtHullState* s, int start, int end, BtIntermediateHull* result) {
+__device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtIntermediateHull* result) {
     int n = end - start;
     switch (n) {
     case 0:
@@ -1068,16 +1081,94 @@ __device__ void bt_computeInternal(BtHullState* s, int start, int end, BtInterme
         return;
     }
     }
+}
 
-    int split0 = start + n / 2;
-    BtPoint32 p = s->originalVertices[split0 - 1]->point;
-    int split1 = split0;
-    while ((split1 < end) && bp32_eq(s->originalVertices[split1]->point, p)) split1++;
+// ============================================================================
+// computeInternal — iterative D&C with explicit stack
+// ============================================================================
 
-    bt_computeInternal(s, start, split0, result);
-    BtIntermediateHull hull1;
-    bt_computeInternal(s, split1, end, &hull1);
-    bt_merge(s, result, &hull1);
+#define BT_ERR_DC_STACK 4
+
+__device__ inline void bt_computeInternal(BtHullState* s, int start, int end, BtIntermediateHull* result) {
+    BtDCStackItem* stack = (BtDCStackItem*)bt_alloc(s->wp, BT_DC_MAX_STACK * (int)sizeof(BtDCStackItem));
+    if (!stack) return;
+
+    int sp = 0;
+    // Push root item (stage 0)
+    BtDCStackItem root;
+    root.start = start;
+    root.end = end;
+    root.stage = 0;
+    root.left_hull.minXy = NULL; root.left_hull.maxXy = NULL;
+    root.left_hull.minYx = NULL; root.left_hull.maxYx = NULL;
+    root.right_hull.minXy = NULL; root.right_hull.maxXy = NULL;
+    root.right_hull.minYx = NULL; root.right_hull.maxYx = NULL;
+    root.result = result;
+    stack[sp++] = root;
+
+    while (sp > 0) {
+        BtDCStackItem item = stack[--sp];
+
+        if (item.stage == 0) {
+            int n = item.end - item.start;
+            if (n <= 2) {
+                bt_computeBase(s, item.start, item.end, item.result);
+                continue;
+            }
+
+            int split0 = item.start + n / 2;
+            BtPoint32 p = s->originalVertices[split0 - 1]->point;
+            int split1 = split0;
+            while ((split1 < item.end) && bp32_eq(s->originalVertices[split1]->point, p)) split1++;
+
+            // Push stage-1 merge item
+            BtDCStackItem merge_item;
+            merge_item.start = item.start;
+            merge_item.end = item.end;
+            merge_item.stage = 1;
+            merge_item.left_hull.minXy = NULL; merge_item.left_hull.maxXy = NULL;
+            merge_item.left_hull.minYx = NULL; merge_item.left_hull.maxYx = NULL;
+            merge_item.right_hull.minXy = NULL; merge_item.right_hull.maxXy = NULL;
+            merge_item.right_hull.minYx = NULL; merge_item.right_hull.maxYx = NULL;
+            merge_item.result = item.result;
+            if (sp >= BT_DC_MAX_STACK) { s->wp->error = BT_ERR_DC_STACK; return; }
+            stack[sp++] = merge_item;
+            // The merge item is at stack[sp-1]; children write into it.
+            BtDCStackItem* merge_ptr = &stack[sp - 1];
+
+            // Push right child (processed second, popped first after merge)
+            BtDCStackItem right_item;
+            right_item.start = split1;
+            right_item.end = item.end;
+            right_item.stage = 0;
+            right_item.left_hull.minXy = NULL; right_item.left_hull.maxXy = NULL;
+            right_item.left_hull.minYx = NULL; right_item.left_hull.maxYx = NULL;
+            right_item.right_hull.minXy = NULL; right_item.right_hull.maxXy = NULL;
+            right_item.right_hull.minYx = NULL; right_item.right_hull.maxYx = NULL;
+            right_item.result = &merge_ptr->right_hull;
+            if (sp >= BT_DC_MAX_STACK) { s->wp->error = BT_ERR_DC_STACK; return; }
+            stack[sp++] = right_item;
+
+            // Push left child (processed first, popped before right)
+            BtDCStackItem left_item;
+            left_item.start = item.start;
+            left_item.end = split0;
+            left_item.stage = 0;
+            left_item.left_hull.minXy = NULL; left_item.left_hull.maxXy = NULL;
+            left_item.left_hull.minYx = NULL; left_item.left_hull.maxYx = NULL;
+            left_item.right_hull.minXy = NULL; left_item.right_hull.maxXy = NULL;
+            left_item.right_hull.minYx = NULL; left_item.right_hull.maxYx = NULL;
+            left_item.result = &merge_ptr->left_hull;
+            if (sp >= BT_DC_MAX_STACK) { s->wp->error = BT_ERR_DC_STACK; return; }
+            stack[sp++] = left_item;
+
+        } else {
+            // Stage 1: merge left_hull and right_hull into result
+            // bt_merge merges h1 into h0 in-place, so merge into left_hull then copy to result
+            bt_merge(s, &item.left_hull, &item.right_hull);
+            *item.result = item.left_hull;
+        }
+    }
 }
 
 // ============================================================================
