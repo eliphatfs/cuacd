@@ -178,13 +178,13 @@ __device__ inline void warp_sort_bp32(BtPoint32* points, char* scratch, int n, i
         // Only push if strictly smaller than parent to guarantee progress.
         if (lane == 0) {
             int split = seg_lo + left_idx;
-            if (split > seg_lo && sp < WS_MAX_STACK) {
+            if (split > 1 + seg_lo && sp < WS_MAX_STACK) {
                 stack_lo[sp] = seg_lo;
                 stack_hi[sp] = split;
                 sp++;
             }
-            if (seg_hi > split && (seg_hi - split) < seg_len && sp < WS_MAX_STACK) {
-                stack_lo[sp] = split;
+            if (seg_hi > split + 2 && sp < WS_MAX_STACK) {
+                stack_lo[sp] = split + 1;
                 stack_hi[sp] = seg_hi;
                 sp++;
             }
