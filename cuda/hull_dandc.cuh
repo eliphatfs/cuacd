@@ -393,6 +393,8 @@ __device__ inline BtPoint64 bt_face_normal(BtFace* f) {
 // Pool allocator backed by WarpPool (no templates for extern "C" compat)
 // ============================================================================
 
+#define BT_ERR_POOL_EXHAUST 5
+
 // Generic pool: stores void* free list, object size, block size
 struct BtPool {
     void* freeList;
@@ -401,39 +403,53 @@ struct BtPool {
     int objSize;
 };
 
-__device__ inline void btpool_init(BtPool* p, WarpPool* wp, int blockSize, int objSize) {
-    p->freeList = NULL;
-    p->wp = wp;
-    p->blockSize = blockSize;
-    p->objSize = (objSize + 3) & ~3;  // pad to multiple of 4
+__device__ inline void btpool_init(BtPool* p, WarpPool* wp, int blockSize, int objSize, int lane) {
+    int padded = (objSize + 3) & ~3;  // pad to multiple of 4
+    // Lane 0: allocate block and init struct fields
+    char* block = NULL;
+    if (lane == 0) {
+        p->wp = wp;
+        p->blockSize = blockSize;
+        p->objSize = padded;
+        int bytes = blockSize * padded;
+        int aligned = (bytes + 15) & ~15;
+        if (wp->offset + aligned > wp->capacity) {
+            wp->error = 1;
+        } else {
+            block = wp->base + wp->offset;
+            wp->offset += aligned;
+        }
+    }
+    // Broadcast block pointer to all lanes
+    long long blk = __shfl_sync(WARP_MASK, (long long)block, 0);
+    block = (char*)blk;
+    if (!block) return;
+    // All 32 lanes: set up next pointers in parallel (each slot points to previous slot)
+    for (int i = lane; i < blockSize; i += WARP_SIZE) {
+        void* slot = block + i * padded;
+        if (i == 0)
+            *(void**)slot = NULL;  // end of free list
+        else
+            *(void**)slot = block + (i - 1) * padded;
+    }
+    __syncwarp();
+    // Lane 0: set free list head to last slot
+    if (lane == 0) {
+        p->freeList = block + (blockSize - 1) * padded;
+    }
 }
 
 __device__ inline void* btpool_new(BtPool* p) {
-    if (p->freeList) {
-        void* obj = p->freeList;
-        p->freeList = *(void**)obj;
-        // Zero-init
-        int* c = (int*)obj;
-        for (int i = 0; i < p->objSize / 4; i++) c[i] = 0;
-        return obj;
-    }
-    int bytes = p->blockSize * p->objSize;
-    int aligned = (bytes + 15) & ~15;
-    if (p->wp->offset + aligned > p->wp->capacity) {
-        p->wp->error = 1;
+    if (!p->freeList) {
+        p->wp->error = BT_ERR_POOL_EXHAUST;
         return NULL;
     }
-    char* block = p->wp->base + p->wp->offset;
-    p->wp->offset += aligned;
-    // Chain all but first into free list
-    for (int i = p->blockSize - 1; i >= 1; i--) {
-        void* slot = block + i * p->objSize;
-        *(void**)slot = p->freeList;
-        p->freeList = slot;
-    }
-    int* first = (int*)block;
-    for (int i = 0; i < p->objSize / 4; i++) first[i] = 0;
-    return first;
+    void* obj = p->freeList;
+    p->freeList = *(void**)obj;
+    // Zero-init
+    int* c = (int*)obj;
+    for (int i = 0; i < p->objSize / 4; i++) c[i] = 0;
+    return obj;
 }
 
 __device__ inline void btpool_free(BtPool* p, void* obj) {
@@ -485,11 +501,11 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
     total += BT_ALIGN16(n * (int)sizeof(BtVertex*));
     // postsort: pre-allocated vertex block
     total += BT_ALIGN16(n * (int)sizeof(BtVertex));
-    // vertexPool block (lazy alloc, one block of n vertices)
+    // vertexPool block (btpool_init, one block of n vertices)
     total += BT_ALIGN16(n * (int)sizeof(BtVertex));
-    // edgePool block (lazy alloc, one block of 6n edges)
+    // edgePool block (btpool_init, one block of 6n edges)
     total += BT_ALIGN16(6 * n * (int)sizeof(BtEdge));
-    // facePool block (lazy alloc, one block of 2n faces)
+    // facePool block (btpool_init, one block of 2n faces)
     total += BT_ALIGN16(2 * n * (int)sizeof(BtFace));
     // bt_computeVolume: DFS stack
     total += BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
@@ -1087,7 +1103,7 @@ __device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtInte
 // computeInternal — iterative D&C with explicit stack
 // ============================================================================
 
-#define BT_ERR_DC_STACK 4
+#define BT_ERR_DC_STACK     4
 
 __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, BtIntermediateHull* result) {
     BtDCStackItem* stack = (BtDCStackItem*)bt_alloc(s->wp, BT_DC_MAX_STACK * (int)sizeof(BtDCStackItem));
@@ -1333,13 +1349,15 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
     return points;
 }
 
-// Post-sort: allocate pools (lane 0), init vertices (all lanes), D&C (lane 0).
+// Post-sort: allocate pools (all lanes), init vertices (all lanes), D&C (lane 0).
 __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count, int lane) {
-    // Lane 0: allocate pools and vertex block
+    // All lanes: allocate vertex pool block and set up free list
+    btpool_init(&s->vertexPool, s->wp, count, (int)sizeof(BtVertex), lane);
+
+    // Lane 0: allocate origVerts and vblock
     BtVertex* vblock = NULL;
     BtVertex** origVerts = NULL;
     if (lane == 0) {
-        btpool_init(&s->vertexPool, s->wp, count, (int)sizeof(BtVertex));
         origVerts = (BtVertex**)bt_alloc(s->wp, count * (int)sizeof(BtVertex*));
         s->originalVertices = origVerts;
         if (origVerts)
@@ -1370,11 +1388,12 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     }
     __syncwarp();
 
-    // Lane 0: remaining init + D&C
-    if (lane == 0) {
-        btpool_init(&s->edgePool, s->wp, 6 * count, (int)sizeof(BtEdge));
-        btpool_init(&s->facePool, s->wp, 2 * count, (int)sizeof(BtFace));
+    // All lanes: allocate edge and face pool blocks and set up free lists
+    btpool_init(&s->edgePool, s->wp, 6 * count, (int)sizeof(BtEdge), lane);
+    btpool_init(&s->facePool, s->wp, 2 * count, (int)sizeof(BtFace), lane);
 
+    // Lane 0: D&C
+    if (lane == 0) {
         s->usedEdgePairs = 0;
         s->mergeStamp = -3;
 

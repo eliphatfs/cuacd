@@ -134,7 +134,7 @@ class Context:
 
         Returns:
             (volumes, errors) — float32[n_hulls], int32[n_hulls]
-            errors: 0=ok  1=OOM  2=sort_stack_overflow  3=dfs_stack_overflow  4=dc_stack_overflow
+            errors: 0=ok  1=OOM  2=sort_stack_overflow  3=dfs_stack_overflow  4=dc_stack_overflow  5=pool_exhaust
         """
         n_hulls = len(pts_list)
         pts_arrays = [_as_f32(p) for p in pts_list]
