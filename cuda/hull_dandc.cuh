@@ -1133,27 +1133,27 @@ __device__ inline float bt_computeVolume(BtHullState* s) {
 
 // Pre-sort phase (lane 0): AABB, scaling, fill Point32 array, allocate pool memory.
 // Returns pointer to the unsorted BtPoint32 array (in pool), or NULL on error.
-__device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts, int count) {
-    // Find AABB
-    float mn[3] = {1e30f, 1e30f, 1e30f};
-    float mx[3] = {-1e30f, -1e30f, -1e30f};
-    for (int i = 0; i < count; i++) {
-        for (int k = 0; k < 3; k++) {
-            float v = pts[i * 3 + k];
-            if (v < mn[k]) mn[k] = v;
-            if (v > mx[k]) mx[k] = v;
-        }
+__device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts, int count, int lane) {
+    // --- AABB: warp-parallel strided reduction ---
+    float mn0 = 1e30f, mn1 = 1e30f, mn2 = 1e30f;
+    float mx0 = -1e30f, mx1 = -1e30f, mx2 = -1e30f;
+    for (int i = lane; i < count; i += WARP_SIZE) {
+        float v0 = pts[i * 3 + 0];
+        float v1 = pts[i * 3 + 1];
+        float v2 = pts[i * 3 + 2];
+        mn0 = fminf(mn0, v0); mx0 = fmaxf(mx0, v0);
+        mn1 = fminf(mn1, v1); mx1 = fmaxf(mx1, v1);
+        mn2 = fminf(mn2, v2); mx2 = fmaxf(mx2, v2);
     }
+    mn0 = warp_min_f(mn0); mn1 = warp_min_f(mn1); mn2 = warp_min_f(mn2);
+    mx0 = warp_max_f(mx0); mx1 = warp_max_f(mx1); mx2 = warp_max_f(mx2);
 
-    float span[3] = {mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]};
+    // --- Axis/scaling: scalar logic, all lanes compute identically ---
+    float span[3] = {mx0-mn0, mx1-mn1, mx2-mn2};
     int maxAx = (span[0] >= span[1]) ? ((span[0] >= span[2]) ? 0 : 2) : ((span[1] >= span[2]) ? 1 : 2);
     int minAx = (span[0] <= span[1]) ? ((span[0] <= span[2]) ? 0 : 2) : ((span[1] <= span[2]) ? 1 : 2);
     if (minAx == maxAx) minAx = (maxAx + 1) % 3;
     int medAx = 3 - maxAx - minAx;
-
-    s->maxAxis = maxAx;
-    s->minAxis = minAx;
-    s->medAxis = medAx;
 
     float sc[3];
     sc[0] = span[0] / 10216.0f;
@@ -1162,31 +1162,40 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
     if (((medAx + 1) % 3) != maxAx) {
         sc[0] = -sc[0]; sc[1] = -sc[1]; sc[2] = -sc[2];
     }
-    s->scaling[0] = sc[0];
-    s->scaling[1] = sc[1];
-    s->scaling[2] = sc[2];
 
     float inv[3];
     inv[0] = (sc[0] != 0.0f) ? 1.0f / sc[0] : 0.0f;
     inv[1] = (sc[1] != 0.0f) ? 1.0f / sc[1] : 0.0f;
     inv[2] = (sc[2] != 0.0f) ? 1.0f / sc[2] : 0.0f;
 
-    s->center[0] = (mn[0] + mx[0]) * 0.5f;
-    s->center[1] = (mn[1] + mx[1]) * 0.5f;
-    s->center[2] = (mn[2] + mx[2]) * 0.5f;
+    float cen[3] = {(mn0+mx0)*0.5f, (mn1+mx1)*0.5f, (mn2+mx2)*0.5f};
 
-    // Allocate and fill Point32 array
-    BtPoint32* points = (BtPoint32*)bt_alloc(s->wp, count * (int)sizeof(BtPoint32));
+    // --- Lane 0: write state and allocate ---
+    BtPoint32* points = NULL;
+    if (lane == 0) {
+        s->maxAxis = maxAx;
+        s->minAxis = minAx;
+        s->medAxis = medAx;
+        s->scaling[0] = sc[0]; s->scaling[1] = sc[1]; s->scaling[2] = sc[2];
+        s->center[0] = cen[0]; s->center[1] = cen[1]; s->center[2] = cen[2];
+        points = (BtPoint32*)bt_alloc(s->wp, count * (int)sizeof(BtPoint32));
+    }
+    // Broadcast pointer from lane 0
+    long long pp = __shfl_sync(WARP_MASK, (long long)points, 0);
+    points = (BtPoint32*)pp;
     if (!points) return NULL;
-    for (int i = 0; i < count; i++) {
+
+    // --- Point conversion: warp-parallel strided ---
+    for (int i = lane; i < count; i += WARP_SIZE) {
         float p[3];
         for (int k = 0; k < 3; k++)
-            p[k] = (pts[i*3+k] - s->center[k]) * inv[k];
+            p[k] = (pts[i*3+k] - cen[k]) * inv[k];
         points[i].x = (int)p[medAx];
         points[i].y = (int)p[maxAx];
         points[i].z = (int)p[minAx];
         points[i].index = i;
     }
+    __syncwarp();
     return points;
 }
 
@@ -1236,31 +1245,28 @@ __device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* po
         return 0.0f;
     }
 
-    // --- Phase 1: pre-sort (lane 0) ---
+    // --- Phase 1: pre-sort (all lanes) ---
     BtHullState state;
-    BtPoint32* points = NULL;
-    char* sort_scratch = NULL;
     if (lane == 0) {
         state.wp = pool;
         state.vertexList = NULL;
-        points = bt_compute_presort(&state, pts, n);
-        if (points) {
-            int scratch_bytes = n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int);
-            sort_scratch = (char*)bt_alloc(pool, scratch_bytes);
-        }
     }
     __syncwarp();
 
-    // Broadcast pointers from lane 0
+    BtPoint32* points = bt_compute_presort(&state, pts, n, lane);
+    if (!points) { *err = 1; return -1.0f; }
+
+    // Allocate sort scratch (lane 0), broadcast
+    char* sort_scratch = NULL;
+    if (lane == 0) {
+        int scratch_bytes = n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int);
+        sort_scratch = (char*)bt_alloc(pool, scratch_bytes);
+    }
     {
-        long long pp = (lane == 0) ? (long long)points : 0LL;
-        long long sp = (lane == 0) ? (long long)sort_scratch : 0LL;
-        pp = __shfl_sync(WARP_MASK, pp, 0);
-        sp = __shfl_sync(WARP_MASK, sp, 0);
-        points = (BtPoint32*)pp;
+        long long sp = __shfl_sync(WARP_MASK, (long long)sort_scratch, 0);
         sort_scratch = (char*)sp;
     }
-    if (!points || !sort_scratch) { *err = 1; return -1.0f; }
+    if (!sort_scratch) { *err = 1; return -1.0f; }
 
     // --- Phase 2: warp-cooperative sort (all lanes) ---
     warp_sort_bp32(points, sort_scratch, n, lane);

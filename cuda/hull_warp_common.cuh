@@ -52,6 +52,13 @@ __device__ inline float warp_max_f(float val) {
     return val;
 }
 
+// Reduce minimum float value across all 32 lanes.
+__device__ inline float warp_min_f(float val) {
+    for (int off = 16; off > 0; off >>= 1)
+        val = fminf(val, __shfl_xor_sync(WARP_MASK, val, off));
+    return val;
+}
+
 // OR reduction: returns nonzero iff any lane passes nonzero flag.
 __device__ inline int warp_any_i(int flag) {
     return (int)__any_sync(WARP_MASK, flag);
