@@ -25,16 +25,17 @@ struct BtPoint32 {
 // Comparison — includes index as final tiebreaker for total ordering
 // ============================================================================
 
-__device__ inline bool ws_less(BtPoint32 a, BtPoint32 b) {
-    if (a.y != b.y) return a.y < b.y;
-    if (a.x != b.x) return a.x < b.x;
-    if (a.z != b.z) return a.z < b.z;
-    return a.index < b.index;
+__device__ inline int ws_cmp(BtPoint32 a, BtPoint32 b) {
+    if (a.y != b.y) return (a.y < b.y) ? -1 : 1;
+    if (a.x != b.x) return (a.x < b.x) ? -1 : 1;
+    if (a.z != b.z) return (a.z < b.z) ? -1 : 1;
+    if (a.index != b.index) return (a.index < b.index) ? -1 : 1;
+    return 0;
 }
 
 // min/max for bitonic network
-__device__ inline BtPoint32 ws_min(BtPoint32 a, BtPoint32 b) { return ws_less(a, b) ? a : b; }
-__device__ inline BtPoint32 ws_max(BtPoint32 a, BtPoint32 b) { return ws_less(a, b) ? b : a; }
+__device__ inline BtPoint32 ws_min(BtPoint32 a, BtPoint32 b) { return (ws_cmp(a, b) < 0) ? a : b; }
+__device__ inline BtPoint32 ws_max(BtPoint32 a, BtPoint32 b) { return (ws_cmp(a, b) < 0) ? b : a; }
 
 // ============================================================================
 // Bitonic sort for <= 32 elements (all lanes participate)
@@ -133,8 +134,8 @@ __device__ inline void warp_sort_bp32(BtPoint32* points, char* scratch, int n, i
         pivot.z = __shfl_sync(WARP_MASK, sample.z, 15);
         pivot.index = __shfl_sync(WARP_MASK, sample.index, 15);
 
-        // --- Two-way partition into tmp ---
-        // Items where ws_less(elem, pivot) go left; the rest go right.
+        // --- Three-way partition into tmp ---
+        // Items < pivot go left; items > pivot go right; items == pivot skipped.
         int left_idx = 0;
         int right_idx = 0;
 
@@ -148,8 +149,9 @@ __device__ inline void warp_sort_bp32(BtPoint32* points, char* scratch, int n, i
             BtPoint32 elem;
             if (active) elem = points[pos];
 
-            bool is_less = active && ws_less(elem, pivot);
-            bool is_geq  = active && !is_less;
+            int cmp = active ? ws_cmp(elem, pivot) : 0;
+            bool is_less    = active && (cmp == -1);
+            bool is_greater = active && (cmp == 1);
 
             // Write items < pivot from the left
             unsigned mask_less = __ballot_sync(WARP_MASK, is_less);
@@ -158,37 +160,37 @@ __device__ inline void warp_sort_bp32(BtPoint32* points, char* scratch, int n, i
                 tmp[seg_lo + left_idx + prefix_less] = elem;
             left_idx += __popc(mask_less);
 
-            // Write items >= pivot from the right
-            unsigned mask_geq = __ballot_sync(WARP_MASK, is_geq);
-            int prefix_geq = __popc(mask_geq & ((1u << lane) - 1));
-            if (is_geq)
-                tmp[seg_hi - 1 - right_idx - prefix_geq] = elem;
-            right_idx += __popc(mask_geq);
+            // Write items > pivot from the right
+            unsigned mask_gt = __ballot_sync(WARP_MASK, is_greater);
+            int prefix_gt = __popc(mask_gt & ((1u << lane) - 1));
+            if (is_greater)
+                tmp[seg_hi - 1 - right_idx - prefix_gt] = elem;
+            right_idx += __popc(mask_gt);
 
             __syncwarp();
         }
 
-        // --- Copy tmp back to points ---
-        for (int i = lane; i < seg_len; i += 32)
+        // --- Fill middle with pivot, copy left/right from tmp ---
+        int mid_lo = seg_lo + left_idx;
+        int mid_hi = seg_hi - right_idx;
+        for (int i = lane; i < left_idx; i += 32)
             points[seg_lo + i] = tmp[seg_lo + i];
+        for (int i = lane; i < (mid_hi - mid_lo); i += 32)
+            points[mid_lo + i] = pivot;
+        for (int i = lane; i < right_idx; i += 32)
+            points[mid_hi + i] = tmp[mid_hi + i];
         __syncwarp();
 
         // --- Push sub-segments onto stack (lane 0 only) ---
-        // [seg_lo, split) are < pivot, [split, seg_hi) are >= pivot.
-        // two situations we have made no progress:
-        // split is seg_lo, or split is seg_hi
-        // if split is seg_lo, this means everything is >= pivot.
-        // if split is seg_hi, this means everything is < pivot. This is impossible because pivot is >= pivot.
-        // Only push if strictly smaller than parent to guarantee progress.
+        // [seg_lo, mid_lo) are < pivot, [mid_lo, mid_hi) are == pivot, [mid_hi, seg_hi) are > pivot.
         if (lane == 0) {
-            int split = seg_lo + left_idx;
-            if (split > 1 + seg_lo && sp < WS_MAX_STACK) {
+            if (left_idx > 1 && sp < WS_MAX_STACK) {
                 stack_lo[sp] = seg_lo;
-                stack_hi[sp] = split;
+                stack_hi[sp] = mid_lo;
                 sp++;
             }
-            if (seg_hi > split + 1 && sp < WS_MAX_STACK) {
-                stack_lo[sp] = split;
+            if (right_idx > 1 && sp < WS_MAX_STACK) {
+                stack_lo[sp] = mid_hi;
                 stack_hi[sp] = seg_hi;
                 sp++;
             }

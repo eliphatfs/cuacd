@@ -392,7 +392,7 @@ The D&C algorithm is a faithful port of Bullet's `btConvexHullComputer` (Ole Kni
 
 ### Warp Sort (warp_sort.cuh)
 
-Warp-cooperative quicksort for BtPoint32 arrays. All 32 lanes participate. Uses a global-memory workspace of the same size as the input. Segments ≤32 elements use a bitonic sorting network; larger segments use quicksort partitioning with a median-of-32-samples pivot. Two-way partition: items < pivot go left, items >= pivot go right, using `__ballot_sync`/`__popc` for warp-wide prefix sums. Explicit stack (max depth 64) avoids recursion. Known issue: bitonic sort for equal-key elements is not stable (index column may be reordered for ties). This is acceptable since the D&C hull algorithm only uses (y,x,z) ordering.
+Warp-cooperative quicksort for BtPoint32 arrays. All 32 lanes participate. Uses a global-memory workspace of the same size as the input. Segments ≤32 elements use a bitonic sorting network; larger segments use quicksort partitioning with a median-of-32-samples pivot. Three-way partition via `ws_cmp` (returns -1/0/1): items < pivot go left, items > pivot go right, items == pivot are filled in the middle gap by warp-parallel fill. This avoids worst-case O(n²) on all-equal or many-duplicate inputs. Uses `__ballot_sync`/`__popc` for warp-wide prefix sums. Explicit stack (max depth 2048) in global memory, `sp` in lane-0 register broadcast via `__shfl_sync`.
 
 ### pyproject.toml license Field Format
 
