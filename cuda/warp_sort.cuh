@@ -175,6 +175,10 @@ __device__ inline void warp_sort_bp32(BtPoint32* points, char* scratch, int n, i
 
         // --- Push sub-segments onto stack (lane 0 only) ---
         // [seg_lo, split) are < pivot, [split, seg_hi) are >= pivot.
+        // two situations we have made no progress:
+        // split is seg_lo, or split is seg_hi
+        // if split is seg_lo, this means everything is >= pivot.
+        // if split is seg_hi, this means everything is < pivot. This is impossible because pivot is >= pivot.
         // Only push if strictly smaller than parent to guarantee progress.
         if (lane == 0) {
             int split = seg_lo + left_idx;
@@ -183,8 +187,8 @@ __device__ inline void warp_sort_bp32(BtPoint32* points, char* scratch, int n, i
                 stack_hi[sp] = split;
                 sp++;
             }
-            if (seg_hi > split + 2 && sp < WS_MAX_STACK) {
-                stack_lo[sp] = split + 1;
+            if (seg_hi > split + 1 && sp < WS_MAX_STACK) {
+                stack_lo[sp] = split;
                 stack_hi[sp] = seg_hi;
                 sp++;
             }
