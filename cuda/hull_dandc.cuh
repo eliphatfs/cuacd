@@ -1199,38 +1199,56 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
     return points;
 }
 
-// Post-sort phase (lane 0): build vertex/edge/face pools, run D&C, extract volume.
-__device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count) {
-    btpool_init(&s->vertexPool, s->wp, count, (int)sizeof(BtVertex));
-    s->originalVertices = (BtVertex**)bt_alloc(s->wp, count * (int)sizeof(BtVertex*));
-    if (!s->originalVertices) return;
+// Post-sort: allocate pools (lane 0), init vertices (all lanes), D&C (lane 0).
+__device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count, int lane) {
+    // Lane 0: allocate pools and vertex block
+    BtVertex* vblock = NULL;
+    BtVertex** origVerts = NULL;
+    if (lane == 0) {
+        btpool_init(&s->vertexPool, s->wp, count, (int)sizeof(BtVertex));
+        origVerts = (BtVertex**)bt_alloc(s->wp, count * (int)sizeof(BtVertex*));
+        s->originalVertices = origVerts;
+        if (origVerts)
+            vblock = (BtVertex*)bt_alloc(s->wp, count * (int)sizeof(BtVertex));
+    }
+    // Broadcast pointers
+    long long vb = __shfl_sync(WARP_MASK, (long long)vblock, 0);
+    long long ov = __shfl_sync(WARP_MASK, (long long)origVerts, 0);
+    vblock = (BtVertex*)vb;
+    origVerts = (BtVertex**)ov;
+    if (!vblock || !origVerts) return;
 
-    // Pre-allocate vertex block contiguously so v+1 works for case 2
-    BtVertex* vblock = (BtVertex*)bt_alloc(s->wp, count * (int)sizeof(BtVertex));
-    if (!vblock) return;
-    for (int i = 0; i < count; i++) {
+    // All lanes: init vertices in parallel
+    BtInt128 zero128 = bt128_from_u64(0);
+    BtInt128 one128 = bt128_from_u64(1);
+    for (int i = lane; i < count; i += WARP_SIZE) {
         BtVertex* v = &vblock[i];
         v->edges = NULL;
         v->next = NULL; v->prev = NULL;
         v->firstNearbyFace = NULL; v->lastNearbyFace = NULL;
         v->point = points[i];
         v->copy = -1;
-        v->point128.x = bt128_from_u64(0);
-        v->point128.y = bt128_from_u64(0);
-        v->point128.z = bt128_from_u64(0);
-        v->point128.den = bt128_from_u64(1);
-        s->originalVertices[i] = v;
+        v->point128.x = zero128;
+        v->point128.y = zero128;
+        v->point128.z = zero128;
+        v->point128.den = one128;
+        origVerts[i] = v;
     }
+    __syncwarp();
 
-    btpool_init(&s->edgePool, s->wp, 6 * count, (int)sizeof(BtEdge));
-    btpool_init(&s->facePool, s->wp, 2 * count, (int)sizeof(BtFace));
+    // Lane 0: remaining init + D&C
+    if (lane == 0) {
+        btpool_init(&s->edgePool, s->wp, 6 * count, (int)sizeof(BtEdge));
+        btpool_init(&s->facePool, s->wp, 2 * count, (int)sizeof(BtFace));
 
-    s->usedEdgePairs = 0;
-    s->mergeStamp = -3;
+        s->usedEdgePairs = 0;
+        s->mergeStamp = -3;
 
-    BtIntermediateHull hull;
-    bt_computeInternal(s, 0, count, &hull);
-    s->vertexList = hull.minXy;
+        BtIntermediateHull hull;
+        bt_computeInternal(s, 0, count, &hull);
+        s->vertexList = hull.minXy;
+    }
+    __syncwarp();
 }
 
 // ============================================================================
@@ -1272,10 +1290,10 @@ __device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* po
     warp_sort_bp32(points, sort_scratch, n, lane);
     __syncwarp();
 
-    // --- Phase 3: post-sort D&C + volume (lane 0) ---
-    if (lane == 0) {
-        bt_compute_postsort(&state, points, n);
+    // --- Phase 3: post-sort D&C + volume (vertex init: all lanes, D&C: lane 0) ---
+    bt_compute_postsort(&state, points, n, lane);
 
+    if (lane == 0) {
         if (pool->error) {
             *err = 1;
             vol = -1.0f;
