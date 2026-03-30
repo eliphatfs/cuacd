@@ -125,16 +125,16 @@ class Context:
         return cost
 
 
-    def batch_hull_volume(self, pts_list, algo=1):
+    def batch_hull_volume(self, pts_list, algo=2):
         """Compute convex hull volume for a batch of point clouds.
 
         Args:
             pts_list: list of (N_i, 3) float32 arrays — one per hull
-            algo:     0=incremental (max 256 pts), 1=quickhull, 2=dandc
+            algo:     2=dandc (D&C Preparata-Hong; only supported algorithm)
 
         Returns:
             (volumes, errors) — float32[n_hulls], int32[n_hulls]
-            errors: 0=ok  1=OOM  2=degenerate  3=too_large(algo0 only)
+            errors: 0=ok  1=OOM  2=sort_stack_overflow  3=dfs_stack_overflow
         """
         n_hulls = len(pts_list)
         pts_arrays = [_as_f32(p) for p in pts_list]

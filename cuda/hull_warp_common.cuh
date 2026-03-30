@@ -1,7 +1,6 @@
 // hull_warp_common.cuh — Shared utilities for warp-based convex hull algorithms.
 //
-// WarpPool bump allocator and warp-level reductions used by both
-// QuickHull (hull_quickhull.cuh) and D&C (hull_dandc.cuh).
+// WarpPool bump allocator and warp-level reductions used by hull_dandc.cuh.
 //
 // Requires: common.cuh (EPS, signed_tet_volume from geometry.cuh)
 

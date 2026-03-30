@@ -81,8 +81,6 @@ struct beam_ctx {
     CUfunction fn_test_block_reduce_bbox;
     CUfunction fn_test_warp_sort;
 
-    CUfunction fn_batch_hull_incremental;
-    CUfunction fn_batch_hull_quickhull;
     CUfunction fn_batch_hull_dandc;
     CUfunction fn_query_dandc_scratch;
     CUfunction fn_batch_mesh_volume;
@@ -181,8 +179,6 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
     cuModuleGetFunction(&ctx->fn_test_block_reduce_sum, ctx->module, "test_block_reduce_sum");
     cuModuleGetFunction(&ctx->fn_test_block_reduce_bbox, ctx->module, "test_block_reduce_bbox");
     cuModuleGetFunction(&ctx->fn_test_warp_sort,        ctx->module, "test_warp_sort_kernel");
-    cuModuleGetFunction(&ctx->fn_batch_hull_incremental, ctx->module, "batch_hull_incremental");
-    cuModuleGetFunction(&ctx->fn_batch_hull_quickhull,   ctx->module, "batch_hull_quickhull");
     cuModuleGetFunction(&ctx->fn_batch_hull_dandc,       ctx->module, "batch_hull_dandc");
     cuModuleGetFunction(&ctx->fn_query_dandc_scratch,   ctx->module, "query_dandc_scratch");
     cuModuleGetFunction(&ctx->fn_batch_mesh_volume,      ctx->module, "batch_mesh_volume");
@@ -1236,7 +1232,7 @@ int beam_test_warp_sort(beam_ctx_t ctx,
 // ---------------------------------------------------------------------------
 // beam_batch_hull_volume
 // ---------------------------------------------------------------------------
-// algo: 0=incremental (block, max 256 pts), 1=quickhull (warp), 2=dandc (warp)
+// algo: 2=dandc (warp D&C Preparata-Hong)
 
 int beam_batch_hull_volume(
     beam_ctx_t   ctx,
@@ -1250,12 +1246,12 @@ int beam_batch_hull_volume(
     int*         out_errors)
 {
     if (!ctx) return -1;
-    CUfunction fn = NULL;
-    if      (algo == 0) fn = ctx->fn_batch_hull_incremental;
-    else if (algo == 1) fn = ctx->fn_batch_hull_quickhull;
-    else if (algo == 2) fn = ctx->fn_batch_hull_dandc;
-    if (!fn) { snprintf(ctx->last_error, sizeof(ctx->last_error),
-                        "batch_hull_volume: algo %d not loaded", algo); return -1; }
+    if (algo != 2) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "batch_hull_volume: only algo 2 (D&C) is supported");
+        return -1;
+    }
+    CUfunction fn = ctx->fn_batch_hull_dandc;
 
     CUstream s = NULL;
     CUdeviceptr d_pts, d_off, d_vols, d_errs, d_scratch = 0;
@@ -1266,49 +1262,34 @@ int beam_batch_hull_volume(
     CHECK_CU(cuMemcpyHtoDAsync(d_pts, pts, (size_t)total_pts * 3 * sizeof(float), s));
     CHECK_CU(cuMemcpyHtoDAsync(d_off, offsets, (size_t)(n_hulls + 1) * sizeof(int), s));
 
-    if (algo == 0) {
-        // Incremental: 1 block per hull, shared-memory workspace
-        void* args[] = { &d_pts, &d_off, &d_vols, &d_errs, &n_hulls };
-        CHECK_CU(cuLaunchKernel(fn, n_hulls, 1, 1,
-                                BLOCK_SIZE, 1, 1, 0, s, args, NULL));
-    } else {
-        // Warp kernels need scratch per hull
-        size_t scratch_per;
-        if (algo == 2) {
-            // Query exact scratch from device via dandc_scratch_bytes()
-            CUdeviceptr d_qout;
-            CHECK_CU(cuMemAlloc(&d_qout, sizeof(int)));
-            int max_pts_i = max_pts_per_hull;
-            void* qargs[] = { &max_pts_i, &d_qout };
-            CHECK_CU(cuLaunchKernel(ctx->fn_query_dandc_scratch, 1, 1, 1,
-                                    1, 1, 1, 0, s, qargs, NULL));
-            int scratch_result = 0;
-            CHECK_CU(cuMemcpyDtoHAsync(&scratch_result, d_qout, sizeof(int), s));
-            CHECK_CU(cuStreamSynchronize(s));
-            cuMemFree(d_qout);
-            scratch_per = (size_t)scratch_result;
-        } else {
-            // QuickHull needs ~256 bytes/point
-            scratch_per = (size_t)max_pts_per_hull * 512 + 8192;
-        }
-        size_t total_scratch = (size_t)n_hulls * scratch_per;
-        CHECK_CU(cuMemAlloc(&d_scratch, total_scratch));
+    // Query exact scratch from device via dandc_scratch_bytes()
+    CUdeviceptr d_qout;
+    CHECK_CU(cuMemAlloc(&d_qout, sizeof(int)));
+    int max_pts_i = max_pts_per_hull;
+    void* qargs[] = { &max_pts_i, &d_qout };
+    CHECK_CU(cuLaunchKernel(ctx->fn_query_dandc_scratch, 1, 1, 1,
+                            1, 1, 1, 0, s, qargs, NULL));
+    int scratch_result = 0;
+    CHECK_CU(cuMemcpyDtoHAsync(&scratch_result, d_qout, sizeof(int), s));
+    CHECK_CU(cuStreamSynchronize(s));
+    cuMemFree(d_qout);
+    size_t scratch_per = (size_t)scratch_result;
 
-        int block_size = (algo == 2) ? 64 : BLOCK_SIZE;
-        int warps_per_block = block_size / 32;
-        int n_blocks = (n_hulls + warps_per_block - 1) / warps_per_block;
-        int scratch_per_i = (int)scratch_per;
+    size_t total_scratch = (size_t)n_hulls * scratch_per;
+    CHECK_CU(cuMemAlloc(&d_scratch, total_scratch));
 
-        // D&C uses recursion — increase thread stack size
-        if (algo == 2) {
-            CHECK_CU(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, 32 * 1024));
-        }
+    // D&C uses recursion — increase thread stack size
+    CHECK_CU(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, 32 * 1024));
 
-        void* args[] = { &d_pts, &d_off, &d_vols, &d_errs,
-                         &d_scratch, &scratch_per_i, &n_hulls };
-        CHECK_CU(cuLaunchKernel(fn, n_blocks, 1, 1,
-                                block_size, 1, 1, 0, s, args, NULL));
-    }
+    int block_size = 64;  // DANDC_BLOCK_SIZE
+    int warps_per_block = block_size / 32;
+    int n_blocks = (n_hulls + warps_per_block - 1) / warps_per_block;
+    int scratch_per_i = (int)scratch_per;
+
+    void* args[] = { &d_pts, &d_off, &d_vols, &d_errs,
+                     &d_scratch, &scratch_per_i, &n_hulls };
+    CHECK_CU(cuLaunchKernel(fn, n_blocks, 1, 1,
+                            block_size, 1, 1, 0, s, args, NULL));
 
     CHECK_CU(cuMemcpyDtoHAsync(out_volumes, d_vols, (size_t)n_hulls * sizeof(float), s));
     CHECK_CU(cuMemcpyDtoHAsync(out_errors,  d_errs, (size_t)n_hulls * sizeof(int),   s));

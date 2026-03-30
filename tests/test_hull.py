@@ -528,7 +528,7 @@ class TestMeshVolumeGPU:
 @pytest.mark.skipif(not _HAS_GPU, reason="coacd_gpu not available")
 @pytest.mark.skipif(not _HAS_SCIPY, reason="scipy not available")
 class TestHullVolumeGPU:
-    """Validate GPU batch_hull_volume (3 algorithms) against scipy ConvexHull."""
+    """Validate GPU batch_hull_volume (D&C algorithm) against scipy ConvexHull."""
 
     @pytest.fixture(scope="class")
     def ctx(self):
@@ -536,7 +536,7 @@ class TestHullVolumeGPU:
         yield c
         c.close()
 
-    @pytest.mark.parametrize("algo", [0, 1, 2])
+    @pytest.mark.parametrize("algo", [2])
     def test_unit_cube_vertices(self, ctx, algo):
         """Convex hull of the 8 unit-cube vertices must equal 1.0."""
 
@@ -547,8 +547,6 @@ class TestHullVolumeGPU:
             f"algo={algo}: cube hull volume {vols[0]:.4f}, expected ~1.0"
 
     @pytest.mark.parametrize("algo,n_pts,seed", [
-        (0, 20,  42), (0, 50,   7),
-        (1, 20,  42), (1, 100, 123), (1, 200, 99),
         (2, 20,  42), (2, 100, 123), (2, 200, 99),
     ])
     def test_sphere_shell_vs_scipy(self, ctx, algo, n_pts, seed):
@@ -565,7 +563,7 @@ class TestHullVolumeGPU:
             f"algo={algo}, n={n_pts}: gpu={gpu_vol:.4f} scipy={scipy_vol:.4f} err={rel_err:.3%}"
 
     @pytest.mark.parametrize("algo,n_pts,seed", [
-        (0, 20, 0), (1, 50, 0), (2, 50, 0),
+        (2, 50, 0),
     ])
     def test_cube_interior_vs_scipy(self, ctx, algo, n_pts, seed):
         """GPU hull of cube-interior points must match scipy to within 5%."""
@@ -581,8 +579,6 @@ class TestHullVolumeGPU:
             f"algo={algo}, n={n_pts}: gpu={gpu_vol:.4f} scipy={scipy_vol:.4f} err={rel_err:.3%}"
 
     @pytest.mark.parametrize("algo,n_pts,seed", [
-        (0, 20, 0), (0, 50, 7),
-        (1, 20, 0), (1, 100, 123), (1, 200, 99),
         (2, 20, 0), (2, 100, 123), (2, 200, 99),
     ])
     def test_gaussian_vs_scipy(self, ctx, algo, n_pts, seed):
@@ -599,18 +595,9 @@ class TestHullVolumeGPU:
             f"algo={algo}, n={n_pts}: gpu={gpu_vol:.4f} scipy={scipy_vol:.4f} err={rel_err:.3%}"
 
     @pytest.mark.parametrize("algo,n_pts,seed,dist_fn", [
-        # D&C accuracy at high point counts
         (2, 2000, 0, "sphere_shell"),
         (2, 2000, 0, "cube_interior"),
         (2, 2000, 0, "gaussian"),
-        # QuickHull at moderate point counts
-        (1, 200, 0, "sphere_shell"),
-        (1, 200, 0, "cube_interior"),
-        (1, 200, 0, "gaussian"),
-        # Incremental at its limit (256)
-        (0, 200, 0, "sphere_shell"),
-        (0, 200, 0, "cube_interior"),
-        (0, 200, 0, "gaussian"),
     ])
     def test_large_pointcloud_vs_scipy(self, ctx, algo, n_pts, seed, dist_fn):
         """GPU hull volume must match scipy within 5% on larger point clouds."""
@@ -630,7 +617,7 @@ class TestHullVolumeGPU:
         assert rel_err < 0.05, \
             f"algo={algo}, n={n_pts}, {dist_fn}: gpu={gpu_vol:.4f} scipy={scipy_vol:.4f} err={rel_err:.3%}"
 
-    @pytest.mark.parametrize("algo", [1, 2])
+    @pytest.mark.parametrize("algo", [2])
     def test_batch_sphere_hulls_vs_scipy(self, ctx, algo):
         """Batch of 10 sphere-shell hulls must all match scipy to within 5%."""
 
@@ -645,7 +632,7 @@ class TestHullVolumeGPU:
             assert rel_err < 0.05, \
                 f"algo={algo}, hull {i}: gpu={vols[i]:.4f} scipy={scipy_vol:.4f}"
 
-    @pytest.mark.parametrize("algo", [1, 2])
+    @pytest.mark.parametrize("algo", [2])
     def test_icosphere_hull_matches_mesh(self, ctx, algo):
         """Convex hull of level-3 icosphere vertices should match its mesh volume.
 
@@ -660,7 +647,7 @@ class TestHullVolumeGPU:
         assert rel_err < 0.05, \
             f"algo={algo}: hull={vols[0]:.4f}, mesh={mesh_vol:.4f}, err={rel_err:.3%}"
 
-    @pytest.mark.parametrize("algo", [1, 2])
+    @pytest.mark.parametrize("algo", [2])
     def test_volume_scales_cubically(self, ctx, algo):
         """Scaling a point cloud by s must scale GPU hull volume by s^3."""
 
@@ -747,11 +734,7 @@ def benchmark_mesh_volumes():
 
 
 def benchmark_hull_volumes_gpu():
-    """Benchmark GPU hull volume (3 algorithms) on various batch configurations.
-
-    algo=0 (incremental) is skipped for n_pts > 256.
-    Prints timing and mean volume for each (config, distribution, algorithm).
-    """
+    """Benchmark GPU D&C hull volume on various batch configurations."""
     if not _HAS_GPU:
         print("GPU not available — skipping GPU hull benchmark")
         return
@@ -767,42 +750,29 @@ def benchmark_hull_volumes_gpu():
         ("cube_interior", make_cube_interior),
         ("gaussian",      make_gaussian),
     ]
-    algos = [
-        (0, "incremental"),
-        (1, "quickhull"),
-        (2, "dandc"),
-    ]
 
     ctx = coacd_gpu.Context(device=0)
     rng = np.random.default_rng(0)
 
     try:
-        header = (f"{'Config':<20} {'Distribution':<16} "
-                  f"{'Algorithm':<14} {'GPU ms':>9} {'mean vol':>10}")
+        header = (f"{'Config':<20} {'Distribution':<16} {'GPU ms':>9} {'mean vol':>10}")
         print(f"\n{header}")
         print("-" * len(header))
 
         for n_hulls, n_pts, cfg_name in configs:
             for dist_name, dist_fn in distributions:
                 pts_list = [dist_fn(n_pts, rng) for _ in range(n_hulls)]
-                for algo_id, algo_name in algos:
-                    if algo_id == 0 and n_pts > 256:
-                        continue
-                    if algo_id in (0, 1) and n_pts >= 2000:
-                        continue
-                    try:
-                        # warm up
-                        ctx.batch_hull_volume(pts_list[:min(8, n_hulls)], algo=algo_id)
-                        t0 = time.perf_counter()
-                        vols, _ = ctx.batch_hull_volume(pts_list, algo=algo_id)
-                        t1 = time.perf_counter()
-                        gpu_ms = (t1 - t0) * 1000.0
-                        mean_vol = float(np.mean(vols))
-                        print(f"{cfg_name:<20} {dist_name:<16} "
-                              f"{algo_name:<14} {gpu_ms:>9.1f} {mean_vol:>10.4f}")
-                    except Exception as e:
-                        print(f"{cfg_name:<20} {dist_name:<16} "
-                              f"{algo_name:<14} ERROR: {e}")
+                try:
+                    # warm up
+                    ctx.batch_hull_volume(pts_list[:min(8, n_hulls)])
+                    t0 = time.perf_counter()
+                    vols, _ = ctx.batch_hull_volume(pts_list)
+                    t1 = time.perf_counter()
+                    gpu_ms = (t1 - t0) * 1000.0
+                    mean_vol = float(np.mean(vols))
+                    print(f"{cfg_name:<20} {dist_name:<16} {gpu_ms:>9.1f} {mean_vol:>10.4f}")
+                except Exception as e:
+                    print(f"{cfg_name:<20} {dist_name:<16} ERROR: {e}")
 
         print()
     finally:

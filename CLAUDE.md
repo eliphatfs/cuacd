@@ -20,12 +20,10 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
   hull.cuh            #   Incremental convex hull (shared mem, ≤256 verts, used by beam search)
-  hull_warp.cuh       #   Umbrella include for warp-parallel hull algorithms
-  hull_warp_common.cuh#   WarpPool allocator + warp reductions (shared by QuickHull & D&C)
-  hull_quickhull.cuh  #   QuickHull warp algorithm (algo=1)
-  hull_dandc.cuh      #   Preparata-Hong D&C hull volume (algo=2, Bullet port, warp sort + lane-0 D&C)
+  hull_warp_common.cuh#   WarpPool allocator + warp reductions (used by D&C)
+  hull_dandc.cuh      #   Preparata-Hong D&C hull volume (Bullet port, warp sort + lane-0 D&C)
   warp_sort.cuh       #   Warp-cooperative quicksort for BtPoint32 (bitonic ≤32, partitioned >32)
-  hull_batch.cu       #   batch_hull_volume kernel dispatcher (algo 0/1/2)
+  hull_batch.cu       #   batch_hull_dandc kernel + batch_mesh_volume kernel
   test_warp_sort.cu   #   Test kernel for warp_sort_bp32
   beam_search.cu      #   Beam search kernels + compute_rv_for_tris device function
   hausdorff.cu        #   Hausdorff kernels (point_mesh_distance, reduce_max, pairwise)
@@ -93,6 +91,7 @@ One extension is built by `setup.py`:
 - **No PyTorch dependency** — numpy arrays in/out. Reuses existing CUDA context if available.
 - **Single extension** — all GPU functionality (beam search + Hausdorff + merge cost) in one `_gpu` module. No cmake, no ctypes.
 - **Native CPython extension, not ctypes** — ctypes has fragile import path resolution, no type safety, no proper Python object lifecycle. The torchoptix pattern (native CPython extension with embedded fatbin) is the standard approach.
+- **Hull algorithm** — only D&C (Preparata-Hong) is exposed via `batch_hull_volume`. Incremental (algo=0) and QuickHull (algo=1) batch kernels have been removed. The incremental shared-memory hull (`hull.cuh`) is still used internally by beam search for Rv computation.
 
 ### Python API
 
@@ -216,7 +215,7 @@ The beam search kernels should be high-level logic calling these reusable utilit
 | C3 | `compute_tri_bbox` | EXTRACT — ~25 lines duplicated in evaluate_candidates and apply_cuts | `(vp, tp, tri_offset, tri_count, tid, smem, out_lo[3], out_hi[3])` -> per-part bbox from triangle vertex references |
 | C4 | `compute_mesh_volume` | EXTRACT — embedded in compute_rv_for_tris and compute_part_costs | `(verts, tris, n_tris, tid, smem) -> float` — parallel signed-tet reduction, returns absolute volume |
 | C5 | `collect_hull_vertices` | EXTRACT — flag + count + strided sample, ~50 lines in compute_rv_for_tris | `(verts, tris, n_tris, vert_offset, total_verts, flags, out_pts, max_pts, tid, smem, scratch) -> int n_hull` — flags triangle-referenced vertices, strides to <=MAX_HULL_VERTS |
-| C6 | `compute_hull_volume` (shared memory) | EXISTS | hull.cuh — `(points, n_points, tid, ws) -> float`, <=256 verts, ~12KB shared memory |
+| C6 | `compute_hull_volume` (shared memory) | EXISTS | hull.cuh — `(points, n_points, tid, ws) -> float`, ≤256 verts, ~12KB shared memory; used by beam search Rv |
 | C7 | `compute_hull_volume_pool` (pool memory) | EXISTS | hull.cuh — `(points, n_points, tid, fv0..., max_faces) -> float`, unlimited verts, pool-allocated face arrays |
 
 ### D. Block-Level Boundary / Cap Operations (device functions)
@@ -414,8 +413,8 @@ PEP 621 requires `license = {text = "MIT"}` or `license = {file = "LICENSE"}`. T
 - L-shape decomposed into exactly 2 convex boxes at threshold 0.05
 - GPU beam search tests pass (cube convexity, L-shape decomposition, beam params)
 - `batch_mesh_volume` GPU kernel (divergence theorem, watertight meshes) — tested
-- `batch_hull_volume` algo=0 (incremental, ≤256 pts), algo=1 (QuickHull warp), algo=2 (D&C warp) — all tested and passing
-- Full pytest suite: 139 passed (2 pre-existing failures in algo=0/1 gaussian at 200 pts)
+- `batch_hull_volume` algo=2 (D&C warp) — tested and passing
+- Full pytest suite: 118 passed, 0 failures
 
 ### Not Yet Implemented
 - Connected components after clipping (design step 1)
