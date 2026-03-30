@@ -121,27 +121,26 @@ Replace MCTS with beam search over decomposition states. Search space: 3xN axis-
 
 ### Algorithm Steps
 
+No connected component analysis — each cut produces exactly two parts (positive/negative half), matching CoACD's approach. Metrics are computed per-part, not per-component.
+
 **Step 0 — Initialize:**
 Upload mesh, normalize to [-1,1]^3. Generate 3xN cutting planes. Start with all 30 cuts in work list.
 
-**Step 1 — Connected Components (1 kernel):**
-For each item in the work list, scan and compute connected components. 1 candidate per block. Uses parallel union-find with path compression via atomicMin.
+**Step 1 — Compute Rv per part (1 kernel):**
+Compute Rv for each part in each candidate, with 1 part per block. Build index of parts satisfying Rv < epsilon.
 
-**Step 2 — Compute Rv per component (1 kernel):**
-Compute Rv for each component in each candidate, with 1 component per block. Use atomic operations to build an index of components satisfying Rv < epsilon.
+**Step 2 — Hausdorff validation (1 kernel):**
+Compute Hausdorff distance for parts with Rv < epsilon. Build index of parts where max(Rv, Hausdorff) < epsilon.
 
-**Step 3 — Hausdorff validation (1 kernel):**
-Compute Hausdorff distance for components with Rv < epsilon. Build an index of components where max(Rv, Hausdorff) < epsilon.
+**Step 3 — Worst selection + termination check (1 kernel):**
+For each work list item, choose the part with the worst metric max(Rv, Hausdorff). If all parts in all candidates satisfy -> pick the one with fewest parts and terminate.
 
-**Step 4 — Worst selection + termination check (1 kernel):**
-For each work list item, choose the component with the worst metric max(Rv, Hausdorff). If all components in all candidates satisfy -> pick the one with fewest components and terminate.
-
-**Step 5 — Beam expansion (1 kernel):**
+**Step 4 — Beam expansion (1 kernel):**
 For X items in the work list, the worst part leads to 30 next-step candidates -> 30X total. Each thread block handles one candidate: clip, compute Rv, record cost scalar. Block 0 waits via atomic counter and selects the best X candidates.
 
 Memory strategy: Keep at most max(30, X) meshes in global memory. Use references and only add 'cut plane intersection' to memory if needed. Trade recomputation for memory. Rv can be computed without storing convex hull (hull volume accumulated incrementally, only scalar kept). Hull approximated to ~256 vertices during search.
 
-**Step 6 — Apply cuts + update (1 kernel):**
+**Step 5 — Apply cuts + update (1 kernel):**
 Track the indices to find which cuts were taken. Update meshes with the cuts. The work list now contains X items. Update bounding boxes and other metadata. Repeat from step 1.
 
 ### Concavity Metric: Rv (Volume-Ratio)
@@ -226,118 +225,95 @@ The beam search kernels should be high-level logic calling these reusable utilit
 | D2 | `trace_boundary_loops` | WRITE — currently loop tracing is embedded in D1 and D3, duplicated with differences | `(verts, be_a, be_b, n_be, out_loops, out_loop_lens, tid) -> int n_loops` — clean loop tracer by position matching. Consumable by both cap volume and fan cap |
 | D3 | `fan_cap_triangulate` | EXTRACT — ~60 lines in apply_cuts | `(verts, be_a, be_b, n_be, plane, pos_tris, neg_tris, &pc, &nc, tid)` — traces loops, adds fan triangles to both halves with correct winding |
 
-### E. Connected Components (device functions, all threads)
+### E. Rv Computation (composite device functions)
 
 | ID | Function | Status | Signature |
 |----|----------|--------|-----------|
-| E1 | `build_edge_adjacency` | WRITE | `(tris, n_tris, edge_table, table_size, tid)` — hash table: canonical edge -> (tri_a, tri_b). Parallel insert via atomicCAS |
-| E2 | `union_find_init` | WRITE | `(labels, n, tid)` — `labels[i] = i` for all i |
-| E3 | `union_find_iterate` | WRITE | `(labels, tris, n_tris, edge_table, tid) -> bool changed` — one pass of parallel union with path compression via atomicMin |
-| E4 | `compact_components` | WRITE | `(labels, n_tris, comp_offsets, comp_counts, tid) -> int n_components` — per-component triangle index lists |
+| E1 | `compute_rv_closed` | WRITE — for closed meshes (no cap) | `(verts, tris, n_tris, vert_offset, total_verts, tid, hull_ws, smem, scratch, rv_k) -> float` — composes C4 + C5 + C6 + A4 |
+| E2 | `compute_rv_open` | REFACTOR — current `compute_rv_for_tris` | `(verts, tris, n_tris, total_verts, vert_offset, plane, be_a, be_b, n_be, tid, hull_ws, smem, scratch, rv_k) -> float` — composes C4 + D1 + C5 + C6 + A4 |
 
-### F. Rv Computation (composite device functions)
+### F. Hausdorff (kernels + host helpers)
+
+| ID | Function | Status | File |
+|----|----------|--------|------|
+| F1 | `sample_surface` kernel | EXISTS | hausdorff.cu — area-weighted surface sampling |
+| F2 | `point_mesh_distance` kernel | EXISTS | hausdorff.cu — brute-force point-to-triangle, one thread per point |
+| F3 | `reduce_max` kernel | EXISTS | hausdorff.cu — shared-memory parallel max reduction |
+| F4 | `compute_hausdorff_pair` (host orchestration) | WRITE — wire F1+F2+F3 into beam loop for step 2 | Bidirectional: sample A->mesh B, sample B->mesh A, take max |
+| F5 | `pairwise_hausdorff` kernel | EXISTS | hausdorff.cu — batch merge cost matrix |
+
+### G. Mesh Transform (kernels)
+
+| ID | Function | Status | File |
+|----|----------|--------|------|
+| G1 | `normalize_mesh` kernel | EXISTS | mesh_transform.cu |
+| G2 | `recover_coordinates` kernel | EXISTS | mesh_transform.cu |
+
+### H. Selection / Search
 
 | ID | Function | Status | Signature |
 |----|----------|--------|-----------|
-| F1 | `compute_rv_closed` | WRITE — for closed meshes (no cap) | `(verts, tris, n_tris, vert_offset, total_verts, tid, hull_ws, smem, scratch, rv_k) -> float` — composes C4 + C5 + C6 + A4 |
-| F2 | `compute_rv_open` | REFACTOR — current `compute_rv_for_tris` | `(verts, tris, n_tris, total_verts, vert_offset, plane, be_a, be_b, n_be, tid, hull_ws, smem, scratch, rv_k) -> float` — composes C4 + D1 + C5 + C6 + A4 |
+| H1 | `select_top_k` kernel | EXISTS | beam_search.cu — thread-0 insertion sort, single block |
+| H2 | `block_select_top_k` | NEEDED if fusing into expansion kernel | Block-0 selection pattern for step 4 |
 
-### G. Hausdorff (kernels + host helpers)
-
-| ID | Function | Status | File |
-|----|----------|--------|------|
-| G1 | `sample_surface` kernel | EXISTS | hausdorff.cu — area-weighted surface sampling |
-| G2 | `point_mesh_distance` kernel | EXISTS | hausdorff.cu — brute-force point-to-triangle, one thread per point |
-| G3 | `reduce_max` kernel | EXISTS | hausdorff.cu — shared-memory parallel max reduction |
-| G4 | `compute_hausdorff_pair` (host orchestration) | WRITE — wire G1+G2+G3 into beam loop for step 3 | Bidirectional: sample A->mesh B, sample B->mesh A, take max |
-| G5 | `pairwise_hausdorff` kernel | EXISTS | hausdorff.cu — batch merge cost matrix |
-
-### H. Mesh Transform (kernels)
+### I. Memory / Infrastructure
 
 | ID | Function | Status | File |
 |----|----------|--------|------|
-| H1 | `normalize_mesh` kernel | EXISTS | mesh_transform.cu |
-| H2 | `recover_coordinates` kernel | EXISTS | mesh_transform.cu |
+| I1 | `pool_alloc(pool, size) -> void*` | EXISTS | common.cuh |
+| I2 | `atomicMinF / atomicMaxF` | EXISTS | common.cuh |
 
-### I. Selection / Search
-
-| ID | Function | Status | Signature |
-|----|----------|--------|-----------|
-| I1 | `select_top_k` kernel | EXISTS | beam_search.cu — thread-0 insertion sort, single block |
-| I2 | `block_select_top_k` | NEEDED if fusing into expansion kernel | Block-0 selection pattern for step 5 |
-
-### J. Memory / Infrastructure
-
-| ID | Function | Status | File |
-|----|----------|--------|------|
-| J1 | `pool_alloc(pool, size) -> void*` | EXISTS | common.cuh |
-| J2 | `atomicMinF / atomicMaxF` | EXISTS | common.cuh |
-
-### K. Legacy / Dead Code (to remove)
+### J. Legacy / Dead Code (to remove)
 
 | ID | What | Why dead |
 |----|------|----------|
-| K1 | `compute_concavity_tris` in geometry.cuh | Bbox cube-root proxy, superseded by Rv |
-| K2 | Global `planes` array generation + upload in beam.c | Planes derived from per-part bbox; global array allocated/uploaded but never read |
-| K3 | `test_hull_volume` kernel + Python wiring | Debug-only diagnostic |
+| J1 | `compute_concavity_tris` in geometry.cuh | Bbox cube-root proxy, superseded by Rv |
+| J2 | Global `planes` array generation + upload in beam.c | Planes derived from per-part bbox; global array allocated/uploaded but never read |
+| J3 | `test_hull_volume` kernel + Python wiring | Debug-only diagnostic |
 
 ### Kernel Composition from Utilities
 
-**Step 1 kernel** (CC): `E1 -> E2 -> repeat(E3) -> E4`
+**Step 1 kernel** (Rv per part): `E1` or `E2` (one block per part)
 
-**Step 2 kernel** (Rv per component): `F1` (one block per component)
+**Step 2 kernel** (Hausdorff): `F1 -> F2 -> F3` per part (host orchestration via F4)
 
-**Step 3 kernel** (Hausdorff): `G1 -> G2 -> G3` per component (host orchestration via G4)
+**Step 3 kernel** (worst + termination): `B3` reduction over parts per item
 
-**Step 4 kernel** (worst + termination): `B3` reduction over components per item
+**Step 4 kernel** (expand): `C3 -> C1 -> C2 -> E2(pos) -> E2(neg) -> write cost` + block-0 `H2`
 
-**Step 5 kernel** (expand): `C3 -> C1 -> C2 -> F2(pos) -> F2(neg) -> write cost` + block-0 `I2`
-
-**Step 6 kernel** (apply cuts): `C3 -> C1 -> C2 -> D3 -> copy to pool`
+**Step 5 kernel** (apply cuts): `C3 -> C1 -> C2 -> D3 -> copy to pool`
 
 ## Current Implementation vs. Design Discrepancies
 
-### 1. No Connected Components (design step 1)
+### 1. No Hausdorff in beam loop (design step 2)
 
-**Design**: Dedicated kernel — for each item, compute CC. 1 candidate per block.
-
-**Current**: Completely absent. Each clip half is one part regardless of connectivity.
-
-### 2. Rv is per-half, not per-component (design step 2)
-
-**Design**: Separate kernel — Rv for each connected component, 1 component per block.
-
-**Current**: Rv computed per clip-half (fused into `evaluate_candidates`), not per component.
-
-### 3. No Hausdorff in beam loop (design step 3)
-
-**Design**: Dedicated kernel — Hausdorff for components where Rv < eps.
+**Design**: Dedicated kernel — Hausdorff for parts where Rv < eps.
 
 **Current**: Hausdorff kernels exist but are not wired into the beam loop. Termination uses Rv alone.
 
-### 4. Worst selection / termination (design step 4)
+### 2. Worst selection / termination (design step 3)
 
-**Design**: Per-item worst component based on max(Rv, Hausdorff). Single kernel.
+**Design**: Per-item worst part based on max(Rv, Hausdorff). Single kernel.
 
 **Current**: `compute_part_costs` finds worst per beam item (Rv only, sequential per-part loop, 1 block per beam item). Termination on host.
 
-### 5. Expansion kernel architecture (design step 5)
+### 3. Expansion kernel architecture (design step 4)
 
 **Design**: Single fused kernel — 30X blocks, block-0 selects top X.
 
 **Current**: Three separate kernels with host sync: evaluate_candidates, select_top_k, apply_cuts.
 
-### 6. Memory model (design step 5)
+### 4. Memory model (design step 4)
 
 **Design**: Keep at most max(30, X) meshes. Use references. Trade recomputation for memory.
 
 **Current**: Double-buffered pools with full vertex/triangle copies per part. Each part copies ALL parent vertices (superset). Scratch materializes full clipped meshes for all 30X candidates.
 
-### 7. Global planes array is dead code
+### 5. Global planes array is dead code
 
 `generate_planes()` uploads a global planes array. Both `evaluate_candidates` and `apply_cuts` reconstruct planes from per-part bounding boxes and ignore the global array. The plane_idx is used only to derive axis + cut index for the per-part bbox formula.
 
-### 8. compute_part_costs hangs on large meshes
+### 6. compute_part_costs hangs on large meshes
 
 `evaluate_candidates` uses 256-vert approximate hull (correct). `compute_part_costs` attempts full-precision hull with ALL vertices unconditionally — hangs on 20K+ vertices because thread-0 sequential hull is O(N^2 * F).
 
@@ -425,9 +401,8 @@ Moving `query_dandc_scratch` before the large `cuMemcpyHtoDAsync` calls (to avoi
 - Full pytest suite: 118 passed, 0 failures
 
 ### Not Yet Implemented
-- Connected components after clipping (design step 1)
-- Hausdorff validation in beam loop (design step 3; kernels exist, not wired in)
-- Fused expansion kernel with block-0 selection (design step 5)
+- Hausdorff validation in beam loop (design step 2; kernels exist, not wired in)
+- Fused expansion kernel with block-0 selection (design step 4)
 - Merge post-processing
 - Vertex compaction (parts carry superset of vertices)
 - Large mesh support (compute_part_costs hangs on 20K+ vertices)
