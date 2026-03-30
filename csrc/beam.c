@@ -84,6 +84,7 @@ struct beam_ctx {
     CUfunction fn_batch_hull_incremental;
     CUfunction fn_batch_hull_quickhull;
     CUfunction fn_batch_hull_dandc;
+    CUfunction fn_query_dandc_scratch;
     CUfunction fn_batch_mesh_volume;
 
     struct MeshPool pool_a, pool_b;
@@ -183,6 +184,7 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
     cuModuleGetFunction(&ctx->fn_batch_hull_incremental, ctx->module, "batch_hull_incremental");
     cuModuleGetFunction(&ctx->fn_batch_hull_quickhull,   ctx->module, "batch_hull_quickhull");
     cuModuleGetFunction(&ctx->fn_batch_hull_dandc,       ctx->module, "batch_hull_dandc");
+    cuModuleGetFunction(&ctx->fn_query_dandc_scratch,   ctx->module, "query_dandc_scratch");
     cuModuleGetFunction(&ctx->fn_batch_mesh_volume,      ctx->module, "batch_mesh_volume");
 
     return 0;
@@ -1270,19 +1272,27 @@ int beam_batch_hull_volume(
         CHECK_CU(cuLaunchKernel(fn, n_hulls, 1, 1,
                                 BLOCK_SIZE, 1, 1, 0, s, args, NULL));
     } else {
-        // Warp kernels: 8 warps per block (BLOCK_SIZE=256), need scratch
-        // D&C hull (Bullet port) needs large structs (~1KB/vertex + edge/face pools).
-        // QuickHull needs ~256 bytes/point.
+        // Warp kernels need scratch per hull
         size_t scratch_per;
         if (algo == 2) {
-            // D&C: generous 2MB per hull
-            scratch_per = 2 * 1024 * 1024;
+            // Query exact scratch from device via dandc_scratch_bytes()
+            CUdeviceptr d_qout;
+            CHECK_CU(cuMemAlloc(&d_qout, sizeof(int)));
+            int max_pts_i = max_pts_per_hull;
+            void* qargs[] = { &max_pts_i, &d_qout };
+            CHECK_CU(cuLaunchKernel(ctx->fn_query_dandc_scratch, 1, 1, 1,
+                                    1, 1, 1, 0, s, qargs, NULL));
+            int scratch_result = 0;
+            CHECK_CU(cuMemcpyDtoHAsync(&scratch_result, d_qout, sizeof(int), s));
+            CHECK_CU(cuStreamSynchronize(s));
+            cuMemFree(d_qout);
+            scratch_per = (size_t)scratch_result;
         } else {
+            // QuickHull needs ~256 bytes/point
             scratch_per = (size_t)max_pts_per_hull * 512 + 8192;
         }
         size_t total_scratch = (size_t)n_hulls * scratch_per;
         CHECK_CU(cuMemAlloc(&d_scratch, total_scratch));
-        CHECK_CU(cuMemsetD8Async(d_scratch, 0, total_scratch, s));
 
         int block_size = (algo == 2) ? 64 : BLOCK_SIZE;
         int warps_per_block = block_size / 32;

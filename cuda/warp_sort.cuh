@@ -70,11 +70,11 @@ __device__ inline BtPoint32 ws_bitonic32(BtPoint32 val, int n, int lane) {
 
 #define WS_MAX_STACK 2048
 
-// Sort points[0..n) in-place.
+// Sort points[0..n) in-place.  Returns 0 on success, 1 if stack overflowed.
 // scratch must be (n * sizeof(BtPoint32) + WS_MAX_STACK * 2 * sizeof(int)) bytes.
 // All 32 lanes must call with identical arguments.
-__device__ inline void warp_sort_bp32(BtPoint32* points, char* scratch, int n, int lane) {
-    if (n <= 1) return;
+__device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, int lane) {
+    if (n <= 1) return 0;
 
     BtPoint32* tmp = (BtPoint32*)scratch;
     // Stack lives in global memory after the tmp array
@@ -184,19 +184,20 @@ __device__ inline void warp_sort_bp32(BtPoint32* points, char* scratch, int n, i
         // --- Push sub-segments onto stack (lane 0 only) ---
         // [seg_lo, mid_lo) are < pivot, [mid_lo, mid_hi) are == pivot, [mid_hi, seg_hi) are > pivot.
         if (lane == 0) {
-            if (left_idx > 1 && sp < WS_MAX_STACK) {
-                stack_lo[sp] = seg_lo;
-                stack_hi[sp] = mid_lo;
-                sp++;
+            if (left_idx > 1) {
+                if (sp >= WS_MAX_STACK) { sp = -1; }
+                else { stack_lo[sp] = seg_lo; stack_hi[sp] = mid_lo; sp++; }
             }
-            if (right_idx > 1 && sp < WS_MAX_STACK) {
-                stack_lo[sp] = mid_hi;
-                stack_hi[sp] = seg_hi;
-                sp++;
+            if (sp >= 0 && right_idx > 1) {
+                if (sp >= WS_MAX_STACK) { sp = -1; }
+                else { stack_lo[sp] = mid_hi; stack_hi[sp] = seg_hi; sp++; }
             }
         }
         __syncwarp();
+        // Check for stack overflow (sp == -1 on lane 0)
+        if (__shfl_sync(WARP_MASK, sp, 0) < 0) return 1;
     }
+    return 0;
 }
 
 #endif // WARP_SORT_CUH

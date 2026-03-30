@@ -446,6 +446,48 @@ __device__ inline void* bt_alloc(WarpPool* wp, int bytes) {
 }
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+#define BT_DFS_MAX_STACK 4096
+
+// Error codes (distinct from pool OOM = 1)
+#define BT_ERR_SORT_STACK  2
+#define BT_ERR_DFS_STACK   3
+
+// ============================================================================
+// Scratch size calculation
+// ============================================================================
+
+// Aligned size matching bt_alloc's 16-byte alignment.
+#define BT_ALIGN16(x) (((x) + 15) & ~15)
+
+// Compute total WarpPool scratch bytes needed for D&C hull with n points.
+// Matches all bt_alloc / btpool_init allocations in presort, sort, postsort, volume.
+__host__ __device__ inline int dandc_scratch_bytes(int n) {
+    int total = 0;
+    // presort: BtPoint32 array
+    total += BT_ALIGN16(n * (int)sizeof(BtPoint32));
+    // sort scratch: tmp array + two stack arrays
+    total += BT_ALIGN16(n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int));
+    // postsort: originalVertices pointer array
+    total += BT_ALIGN16(n * (int)sizeof(BtVertex*));
+    // postsort: pre-allocated vertex block
+    total += BT_ALIGN16(n * (int)sizeof(BtVertex));
+    // vertexPool block (lazy alloc, one block of n vertices)
+    total += BT_ALIGN16(n * (int)sizeof(BtVertex));
+    // edgePool block (lazy alloc, one block of 6n edges)
+    total += BT_ALIGN16(6 * n * (int)sizeof(BtEdge));
+    // facePool block (lazy alloc, one block of 2n faces)
+    total += BT_ALIGN16(2 * n * (int)sizeof(BtFace));
+    // bt_computeVolume: DFS stack
+    total += BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
+    // alignment padding headroom
+    total += 32 * 1024;
+    return total;
+}
+
+// ============================================================================
 // State struct (replaces btConvexHullInternal class members)
 // ============================================================================
 
@@ -1070,9 +1112,8 @@ __device__ inline float bt_computeVolume(BtHullState* s) {
         // We'll use a simple DFS with a pre-allocated stack
     }
 
-    // Allocate a stack of vertex pointers (generous size)
-    int maxStack = 4096;
-    BtVertex** stack = (BtVertex**)bt_alloc(s->wp, maxStack * (int)sizeof(BtVertex*));
+    // Allocate a stack of vertex pointers
+    BtVertex** stack = (BtVertex**)bt_alloc(s->wp, BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
     if (!stack) return -1.0f;
 
     s->vertexList->copy = stamp;
@@ -1089,9 +1130,11 @@ __device__ inline float bt_computeVolume(BtHullState* s) {
         do {
             if (e->target->copy != stamp) {
                 e->target->copy = stamp;
-                if (stackSize < maxStack) {
-                    stack[stackSize++] = e->target;
+                if (stackSize >= BT_DFS_MAX_STACK) {
+                    s->wp->error = BT_ERR_DFS_STACK;
+                    return -1.0f;
                 }
+                stack[stackSize++] = e->target;
             }
             if (e->copy != stamp) {
                 // Walk face: fan-triangulate from first vertex
@@ -1287,19 +1330,20 @@ __device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* po
     if (!sort_scratch) { *err = 1; return -1.0f; }
 
     // --- Phase 2: warp-cooperative sort (all lanes) ---
-    warp_sort_bp32(points, sort_scratch, n, lane);
+    int sort_err = warp_sort_bp32(points, sort_scratch, n, lane);
     __syncwarp();
+    if (sort_err) { *err = BT_ERR_SORT_STACK; return -1.0f; }
 
     // --- Phase 3: post-sort D&C + volume (vertex init: all lanes, D&C: lane 0) ---
     bt_compute_postsort(&state, points, n, lane);
 
     if (lane == 0) {
         if (pool->error) {
-            *err = 1;
+            *err = pool->error;
             vol = -1.0f;
         } else {
             vol = bt_computeVolume(&state);
-            if (pool->error) { *err = 1; vol = -1.0f; }
+            if (pool->error) { *err = pool->error; vol = -1.0f; }
         }
     }
 

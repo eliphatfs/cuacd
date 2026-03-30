@@ -137,8 +137,16 @@ __global__ void batch_hull_dandc(
 
     if (lane == 0) {
         volumes[warp_id] = vol;
-        errors[warp_id]  = pool.error ? 1 : err;
+        errors[warp_id]  = pool.error ? pool.error : err;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Query kernel: write dandc_scratch_bytes(n) to output.
+// ---------------------------------------------------------------------------
+__global__ void query_dandc_scratch(int n, int* out) {
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+        *out = dandc_scratch_bytes(n);
 }
 
 // ---------------------------------------------------------------------------
