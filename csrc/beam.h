@@ -31,14 +31,6 @@ void beam_params_default(beam_params_t* params);
 int  beam_init(beam_ctx_t* ctx, int device_ordinal);
 void beam_destroy(beam_ctx_t ctx);
 
-int beam_run(
-    beam_ctx_t           ctx,
-    const float*         vertices,
-    int                  n_verts,
-    const int*           triangles,
-    int                  n_tris,
-    const beam_params_t* params);
-
 int  beam_get_num_parts(beam_ctx_t ctx);
 
 int beam_get_part(
@@ -90,55 +82,6 @@ int beam_pairwise_hausdorff(
     const int*      vert_offsets,    // [n_parts + 1]
     int             n_parts,
     float*          cost_matrix);    // [n_parts * n_parts] output
-
-// Diagnostic: test hull volume computation directly
-int beam_test_hull_volume(beam_ctx_t ctx,
-                          const float* points, int n_points,
-                          float* out_volume, int* out_n_faces);
-
-// ---------------------------------------------------------------------------
-// Batch test functions for scalar device functions
-// ---------------------------------------------------------------------------
-
-int beam_batch_signed_tet_volume(beam_ctx_t ctx,
-    const float* tets, int n, float* out_volumes);
-
-int beam_batch_point_triangle_dist(beam_ctx_t ctx,
-    const float* points, const float* triangles, int n, float* out_dists);
-
-int beam_batch_intersect_edge(beam_ctx_t ctx,
-    const float* segments, const float* planes, int n, float* out_results);
-
-int beam_batch_rv_from_volumes(beam_ctx_t ctx,
-    const float* mesh_vols, const float* hull_vols, int n,
-    float rv_k, float* out_rvs);
-
-// ---------------------------------------------------------------------------
-// Test functions for block-level reductions
-// ---------------------------------------------------------------------------
-
-// Reduce max over BLOCK_SIZE-element chunks. n must be multiple of BLOCK_SIZE.
-// out has n/BLOCK_SIZE elements.
-int beam_test_block_reduce_max(beam_ctx_t ctx,
-    const float* data, int n, float* out);
-
-// Count nonzero flags in BLOCK_SIZE-element chunks. n must be multiple of BLOCK_SIZE.
-// out has n/BLOCK_SIZE elements.
-int beam_test_block_reduce_count(beam_ctx_t ctx,
-    const int* flags, int n, int* out);
-
-// Reduce sum over BLOCK_SIZE-element chunks. n must be multiple of BLOCK_SIZE.
-// out has n/BLOCK_SIZE elements.
-int beam_test_block_reduce_sum(beam_ctx_t ctx,
-    const float* data, int n, float* out);
-
-// Reduce 3D bounding box over vertex groups.
-// verts: [total_verts*3], offsets/counts: [n_groups], out_bbox: [n_groups*6]
-// out_bbox layout per group: xmin, ymin, zmin, xmax, ymax, zmax
-int beam_test_block_reduce_bbox(beam_ctx_t ctx,
-    const float* verts, int total_verts,
-    const int* offsets, const int* counts, int n_groups,
-    float* out_bbox);
 
 // Test: warp_sort — sort BtPoint32 sub-arrays in-place
 // points: packed int[total_pts * 4] (x,y,z,index), modified in-place

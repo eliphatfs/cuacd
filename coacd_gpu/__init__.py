@@ -6,7 +6,7 @@ Only requires an NVIDIA GPU driver (libcuda.so / nvcuda.dll).
 
 Includes:
 - Hausdorff distance computation (point_mesh_distances, hausdorff, pairwise_hausdorff)
-- GPU beam search convex decomposition (BeamContext, run_beam_coacd)
+- GPU beam search convex decomposition V2 (BeamContext, run_beam_coacd_v2)
 """
 
 import numpy as np
@@ -188,4 +188,4 @@ class Context:
         return volumes
 
 
-from coacd_gpu.beam import BeamContext, run_beam_coacd
+from coacd_gpu.beam import BeamContext, run_beam_coacd_v2

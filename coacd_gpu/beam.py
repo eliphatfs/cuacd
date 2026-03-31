@@ -14,12 +14,12 @@ class BeamContext:
     Usage::
 
         with BeamContext(device=0) as ctx:
-            parts = ctx.run(vertices, triangles, threshold=0.05)
+            parts = ctx.run_v2(vertices, triangles, threshold=0.05)
 
     Or::
 
         ctx = BeamContext()
-        parts = ctx.run(vertices, triangles)
+        parts = ctx.run_v2(vertices, triangles)
         ctx.close()
     """
 
@@ -40,42 +40,6 @@ class BeamContext:
 
     def __exit__(self, *args):
         self.close()
-
-    def run(self, vertices, triangles, *,
-            beam_width=16,
-            cuts_per_axis=15,
-            threshold=0.05,
-            rv_k=0.3,
-            max_parts=64,
-            max_iterations=64,
-            hausdorff_samples=1000):
-        """Run beam search convex decomposition (V1 path).
-
-        Args:
-            vertices:    (V, 3) float array -- mesh vertices
-            triangles:   (T, 3) int array -- mesh face indices
-            beam_width:  Number of beam items to maintain (default 16)
-            cuts_per_axis: Planes per axis (45 total by default)
-            threshold:   Concavity threshold (default 0.05)
-            rv_k:        Rv scaling factor (default 0.3)
-            max_parts:   Maximum parts per beam item (default 64)
-            max_iterations: Max decomposition steps (default 64)
-            hausdorff_samples: Samples for Hausdorff check (default 1000)
-
-        Returns:
-            List of (vertices, triangles) tuples -- each part's mesh.
-        """
-        verts = np.ascontiguousarray(vertices, dtype=np.float32)
-        tris = np.ascontiguousarray(triangles, dtype=np.int32)
-
-        num_parts = _gpu.run(
-            verts.ctypes.data, len(verts),
-            tris.ctypes.data, len(tris),
-            beam_width, cuts_per_axis,
-            threshold, rv_k,
-            max_parts, max_iterations, hausdorff_samples)
-
-        return self._download_parts(num_parts)
 
     def run_v2(self, vertices, triangles, *,
                beam_width=30,
@@ -165,22 +129,6 @@ class BeamContext:
             parts.append((out_v[:actual_nv], out_t[:actual_nt]))
 
         return parts
-
-
-def run_beam_coacd(vertices, triangles, **kwargs):
-    """Convenience function: run GPU beam search decomposition.
-
-    Args:
-        vertices:  (V, 3) float array -- mesh vertices
-        triangles: (T, 3) int array -- mesh face indices
-        **kwargs:  Passed to BeamContext.run()
-
-    Returns:
-        List of (vertices, triangles) tuples.
-    """
-    device = kwargs.pop('device', -1)
-    with BeamContext(device=device) as ctx:
-        return ctx.run(vertices, triangles, **kwargs)
 
 
 def run_beam_coacd_v2(vertices, triangles, **kwargs):

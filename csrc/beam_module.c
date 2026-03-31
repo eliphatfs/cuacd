@@ -69,47 +69,6 @@ static PyObject* py_destroy(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
-// run(vertices_ptr, n_verts, triangles_ptr, n_tris,
-//     beam_width, cuts_per_axis, threshold, rv_k,
-//     max_parts, max_iterations, hausdorff_samples) -> int (num_parts)
-// ---------------------------------------------------------------------------
-
-static PyObject* py_run(PyObject* self, PyObject* args) {
-    unsigned long long verts_ptr, tris_ptr;
-    int n_verts, n_tris;
-    int beam_width, cuts_per_axis, max_parts, max_iterations, hausdorff_samples;
-    float threshold, rv_k;
-
-    if (!PyArg_ParseTuple(args, "KiKiiiffiii",
-            &verts_ptr, &n_verts,
-            &tris_ptr, &n_tris,
-            &beam_width, &cuts_per_axis,
-            &threshold, &rv_k,
-            &max_parts, &max_iterations, &hausdorff_samples))
-        return NULL;
-
-    REQUIRE_CTX();
-
-    beam_params_t params;
-    params.beam_width = beam_width;
-    params.cuts_per_axis = cuts_per_axis;
-    params.threshold = threshold;
-    params.rv_k = rv_k;
-    params.max_parts = max_parts;
-    params.max_iterations = max_iterations;
-    params.hausdorff_samples = hausdorff_samples;
-
-    int rc = beam_run(g_state.ctx,
-                      (const float*)(uintptr_t)verts_ptr, n_verts,
-                      (const int*)(uintptr_t)tris_ptr, n_tris,
-                      &params);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-
-    int num_parts = beam_get_num_parts(g_state.ctx);
-    return PyLong_FromLong(num_parts);
-}
-
-// ---------------------------------------------------------------------------
 // run_v2(verts_ptr, n_verts, tris_ptr, n_tris,
 //        hull_verts_ptr, n_hull_verts, hull_tris_ptr, n_hull_tris,
 //        hull_volume, scratch_size,
@@ -291,156 +250,6 @@ static PyObject* py_pairwise_hausdorff(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
-static PyObject* py_test_hull_volume(PyObject* self, PyObject* args) {
-    unsigned long long pts_ptr;
-    int n_points;
-    if (!PyArg_ParseTuple(args, "Ki", &pts_ptr, &n_points)) return NULL;
-    REQUIRE_CTX();
-    float volume = 0.0f;
-    int n_faces = 0;
-    int rc = beam_test_hull_volume(g_state.ctx,
-        (const float*)(uintptr_t)pts_ptr, n_points, &volume, &n_faces);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    return Py_BuildValue("fi", volume, n_faces);
-}
-
-// ---------------------------------------------------------------------------
-// Batch test: signed_tet_volume
-// ---------------------------------------------------------------------------
-
-static PyObject* py_batch_signed_tet_volume(PyObject* self, PyObject* args) {
-    unsigned long long tets_ptr, out_ptr;
-    int n;
-    if (!PyArg_ParseTuple(args, "KiK", &tets_ptr, &n, &out_ptr)) return NULL;
-    REQUIRE_CTX();
-    int rc = beam_batch_signed_tet_volume(g_state.ctx,
-        (const float*)(uintptr_t)tets_ptr, n,
-        (float*)(uintptr_t)out_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
-// ---------------------------------------------------------------------------
-// Batch test: point_triangle_dist
-// ---------------------------------------------------------------------------
-
-static PyObject* py_batch_point_triangle_dist(PyObject* self, PyObject* args) {
-    unsigned long long pts_ptr, tris_ptr, out_ptr;
-    int n;
-    if (!PyArg_ParseTuple(args, "KKiK", &pts_ptr, &tris_ptr, &n, &out_ptr)) return NULL;
-    REQUIRE_CTX();
-    int rc = beam_batch_point_triangle_dist(g_state.ctx,
-        (const float*)(uintptr_t)pts_ptr,
-        (const float*)(uintptr_t)tris_ptr, n,
-        (float*)(uintptr_t)out_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
-// ---------------------------------------------------------------------------
-// Batch test: intersect_edge
-// ---------------------------------------------------------------------------
-
-static PyObject* py_batch_intersect_edge(PyObject* self, PyObject* args) {
-    unsigned long long segs_ptr, planes_ptr, out_ptr;
-    int n;
-    if (!PyArg_ParseTuple(args, "KKiK", &segs_ptr, &planes_ptr, &n, &out_ptr)) return NULL;
-    REQUIRE_CTX();
-    int rc = beam_batch_intersect_edge(g_state.ctx,
-        (const float*)(uintptr_t)segs_ptr,
-        (const float*)(uintptr_t)planes_ptr, n,
-        (float*)(uintptr_t)out_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
-// ---------------------------------------------------------------------------
-// Batch test: rv_from_volumes
-// ---------------------------------------------------------------------------
-
-static PyObject* py_batch_rv_from_volumes(PyObject* self, PyObject* args) {
-    unsigned long long mv_ptr, hv_ptr, out_ptr;
-    int n;
-    float rv_k;
-    if (!PyArg_ParseTuple(args, "KKifK", &mv_ptr, &hv_ptr, &n, &rv_k, &out_ptr)) return NULL;
-    REQUIRE_CTX();
-    int rc = beam_batch_rv_from_volumes(g_state.ctx,
-        (const float*)(uintptr_t)mv_ptr,
-        (const float*)(uintptr_t)hv_ptr, n, rv_k,
-        (float*)(uintptr_t)out_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
-// ---------------------------------------------------------------------------
-// Test: block_reduce_max
-// ---------------------------------------------------------------------------
-
-static PyObject* py_test_block_reduce_max(PyObject* self, PyObject* args) {
-    unsigned long long data_ptr, out_ptr;
-    int n;
-    if (!PyArg_ParseTuple(args, "KiK", &data_ptr, &n, &out_ptr)) return NULL;
-    REQUIRE_CTX();
-    int rc = beam_test_block_reduce_max(g_state.ctx,
-        (const float*)(uintptr_t)data_ptr, n,
-        (float*)(uintptr_t)out_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
-// ---------------------------------------------------------------------------
-// Test: block_reduce_count
-// ---------------------------------------------------------------------------
-
-static PyObject* py_test_block_reduce_count(PyObject* self, PyObject* args) {
-    unsigned long long flags_ptr, out_ptr;
-    int n;
-    if (!PyArg_ParseTuple(args, "KiK", &flags_ptr, &n, &out_ptr)) return NULL;
-    REQUIRE_CTX();
-    int rc = beam_test_block_reduce_count(g_state.ctx,
-        (const int*)(uintptr_t)flags_ptr, n,
-        (int*)(uintptr_t)out_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
-// ---------------------------------------------------------------------------
-// Test: block_reduce_sum
-// ---------------------------------------------------------------------------
-
-static PyObject* py_test_block_reduce_sum(PyObject* self, PyObject* args) {
-    unsigned long long data_ptr, out_ptr;
-    int n;
-    if (!PyArg_ParseTuple(args, "KiK", &data_ptr, &n, &out_ptr)) return NULL;
-    REQUIRE_CTX();
-    int rc = beam_test_block_reduce_sum(g_state.ctx,
-        (const float*)(uintptr_t)data_ptr, n,
-        (float*)(uintptr_t)out_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
-// ---------------------------------------------------------------------------
-// Test: block_reduce_bbox
-// ---------------------------------------------------------------------------
-
-static PyObject* py_test_block_reduce_bbox(PyObject* self, PyObject* args) {
-    unsigned long long verts_ptr, offsets_ptr, counts_ptr, out_ptr;
-    int total_verts, n_groups;
-    if (!PyArg_ParseTuple(args, "KiKKiK",
-            &verts_ptr, &total_verts,
-            &offsets_ptr, &counts_ptr, &n_groups,
-            &out_ptr)) return NULL;
-    REQUIRE_CTX();
-    int rc = beam_test_block_reduce_bbox(g_state.ctx,
-        (const float*)(uintptr_t)verts_ptr, total_verts,
-        (const int*)(uintptr_t)offsets_ptr,
-        (const int*)(uintptr_t)counts_ptr, n_groups,
-        (float*)(uintptr_t)out_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
 // ---------------------------------------------------------------------------
 // test_warp_sort(pts_ptr, total_pts, offsets_ptr, n_arrays) -> None
 // ---------------------------------------------------------------------------
@@ -544,22 +353,12 @@ static PyObject* py_batch_hull_dandc_mesh(PyObject* self, PyObject* args) {
 static PyMethodDef gpu_methods[] = {
     { "init",                   py_init,                   METH_VARARGS, "Initialize GPU context." },
     { "destroy",                py_destroy,                METH_NOARGS,  "Destroy GPU context." },
-    { "run",                    py_run,                    METH_VARARGS, "Run beam search decomposition." },
     { "run_v2",                 py_run_v2,                 METH_VARARGS, "Run V2 beam search (3-kernel)." },
     { "get_part_sizes",         py_get_part_sizes,         METH_VARARGS, "Get part vertex/triangle counts." },
     { "get_part",               py_get_part,               METH_VARARGS, "Copy part data to buffers." },
     { "point_mesh_distances",   py_point_mesh_distances,   METH_VARARGS, "Compute point-to-mesh distances." },
     { "hausdorff",              py_hausdorff,              METH_VARARGS, "Compute Hausdorff distance." },
     { "pairwise_hausdorff",     py_pairwise_hausdorff,     METH_VARARGS, "Compute pairwise Hausdorff cost matrix." },
-    { "test_hull_volume",       py_test_hull_volume,       METH_VARARGS, "Test hull volume computation." },
-    { "batch_signed_tet_volume",    py_batch_signed_tet_volume,    METH_VARARGS, "Batch signed tet volume." },
-    { "batch_point_triangle_dist",  py_batch_point_triangle_dist,  METH_VARARGS, "Batch point-triangle distance." },
-    { "batch_intersect_edge",       py_batch_intersect_edge,       METH_VARARGS, "Batch edge-plane intersection." },
-    { "batch_rv_from_volumes",      py_batch_rv_from_volumes,      METH_VARARGS, "Batch Rv from volumes." },
-    { "test_block_reduce_max",      py_test_block_reduce_max,      METH_VARARGS, "Test block reduce max." },
-    { "test_block_reduce_count",    py_test_block_reduce_count,    METH_VARARGS, "Test block reduce count." },
-    { "test_block_reduce_sum",      py_test_block_reduce_sum,      METH_VARARGS, "Test block reduce sum." },
-    { "test_block_reduce_bbox",     py_test_block_reduce_bbox,     METH_VARARGS, "Test block reduce bbox." },
     { "test_warp_sort",             py_test_warp_sort,             METH_VARARGS, "Test warp sort BtPoint32." },
     { "batch_hull_volume",          py_batch_hull_volume,          METH_VARARGS, "Batch hull volume (three algorithms)." },
     { "batch_mesh_volume",          py_batch_mesh_volume,          METH_VARARGS, "Batch mesh volume (divergence theorem)." },
