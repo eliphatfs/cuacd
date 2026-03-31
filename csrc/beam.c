@@ -62,6 +62,7 @@ struct beam_ctx {
     CUfunction fn_beam_expansion;
     CUfunction fn_beam_hausdorff_parts;
     CUfunction fn_beam_termination;
+    CUfunction fn_plane_cut;
 
     struct DevicePool scratch;
 
@@ -144,6 +145,7 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
     cuModuleGetFunction(&ctx->fn_beam_expansion,       ctx->module, "beam_expansion");
     cuModuleGetFunction(&ctx->fn_beam_hausdorff_parts, ctx->module, "beam_hausdorff_parts");
     cuModuleGetFunction(&ctx->fn_beam_termination,     ctx->module, "beam_termination");
+    cuModuleGetFunction(&ctx->fn_plane_cut,            ctx->module, "plane_cut_kernel");
 
     return 0;
 }
@@ -1397,4 +1399,133 @@ int beam_test_expansion(
     cuMemFree(d_counters); cuMemFree(d_kerr);
     cuMemFree(d_scratch_base); cuMemFree(d_scratch_off);
     return 0;
+}
+
+// ============================================================================
+// GPU Plane Cut with Cap Triangulation
+// ============================================================================
+// Launches plane_cut_kernel (cuda/plane_cut.cu) — one block of 64 threads.
+// Handles simple loop, ring (annular), and multi-hole boundary topologies.
+
+
+// GPU kernel error bit flags (must match plane_cut.cu)
+#define PC_KERR_SCRATCH_OOM 1
+#define PC_KERR_POOL_OOM    2
+#define PC_KERR_SORT_ERR    4
+
+// Global ctx pointer set by py_test_plane_cut binding (avoids API change)
+static beam_ctx_t g_plane_cut_ctx = NULL;
+
+void beam_set_plane_cut_ctx(beam_ctx_t ctx) { g_plane_cut_ctx = ctx; }
+
+int beam_test_plane_cut(
+    const float* vertices, int n_verts,
+    const int* triangles, int n_tris,
+    float pa, float pb, float pc_n, float pd,
+    float* out_all_verts, int out_verts_cap,
+    int* out_pos_tris, int out_pos_cap,
+    int* out_neg_tris, int out_neg_cap,
+    int* out_n_verts,
+    int* out_n_pos_tris,
+    int* out_n_neg_tris)
+{
+    beam_ctx_t ctx = g_plane_cut_ctx;
+    if (!ctx) return -1;
+
+    *out_n_verts = 0; *out_n_pos_tris = 0; *out_n_neg_tris = 0;
+
+    CUstream s = NULL;
+    CUdeviceptr d_verts = 0, d_tris = 0;
+    CUdeviceptr d_out_verts = 0, d_out_pos = 0, d_out_neg = 0;
+    CUdeviceptr d_counts = 0, d_kerr = 0;
+    CUdeviceptr d_scratch_base = 0, d_scratch_off = 0;
+
+    CHECK_CU(cuMemAlloc(&d_verts, (size_t)n_verts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_tris, (size_t)n_tris * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_out_verts, (size_t)out_verts_cap * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_out_pos, (size_t)out_pos_cap * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_out_neg, (size_t)out_neg_cap * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_counts, 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_kerr, sizeof(int)));
+
+    // Scratch pool
+    size_t free_mem = 0, total_mem = 0;
+    cuMemGetInfo(&free_mem, &total_mem);
+    size_t scratch_sz = (size_t)(free_mem * 0.5);
+    if (scratch_sz < 64 * 1024 * 1024) scratch_sz = 64 * 1024 * 1024;
+    CHECK_CU(cuMemAlloc(&d_scratch_base, scratch_sz));
+    CHECK_CU(cuMemAlloc(&d_scratch_off, sizeof(unsigned long long)));
+
+    struct DevicePool sp;
+    sp.base = (char*)(uintptr_t)d_scratch_base;
+    sp.offset = (unsigned long long*)(uintptr_t)d_scratch_off;
+    sp.capacity = (unsigned long long)scratch_sz;
+
+    // Upload input
+    CHECK_CU(cuMemcpyHtoDAsync(d_verts, vertices, (size_t)n_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tris, triangles, (size_t)n_tris * 3 * sizeof(int), s));
+
+    // Zero scratch offset and kernel error
+    unsigned long long zero_ull = 0;
+    CHECK_CU(cuMemcpyHtoDAsync(d_scratch_off, &zero_ull, sizeof(unsigned long long), s));
+    int zero_i = 0;
+    CHECK_CU(cuMemcpyHtoDAsync(d_kerr, &zero_i, sizeof(int), s));
+
+    // Count pointers
+    CUdeviceptr d_nv = d_counts;
+    CUdeviceptr d_np = d_counts + sizeof(int);
+    CUdeviceptr d_nn = d_counts + 2 * sizeof(int);
+
+    void* args[] = {
+        &d_verts, &d_tris,
+        &n_verts, &n_tris,
+        &pa, &pb, &pc_n, &pd,
+        &d_out_verts, &d_out_pos, &d_out_neg,
+        &out_verts_cap, &out_pos_cap, &out_neg_cap,
+        &d_nv, &d_np, &d_nn,
+        &sp, &d_kerr
+    };
+
+    CHECK_CU(cuLaunchKernel(ctx->fn_plane_cut,
+        1, 1, 1, 64, 1, 1, 0, s, args, NULL));
+
+    int kerr_h = 0;
+    int counts_h[3] = {0, 0, 0};
+    CHECK_CU(cuMemcpyDtoHAsync(&kerr_h, d_kerr, sizeof(int), s));
+    CHECK_CU(cuMemcpyDtoHAsync(counts_h, d_counts, 3 * sizeof(int), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    if (kerr_h) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "plane_cut kernel error: 0x%x", kerr_h);
+        goto gpu_cleanup_err;
+    }
+
+    *out_n_verts = counts_h[0];
+    *out_n_pos_tris = counts_h[1];
+    *out_n_neg_tris = counts_h[2];
+
+    if (*out_n_verts > 0)
+        CHECK_CU(cuMemcpyDtoHAsync(out_all_verts, d_out_verts,
+            (size_t)(*out_n_verts) * 3 * sizeof(float), s));
+    if (*out_n_pos_tris > 0)
+        CHECK_CU(cuMemcpyDtoHAsync(out_pos_tris, d_out_pos,
+            (size_t)(*out_n_pos_tris) * 3 * sizeof(int), s));
+    if (*out_n_neg_tris > 0)
+        CHECK_CU(cuMemcpyDtoHAsync(out_neg_tris, d_out_neg,
+            (size_t)(*out_n_neg_tris) * 3 * sizeof(int), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_verts); cuMemFree(d_tris);
+    cuMemFree(d_out_verts); cuMemFree(d_out_pos); cuMemFree(d_out_neg);
+    cuMemFree(d_counts); cuMemFree(d_kerr);
+    cuMemFree(d_scratch_base); cuMemFree(d_scratch_off);
+    return 0;
+
+gpu_cleanup_err:
+    cuMemFree(d_verts); cuMemFree(d_tris);
+    cuMemFree(d_out_verts); cuMemFree(d_out_pos); cuMemFree(d_out_neg);
+    cuMemFree(d_counts); cuMemFree(d_kerr);
+    cuMemFree(d_scratch_base); cuMemFree(d_scratch_off);
+    return -1;
 }

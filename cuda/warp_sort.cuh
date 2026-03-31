@@ -1,11 +1,24 @@
-// warp_sort.cuh — Warp-cooperative quicksort for BtPoint32 arrays.
+// warp_sort.cuh — Generic warp-cooperative quicksort template.
 //
-// All 32 lanes must call. Uses a global-memory workspace (same size as input
-// + 4KB for stack) for partitioning scratch. Segments <= 32 elements are
-// sorted via a bitonic network; larger segments use quicksort partitioning
-// with a median-of-samples pivot.
+// Template API:
+//   warp_sort_t<T, Cmp>(data, scratch, n, lane) -> int (0=ok, 1=stack overflow)
 //
-// Defines BtPoint32 (the canonical definition used by hull_dandc.cuh too).
+//   T:   element type, sizeof(T) must be a multiple of 4 bytes
+//   Cmp: comparator struct with two static __device__ methods:
+//        int cmp(T a, T b)  — returns -1, 0, or 1
+//        T   sentinel()     — value that sorts after all valid elements
+//
+// All 32 lanes must call. Uses a global-memory workspace for partitioning:
+//   scratch bytes = n * sizeof(T) + WS_MAX_STACK * 2 * sizeof(int)
+// Segments <= 32 elements use a bitonic network; larger segments use
+// quicksort partitioning with a median-of-32-samples pivot and three-way
+// partition (< pivot left, > pivot right, == pivot middle).
+//
+// Legacy API preserved:
+//   warp_sort_bp32(points, scratch, n, lane)           — sorts BtPoint32
+//   ws_cmp / ws_min / ws_max / ws_bitonic32            — BtPoint32 helpers
+//
+// Defines BtPoint32 (canonical definition used by hull_dandc.cuh too).
 // Requires: hull_warp_common.cuh (WARP_SIZE, WARP_MASK)
 
 #ifndef WARP_SORT_CUH
@@ -13,75 +26,78 @@
 
 #include "hull_warp_common.cuh"
 
-// BtPoint32 — canonical definition, shared with hull_dandc.cuh
-#ifndef BT_POINT32_DEFINED
-#define BT_POINT32_DEFINED
-struct BtPoint32 {
-    int x, y, z, index;
-};
+// ============================================================================
+// Template section — must have C++ linkage (overrides extern "C" from kernels.cu)
+// ============================================================================
+#ifdef __cplusplus
+extern "C++" {
 #endif
 
 // ============================================================================
-// Comparison — includes index as final tiebreaker for total ordering
+// Generic warp shuffle for any POD type (sizeof(T) % 4 == 0)
 // ============================================================================
 
-__device__ inline int ws_cmp(BtPoint32 a, BtPoint32 b) {
-    if (a.y != b.y) return (a.y < b.y) ? -1 : 1;
-    if (a.x != b.x) return (a.x < b.x) ? -1 : 1;
-    if (a.z != b.z) return (a.z < b.z) ? -1 : 1;
-    if (a.index != b.index) return (a.index < b.index) ? -1 : 1;
-    return 0;
+template<typename T>
+__device__ inline T ws_shfl_xor_t(T val, int xor_mask) {
+    union { T v; int i[sizeof(T) / 4]; } u, r;
+    u.v = val;
+    #pragma unroll
+    for (int k = 0; k < (int)(sizeof(T) / 4); k++)
+        r.i[k] = __shfl_xor_sync(WARP_MASK, u.i[k], xor_mask);
+    return r.v;
 }
 
-// min/max for bitonic network
-__device__ inline BtPoint32 ws_min(BtPoint32 a, BtPoint32 b) { return (ws_cmp(a, b) < 0) ? a : b; }
-__device__ inline BtPoint32 ws_max(BtPoint32 a, BtPoint32 b) { return (ws_cmp(a, b) < 0) ? b : a; }
+template<typename T>
+__device__ inline T ws_shfl_t(T val, int src_lane) {
+    union { T v; int i[sizeof(T) / 4]; } u, r;
+    u.v = val;
+    #pragma unroll
+    for (int k = 0; k < (int)(sizeof(T) / 4); k++)
+        r.i[k] = __shfl_sync(WARP_MASK, u.i[k], src_lane);
+    return r.v;
+}
 
 // ============================================================================
-// Bitonic sort for <= 32 elements (all lanes participate)
+// Generic bitonic sort for <= 32 elements (all lanes participate)
 // ============================================================================
 
-__device__ inline BtPoint32 ws_bitonic32(BtPoint32 val, int n, int lane) {
-    // Inactive lanes get a sentinel that sorts to the end
-    BtPoint32 oob;
-    oob.x = 0x7fffffff; oob.y = 0x7fffffff; oob.z = 0x7fffffff; oob.index = 0x7fffffff;
-    if (lane >= n) val = oob;
+template<typename T, typename Cmp>
+__device__ inline T warp_bitonic32_t(T val, int n, int lane) {
+    if (lane >= n) val = Cmp::sentinel();
 
     for (int k = 1; k <= 16; k <<= 1) {
         for (int j = k; j >= 1; j >>= 1) {
-            BtPoint32 other;
-            other.x = __shfl_xor_sync(WARP_MASK, val.x, j);
-            other.y = __shfl_xor_sync(WARP_MASK, val.y, j);
-            other.z = __shfl_xor_sync(WARP_MASK, val.z, j);
-            other.index = __shfl_xor_sync(WARP_MASK, val.index, j);
+            T other = ws_shfl_xor_t(val, j);
             bool asc = ((lane & (k << 1)) == 0);
+            bool less = (Cmp::cmp(val, other) < 0);
+            // lane & j == 0: keep min if ascending, max if descending
+            // lane & j != 0: keep max if ascending, min if descending
             if ((lane & j) == 0)
-                val = asc ? ws_min(val, other) : ws_max(val, other);
+                val = (asc == less) ? val : other;
             else
-                val = asc ? ws_max(val, other) : ws_min(val, other);
+                val = (asc != less) ? val : other;
         }
     }
     return val;
 }
 
 // ============================================================================
-// Warp quicksort
+// Generic warp quicksort
 // ============================================================================
 
 #define WS_MAX_STACK 2048
 
-// Sort points[0..n) in-place.  Returns 0 on success, 1 if stack overflowed.
-// scratch must be (n * sizeof(BtPoint32) + WS_MAX_STACK * 2 * sizeof(int)) bytes.
+// Sort data[0..n) in-place.  Returns 0 on success, 1 if stack overflowed.
+// scratch must be (n * sizeof(T) + WS_MAX_STACK * 2 * sizeof(int)) bytes.
 // All 32 lanes must call with identical arguments.
-__device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, int lane) {
+template<typename T, typename Cmp>
+__device__ inline int warp_sort_t(T* data, char* scratch, int n, int lane) {
     if (n <= 1) return 0;
 
-    BtPoint32* tmp = (BtPoint32*)scratch;
-    // Stack lives in global memory after the tmp array
-    int* stack_lo = (int*)(scratch + n * (int)sizeof(BtPoint32));
+    T* tmp = (T*)scratch;
+    int* stack_lo = (int*)(scratch + n * (int)sizeof(T));
     int* stack_hi = stack_lo + WS_MAX_STACK;
 
-    // sp lives in lane-0 register, broadcast via shfl
     int sp = 0;
     if (lane == 0) {
         stack_lo[0] = 0;
@@ -90,10 +106,8 @@ __device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, in
     }
 
     while (true) {
-        // Broadcast sp from lane 0
         int cur_sp = __shfl_sync(WARP_MASK, sp, 0);
         if (cur_sp <= 0) break;
-        // Pop — lane 0 decrements, all threads read stack from global mem
         if (lane == 0) sp--;
         cur_sp--;
         int seg_lo = stack_lo[cur_sp];
@@ -103,19 +117,16 @@ __device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, in
         if (seg_len <= 1) continue;
 
         if (seg_len <= 32) {
-            // Bitonic sort this small segment
-            BtPoint32 oob;
-            oob.x = 0x7fffffff; oob.y = 0x7fffffff; oob.z = 0x7fffffff; oob.index = 0x7fffffff;
-            BtPoint32 val = (lane < seg_len) ? points[seg_lo + lane] : oob;
-            val = ws_bitonic32(val, seg_len, lane);
+            T val = (lane < seg_len) ? data[seg_lo + lane] : Cmp::sentinel();
+            val = warp_bitonic32_t<T, Cmp>(val, seg_len, lane);
             if (lane < seg_len)
-                points[seg_lo + lane] = val;
+                data[seg_lo + lane] = val;
             __syncwarp();
             continue;
         }
 
-        // --- Pick pivot: sample 32 elements uniformly, bitonic sort, take median ---
-        BtPoint32 sample;
+        // --- Pick pivot: sample 32 elements uniformly, bitonic sort, median ---
+        T sample;
         {
             int base_step = seg_len / 32;
             int remainder = seg_len - base_step * 32;
@@ -124,21 +135,14 @@ __device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, in
                 idx = seg_lo + lane * (base_step + 1);
             else
                 idx = seg_lo + remainder * (base_step + 1) + (lane - remainder) * base_step;
-            sample = points[idx];
+            sample = data[idx];
         }
-        sample = ws_bitonic32(sample, 32, lane);
-        // Broadcast pivot (element 15) from lane 15
-        BtPoint32 pivot;
-        pivot.x = __shfl_sync(WARP_MASK, sample.x, 15);
-        pivot.y = __shfl_sync(WARP_MASK, sample.y, 15);
-        pivot.z = __shfl_sync(WARP_MASK, sample.z, 15);
-        pivot.index = __shfl_sync(WARP_MASK, sample.index, 15);
+        sample = warp_bitonic32_t<T, Cmp>(sample, 32, lane);
+        T pivot = ws_shfl_t(sample, 15);
 
         // --- Three-way partition into tmp ---
-        // Items < pivot go left; items > pivot go right; items == pivot skipped.
         int left_idx = 0;
         int right_idx = 0;
-
         int full_blocks = seg_len / 32;
         int tail = seg_len - full_blocks * 32;
 
@@ -146,21 +150,19 @@ __device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, in
             int pos = seg_lo + blk * 32 + lane;
             bool active = (blk < full_blocks) || (lane < tail);
 
-            BtPoint32 elem;
-            if (active) elem = points[pos];
+            T elem;
+            if (active) elem = data[pos];
 
-            int cmp = active ? ws_cmp(elem, pivot) : 0;
+            int cmp = active ? Cmp::cmp(elem, pivot) : 0;
             bool is_less    = active && (cmp == -1);
             bool is_greater = active && (cmp == 1);
 
-            // Write items < pivot from the left
             unsigned mask_less = __ballot_sync(WARP_MASK, is_less);
             int prefix_less = __popc(mask_less & ((1u << lane) - 1));
             if (is_less)
                 tmp[seg_lo + left_idx + prefix_less] = elem;
             left_idx += __popc(mask_less);
 
-            // Write items > pivot from the right
             unsigned mask_gt = __ballot_sync(WARP_MASK, is_greater);
             int prefix_gt = __popc(mask_gt & ((1u << lane) - 1));
             if (is_greater)
@@ -174,15 +176,14 @@ __device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, in
         int mid_lo = seg_lo + left_idx;
         int mid_hi = seg_hi - right_idx;
         for (int i = lane; i < left_idx; i += 32)
-            points[seg_lo + i] = tmp[seg_lo + i];
+            data[seg_lo + i] = tmp[seg_lo + i];
         for (int i = lane; i < (mid_hi - mid_lo); i += 32)
-            points[mid_lo + i] = pivot;
+            data[mid_lo + i] = pivot;
         for (int i = lane; i < right_idx; i += 32)
-            points[mid_hi + i] = tmp[mid_hi + i];
+            data[mid_hi + i] = tmp[mid_hi + i];
         __syncwarp();
 
-        // --- Push sub-segments onto stack (lane 0 only) ---
-        // [seg_lo, mid_lo) are < pivot, [mid_lo, mid_hi) are == pivot, [mid_hi, seg_hi) are > pivot.
+        // --- Push sub-segments onto stack ---
         if (lane == 0) {
             if (left_idx > 1) {
                 if (sp >= WS_MAX_STACK) { sp = -1; }
@@ -194,10 +195,64 @@ __device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, in
             }
         }
         __syncwarp();
-        // Check for stack overflow (sp == -1 on lane 0)
         if (__shfl_sync(WARP_MASK, sp, 0) < 0) return 1;
     }
     return 0;
 }
+
+// ============================================================================
+// BtPoint32 — canonical definition, shared with hull_dandc.cuh
+// ============================================================================
+
+#ifndef BT_POINT32_DEFINED
+#define BT_POINT32_DEFINED
+struct BtPoint32 {
+    int x, y, z, index;
+};
+#endif
+
+// BtPoint32 comparator: lexicographic on (y, x, z, index)
+struct BtPoint32Cmp {
+    static __device__ inline int cmp(BtPoint32 a, BtPoint32 b) {
+        if (a.y != b.y) return (a.y < b.y) ? -1 : 1;
+        if (a.x != b.x) return (a.x < b.x) ? -1 : 1;
+        if (a.z != b.z) return (a.z < b.z) ? -1 : 1;
+        if (a.index != b.index) return (a.index < b.index) ? -1 : 1;
+        return 0;
+    }
+    static __device__ inline BtPoint32 sentinel() {
+        BtPoint32 s;
+        s.x = 0x7fffffff; s.y = 0x7fffffff; s.z = 0x7fffffff; s.index = 0x7fffffff;
+        return s;
+    }
+};
+
+// ============================================================================
+// Legacy API — warp_sort_bp32 and BtPoint32 helpers
+// (Also needs C++ linkage since they call templates)
+// ============================================================================
+
+__device__ inline int ws_cmp(BtPoint32 a, BtPoint32 b) {
+    return BtPoint32Cmp::cmp(a, b);
+}
+__device__ inline BtPoint32 ws_min(BtPoint32 a, BtPoint32 b) {
+    return (ws_cmp(a, b) < 0) ? a : b;
+}
+__device__ inline BtPoint32 ws_max(BtPoint32 a, BtPoint32 b) {
+    return (ws_cmp(a, b) < 0) ? b : a;
+}
+__device__ inline BtPoint32 ws_bitonic32(BtPoint32 val, int n, int lane) {
+    return warp_bitonic32_t<BtPoint32, BtPoint32Cmp>(val, n, lane);
+}
+
+// Sort BtPoint32 array in-place (legacy wrapper).
+// scratch: n * sizeof(BtPoint32) + WS_MAX_STACK * 2 * sizeof(int) bytes.
+__device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, int lane) {
+    return warp_sort_t<BtPoint32, BtPoint32Cmp>(points, scratch, n, lane);
+}
+
+#ifdef __cplusplus
+} // extern "C++"
+#endif
 
 #endif // WARP_SORT_CUH

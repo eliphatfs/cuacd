@@ -275,6 +275,31 @@ int beam_test_expansion(
     int*             out_tri_count,
     int*             kernel_error);
 
+// ---------------------------------------------------------------------------
+// CPU plane cut with cap triangulation
+// ---------------------------------------------------------------------------
+// Cuts mesh by plane pa*x + pb*y + pc*z + pd = 0.
+// Produces two closed meshes (positive and negative halves) with properly
+// triangulated caps. Handles simple loop, ring, and multi-hole topologies.
+// Pure CPU implementation — no GPU required.
+//
+// out_all_verts: [out_verts_cap * 3] float — original + intersection vertices
+// out_pos_tris/out_neg_tris: [cap * 3] int — triangle indices into out_all_verts
+// Returns 0 on success, -1 on error (buffer overflow).
+// Set the context for plane_cut (avoids API change to beam_test_plane_cut)
+void beam_set_plane_cut_ctx(beam_ctx_t ctx);
+
+int beam_test_plane_cut(
+    const float* vertices, int n_verts,
+    const int* triangles, int n_tris,
+    float pa, float pb, float pc, float pd,
+    float* out_all_verts, int out_verts_cap,
+    int* out_pos_tris, int out_pos_cap,
+    int* out_neg_tris, int out_neg_cap,
+    int* out_n_verts,
+    int* out_n_pos_tris,
+    int* out_n_neg_tris);
+
 #ifdef __cplusplus
 }
 #endif

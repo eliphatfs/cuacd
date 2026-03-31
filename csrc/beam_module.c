@@ -457,6 +457,43 @@ static PyObject* py_test_expansion(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// test_plane_cut(verts_ptr, n_verts, tris_ptr, n_tris,
+//                pa, pb, pc, pd,
+//                out_v_ptr, out_v_cap, out_pt_ptr, out_pt_cap,
+//                out_nt_ptr, out_nt_cap) -> (n_verts, n_pos_tris, n_neg_tris)
+// ---------------------------------------------------------------------------
+
+static PyObject* py_test_plane_cut(PyObject* self, PyObject* args) {
+    unsigned long long vp, tp, ovp, optp, ontp;
+    int nv, nt, ovc, optc, ontc;
+    float pa, pb, pc, pd;
+
+    if (!PyArg_ParseTuple(args, "KiKiffffKiKiKi",
+            &vp, &nv, &tp, &nt,
+            &pa, &pb, &pc, &pd,
+            &ovp, &ovc, &optp, &optc, &ontp, &ontc))
+        return NULL;
+
+    REQUIRE_CTX();
+    beam_set_plane_cut_ctx(g_state.ctx);
+
+    int out_nv = 0, out_npt = 0, out_nnt = 0;
+    int rc = beam_test_plane_cut(
+        (const float*)(uintptr_t)vp, nv,
+        (const int*)(uintptr_t)tp, nt,
+        pa, pb, pc, pd,
+        (float*)(uintptr_t)ovp, ovc,
+        (int*)(uintptr_t)optp, optc,
+        (int*)(uintptr_t)ontp, ontc,
+        &out_nv, &out_npt, &out_nnt);
+    if (rc != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "plane_cut failed (buffer overflow or alloc error)");
+        return NULL;
+    }
+    return Py_BuildValue("iii", out_nv, out_npt, out_nnt);
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -477,6 +514,7 @@ static PyMethodDef gpu_methods[] = {
     { "test_termination",           py_test_termination,           METH_VARARGS, "Test beam_termination kernel." },
     { "test_hausdorff_parts",       py_test_hausdorff_parts,       METH_VARARGS, "Test beam_hausdorff_parts kernel." },
     { "test_expansion",             py_test_expansion,             METH_VARARGS, "Test beam_expansion kernel." },
+    { "test_plane_cut",             py_test_plane_cut,             METH_VARARGS, "CPU plane cut with cap triangulation." },
     { NULL, NULL, 0, NULL }
 };
 

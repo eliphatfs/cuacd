@@ -21,10 +21,11 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
   hull_warp_common.cuh#   WarpPool allocator + warp reductions (used by D&C)
   hull_dandc.cuh      #   Preparata-Hong D&C hull volume (Bullet port, warp sort + lane-0 D&C)
-  warp_sort.cuh       #   Warp-cooperative quicksort for BtPoint32 (bitonic ≤32, partitioned >32)
+  warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
   hull_batch.cu       #   batch_hull_dandc + batch_hull_dandc_mesh + batch_mesh_volume kernels
   test_warp_sort.cu   #   Test kernel for warp_sort_bp32
   beam_v2.cu          #   V2 beam search: beam_expansion, beam_hausdorff_parts, beam_termination
+  plane_cut.cu        #   GPU plane cut kernel with cap triangulation (ear clipping, multi-hole bridging)
   hausdorff.cu        #   Hausdorff kernels (point_mesh_distance, reduce_max, pairwise)
   mesh_transform.cu   #   Normalize/recover coordinate kernels
 csrc/                 # C host code
@@ -41,6 +42,7 @@ tests/                # All tests
   bench_dandc.py      #   D&C hull benchmark for NCU profiling (gaussian points)
   test_v2_kernels.py  #   Per-kernel tests for beam_expansion, beam_hausdorff_parts, beam_termination
   test_warp_sort.py   #   Tests for warp_sort_bp32 (bitonic + quicksort paths)
+  test_plane_cut.py   #   Plane cut tests: simple loop, ring, multi-hole, edge cases (14 tests)
 CoACD/                # Reference C++ CoACD (submodule/external)
 ```
 
@@ -69,7 +71,7 @@ python tests/bench_dandc.py --n_pts 200 --n_hulls 8
 ncu --set full -o dandc_profile python tests/bench_dandc.py --n_pts 200 --n_hulls 8
 ```
 
-Dependencies: `numpy`, `pytest` (test only), `trimesh` (comparison only).
+Dependencies: `numpy`, `pytest` (test only), `trimesh` (comparison only), `manifold3d` (optional, ring/multi-hole plane cut tests).
 
 ### CoACD (C++ / Python)
 
@@ -141,7 +143,7 @@ Rv = `(3 * |V_mesh - V_hull| / (4*pi))^(1/3) * k` where k = rv_k (default 0.3).
 
 - **Mesh volume**: parallel signed-tetrahedra reduction `V = (1/6) * sum p0.(p1 x p2)`. For open meshes after clipping, cap volume correction via divergence theorem: `V_cap = (d/3) * |A_boundary|` from boundary edge loop shoelace signed area.
 - **Hull volume**: D&C hull (`hull_dandc_warp_mesh`) — warp-parallel Preparata-Hong, unlimited vertices, exact Int128 arithmetic. Returns both volume and extracted mesh for Hausdorff.
-- **Cap triangulation**: fan cap triangles close meshes after each clip for correct signed-tet volumes in subsequent iterations.
+- **Cap triangulation**: ear-clipping cap triangulates the cut boundary to close meshes after each clip. Supports simple loop, ring (annular), and multi-hole topologies via boundary loop reconstruction + hole bridging. GPU kernel `plane_cut_kernel` (plane_cut.cu) handles all phases: parallel vertex classification → parallel triangle splitting with edge dedup via warp_sort → parallel directed-edge boundary detection via sort + binary search → thread-0 sequential loop chaining, hole bridging (rightmost-first), and ear clipping.
 - **Threshold**: compatible with CoACD semantics. Convex shape -> Rv ~ 0. Threshold 0.05 typical.
 - **Scoring a cut**: `max(Rv_positive_half, Rv_negative_half)`. Beam search minimizes worst-case concavity.
 - **Per-part bounding box planes**: cutting planes uniformly distributed within each part's triangle-vertex bbox (not all-vertex bbox, not global). Odd cuts_per_axis (e.g., 15) ensures midpoint is always a candidate. No snapping to vertex coordinates.
@@ -297,7 +299,11 @@ The D&C algorithm is a faithful port of Bullet's `btConvexHullComputer` (Ole Kni
 
 ### Warp Sort (warp_sort.cuh)
 
-Warp-cooperative quicksort for BtPoint32 arrays. All 32 lanes participate. Uses a global-memory workspace of the same size as the input. Segments ≤32 elements use a bitonic sorting network; larger segments use quicksort partitioning with a median-of-32-samples pivot. Three-way partition via `ws_cmp` (returns -1/0/1): items < pivot go left, items > pivot go right, items == pivot are filled in the middle gap by warp-parallel fill. This avoids worst-case O(n²) on all-equal or many-duplicate inputs. Uses `__ballot_sync`/`__popc` for warp-wide prefix sums. Explicit stack (max depth 2048) in global memory, `sp` in lane-0 register broadcast via `__shfl_sync`.
+Generic warp-cooperative quicksort template. All 32 lanes participate. Uses a global-memory workspace of the same size as the input. Segments ≤32 elements use a bitonic sorting network; larger segments use quicksort partitioning with a median-of-32-samples pivot. Three-way partition via comparator (returns -1/0/1): items < pivot go left, items > pivot go right, items == pivot are filled in the middle gap by warp-parallel fill. This avoids worst-case O(n²) on all-equal or many-duplicate inputs. Uses `__ballot_sync`/`__popc` for warp-wide prefix sums. Explicit stack (max depth 2048) in global memory, `sp` in lane-0 register broadcast via `__shfl_sync`.
+
+**Template API**: `warp_sort_t<T, Cmp>(data, scratch, n, lane)` where `T` is any POD type with `sizeof(T) % 4 == 0`, and `Cmp` is a struct with `static __device__ int cmp(T, T)` (returns -1/0/1) and `static __device__ T sentinel()`. Generic shuffles via `ws_shfl_xor_t<T>` / `ws_shfl_t<T>` use a union-based approach to shuffle each 4-byte field. Template code is wrapped in `extern "C++"` to work inside `kernels.cu`'s `extern "C"` block.
+
+**Comparators**: `BtPoint32Cmp` sorts by (y,x,z,index) — used by D&C hull. `EdgeCmp` (in plane_cut.cu) sorts by (x,y,z,index) — used for directed edge sorting. **Legacy API**: `warp_sort_bp32`, `ws_cmp`, `ws_min`, `ws_max`, `ws_bitonic32` are thin wrappers calling the template with `BtPoint32Cmp`.
 
 ### btpool: Eager Warp-Parallel Init, No Lazy Allocation
 
@@ -361,6 +367,15 @@ Moving `query_dandc_scratch` before the large `cuMemcpyHtoDAsync` calls (to avoi
 ### V2 Scaling Note
 
 Every expansion block allocates O(n_verts) pool space for mesh copies + hull output, but only beam_width results survive selection. For large meshes (20k+ verts), this wastes significant pool space per iteration. A GPU-side pool compaction kernel (run between iterations) would reclaim dead space. Currently this is not a problem because pools are sized from available GPU memory (65% of free VRAM).
+
+### Plane Cut Kernel (plane_cut.cu) — Working
+- GPU kernel `plane_cut_kernel`: 1 block × 64 threads (2 warps), handles one plane cut
+- Parallel phases: vertex classification, crossing edge collection, triangle splitting (with sorted edge dedup), directed edge collection, boundary detection (sort + binary search)
+- Warp 0 phases: sort crossing edges and directed edges via `warp_sort_t<BtPoint32, EdgeCmp>`
+- Thread 0 sequential phases: boundary loop reconstruction, multi-hole bridging (sorted by rightmost vertex), ear clipping with bridge-duplicate-aware point-in-triangle
+- Cap winding determined from 2D projection convention (`e_pu × e_pv` cross product direction)
+- Tested: simple loop (cube cuts on all axes, off-center, sphere), non-convex cap (L-shape), ring topology (hollow tube), multi-hole (box with 2 through-holes), edge cases (plane through vertex/edge, diagonal plane) — 14 tests pass
+- Host launcher in `beam_test_plane_cut` (beam.c) handles device memory allocation, kernel launch, result download
 
 ### Not Yet Implemented
 - Pool compaction kernel (GPU-side, between iterations — reclaim dead pool space from non-winning expansion blocks)
