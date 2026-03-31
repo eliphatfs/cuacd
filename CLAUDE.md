@@ -15,8 +15,8 @@ This repository contains:
 setup.py              # Build config: setuptools builds _gpu extension
 pyproject.toml        # PEP 621 metadata
 cuda/                 # CUDA device code (compiled to single fatbin)
-  kernels.cu          #   Root compilation unit — includes all modules
-  common.cuh          #   Constants, data structures, pool allocator, atomics
+  kernels.cu          #   Root compilation unit — includes all .cu modules (each is self-contained)
+  common.cuh          #   Constants, data structures, pool allocator, atomics, global_alloc helpers
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
   hull_warp_common.cuh#   WarpPool allocator + warp reductions (used by D&C)
@@ -88,7 +88,9 @@ cd CoACD && pip install -e .
 
 One extension is built by `setup.py`:
 
-**`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all `.cuh`/`.cu` modules) -> fatbin -> xxd-style C header, then builds `csrc/beam_module.c` + `csrc/beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). No cmake involved. Fatbin is compiled with `--generate-line-info` for NCU source-level profiling.
+**`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all self-contained `.cu` modules) -> fatbin -> xxd-style C header, then builds `csrc/beam_module.c` + `csrc/beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). No cmake involved. Fatbin is compiled with `--generate-line-info` for NCU source-level profiling.
+
+Each `.cu` kernel module is self-contained: it carries its own `#include` directives for all `.cuh` dependencies, and all `__global__` kernels are declared `extern "C"` directly on the function definition (no file-level `extern "C"` block). The `.cuh` headers also include their own dependencies (e.g. `reduce.cuh` includes `common.cuh`). This means any `.cu` file can be compiled standalone without relying on include order from `kernels.cu`.
 
 ### Design Principles
 
@@ -301,7 +303,7 @@ The D&C algorithm is a faithful port of Bullet's `btConvexHullComputer` (Ole Kni
 
 Generic warp-cooperative quicksort template. All 32 lanes participate. Uses a global-memory workspace of the same size as the input. Segments ≤32 elements use a bitonic sorting network; larger segments use quicksort partitioning with a median-of-32-samples pivot. Three-way partition via comparator (returns -1/0/1): items < pivot go left, items > pivot go right, items == pivot are filled in the middle gap by warp-parallel fill. This avoids worst-case O(n²) on all-equal or many-duplicate inputs. Uses `__ballot_sync`/`__popc` for warp-wide prefix sums. Explicit stack (max depth 2048) in global memory, `sp` in lane-0 register broadcast via `__shfl_sync`.
 
-**Template API**: `warp_sort_t<T, Cmp>(data, scratch, n, lane)` where `T` is any POD type with `sizeof(T) % 4 == 0`, and `Cmp` is a struct with `static __device__ int cmp(T, T)` (returns -1/0/1) and `static __device__ T sentinel()`. Generic shuffles via `ws_shfl_xor_t<T>` / `ws_shfl_t<T>` use a union-based approach to shuffle each 4-byte field. Template code is wrapped in `extern "C++"` to work inside `kernels.cu`'s `extern "C"` block.
+**Template API**: `warp_sort_t<T, Cmp>(data, scratch, n, lane)` where `T` is any POD type with `sizeof(T) % 4 == 0`, and `Cmp` is a struct with `static __device__ int cmp(T, T)` (returns -1/0/1) and `static __device__ T sentinel()`. Generic shuffles via `ws_shfl_xor_t<T>` / `ws_shfl_t<T>` use a union-based approach to shuffle each 4-byte field. Compiled as C++ throughout — no `extern "C++"` wrapper needed.
 
 **Comparators**: `BtPoint32Cmp` sorts by (y,x,z,index) — used by D&C hull. `Edge2iCmp` (in plane_cut.cu) sorts `Edge2i` structs (8 bytes: two ints `a,b`) by (a,b) — used for crossing edge dedup and directed edge boundary detection. **Legacy API**: `warp_sort_bp32`, `ws_cmp`, `ws_min`, `ws_max`, `ws_bitonic32` are thin wrappers calling the template with `BtPoint32Cmp`.
 

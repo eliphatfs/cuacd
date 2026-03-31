@@ -3,8 +3,6 @@
 // Kernels (one block or one warp per item):
 //   batch_hull_dandc        — warp D&C (Preparata-Hong), 1 warp per hull
 //   batch_mesh_volume       — divergence theorem on watertight mesh, 1 block per mesh
-//
-// Requires: common.cuh, geometry.cuh, hull_warp_common.cuh, hull_dandc.cuh
 
 #include "hull_warp_common.cuh"
 #include "hull_dandc.cuh"
@@ -15,7 +13,7 @@
 // ---------------------------------------------------------------------------
 #define DANDC_BLOCK_SIZE 32
 
-__global__ void batch_hull_dandc(
+extern "C" __global__ void batch_hull_dandc(
     const float* __restrict__ pts,
     const int*   __restrict__ offsets,
     float*       __restrict__ volumes,
@@ -56,7 +54,7 @@ __global__ void batch_hull_dandc(
 // ---------------------------------------------------------------------------
 // Query kernel: write dandc_scratch_bytes(n) to output.
 // ---------------------------------------------------------------------------
-__global__ void query_dandc_scratch(int n, int* out) {
+extern "C" __global__ void query_dandc_scratch(int n, int* out) {
     if (threadIdx.x == 0 && blockIdx.x == 0)
         *out = dandc_scratch_bytes(n);
 }
@@ -69,7 +67,7 @@ __global__ void query_dandc_scratch(int n, int* out) {
 //   out_tris [hull_id * max_hull_tris  * 3 ... (hull_id+1)*max_hull_tris *3 - 1]
 // out_vert_counts[hull_id] and out_tri_counts[hull_id] hold the actual counts.
 // ---------------------------------------------------------------------------
-__global__ void batch_hull_dandc_mesh(
+extern "C" __global__ void batch_hull_dandc_mesh(
     const float* __restrict__ pts,
     const int*   __restrict__ offsets,
     float*       __restrict__ volumes,
@@ -129,7 +127,7 @@ __global__ void batch_hull_dandc_mesh(
 // tris uses RELATIVE vertex indices within each mesh (0-based per mesh).
 // Absolute vertex = vert_offsets[mesh] + relative_idx.
 // ---------------------------------------------------------------------------
-__global__ void batch_mesh_volume(
+extern "C" __global__ void batch_mesh_volume(
     const float* __restrict__ verts,        // packed [total_V * 3]
     const int*   __restrict__ tris,         // packed [total_T * 3] relative indices
     const int*   __restrict__ tri_offsets,  // [n_meshes + 1]

@@ -16,8 +16,8 @@
 //  10-12 Chain loops, bridge holes, ear clip cap       (thread 0)
 //  13    Write cap + mesh triangles to output          (parallel, 64 threads)
 //
-// Requires: common.cuh, warp_sort.cuh, geometry.cuh
-
+#include "common.cuh"
+#include "geometry.cuh"
 #include "warp_sort.cuh"
 
 #define PC_BLOCK 64
@@ -127,7 +127,7 @@ __device__ inline void pc_intersect(
 #define PC_KERR_POOL_OOM    2
 #define PC_KERR_SORT_ERR    4
 
-__global__ void plane_cut_kernel(
+extern "C" __global__ void plane_cut_kernel(
     // Input
     const float* __restrict__ vertices,   // [n_verts * 3]
     const int*   __restrict__ triangles,  // [n_tris * 3]

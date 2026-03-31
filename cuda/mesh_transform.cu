@@ -1,11 +1,12 @@
 // Mesh coordinate transformation kernels: normalize to [-1,1]³ and recover.
-// Requires: common.cuh for BLOCK_SIZE
+
+#include "common.cuh"
 
 // ============================================================================
 // normalize_mesh — normalize vertices to [-1,1]³, store transform info
 // ============================================================================
 
-__global__ void normalize_mesh(
+extern "C" __global__ void normalize_mesh(
     float* __restrict__ vertices, int n_verts,
     float* __restrict__ norm_info)   // [4]: cx,cy,cz,scale
 {
@@ -57,7 +58,7 @@ __global__ void normalize_mesh(
 // recover_coordinates — inverse of normalize_mesh
 // ============================================================================
 
-__global__ void recover_coordinates(
+extern "C" __global__ void recover_coordinates(
     float* __restrict__ vertices, int n_verts,
     const float* __restrict__ norm_info)
 {

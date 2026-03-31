@@ -11,7 +11,7 @@
 
 #define TEST_SORT_BLOCK 64
 
-__global__ void test_warp_sort_kernel(
+extern "C" __global__ void test_warp_sort_kernel(
     int*       __restrict__ points,           // packed BtPoint32 as int[4] per point
     const int* __restrict__ offsets,          // [n_arrays + 1] point offsets
     char*      __restrict__ scratch,          // total scratch buffer

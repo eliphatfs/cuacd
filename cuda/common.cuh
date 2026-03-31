@@ -78,6 +78,27 @@ __device__ inline void* pool_alloc(DevicePool* pool, unsigned int size) {
     return pool->base + old;
 }
 
+// Allocate from a DevicePool — thread 0 only, block-level use.
+__device__ inline void* global_alloc_t0(DevicePool* gpool, int bytes) {
+    unsigned long long aligned = (unsigned long long)((bytes + 15) & ~15);
+    unsigned long long old = atomicAdd(gpool->offset, aligned);
+    if (old + aligned > gpool->capacity) return NULL;
+    return gpool->base + old;
+}
+
+// Allocate from a DevicePool — lane 0 only, result broadcast to warp.
+__device__ inline void* global_alloc_warp(DevicePool* gpool, int bytes, int lane) {
+    long long ptr_ll = 0LL;
+    if (lane == 0) {
+        unsigned long long aligned = (unsigned long long)((bytes + 15) & ~15);
+        unsigned long long old = atomicAdd(gpool->offset, aligned);
+        if (old + aligned <= gpool->capacity)
+            ptr_ll = (long long)(gpool->base + old);
+    }
+    ptr_ll = __shfl_sync(0xffffffffu, ptr_ll, 0);
+    return (void*)ptr_ll;
+}
+
 // ============================================================================
 // Atomic float min/max via CAS
 // ============================================================================

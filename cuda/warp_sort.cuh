@@ -27,13 +27,6 @@
 #include "hull_warp_common.cuh"
 
 // ============================================================================
-// Template section — must have C++ linkage (overrides extern "C" from kernels.cu)
-// ============================================================================
-#ifdef __cplusplus
-extern "C++" {
-#endif
-
-// ============================================================================
 // Generic warp shuffle for any POD type (sizeof(T) % 4 == 0)
 // ============================================================================
 
@@ -251,8 +244,5 @@ __device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, in
     return warp_sort_t<BtPoint32, BtPoint32Cmp>(points, scratch, n, lane);
 }
 
-#ifdef __cplusplus
-} // extern "C++"
-#endif
 
 #endif // WARP_SORT_CUH

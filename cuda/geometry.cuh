@@ -1,9 +1,10 @@
 // Geometry device functions: edge intersection, point-triangle distance,
 // bbox concavity metric.
-// Requires common.cuh for BLOCK_SIZE.
 
 #ifndef GEOMETRY_CUH
 #define GEOMETRY_CUH
+
+#include "common.cuh"
 
 // Signed volume of tetrahedron formed by triangle and origin.
 // V = p0 . (p1 x p2) / 6

@@ -1,12 +1,14 @@
 // Hausdorff distance kernels: surface sampling, point-mesh distance,
 // max reduction, pairwise merge cost.
-// Requires: common.cuh, geometry.cuh
+
+#include "common.cuh"
+#include "geometry.cuh"
 
 // ============================================================================
 // sample_surface — area-weighted surface sampling via xorshift RNG
 // ============================================================================
 
-__global__ void sample_surface(
+extern "C" __global__ void sample_surface(
     const float* __restrict__ vertices, const int* __restrict__ triangles,
     int n_tris, int vert_offset,
     float* __restrict__ samples, int n_samples, unsigned int seed)
@@ -36,7 +38,7 @@ __global__ void sample_surface(
 // point_mesh_distance — brute-force min distance, one thread per point
 // ============================================================================
 
-__global__ void point_mesh_distance(
+extern "C" __global__ void point_mesh_distance(
     const float* __restrict__ points,
     const float* __restrict__ vertices,
     const int*   __restrict__ triangles,
@@ -64,7 +66,7 @@ __global__ void point_mesh_distance(
 // reduce_max — shared-memory parallel max reduction (two-stage)
 // ============================================================================
 
-__global__ void reduce_max(
+extern "C" __global__ void reduce_max(
     const float* __restrict__ data,
     float*       __restrict__ output,
     int N)
@@ -93,7 +95,7 @@ __global__ void reduce_max(
 // (i,j) pair, computes min dist to the other part's mesh, atomically updates
 // the max into cost_matrix[i*P+j].
 
-__global__ void pairwise_hausdorff(
+extern "C" __global__ void pairwise_hausdorff(
     const float* __restrict__ all_samples,
     const int*   __restrict__ sample_offsets, // [P+1]
     const float* __restrict__ all_vertices,

@@ -3,32 +3,11 @@
 // Kernel 1: beam_expansion     (EXPANSION_BLOCK_SIZE=64 threads, 2 warps)
 // Kernel 2: beam_hausdorff_parts (HAUSDORFF_BLOCK_SIZE=256 threads)
 // Kernel 3: beam_termination   (32 threads, 1 warp)
-//
-// Uses PartInfoV2 + WorkItem from common.cuh (V2 structs).
-// Requires: common.cuh, reduce.cuh, geometry.cuh, hull_warp_common.cuh, hull_dandc.cuh
 
-// ============================================================================
-// Helper: allocate a region from DevicePool (lane 0 only, broadcast to warp)
-// ============================================================================
-__device__ inline void* global_alloc_warp(DevicePool* gpool, int bytes, int lane) {
-    long long ptr_ll = 0LL;
-    if (lane == 0) {
-        unsigned long long aligned = (unsigned long long)((bytes + 15) & ~15);
-        unsigned long long old = atomicAdd(gpool->offset, aligned);
-        if (old + aligned <= gpool->capacity)
-            ptr_ll = (long long)(gpool->base + old);
-    }
-    ptr_ll = __shfl_sync(WARP_MASK, ptr_ll, 0);
-    return (void*)ptr_ll;
-}
-
-// Helper: thread-0-only alloc from DevicePool (for block-level use, NOT warp)
-__device__ inline void* global_alloc_t0(DevicePool* gpool, int bytes) {
-    unsigned long long aligned = (unsigned long long)((bytes + 15) & ~15);
-    unsigned long long old = atomicAdd(gpool->offset, aligned);
-    if (old + aligned > gpool->capacity) return NULL;
-    return gpool->base + old;
-}
+#include "common.cuh"
+#include "reduce.cuh"
+#include "geometry.cuh"
+#include "hull_dandc.cuh"
 
 // ============================================================================
 // Kernel 1: beam_expansion
@@ -49,7 +28,7 @@ __device__ inline void* global_alloc_t0(DevicePool* gpool, int bytes) {
 #define KERR_POOL_OOM     8   // vert/tri/part output pool overflow
 #define KERR_HULL_ERR    16   // D&C hull internal error
 
-__global__ void beam_expansion(
+extern "C" __global__ void beam_expansion(
     // Input pools (read-only)
     const float* __restrict__ vertex_pool,
     const int*   __restrict__ triangle_pool,
@@ -686,7 +665,7 @@ selection:
 // ============================================================================
 // Kernel 2: beam_hausdorff_parts
 // ============================================================================
-__global__ void beam_hausdorff_parts(
+extern "C" __global__ void beam_hausdorff_parts(
     const float* __restrict__ vertex_pool,
     const int*   __restrict__ triangle_pool,
     PartInfoV2*  __restrict__ part_pool,
@@ -762,7 +741,7 @@ __global__ void beam_hausdorff_parts(
 // ============================================================================
 // Kernel 3: beam_termination
 // ============================================================================
-__global__ void beam_termination(
+extern "C" __global__ void beam_termination(
     const PartInfoV2* __restrict__ part_pool,
     WorkItem*         __restrict__ work_items,
     int               num_work_items,

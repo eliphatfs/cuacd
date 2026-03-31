@@ -1,8 +1,9 @@
 // Block-level parallel reductions.
-// Requires common.cuh for BLOCK_SIZE.
 
 #ifndef REDUCE_CUH
 #define REDUCE_CUH
+
+#include "common.cuh"
 
 // Shared-memory parallel reduction (sum).
 __device__ inline float block_reduce_sum(float val, float* smem, int tid) {
