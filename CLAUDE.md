@@ -431,7 +431,7 @@ Warp-cooperative quicksort for BtPoint32 arrays. All 32 lanes participate. Uses 
 
 ### btpool: Eager Warp-Parallel Init, No Lazy Allocation
 
-`btpool_init(p, wp, blockSize, objSize, lane)` eagerly allocates the pool block and uses all 32 warp lanes to build the free list in parallel (each lane handles every 32nd slot). `btpool_new` only pops from the free list; if exhausted, it sets `BT_ERR_POOL_EXHAUST` (error code 5) and returns NULL — no lazy block allocation. `objSize` is padded to multiple of 4; zero-init in `btpool_new` uses `int*` with `objSize/4` iterations. All three pool types (BtVertex=96B, BtEdge=48B, BtFace=56B) are already multiples of 4.
+`btpool_init(p, wp, blockSize, objSize, lane)` eagerly allocates the pool block and uses all 32 warp lanes to build the free list in parallel (each lane handles every 32nd slot). `btpool_new` only pops from the free list; if exhausted, it sets `BT_ERR_POOL_EXHAUST` (error code 5) and returns NULL — no lazy block allocation. `objSize` is padded to multiple of 4; zero-init in `btpool_new` uses `int*` with `objSize/4` iterations. Only the edge pool (BtEdge=40B) is used; vertex and face pools were removed as unused.
 
 ### pyproject.toml license Field Format
 

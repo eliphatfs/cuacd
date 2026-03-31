@@ -278,23 +278,11 @@ __device__ inline int br128_cmp_i64(BtRational128 a, long long b) {
 
 struct BtVertex;
 struct BtEdge;
-struct BtFace;
-
-struct BtFace {
-    BtFace* next;
-    BtVertex* nearbyVertex;
-    BtFace* nextWithSameNearbyVertex;
-    BtPoint32 origin;
-    BtPoint32 dir0;
-    BtPoint32 dir1;
-};
-
 struct BtEdge {
     BtEdge* next;
     BtEdge* prev;
     BtEdge* reverse;
     BtVertex* target;
-    BtFace* face;
     int copy;
 };
 
@@ -302,8 +290,6 @@ struct BtVertex {
     BtVertex* next;
     BtVertex* prev;
     BtEdge* edges;
-    BtFace* firstNearbyFace;
-    BtFace* lastNearbyFace;
     BtPointR128 point128;
     BtPoint32 point;
     int copy;
@@ -350,43 +336,9 @@ __device__ inline float bv_zval(BtVertex* v) {
     return (v->point.index >= 0) ? (float)v->point.z : bpr128_zval(v->point128);
 }
 
-__device__ inline void bv_receiveNearbyFaces(BtVertex* dst, BtVertex* src) {
-    if (dst->lastNearbyFace) {
-        dst->lastNearbyFace->nextWithSameNearbyVertex = src->firstNearbyFace;
-    } else {
-        dst->firstNearbyFace = src->firstNearbyFace;
-    }
-    if (src->lastNearbyFace) {
-        dst->lastNearbyFace = src->lastNearbyFace;
-    }
-    for (BtFace* f = src->firstNearbyFace; f; f = f->nextWithSameNearbyVertex) {
-        f->nearbyVertex = dst;
-    }
-    src->firstNearbyFace = NULL;
-    src->lastNearbyFace = NULL;
-}
-
 __device__ inline void bt_edge_link(BtEdge* a, BtEdge* n) {
     a->next = n;
     n->prev = a;
-}
-
-__device__ inline void bt_face_init(BtFace* f, BtVertex* a, BtVertex* b, BtVertex* c) {
-    f->nearbyVertex = a;
-    f->nextWithSameNearbyVertex = NULL;
-    f->origin = a->point;
-    f->dir0 = bp32_sub(b->point, a->point);
-    f->dir1 = bp32_sub(c->point, a->point);
-    if (a->lastNearbyFace) {
-        a->lastNearbyFace->nextWithSameNearbyVertex = f;
-    } else {
-        a->firstNearbyFace = f;
-    }
-    a->lastNearbyFace = f;
-}
-
-__device__ inline BtPoint64 bt_face_normal(BtFace* f) {
-    return bp32_cross(f->dir0, f->dir1);
 }
 
 // ============================================================================
@@ -458,9 +410,7 @@ __device__ inline void btpool_free(BtPool* p, void* obj) {
 }
 
 // Typed wrappers
-__device__ inline BtVertex* btpool_new_vertex(BtPool* p) { return (BtVertex*)btpool_new(p); }
 __device__ inline BtEdge*   btpool_new_edge(BtPool* p)   { return (BtEdge*)btpool_new(p); }
-__device__ inline BtFace*   btpool_new_face(BtPool* p)   { return (BtFace*)btpool_new(p); }
 
 // Simple alloc from WarpPool (lane 0 only)
 __device__ inline void* bt_alloc(WarpPool* wp, int bytes) {
@@ -522,12 +472,8 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
     postsort += BT_ALIGN16(n * (int)sizeof(BtVertex*));
     // postsort: pre-allocated vertex block
     postsort += BT_ALIGN16(n * (int)sizeof(BtVertex));
-    // vertexPool block (btpool_init, one block of n vertices)
-    postsort += BT_ALIGN16(n * (int)sizeof(BtVertex));
     // edgePool block (btpool_init, one block of 6n edges)
     postsort += BT_ALIGN16(6 * n * (int)sizeof(BtEdge));
-    // facePool block (btpool_init, one block of 2n faces)
-    postsort += BT_ALIGN16(2 * n * (int)sizeof(BtFace));
     // bt_computeVolume: DFS stack
     postsort += BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
     // bt_computeInternal: iterative D&C stack
@@ -550,9 +496,7 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
 struct BtHullState {
     float scaling[3];
     float center[3];
-    BtPool vertexPool;
     BtPool edgePool;
-    BtPool facePool;
     BtVertex** originalVertices;
     int mergeStamp;
     int minAxis, medAxis, maxAxis;
@@ -575,8 +519,6 @@ __device__ inline BtEdge* bt_newEdgePair(BtHullState* s, BtVertex* from, BtVerte
     r->copy = s->mergeStamp;
     e->target = to;
     r->target = from;
-    e->face = NULL;
-    r->face = NULL;
     e->next = NULL; e->prev = NULL;
     r->next = NULL; r->prev = NULL;
     s->usedEdgePairs++;
@@ -1285,7 +1227,6 @@ __device__ inline float bt_computeVolume(BtHullState* s) {
                         volume = bt128_add(volume, bt128_from_i64(vol));
                     }
                     f->copy = stamp;
-                    f->face = NULL; // reuse face field
                     a = b;
                     b = f->target;
                     f = f->reverse->prev;
@@ -1577,9 +1518,6 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
 
 // Post-sort: allocate pools (all lanes), init vertices (all lanes), D&C (lane 0).
 __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count, int lane) {
-    // All lanes: allocate vertex pool block and set up free list
-    btpool_init(&s->vertexPool, s->wp, count, (int)sizeof(BtVertex), lane);
-
     // Lane 0: allocate origVerts and vblock
     BtVertex* vblock = NULL;
     BtVertex** origVerts = NULL;
@@ -1603,7 +1541,6 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         BtVertex* v = &vblock[i];
         v->edges = NULL;
         v->next = NULL; v->prev = NULL;
-        v->firstNearbyFace = NULL; v->lastNearbyFace = NULL;
         v->point = points[i];
         v->copy = -1;
         v->point128.x = zero128;
@@ -1616,7 +1553,6 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 
     // All lanes: allocate edge and face pool blocks and set up free lists
     btpool_init(&s->edgePool, s->wp, 6 * count, (int)sizeof(BtEdge), lane);
-    btpool_init(&s->facePool, s->wp, 2 * count, (int)sizeof(BtFace), lane);
 
     // Lane 0: D&C
     if (lane == 0) {
