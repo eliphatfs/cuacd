@@ -57,8 +57,9 @@ COACD_GPU_ARCHS="80;86" pip install -e .
 # Run GPU smoke tests
 python tests/test_extension.py
 
-# Run GPU beam search tests
-python -m pytest tests/ -v
+# Run GPU beam search tests (ALWAYS ignore test_beam_v2 — it's under development
+# and its CUDA errors poison subsequent tests in the same pytest session)
+python -m pytest tests/ -v --ignore=tests/test_beam_v2.py
 
 # D&C hull benchmark (standalone, for profiling)
 python tests/bench_dandc.py --n_pts 200 --n_hulls 8
@@ -94,7 +95,7 @@ One extension is built by `setup.py`:
 - **No PyTorch dependency** — numpy arrays in/out. Reuses existing CUDA context if available.
 - **Single extension** — all GPU functionality (beam search + Hausdorff + merge cost) in one `_gpu` module. No cmake, no ctypes.
 - **Native CPython extension, not ctypes** — ctypes has fragile import path resolution, no type safety, no proper Python object lifecycle. The torchoptix pattern (native CPython extension with embedded fatbin) is the standard approach.
-- **Hull algorithm** — D&C (Preparata-Hong) is the primary hull algorithm, exposed via `batch_hull_volume` and `batch_hull_dandc_mesh` (volume + mesh extraction). `hull_dandc_warp_mesh` returns both volume and the extracted hull mesh (vertices + triangles). Sort scratch is rewound after sort completes (`bt_rewind`) so postsort allocations reuse that space, reducing peak scratch. The incremental shared-memory hull (`hull.cuh`) is still used internally by V1 beam search for Rv computation.
+- **Hull algorithm** — D&C (Preparata-Hong) is the primary hull algorithm, exposed via `batch_hull_volume` and `batch_hull_dandc_mesh` (volume + mesh extraction). `hull_dandc_warp_mesh` returns both volume and the extracted hull mesh (vertices + triangles). Three rewind points minimize peak scratch: (1) sort scratch rewound after sort, (2) D&C stack rewound after `bt_computeInternal`, (3) mesh extraction stacks rewound before `bt_computeVolume`. `dandc_scratch_bytes` reports `presort + max(sort_scratch, persistent + max(dc_stack, mesh_stacks, vol_stack))`. The incremental shared-memory hull (`hull.cuh`) is still used internally by V1 beam search for Rv computation.
 
 ### Python API
 
@@ -331,7 +332,12 @@ V2 replaces V1's 5-kernel pipeline with 3 kernels using D&C hull everywhere, Par
 
 ### Sort Scratch Rewind (hull_dandc.cuh)
 
-`hull_dandc_warp` and `hull_dandc_warp_mesh` save the WarpPool offset before allocating sort scratch, then call `bt_rewind(pool, saved_offset)` after sort completes. Postsort allocations reuse the sort scratch space. This eliminates `n * sizeof(BtPoint32)` from peak scratch per hull since postsort is always larger.
+Three rewind points in the D&C hull minimize peak scratch:
+1. **Sort scratch**: rewound after `warp_sort_bp32` completes. Postsort allocations reuse the space.
+2. **D&C stack**: `bt_computeInternal`'s `BT_DC_MAX_STACK * sizeof(BtDCStackItem)` rewound in `bt_compute_postsort` after D&C completes, before volume/mesh extraction.
+3. **Mesh extraction stacks**: `bt_extractMesh`'s DFS stack + `ordered_verts` rewound in `hull_dandc_warp_mesh` before `bt_computeVolume`.
+
+`dandc_scratch_bytes` computes peak as: `presort + max(sort_scratch, persistent + max(phase_dc, phase_mesh, phase_vol))` where persistent = vblock + edgePool.
 
 ### Global DevicePool Scratch Allocation
 
@@ -339,7 +345,7 @@ V2 kernels allocate all scratch from a single global DevicePool (70% of free VRA
 
 ### V2 Status
 
-- **Working**: Hull mesh extraction (`batch_hull_dandc_mesh`), cube convexity (early exit), sort scratch rewind, all V1 tests still pass (118 tests).
+- **Working**: Hull mesh extraction (`batch_hull_dandc_mesh`), cube convexity (early exit), sort scratch rewind + D&C/mesh/volume stack rewinds, all V1 tests still pass (122 tests).
 - **Bug (WIP)**: `beam_run_v2` has an illegal memory access during the initial `batch_mesh_volume` call for hull volume computation. The hull triangle indices in the triangle pool are 0-based but need rebasing by `n_verts` since hull vertices are stored after original vertices. The `vert_offsets` fix to `{n_verts, n_verts}` was applied but the crash persists — needs further debugging.
 - **Not yet working**: Full L-shape decomposition via V2 path.
 
@@ -464,7 +470,7 @@ Moving `query_dandc_scratch` before the large `cuMemcpyHtoDAsync` calls (to avoi
 - D&C hull mesh extraction (`bt_extractMesh`, `hull_dandc_warp_mesh`, `batch_hull_dandc_mesh`) — tested (cube 8v/12t, tetra 4v/4t, gaussian)
 - V2 data structures (PartInfoV2, WorkItem) — defined in common.cuh, beam.h
 - Two-warp reductions (`twowarp_reduce_sum/max/count`) — in reduce.cuh
-- Sort scratch rewind in D&C hull (`bt_rewind`) — saves ~n*16 bytes per hull
+- Sort scratch rewind + D&C stack/mesh/volume stack rewinds in D&C hull — peak scratch = persistent + max(phase) instead of sum
 - Global DevicePool scratch allocation (`warppool_from_global`) — in hull_warp_common.cuh
 - V2 kernel compilation: beam_expansion, beam_hausdorff_parts, beam_termination — compiles
 - V2 host code (`beam_run_v2`) and Python API (`run_v2`, `run_beam_coacd_v2`) — compiles

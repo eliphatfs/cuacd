@@ -446,40 +446,38 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 #define BT_ALIGN16(x) (((x) + 15) & ~15)
 
 // Compute total WarpPool scratch bytes needed for D&C hull with n points.
-// Sort scratch is allocated then freed (rewound) so it doesn't count toward
-// the peak — only the max(sort_scratch, postsort_allocs) matters.
-// Since postsort allocs are always larger than sort scratch for n >= ~10,
-// we just count everything after sort rewind.
+// Sort scratch is rewound after sort. Postsort: vblock + edgePool persist,
+// then D&C stack, volume DFS stack, and mesh extraction stacks are each
+// rewound after use, so they share the same high-water space.
+// Peak = presort + max(sort_scratch, postsort_persistent + max(rewindable_phases)).
 __host__ __device__ inline int dandc_scratch_bytes(int n) {
     int total = 0;
     // presort: BtPoint32 array (persists through sort, NOT rewound)
     total += BT_ALIGN16(n * (int)sizeof(BtPoint32));
-    // sort scratch: tmp array + two stack arrays
-    // This IS rewound after sort, but we still need space for it at peak.
-    // Peak = presort + max(sort_scratch, postsort_onwards).
-    // Sort scratch = n*16 + WS_MAX_STACK*8.  Postsort onwards is much larger.
-    // So sort scratch doesn't increase peak. We include it for safety anyway
-    // since the rewind only saves space when postsort > sort scratch.
-    // Actually: presort (points) is NOT freed before sort, and sort uses
-    // the same points array. Sort scratch is separate.  After sort, we rewind
-    // the sort scratch. Then postsort allocates on top of presort.
-    // So peak = presort + sort_scratch during sort phase,
-    //    or    presort + postsort_onwards after rewind.
-    // We report max of those two.
+
     int sort_scratch = BT_ALIGN16(n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int));
-    int postsort = 0;
-    // postsort: pre-allocated vertex block
-    postsort += BT_ALIGN16(n * (int)sizeof(BtVertex));
-    // edgePool block (btpool_init, one block of 6n edges)
-    postsort += BT_ALIGN16(6 * n * (int)sizeof(BtEdge));
-    // bt_computeVolume: DFS stack
-    postsort += BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
-    // bt_computeInternal: iterative D&C stack
-    postsort += BT_ALIGN16(BT_DC_MAX_STACK * (int)sizeof(BtDCStackItem));
-    // bt_extractMesh: DFS stack
-    postsort += BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
-    // bt_extractMesh: ordered_verts array (max n vertices)
-    postsort += BT_ALIGN16(n * (int)sizeof(BtVertex*));
+
+    int postsort_persistent = 0;
+    // postsort: pre-allocated vertex block (persists)
+    postsort_persistent += BT_ALIGN16(n * (int)sizeof(BtVertex));
+    // edgePool block (persists)
+    postsort_persistent += BT_ALIGN16(6 * n * (int)sizeof(BtEdge));
+
+    // These three phases are each rewound after use, so only the max matters:
+    // Phase A: bt_computeInternal D&C stack
+    int phase_dc = BT_ALIGN16(BT_DC_MAX_STACK * (int)sizeof(BtDCStackItem));
+    // Phase B: bt_extractMesh DFS stack + ordered_verts
+    int phase_mesh = BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*))
+                   + BT_ALIGN16(n * (int)sizeof(BtVertex*));
+    // Phase C: bt_computeVolume DFS stack
+    int phase_vol = BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
+
+    // Max of the three rewindable phases
+    int rewindable_peak = phase_dc;
+    if (phase_mesh > rewindable_peak) rewindable_peak = phase_mesh;
+    if (phase_vol > rewindable_peak) rewindable_peak = phase_vol;
+
+    int postsort = postsort_persistent + rewindable_peak;
 
     total += (sort_scratch > postsort) ? sort_scratch : postsort;
     // alignment padding headroom
@@ -1551,9 +1549,15 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         s->usedEdgePairs = 0;
         s->mergeStamp = -3;
 
+        // Save offset before D&C stack allocation so we can rewind after
+        int pre_dc_offset = s->wp->offset;
+
         BtIntermediateHull hull;
         bt_computeInternal(s, 0, count, &hull);
         s->vertexList = hull.minXy;
+
+        // Rewind D&C stack — it's no longer needed after computeInternal
+        bt_rewind(s->wp, pre_dc_offset);
     }
     __syncwarp();
 }
@@ -1692,6 +1696,8 @@ __device__ float hull_dandc_warp_mesh(
             vol = -1.0f;
         } else {
             // Extract mesh first (uses the hull graph)
+            // Save offset so we can rewind mesh extraction stacks before volume
+            int pre_mesh_offset = pool->offset;
             if (out_verts && out_tris && n_hull_verts && n_hull_tris) {
                 int mesh_err = bt_extractMesh(&state,
                     out_verts, out_tris,
@@ -1702,6 +1708,8 @@ __device__ float hull_dandc_warp_mesh(
                     vol = -1.0f;
                 }
             }
+            // Rewind mesh extraction stacks (DFS stack + ordered_verts)
+            bt_rewind(pool, pre_mesh_offset);
             if (!pool->error && vol >= 0.0f) {
                 vol = bt_computeVolume(&state);
                 if (pool->error) { *err = pool->error; vol = -1.0f; }
