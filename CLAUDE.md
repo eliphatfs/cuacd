@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This repository contains:
 
 1. **CoACD** (`CoACD/`) — Collision-Aware Approximate Convex Decomposition (reference C++ implementation, SIGGRAPH 2022).
-2. **coacd_gpu** — GPU-accelerated convex decomposition via beam search. Single CPython extension (abi3, cp310+) via CUDA driver API. Includes beam search decomposition and Hausdorff distance (V2 kernel, in beam_v2.cu).
+2. **coacd_gpu** — GPU-accelerated convex decomposition. Single CPython extension (abi3, cp310+) via CUDA driver API. Includes D&C hull volume/mesh, plane cut with cap triangulation, batch mesh volume.
 
 ## Repository Layout
 
@@ -24,21 +24,17 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
   hull_batch.cu       #   batch_hull_dandc + batch_hull_dandc_mesh + batch_mesh_volume kernels
   test_warp_sort.cu   #   Test kernel for warp_sort_bp32
-  beam_v2.cu          #   V2 beam search: beam_expansion, beam_hausdorff_parts, beam_termination
   plane_cut.cu        #   GPU plane cut: plane_cut_block (__device__) + plane_cut_kernel thin wrapper
   mesh_transform.cu   #   Normalize/recover coordinate kernels
 csrc/                 # C host code
   beam.h/.c           #   Host implementation (CUDA driver API) — beam search
   beam_module.c       #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
-  __init__.py         #   Context class (hull/mesh volume API) + re-exports BeamContext
-  beam.py             #   Python API for beam search (imports _gpu extension)
+  __init__.py         #   Context class (hull/mesh volume API)
 tests/                # All tests
-  test_beam_v2.py     #   GPU beam search V2 tests (3-kernel architecture)
   test_hull.py        #   Hull volume + mesh volume tests (CPU ref, GPU D&C vs scipy, noisy icosphere)
   test_hull_mesh.py   #   D&C hull mesh extraction tests (batch_hull_dandc_mesh)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling (gaussian points)
-  test_v2_kernels.py  #   Per-kernel tests for beam_expansion, beam_hausdorff_parts, beam_termination
   test_warp_sort.py   #   Tests for warp_sort_bp32 (bitonic + quicksort paths)
   test_plane_cut.py   #   Plane cut tests: simple loop, ring, multi-hole, edge cases (14 tests)
 CoACD/                # Reference C++ CoACD (submodule/external)
@@ -69,8 +65,8 @@ COACD_GPU_ARCHS="80;86" pip install -e .
 # Run all tests
 python -m pytest tests/ -v
 
-# Build with V2 beam loop debug output (iter/metric/kernel error per iteration)
-COACD_V2_DEBUG=1 pip install -e .
+# Build with verbose host-side debug output
+COACD_DEBUG=1 pip install -e .
 
 # D&C hull benchmark (standalone, for profiling)
 python tests/bench_dandc.py --n_pts 200 --n_hulls 8
@@ -121,53 +117,9 @@ import coacd_gpu
 with coacd_gpu.Context(device=0) as ctx:
     volumes, errors = ctx.batch_hull_volume(pts_list)
     volumes = ctx.batch_mesh_volume(verts_list, tris_list)
-
-# Beam search decomposition (V2 — 3-kernel, D&C hull + Hausdorff)
-from coacd_gpu.beam import BeamContext, run_beam_coacd_v2
-with BeamContext(device=0) as ctx:
-    parts = ctx.run_v2(vertices, triangles, threshold=0.05)
-# or:
-parts = run_beam_coacd_v2(vertices, triangles, threshold=0.05)
 ```
 
-`Context` and `BeamContext` share the same underlying `_gpu` extension and CUDA context.
-
-## Beam Search Algorithm Design
-
-### Overview
-
-Replace MCTS with beam search over decomposition states. Search space: 3xN axis-aligned cuts (N per axis, default N=10 -> 30 total candidates). Beam width X (default 30). 3-kernel architecture (V2):
-
-**Kernel 1 — `beam_expansion`**: For X work items × 30 candidates = 30X blocks. Each block clips the worst part of a work item along a candidate plane, computes Rv via D&C hull, writes new PartInfoV2 entries. Last block (via atomicAdd counter) selects top X candidates by insertion sort.
-
-**Kernel 2 — `beam_hausdorff_parts`**: For each unique part (across all work items). Bidirectional Hausdorff between part mesh and its hull mesh. Skips parts already computed or with Rv > 2×threshold.
-
-**Kernel 3 — `beam_termination`**: One warp per work item. Uses `__all_sync` to check if all parts are below threshold. `warp_argmax_f` to find worst part. Writes winning item to `result` if all items are done.
-
-No connected component analysis — each cut produces exactly two parts (positive/negative half), matching CoACD's approach. Metrics are computed per-part, not per-component.
-
-### Concavity Metric: Rv (Volume-Ratio)
-
-Rv = `(3 * |V_mesh - V_hull| / (4*pi))^(1/3) * k` where k = rv_k (default 0.3).
-
-- **Mesh volume**: parallel signed-tetrahedra reduction `V = (1/6) * sum p0.(p1 x p2)`. For open meshes after clipping, cap volume correction via divergence theorem: `V_cap = (d/3) * |A_boundary|` from boundary edge loop shoelace signed area.
-- **Hull volume**: D&C hull (`hull_dandc_warp_mesh`) — warp-parallel Preparata-Hong, unlimited vertices, exact Int128 arithmetic. Returns both volume and extracted mesh for Hausdorff.
-- **Cap triangulation**: ear-clipping cap triangulates the cut boundary to close meshes after each clip. Supports simple loop, ring (annular), and multi-hole topologies via boundary loop reconstruction + hole bridging. `plane_cut_block` (plane_cut.cu, called via `plane_cut_kernel`) handles all phases: parallel vertex classification → parallel triangle splitting with edge dedup via warp_sort → parallel directed-edge boundary detection via sort + binary search → thread-0 sequential loop chaining, hole bridging (rightmost-first), and ear clipping.
-- **Threshold**: compatible with CoACD semantics. Convex shape -> Rv ~ 0. Threshold 0.05 typical.
-- **Scoring a cut**: `max(Rv_positive_half, Rv_negative_half)`. Beam search minimizes worst-case concavity.
-- **Per-part bounding box planes**: cutting planes uniformly distributed within each part's triangle-vertex bbox (not all-vertex bbox, not global). Odd cuts_per_axis (e.g., 15) ensures midpoint is always a candidate. No snapping to vertex coordinates.
-
-### Hyperparameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `beam_width` (X) | 30 | Number of beam items to keep |
-| `cuts_per_axis` (N) | 10 | Planes per axis direction (30 total) |
-| `threshold` | 0.05 | Concavity threshold for termination |
-| `rv_k` | 0.3 | Scaling factor in Rv formula |
-| `max_parts` | 64 | Max parts per beam item |
-| `max_iterations` | 64 | Max decomposition steps |
-| `hausdorff_samples` | 1000 | Samples for Hausdorff validation |
+## Algorithm Notes
 
 ### Pool Allocator Pattern
 
@@ -205,10 +157,6 @@ If all 256 threads call `pool_alloc`, each gets a different offset (256x memory 
 | B3 | `block_reduce_max(val, smem, tid) -> float` | reduce.cuh |
 | B4 | `block_reduce_count(flag, smem_i, tid) -> int` | reduce.cuh |
 
-### F. Hausdorff (V2 kernel, beam_v2.cu)
-
-`beam_hausdorff_parts` — per-block bidirectional Hausdorff between part mesh and its D&C hull mesh. Skips parts where `hausdorff >= 0` or `rv_cost > 2*threshold`. Called as Kernel 2 in the V2 beam loop.
-
 ### G. Mesh Transform (kernels)
 
 | ID | Function | File |
@@ -229,39 +177,6 @@ If all 256 threads call `pool_alloc`, each gets a different offset (256x memory 
 |----|------|----------|
 | J1 | `compute_concavity_tris` in geometry.cuh | Bbox cube-root proxy, superseded by Rv |
 
-## Beam Search Architecture Detail
-
-### Data Structures (common.cuh)
-
-- **PartInfoV2**: `hull_vert_offset`, `hull_vert_count`, `hull_tri_offset`, `hull_tri_count`, `hausdorff` (-1 = not computed), `mesh_volume`, `hull_volume`.
-- **WorkItem**: `part_indices[MAX_PARTS_PER_BEAM]` for indirect indexing into a global PartInfoV2 pool (no per-item part copies). `worst_part_idx` indexes into `part_indices`, `worst_metric` = max(rv, hausdorff) of worst part.
-
-### Kernels (beam_v2.cu)
-
-**Kernel 1 — `beam_expansion`** (64 threads = 2 warps per block):
-- Grid: `num_work_items * 3 * cuts_per_axis`. Each block = one candidate cut.
-- Split scratch allocated from global DevicePool via `global_alloc_t0` (thread 0 atomicAdd).
-- Each warp allocates its own D&C WarpPool from the global DevicePool via `warppool_from_global` (lane 0 atomicAdd). No shared memory for pointers.
-- No hull vertex limit — all unique triangle-referenced vertices fed to D&C.
-- Hull mesh extracted via `hull_dandc_warp_mesh` into the output vertex/triangle pool.
-- Last-block selection: `atomicAdd(done_counter)`, last block does insertion sort.
-
-**Kernel 2 — `beam_hausdorff_parts`** (256 threads per block):
-- Grid: total unique parts. Bidirectional Hausdorff between part mesh and hull mesh.
-- Skips parts where `hausdorff >= 0` (already computed) or `rv_cost > 2*threshold` (too far).
-
-**Kernel 3 — `beam_termination`** (32 threads = 1 warp per block):
-- Grid: `num_work_items`. Uses `__all_sync` for termination check, `warp_argmax_f` for worst part.
-- Writes winning work item index to `result` via `atomicExch`.
-
-### Host Loop (beam_run_v2 in beam.c)
-
-1. Upload mesh + scipy ConvexHull to vertex/triangle pools
-2. Normalize both mesh and hull together
-3. Compute initial mesh_vol and hull_vol via `batch_mesh_volume` kernel
-4. Compute initial Rv; early exit if convex
-5. Loop: Hausdorff → Termination check → Expansion → swap buffers
-
 ### Scratch Rewind and BFS (hull_dandc.cuh)
 
 Three rewind points in the D&C hull minimize peak scratch:
@@ -272,24 +187,6 @@ Three rewind points in the D&C hull minimize peak scratch:
 Volume and mesh extraction use BFS (Bullet `getVertexCopy` pattern) instead of DFS — no stack overflow possible. BFS queue size = n vertex pointers, bounded by hull vertex count. `dandc_scratch_bytes` = `presort + max(sort_scratch, persistent + max(dc_stack, bfs_queue))`.
 
 Edge pool: `6n` half-edges. Empirically confirmed exact: max live edge pairs = `3n - 6` (Euler, triangulated hull), peak never exceeds final count during merge. `COACD_TRACK_EDGES=1 pip install -e .` enables `TRACK_MAX_EDGE_PAIRS` compile macro for printf tracking.
-
-### Global DevicePool Scratch Allocation
-
-V2 kernels allocate all scratch from a single global DevicePool (70% of free VRAM, capped at 4GB). Each warp calls `warppool_from_global(&scratch, dandc_scratch_bytes(n), &wp)` from lane 0, which does an `atomicAdd` on the global offset. No pre-sized per-block scratch arrays.
-
-### V2 Status
-
-- **Working**: Hull mesh extraction (`batch_hull_dandc_mesh`), cube convexity (early exit), scratch rewinds (sort/D&C/BFS), BFS graph traversal (no DFS stack overflow).
-- **Bug (WIP)**: `beam_run_v2` has an illegal memory access during the initial `batch_mesh_volume` call for hull volume computation. The hull triangle indices in the triangle pool are 0-based but need rebasing by `n_verts` since hull vertices are stored after original vertices. The `vert_offsets` fix to `{n_verts, n_verts}` was applied but the crash persists — needs further debugging.
-- **Not yet working**: Full L-shape decomposition via V2 path.
-
-## Current Implementation vs. Design Discrepancies
-
-### No Hausdorff in beam loop
-
-**Design**: Dedicated kernel — Hausdorff for parts where Rv < eps, skipping parts with Rv > 2×threshold.
-
-**Current**: `beam_hausdorff_parts` kernel exists and skips expensive cases, but host wiring to integrate it into the termination loop is incomplete. Termination currently uses Rv alone.
 
 ## Implementation Lessons
 
@@ -321,56 +218,17 @@ PEP 621 requires `license = {text = "MIT"}` or `license = {file = "LICENSE"}`. T
 
 nvcc crashed when compiling with `--generate-line-info` while `bt_computeInternal` was recursive. Converting to an iterative explicit stack resolved the crash. Line info is now always enabled for NCU profiling.
 
-### scipy ConvexHull.simplices Winding Is Not Consistent
-
-`scipy.spatial.ConvexHull.simplices` does not guarantee outward-facing normals. For signed-tet volume computation, inconsistent winding causes triangle contributions to cancel, yielding ≈0 instead of the true volume. Fix: for each simplex `[a,b,c]`, compute `cross(b-a, c-a)` and check `dot(normal, va - centroid) < 0`; flip `b,c` if so. Apply in `beam.py` after remapping hull triangle indices.
-
-### V2 Pool Capacity Formula
-
-V2's `beam_expansion` creates 2 new parts per block per iteration. Hull output uses natural Euler bounds from actual hull input size (n input points → max n hull verts, max 2n-4 hull tris) — no artificial limits. Pool capacity is sized from available GPU memory (65% of free VRAM split 45/45/10 between vert/tri/part pools) — no arbitrary caps.
-
-### V2 Kernel Error Reporting Pattern
-
-All three V2 kernels (`beam_expansion`, `beam_hausdorff_parts`, `beam_termination`) take `int* kernel_error`. Errors are written via `atomicOr(kernel_error, KERR_*)`. Host zeros `d_kerr` before each launch, then issues `cuMemcpyDtoHAsync` immediately after the `cuLaunchKernel` call (before `cuStreamSynchronize`) so the download overlaps with kernel execution. Bit flags: `KERR_SCRATCH_OOM=1`, `KERR_SPLIT_OOM=2`, `KERR_HULL_PTS_OOM=4`, `KERR_POOL_OOM=8`, `KERR_HULL_ERR=16`.
-
 ### Scratch Query Ordering Does Not Help batch_hull_volume
 
 Moving `query_dandc_scratch` before the large `cuMemcpyHtoDAsync` calls (to avoid syncing after copies) was tested and made performance slightly worse. The `cuMemAlloc` calls themselves may already serialize, so reordering provides no benefit. Keep the query after copies for now.
 
 ## Current Status
 
-### Working (V2 — partial)
-- D&C hull mesh extraction (`bt_extractMesh`, `hull_dandc_warp_mesh`, `batch_hull_dandc_mesh`) — tested (cube 8v/12t, tetra 4v/4t, gaussian)
-- V2 data structures (PartInfoV2, WorkItem) — defined in common.cuh, beam.h
-- Two-warp reductions (`twowarp_reduce_sum/max/count`) — in reduce.cuh
-- Scratch rewinds (sort/D&C/BFS) + BFS graph traversal replacing DFS in D&C hull
-- Global DevicePool scratch allocation (`warppool_from_global`) — in hull_warp_common.cuh
-- V2 kernel compilation: beam_expansion, beam_hausdorff_parts, beam_termination — compiles and individually tested
-- V2 host code (`beam_run_v2`) and Python API (`run_v2`, `run_beam_coacd_v2`) — compiles
-- V2 cube convexity early-exit path — **working**
-- V2 L-shape decomposition — **working** (7 parts at threshold=0.05)
-- V2 Octocat-v2 (20k verts) — **working** (37 parts at threshold=0.05, ~6s)
-- Per-kernel test infrastructure: `test_termination`, `test_hausdorff_parts`, `test_expansion` C API + Python wrappers (tests/test_v2_kernels.py — 14 tests pass)
-- Kernel-side error reporting: `KERR_*` bit flags in all 3 V2 kernels (`KERR_SCRATCH_OOM=1`, `KERR_SPLIT_OOM=2`, `KERR_HULL_PTS_OOM=4`, `KERR_POOL_OOM=8`, `KERR_HULL_ERR=16`); host async-downloads and checks after each launch
-- Pool OOM bounds checking in `beam_expansion` (hull pre-alloc and mesh copy both checked)
-- `CHECK_CU` macro now includes `beam.c:LINE` in error messages for faster diagnosis
-
-### V2 Bugs Fixed
-- **Scipy hull winding**: `hull.simplices` have inconsistent winding → signed-tet sum ≈ 0 → rv non-zero for convex shapes → no early exit → pool overflow. Fixed in `beam.py`: orient each hull triangle outward using centroid dot-product check.
-- **Triangle pool overflow in `beam_expansion`**: Fixed by removing artificial `max_hull_verts_per_part`/`max_hull_tris_per_part` limits and using natural Euler bounds from actual hull input size. Pool capacities computed from worst-case per-block allocation.
-- Root cause of illegal memory access confirmed via `compute-sanitizer`: `bt_extractMesh` writing to `out_tris` past end of triangle pool in block 324/480 (second iteration).
-
-### V2 Bugs Fixed (cont.)
-- **Hull triangle index rebasing**: `hull_dandc_warp_mesh` writes 0-based triangle indices, but the Hausdorff kernel needs absolute pool indices. Missing rebase (`+= hull_vo_pos/neg`) caused Hausdorff to read wrong vertices → absurd distances (1.6 on normalized mesh) → termination never fired. Fixed by adding rebase loop in `beam_expansion` after D&C hull extraction.
-- **DevicePool 32-bit offset wraparound**: `DevicePool.offset` was `unsigned int`, causing silent wraparound when >4GB scratch was consumed by concurrent expansion blocks (480 blocks × ~15MB D&C scratch each). Blocks got overlapping memory → corrupted edge pool free lists → illegal memory access in `btpool_new`. Fixed by widening offset/capacity to `unsigned long long`; removed 4GB scratch cap.
-
-### V2 Bugs Remaining
-- Hull mesh winding: `bt_extractMesh` produces mixed winding (mesh volume via signed tet = 0.667 for unit cube instead of 1.0). The D&C volume (via int128 arithmetic) is correct. Winding consistency in extracted mesh needs investigation.
-- Hausdorff kernel skipped in beam loop (debugging Rv-only termination quality first).
-
-### V2 Scaling Note
-
-Every expansion block allocates O(n_verts) pool space for mesh copies + hull output, but only beam_width results survive selection. For large meshes (20k+ verts), this wastes significant pool space per iteration. A GPU-side pool compaction kernel (run between iterations) would reclaim dead space. Currently this is not a problem because pools are sized from available GPU memory (65% of free VRAM).
+### Working
+- D&C hull volume (`batch_hull_volume`) and mesh extraction (`batch_hull_dandc_mesh`) — tested (cube 8v/12t, tetra 4v/4t, gaussian)
+- Batch mesh volume (`batch_mesh_volume`) — divergence theorem, watertight meshes
+- Scratch rewinds (sort/D&C/BFS) + BFS graph traversal (no DFS stack overflow)
+- `CHECK_CU` macro includes `beam.c:LINE` in error messages for faster diagnosis
 
 ### Plane Cut Kernel (plane_cut.cu) — Working
 - `plane_cut_block` is the `__device__` function doing the real work; `plane_cut_kernel` is a thin `__global__` wrapper that calls it (enables future multi-block use)
@@ -383,7 +241,4 @@ Every expansion block allocates O(n_verts) pool space for mesh copies + hull out
 - Host launcher in `beam_test_plane_cut` (beam.c) handles device memory allocation, kernel launch, result download
 
 ### Not Yet Implemented
-- Pool compaction kernel (GPU-side, between iterations — reclaim dead pool space from non-winning expansion blocks)
-- Merge post-processing
-- Vertex compaction (parts carry superset of vertices)
 - `__cuda_array_interface__` support for GPU tensor input

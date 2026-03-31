@@ -31,7 +31,6 @@ except ImportError:
 
 try:
     import coacd_gpu
-    from coacd_gpu.beam import BeamContext
     _HAS_GPU = True
 except Exception:
     _HAS_GPU = False

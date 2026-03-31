@@ -73,42 +73,4 @@ __device__ inline void block_reduce_bbox(
     }
 }
 
-// ============================================================================
-// Two-warp reductions for EXPANSION_BLOCK_SIZE (64 threads)
-// ============================================================================
-
-__device__ inline float twowarp_reduce_sum(float val, float* smem, int tid) {
-    // Intra-warp reduction via shuffle
-    for (int off = 16; off > 0; off >>= 1)
-        val = val + __shfl_xor_sync(0xffffffffu, val, off);
-    // Write warp result to smem
-    if ((tid & 31) == 0) smem[tid >> 5] = val;
-    __syncthreads();
-    // Combine two warps
-    float result = smem[0] + smem[1];
-    __syncthreads();
-    return result;
-}
-
-__device__ inline float twowarp_reduce_max(float val, float* smem, int tid) {
-    for (int off = 16; off > 0; off >>= 1)
-        val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, off));
-    if ((tid & 31) == 0) smem[tid >> 5] = val;
-    __syncthreads();
-    float result = fmaxf(smem[0], smem[1]);
-    __syncthreads();
-    return result;
-}
-
-__device__ inline int twowarp_reduce_count(int flag, int* smem, int tid) {
-    int val = flag;
-    for (int off = 16; off > 0; off >>= 1)
-        val = val + __shfl_xor_sync(0xffffffffu, val, off);
-    if ((tid & 31) == 0) smem[tid >> 5] = val;
-    __syncthreads();
-    int result = smem[0] + smem[1];
-    __syncthreads();
-    return result;
-}
-
 #endif // REDUCE_CUH

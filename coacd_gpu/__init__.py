@@ -3,9 +3,6 @@ coacd_gpu — GPU-accelerated convex decomposition.
 
 Uses CUDA driver API via a native CPython extension. No PyTorch or CUDA runtime dependency.
 Only requires an NVIDIA GPU driver (libcuda.so / nvcuda.dll).
-
-Includes:
-- GPU beam search convex decomposition V2 (BeamContext, run_beam_coacd_v2)
 """
 
 import numpy as np
@@ -108,5 +105,3 @@ class Context:
             n_meshes, volumes.ctypes.data)
         return volumes
 
-
-from coacd_gpu.beam import BeamContext, run_beam_coacd_v2
