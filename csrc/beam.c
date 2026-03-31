@@ -117,7 +117,7 @@ struct beam_ctx {
         const char* _msg = NULL; \
         cuGetErrorString(_r, &_msg); \
         snprintf(ctx->last_error, sizeof(ctx->last_error), \
-                 "%s failed: %s", #call, _msg ? _msg : "unknown"); \
+                 "%s failed at beam.c:%d: %s", #call, __LINE__, _msg ? _msg : "unknown"); \
         return (int)_r; \
     } \
 } while(0)
@@ -1487,14 +1487,34 @@ int beam_run_v2(
     // Vertex pool, triangle pool, PartInfoV2 array, WorkItem arrays (double-buffered),
     // cost buffer, work scratch, D&C scratch, atomic counters
 
-    int vert_capacity   = (n_verts + n_hull_verts + 4096) * beam_width * 8;
-    int tri_capacity    = (n_tris + n_hull_tris + 4096) * beam_width * 8;
-    int part_capacity   = beam_width * MAX_PARTS_PER_BEAM * 4;
     int grid_max        = beam_width * num_planes;
-    // Hull mesh output limits (max vertices/triangles per extracted hull mesh)
-    // No limit on D&C hull input vertices — all unique vertices are fed in.
-    int max_hull_verts_per_part = 1024;
-    int max_hull_tris_per_part  = 2048;
+    // Hull mesh output limits (max vertices/triangles per extracted hull mesh).
+    // These must be small enough that pool allocations don't overflow.
+    int max_hull_verts_per_part = 64;
+    int max_hull_tris_per_part  = 128;
+
+    // Pool capacity: must hold all parts across all iterations.
+    // Total expansion blocks = max_iterations * beam_width * num_planes + num_planes (first iter).
+    // Each block creates 2 parts: 2 hull meshes + 2 mesh copies.
+    int vert_capacity, tri_capacity, part_capacity;
+    {
+        long long max_blocks = (long long)p.max_iterations * beam_width * num_planes + num_planes;
+        long long vc64 = (long long)(n_verts + n_hull_verts)
+            + max_blocks * (max_hull_verts_per_part * 2 + (n_verts + 32) * 2);
+        long long tc64 = (long long)(n_tris + n_hull_tris)
+            + max_blocks * (max_hull_tris_per_part * 2 + (n_tris + 16) * 3);
+        long long pc64 = 1 + max_blocks * 2;
+        if (vc64 > 4*1024*1024) vc64 = 4*1024*1024;
+        if (tc64 > 4*1024*1024) tc64 = 4*1024*1024;
+        if (pc64 > 128*1024)    pc64 = 128*1024;
+        // Minimum floor: original V1-style formula
+        long long vc_min = (long long)(n_verts + n_hull_verts + 4096) * beam_width * 8;
+        long long tc_min = (long long)(n_tris + n_hull_tris + 4096) * beam_width * 8;
+        long long pc_min = (long long)beam_width * MAX_PARTS_PER_BEAM * 4;
+        vert_capacity  = (int)(vc64 > vc_min ? vc64 : vc_min);
+        tri_capacity   = (int)(tc64 > tc_min ? tc64 : tc_min);
+        part_capacity  = (int)(pc64 > pc_min ? pc64 : pc_min);
+    }
 
     // Compute total allocation
     size_t vp_bytes   = (size_t)vert_capacity * 3 * sizeof(float);
@@ -1511,7 +1531,7 @@ int beam_run_v2(
 
     // Allocate everything separately for clarity
     CUdeviceptr d_vp, d_tp, d_pp, d_wi_a, d_wi_b, d_cost, d_ws;
-    CUdeviceptr d_counters, d_result, d_norm, d_pidx;
+    CUdeviceptr d_counters, d_result, d_norm, d_pidx, d_kerr;
     CUdeviceptr d_scratch_base, d_scratch_off;
 
     CHECK_CU(cuMemAlloc(&d_vp, vp_bytes));
@@ -1525,6 +1545,7 @@ int beam_run_v2(
     CHECK_CU(cuMemAlloc(&d_result, result_bytes));
     CHECK_CU(cuMemAlloc(&d_norm, norm_bytes));
     CHECK_CU(cuMemAlloc(&d_pidx, pidx_bytes));
+    CHECK_CU(cuMemAlloc(&d_kerr, sizeof(int)));
     // Global scratch pool for split + D&C (2GB)
     {
         size_t free_mem = 0, total_mem = 0;
@@ -1737,26 +1758,47 @@ int beam_run_v2(
                 }
                 if (n_pidx > 0) {
                     CHECK_CU(cuMemcpyHtoDAsync(d_pidx, pidx, n_pidx * sizeof(int), s));
-                    void* h_args[] = { &d_vp, &d_tp, &d_pp, &d_pidx, &n_pidx, &p.threshold };
+                    unsigned int kerr_zero = 0;
+                    CHECK_CU(cuMemcpyHtoDAsync(d_kerr, &kerr_zero, sizeof(int), s));
+                    void* h_args[] = { &d_vp, &d_tp, &d_pp, &d_pidx, &n_pidx,
+                                       &p.threshold, &d_kerr };
                     CHECK_CU(cuLaunchKernel(ctx->fn_beam_hausdorff_parts,
                         n_pidx, 1, 1, HAUSDORFF_BLOCK_SIZE, 1, 1, 0, s, h_args, NULL));
+                    // Async download kernel error
+                    int kerr_h = 0;
+                    CHECK_CU(cuMemcpyDtoHAsync(&kerr_h, d_kerr, sizeof(int), s));
+                    CHECK_CU(cuStreamSynchronize(s));
+                    if (kerr_h) {
+                        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                            "beam_hausdorff_parts kernel error 0x%x at iter %d", kerr_h, iter);
+                        goto cleanup;
+                    }
                 }
             }
 
             // Kernel 3: Termination check
             {
                 int neg1_v = -1;
+                unsigned int kerr_zero = 0;
                 CHECK_CU(cuMemcpyHtoDAsync(d_result, &neg1_v, sizeof(int), s));
-                void* t_args[] = { &d_pp, &d_wi_cur, &num_items, &p.threshold, &d_result };
+                CHECK_CU(cuMemcpyHtoDAsync(d_kerr, &kerr_zero, sizeof(int), s));
+                void* t_args[] = { &d_pp, &d_wi_cur, &num_items, &p.threshold,
+                                   &d_result, &d_kerr };
                 CHECK_CU(cuLaunchKernel(ctx->fn_beam_termination,
                     num_items, 1, 1, 32, 1, 1, 0, s, t_args, NULL));
             }
+            // Async download result + kernel error simultaneously
+            int result_val = -1;
+            int kerr_term = 0;
+            CHECK_CU(cuMemcpyDtoHAsync(&result_val, d_result, sizeof(int), s));
+            CHECK_CU(cuMemcpyDtoHAsync(&kerr_term, d_kerr, sizeof(int), s));
             CHECK_CU(cuStreamSynchronize(s));
 
-            // Check result
-            int result_val = -1;
-            CHECK_CU(cuMemcpyDtoHAsync(&result_val, d_result, sizeof(int), s));
-            CHECK_CU(cuStreamSynchronize(s));
+            if (kerr_term) {
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                    "beam_termination kernel error 0x%x at iter %d", kerr_term, iter);
+                goto cleanup;
+            }
 
             if (result_val >= 0) {
                 // Terminated — download the winning work item's parts
@@ -1766,27 +1808,42 @@ int beam_run_v2(
             // Kernel 1: Expansion
             int grid_size = num_items * num_planes;
             {
-                // Reset done counter and scratch pool offset
+                // Reset done counter, scratch pool offset, and kernel error
                 unsigned int zero = 0;
                 CHECK_CU(cuMemcpyHtoDAsync(d_done_ctr, &zero, sizeof(unsigned int), s));
                 CHECK_CU(cuMemsetD32Async(d_scratch_off, 0, 1, s));
+                CHECK_CU(cuMemcpyHtoDAsync(d_kerr, &zero, sizeof(int), s));
 
                 struct DevicePool sp = ctx->scratch;
+                unsigned int uvc = (unsigned int)vert_capacity;
+                unsigned int utc = (unsigned int)tri_capacity;
+                unsigned int upc = (unsigned int)part_capacity;
                 void* e_args[] = {
                     &d_vp, &d_tp, &d_pp, &d_wi_cur,
                     &num_items, &cpa, &p.rv_k,
                     &d_vp, &d_tp, &d_pp,
                     &d_vert_ctr, &d_tri_ctr, &d_part_ctr,
+                    &uvc, &utc, &upc,
                     &sp,
                     &d_ws, &d_cost,
                     &d_wi_nxt, &beam_width,
                     &d_done_ctr,
-                    &max_hull_verts_per_part, &max_hull_tris_per_part
+                    &max_hull_verts_per_part, &max_hull_tris_per_part,
+                    &d_kerr
                 };
                 CHECK_CU(cuLaunchKernel(ctx->fn_beam_expansion,
                     grid_size, 1, 1, EXPANSION_BLOCK_SIZE, 1, 1, 0, s, e_args, NULL));
             }
+            // Async download kernel error while GPU runs
+            int kerr_exp = 0;
+            CHECK_CU(cuMemcpyDtoHAsync(&kerr_exp, d_kerr, sizeof(int), s));
             CHECK_CU(cuStreamSynchronize(s));
+            if (kerr_exp) {
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                    "beam_expansion kernel error 0x%x at iter %d (SCRATCH_OOM=1,SPLIT_OOM=2,HULL_PTS_OOM=4,POOL_OOM=8,HULL_ERR=16)",
+                    kerr_exp, iter);
+                goto cleanup;
+            }
 
             // Swap work item buffers
             CUdeviceptr tmp = d_wi_cur;
@@ -1871,7 +1928,7 @@ cleanup:
     cuMemFree(d_wi_a); cuMemFree(d_wi_b);
     cuMemFree(d_cost); cuMemFree(d_ws);
     cuMemFree(d_counters); cuMemFree(d_result);
-    cuMemFree(d_norm); cuMemFree(d_pidx);
+    cuMemFree(d_norm); cuMemFree(d_pidx); cuMemFree(d_kerr);
     cuMemFree(d_scratch_base); cuMemFree(d_scratch_off);
     return 0;
 }

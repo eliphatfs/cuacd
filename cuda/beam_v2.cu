@@ -42,6 +42,13 @@ __device__ inline void* global_alloc_t0(DevicePool* gpool, int bytes) {
 // All scratch memory is allocated from a global DevicePool via atomicAdd.
 // No pre-sized per-block scratch — each warp grabs what it needs.
 
+// Kernel error bit flags (written via atomicOr)
+#define KERR_SCRATCH_OOM  1   // warppool_from_global OOM
+#define KERR_SPLIT_OOM    2   // split scratch alloc failed
+#define KERR_HULL_PTS_OOM 4   // hull vertex collect alloc failed
+#define KERR_POOL_OOM     8   // vert/tri/part output pool overflow
+#define KERR_HULL_ERR    16   // D&C hull internal error
+
 __global__ void beam_expansion(
     // Input pools (read-only)
     const float* __restrict__ vertex_pool,
@@ -58,6 +65,10 @@ __global__ void beam_expansion(
     unsigned int* __restrict__ vert_counter,
     unsigned int* __restrict__ tri_counter,
     unsigned int* __restrict__ part_counter,
+    // Output pool capacities for bounds checking
+    unsigned int vert_pool_cap,
+    unsigned int tri_pool_cap,
+    unsigned int part_pool_cap,
     // Global scratch pool for split + D&C
     DevicePool   scratch,
     // Candidate output
@@ -70,7 +81,9 @@ __global__ void beam_expansion(
     unsigned int* __restrict__ done_counter,
     // Hull mesh limits
     int          max_hull_verts_per_part,
-    int          max_hull_tris_per_part)
+    int          max_hull_tris_per_part,
+    // Error output (atomicOr)
+    int*         __restrict__ kernel_error)
 {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
@@ -151,7 +164,7 @@ __global__ void beam_expansion(
     __syncthreads();
 
     if (!s_split_ok) {
-        if (tid == 0) cost_buffer[bid] = 1e30f;
+        if (tid == 0) { cost_buffer[bid] = 1e30f; atomicOr(kernel_error, KERR_SPLIT_OOM); }
         goto selection;
     }
 
@@ -381,7 +394,7 @@ __global__ void beam_expansion(
     __syncthreads();
 
     if (!s_flags) {
-        if (tid == 0) cost_buffer[bid] = 1e30f;
+        if (tid == 0) { cost_buffer[bid] = 1e30f; atomicOr(kernel_error, KERR_HULL_PTS_OOM); }
         goto selection;
     }
 
@@ -430,6 +443,7 @@ __global__ void beam_expansion(
     __shared__ int hull_nv_pos, hull_nt_pos, hull_nv_neg, hull_nt_neg;
     __shared__ unsigned int hull_vo_pos, hull_to_pos, hull_vo_neg, hull_to_neg;
 
+    __shared__ int s_hull_pool_ok;
     if (tid == 0) {
         hull_vol_pos = 0.0f; hull_vol_neg = 0.0f;
         hull_err_pos = 0; hull_err_neg = 0;
@@ -440,11 +454,18 @@ __global__ void beam_expansion(
         hull_to_pos = atomicAdd(tri_counter, max_hull_tris_per_part * 2);
         hull_vo_neg = hull_vo_pos + max_hull_verts_per_part;
         hull_to_neg = hull_to_pos + max_hull_tris_per_part;
+        // Bounds check: ensure output won't overflow the pools
+        s_hull_pool_ok = 1;
+        if (hull_vo_pos + (unsigned int)(max_hull_verts_per_part * 2) > vert_pool_cap ||
+            hull_to_pos + (unsigned int)(max_hull_tris_per_part * 2) > tri_pool_cap) {
+            s_hull_pool_ok = 0;
+            atomicOr(kernel_error, KERR_POOL_OOM);
+        }
     }
     __syncthreads();
 
     // Warp 0: positive half D&C hull
-    if (warp_id == 0 && s_n_hull_pos >= 4) {
+    if (warp_id == 0 && s_n_hull_pos >= 4 && s_hull_pool_ok) {
         // Allocate WarpPool from global scratch
         int needed = dandc_scratch_bytes(s_n_hull_pos);
         WarpPool wp;
@@ -457,7 +478,9 @@ __global__ void beam_expansion(
             int e = __shfl_sync(WARP_MASK, wp.error, 0);
             wp.base = (char*)b; wp.offset = o; wp.capacity = c; wp.error = e;
         }
-        if (!wp.error) {
+        if (wp.error) {
+            if (lane == 0) atomicOr(kernel_error, KERR_SCRATCH_OOM);
+        } else {
             int err0 = 0;
             float* hv = out_vertex_pool + (long long)hull_vo_pos * 3;
             int* ht = out_triangle_pool + (long long)hull_to_pos * 3;
@@ -470,12 +493,13 @@ __global__ void beam_expansion(
                 hull_vol_pos = vol;
                 hull_err_pos = wp.error ? wp.error : err0;
                 hull_nv_pos = nhv; hull_nt_pos = nht;
+                if (hull_err_pos) atomicOr(kernel_error, KERR_HULL_ERR);
             }
         }
     }
 
     // Warp 1: negative half D&C hull
-    if (warp_id == 1 && s_n_hull_neg >= 4) {
+    if (warp_id == 1 && s_n_hull_neg >= 4 && s_hull_pool_ok) {
         int needed = dandc_scratch_bytes(s_n_hull_neg);
         WarpPool wp;
         if (lane == 0) warppool_from_global(&scratch, needed, &wp);
@@ -486,7 +510,9 @@ __global__ void beam_expansion(
             int e = __shfl_sync(WARP_MASK, wp.error, 0);
             wp.base = (char*)b; wp.offset = o; wp.capacity = c; wp.error = e;
         }
-        if (!wp.error) {
+        if (wp.error) {
+            if (lane == 0) atomicOr(kernel_error, KERR_SCRATCH_OOM);
+        } else {
             int err1 = 0;
             float* hv = out_vertex_pool + (long long)hull_vo_neg * 3;
             int* ht = out_triangle_pool + (long long)hull_to_neg * 3;
@@ -499,6 +525,7 @@ __global__ void beam_expansion(
                 hull_vol_neg = vol;
                 hull_err_neg = wp.error ? wp.error : err1;
                 hull_nv_neg = nhv; hull_nt_neg = nht;
+                if (hull_err_neg) atomicOr(kernel_error, KERR_HULL_ERR);
             }
         }
     }
@@ -517,6 +544,7 @@ __global__ void beam_expansion(
     // --- Copy mesh to output pool, create PartInfoV2 entries ---
     __shared__ unsigned int out_vo_pos, out_to_pos, out_vo_neg, out_to_neg;
     __shared__ unsigned int out_pi_pos, out_pi_neg;
+    __shared__ int s_mesh_pool_ok;
 
     if (tid == 0) {
         out_vo_pos = atomicAdd(vert_counter, total_verts);
@@ -525,8 +553,22 @@ __global__ void beam_expansion(
         out_to_neg = atomicAdd(tri_counter, n_neg);
         out_pi_pos = atomicAdd(part_counter, 2);
         out_pi_neg = out_pi_pos + 1;
+        s_mesh_pool_ok = 1;
+        if (out_vo_pos + (unsigned int)total_verts > vert_pool_cap ||
+            out_vo_neg + (unsigned int)total_verts > vert_pool_cap ||
+            out_to_pos + (unsigned int)n_pos > tri_pool_cap  ||
+            out_to_neg + (unsigned int)n_neg > tri_pool_cap  ||
+            out_pi_pos + 1u >= part_pool_cap) {
+            s_mesh_pool_ok = 0;
+            atomicOr(kernel_error, KERR_POOL_OOM);
+        }
     }
     __syncthreads();
+
+    if (!s_mesh_pool_ok) {
+        if (tid == 0) cost_buffer[bid] = 1e30f;
+        goto selection;
+    }
 
     for (int v = tid; v < total_verts * 3; v += EXPANSION_BLOCK_SIZE) {
         out_vertex_pool[out_vo_pos * 3 + v] = all_verts[v];
@@ -634,7 +676,8 @@ __global__ void beam_hausdorff_parts(
     PartInfoV2*  __restrict__ part_pool,
     const int*   __restrict__ part_indices,
     int          total_parts,
-    float        threshold)
+    float        threshold,
+    int*         __restrict__ kernel_error)
 {
     int pid = blockIdx.x;
     int tid = threadIdx.x;
@@ -708,7 +751,8 @@ __global__ void beam_termination(
     WorkItem*         __restrict__ work_items,
     int               num_work_items,
     float             threshold,
-    int*              __restrict__ result)
+    int*              __restrict__ result,
+    int*              __restrict__ kernel_error)
 {
     int wid = blockIdx.x;
     int lane = threadIdx.x;

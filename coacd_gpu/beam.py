@@ -124,6 +124,18 @@ class BeamContext:
             for j in range(3):
                 hull_tris_remapped[i, j] = vertex_map[hull_tris[i, j]]
         hull_tris = np.ascontiguousarray(hull_tris_remapped, dtype=np.int32)
+
+        # Ensure consistent outward winding for signed-tet volume computation.
+        # scipy ConvexHull.simplices are not guaranteed to have outward normals.
+        centroid = np.mean(hull_verts, axis=0).astype(np.float64)
+        hv64 = hull_verts.astype(np.float64)
+        for i in range(len(hull_tris)):
+            a, b, c = hull_tris[i]
+            va, vb, vc = hv64[a], hv64[b], hv64[c]
+            normal = np.cross(vb - va, vc - va)
+            if np.dot(normal, va - centroid) < 0:
+                hull_tris[i, 1], hull_tris[i, 2] = hull_tris[i, 2], hull_tris[i, 1]
+
         hull_volume = float(hull.volume)
 
         num_parts = _gpu.run_v2(

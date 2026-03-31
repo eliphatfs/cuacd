@@ -449,6 +449,18 @@ PEP 621 requires `license = {text = "MIT"}` or `license = {file = "LICENSE"}`. T
 
 nvcc crashed when compiling with `--generate-line-info` while `bt_computeInternal` was recursive. Converting to an iterative explicit stack resolved the crash. Line info is now always enabled for NCU profiling.
 
+### scipy ConvexHull.simplices Winding Is Not Consistent
+
+`scipy.spatial.ConvexHull.simplices` does not guarantee outward-facing normals. For signed-tet volume computation, inconsistent winding causes triangle contributions to cancel, yielding ≈0 instead of the true volume. Fix: for each simplex `[a,b,c]`, compute `cross(b-a, c-a)` and check `dot(normal, va - centroid) < 0`; flip `b,c` if so. Apply in `beam.py` after remapping hull triangle indices.
+
+### V2 Pool Capacity Formula
+
+V2's `beam_expansion` creates 2 new parts per block per iteration. Across `max_iterations × beam_width × num_planes` total expansion blocks, the original V1-style formula `(n_verts + 4096) × beam_width × 8` is far too small (e.g., 480 blocks × 4096 hull tris/block >> tri_capacity). New formula: `total_blocks × (max_hull_tris_per_part × 2 + n_tris × 3)`, capped at 4M entries. Hull output limits reduced to `max_hull_verts_per_part=64`, `max_hull_tris_per_part=128`.
+
+### V2 Kernel Error Reporting Pattern
+
+All three V2 kernels (`beam_expansion`, `beam_hausdorff_parts`, `beam_termination`) take `int* kernel_error`. Errors are written via `atomicOr(kernel_error, KERR_*)`. Host zeros `d_kerr` before each launch, then issues `cuMemcpyDtoHAsync` immediately after the `cuLaunchKernel` call (before `cuStreamSynchronize`) so the download overlaps with kernel execution. Bit flags: `KERR_SCRATCH_OOM=1`, `KERR_SPLIT_OOM=2`, `KERR_HULL_PTS_OOM=4`, `KERR_POOL_OOM=8`, `KERR_HULL_ERR=16`.
+
 ### Scratch Query Ordering Does Not Help batch_hull_volume
 
 Moving `query_dandc_scratch` before the large `cuMemcpyHtoDAsync` calls (to avoid syncing after copies) was tested and made performance slightly worse. The `cuMemAlloc` calls themselves may already serialize, so reordering provides no benefit. Keep the query after copies for now.
@@ -476,14 +488,22 @@ Moving `query_dandc_scratch` before the large `cuMemcpyHtoDAsync` calls (to avoi
 - Global DevicePool scratch allocation (`warppool_from_global`) — in hull_warp_common.cuh
 - V2 kernel compilation: beam_expansion, beam_hausdorff_parts, beam_termination — compiles
 - V2 host code (`beam_run_v2`) and Python API (`run_v2`, `run_beam_coacd_v2`) — compiles
-- V2 cube convexity early-exit path — logic implemented but has a memory access bug (see below)
+- V2 cube convexity early-exit path — **working** (5/6 tests pass)
+- Kernel-side error reporting: `KERR_*` bit flags in all 3 V2 kernels (`KERR_SCRATCH_OOM=1`, `KERR_SPLIT_OOM=2`, `KERR_HULL_PTS_OOM=4`, `KERR_POOL_OOM=8`, `KERR_HULL_ERR=16`); host async-downloads and checks after each launch
+- Pool OOM bounds checking in `beam_expansion` (hull pre-alloc and mesh copy both checked)
+- `CHECK_CU` macro now includes `beam.c:LINE` in error messages for faster diagnosis
 
-### V2 Bugs to Fix
-- `beam_run_v2` crashes with illegal memory access during initial hull volume computation via `batch_mesh_volume`. The hull tris are uploaded with 0-based indices to the triangle pool at offset `n_tris`, and hull verts are at offset `n_verts` in the vertex pool. The `batch_mesh_volume` call uses `vert_offsets = {n_verts, n_verts}` and `tri_offsets = {n_tris, n_tris + n_hull_tris}` to rebase, but the crash persists — likely a vertex pool allocation size issue or the rebase math is off for the specific kernel.
+### V2 Bugs Fixed
+- **Scipy hull winding**: `hull.simplices` have inconsistent winding → signed-tet sum ≈ 0 → rv non-zero for convex shapes → no early exit → pool overflow. Fixed in `beam.py`: orient each hull triangle outward using centroid dot-product check.
+- **Triangle pool overflow in `beam_expansion`**: `max_hull_tris_per_part=2048` × 480 blocks/iteration exhausted `tri_capacity`. Fixed by reducing to 128 and computing pool capacities from expected total expansion blocks (`max_iterations × beam_width × num_planes`) capped at 4M entries.
+- Root cause of illegal memory access confirmed via `compute-sanitizer`: `bt_extractMesh` writing to `out_tris` past end of triangle pool in block 324/480 (second iteration).
+
+### V2 Bugs Remaining
+- `test_decomposition` (L-shape, `len(parts) >= 2`) returns 0 parts — likely a kernel error or the download/result path is broken after one expansion iteration. Needs investigation with the new kernel error codes.
 - Hull mesh winding: `bt_extractMesh` produces mixed winding (mesh volume via signed tet = 0.667 for unit cube instead of 1.0). The D&C volume (via int128 arithmetic) is correct. Winding consistency in extracted mesh needs investigation.
 
 ### Not Yet Implemented
-- V2 expansion kernel end-to-end (kernels compile, host wiring has the bug above)
+- V2 L-shape decomposition end-to-end (expansion path has a bug, see above)
 - Hausdorff validation in V2 beam loop (kernel exists, host wiring incomplete)
 - Merge post-processing
 - Vertex compaction (parts carry superset of vertices)
