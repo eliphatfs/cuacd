@@ -347,6 +347,89 @@ static PyObject* py_batch_hull_dandc_mesh(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// test_termination(parts_ptr, n_parts, work_items_ptr, n_items, threshold) -> int
+// ---------------------------------------------------------------------------
+static PyObject* py_test_termination(PyObject* self, PyObject* args) {
+    unsigned long long parts_ptr, wi_ptr;
+    int n_parts, n_items;
+    float threshold;
+    if (!PyArg_ParseTuple(args, "KiKif", &parts_ptr, &n_parts, &wi_ptr, &n_items, &threshold))
+        return NULL;
+    REQUIRE_CTX();
+    int result = beam_test_termination(g_state.ctx,
+        (PartInfoV2*)(uintptr_t)parts_ptr, n_parts,
+        (WorkItem*)(uintptr_t)wi_ptr, n_items,
+        threshold);
+    return PyLong_FromLong(result);
+}
+
+// ---------------------------------------------------------------------------
+// test_hausdorff_parts(vp_ptr, n_vp, tp_ptr, n_tp,
+//                      parts_ptr, n_parts, pidx_ptr, n_pidx, threshold) -> int
+// ---------------------------------------------------------------------------
+static PyObject* py_test_hausdorff_parts(PyObject* self, PyObject* args) {
+    unsigned long long vp_ptr, tp_ptr, parts_ptr, pidx_ptr;
+    int n_vp, n_tp, n_parts, n_pidx;
+    float threshold;
+    if (!PyArg_ParseTuple(args, "KiKiKiKif",
+            &vp_ptr, &n_vp, &tp_ptr, &n_tp,
+            &parts_ptr, &n_parts, &pidx_ptr, &n_pidx, &threshold))
+        return NULL;
+    REQUIRE_CTX();
+    int rc = beam_test_hausdorff_parts(g_state.ctx,
+        (const float*)(uintptr_t)vp_ptr, n_vp,
+        (const int*)(uintptr_t)tp_ptr, n_tp,
+        (PartInfoV2*)(uintptr_t)parts_ptr, n_parts,
+        (const int*)(uintptr_t)pidx_ptr, n_pidx,
+        threshold);
+    return PyLong_FromLong(rc);
+}
+
+// ---------------------------------------------------------------------------
+// test_expansion(vp_ptr, n_vp, tp_ptr, n_tp,
+//                parts_ptr, n_parts, wi_ptr, n_items,
+//                cuts_per_axis, rv_k, beam_width, scratch_size,
+//                out_wi_ptr, out_parts_ptr, out_parts_cap,
+//                out_vp_ptr, out_vert_cap, out_tp_ptr, out_tri_cap)
+//   -> (n_out_parts, n_out_verts, n_out_tris, kernel_error)
+// ---------------------------------------------------------------------------
+static PyObject* py_test_expansion(PyObject* self, PyObject* args) {
+    unsigned long long vp_ptr, tp_ptr, parts_ptr, wi_ptr;
+    int n_vp, n_tp, n_parts, n_items;
+    int cuts_per_axis, beam_width;
+    float rv_k;
+    unsigned long long scratch_size;
+    unsigned long long out_wi_ptr, out_parts_ptr, out_vp_ptr, out_tp_ptr;
+    int out_parts_cap, out_vert_cap, out_tri_cap;
+
+    if (!PyArg_ParseTuple(args, "KiKiKiKiifiKKKiKiKi",
+            &vp_ptr, &n_vp, &tp_ptr, &n_tp,
+            &parts_ptr, &n_parts, &wi_ptr, &n_items,
+            &cuts_per_axis, &rv_k, &beam_width, &scratch_size,
+            &out_wi_ptr, &out_parts_ptr, &out_parts_cap,
+            &out_vp_ptr, &out_vert_cap, &out_tp_ptr, &out_tri_cap))
+        return NULL;
+    REQUIRE_CTX();
+
+    int out_parts_count = 0, out_vert_count = 0, out_tri_count = 0, kerr = 0;
+    int rc = beam_test_expansion(g_state.ctx,
+        (const float*)(uintptr_t)vp_ptr, n_vp,
+        (const int*)(uintptr_t)tp_ptr, n_tp,
+        (const PartInfoV2*)(uintptr_t)parts_ptr, n_parts,
+        (const WorkItem*)(uintptr_t)wi_ptr, n_items,
+        cuts_per_axis, rv_k, beam_width, (size_t)scratch_size,
+        (WorkItem*)(uintptr_t)out_wi_ptr,
+        (PartInfoV2*)(uintptr_t)out_parts_ptr, out_parts_cap,
+        &out_parts_count,
+        (float*)(uintptr_t)out_vp_ptr, out_vert_cap,
+        (int*)(uintptr_t)out_tp_ptr, out_tri_cap,
+        &out_vert_count, &out_tri_count, &kerr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+
+    return Py_BuildValue("iiii", out_parts_count, out_vert_count, out_tri_count, kerr);
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -363,6 +446,9 @@ static PyMethodDef gpu_methods[] = {
     { "batch_hull_volume",          py_batch_hull_volume,          METH_VARARGS, "Batch hull volume (three algorithms)." },
     { "batch_mesh_volume",          py_batch_mesh_volume,          METH_VARARGS, "Batch mesh volume (divergence theorem)." },
     { "batch_hull_dandc_mesh",      py_batch_hull_dandc_mesh,      METH_VARARGS, "Batch D&C hull volume + mesh extraction." },
+    { "test_termination",           py_test_termination,           METH_VARARGS, "Test beam_termination kernel." },
+    { "test_hausdorff_parts",       py_test_hausdorff_parts,       METH_VARARGS, "Test beam_hausdorff_parts kernel." },
+    { "test_expansion",             py_test_expansion,             METH_VARARGS, "Test beam_expansion kernel." },
     { NULL, NULL, 0, NULL }
 };
 

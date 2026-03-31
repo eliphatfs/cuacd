@@ -200,6 +200,46 @@ def make_gaussian(n, rng):
     return rng.standard_normal((n, 3)).astype(np.float32)
 
 
+def make_noisy_icosphere(level, amplitude, seed):
+    """Icosphere with Perlin-like normal displacement.
+
+    Each vertex is displaced along its normal by ``amplitude * noise(v)``,
+    where noise is a smooth, spatially-correlated random field built from
+    low-frequency spherical harmonics (band-limited noise on the sphere).
+    The result is a bumpy, non-convex surface whose convex hull volume
+    differs from its mesh volume.
+
+    Returns (vertices [N,3] float32, faces [M,3] int32).
+    """
+    verts, faces = make_icosphere(level)
+    rng = np.random.default_rng(seed)
+
+    # Build smooth noise via random spherical harmonics up to degree 4.
+    # For each vertex, noise = sum of random_coeff * Y_lm-like basis.
+    # We approximate with random linear combos of low-freq trig functions.
+    n_basis = 16
+    dirs = rng.standard_normal((n_basis, 3)).astype(np.float64)
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+    coeffs = rng.standard_normal(n_basis).astype(np.float64)
+
+    # Project each vertex onto each random direction, take sin/cos
+    verts64 = verts.astype(np.float64)
+    proj = verts64 @ dirs.T  # (N, n_basis)
+    noise = np.zeros(len(verts), dtype=np.float64)
+    for i in range(n_basis):
+        noise += coeffs[i] * np.sin(2.0 * np.pi * proj[:, i])
+
+    # Normalize noise to [-1, 1]
+    nmax = np.abs(noise).max()
+    if nmax > 1e-12:
+        noise /= nmax
+
+    # Normals = vertex positions (unit sphere)
+    normals = verts64 / np.linalg.norm(verts64, axis=1, keepdims=True)
+    displaced = verts64 + amplitude * noise[:, None] * normals
+    return displaced.astype(np.float32), faces
+
+
 # ---------------------------------------------------------------------------
 # Section 1: Mesh volume tests (CPU reference)
 # ---------------------------------------------------------------------------
@@ -663,6 +703,45 @@ class TestHullVolumeGPU:
             expected = s ** 3
             assert abs(ratio - expected) / expected < 0.05, \
                 f"algo={algo}, scale={s}: ratio={ratio:.4f}, expected {expected:.4f}"
+
+    @pytest.mark.parametrize("algo,level,amplitude,seed", [
+        (2, 2, 0.1, 42),
+        (2, 2, 0.3, 7),
+        (2, 3, 0.1, 99),
+        (2, 3, 0.2, 123),
+        (2, 3, 0.4, 0),
+    ])
+    def test_noisy_icosphere_vs_scipy(self, ctx, algo, level, amplitude, seed):
+        """GPU hull volume of noisy icosphere vertices must match scipy within 5%.
+
+        The noisy icosphere is non-convex (bumpy surface), so its convex hull
+        volume exceeds its mesh volume.  We compare GPU D&C hull vs scipy hull.
+        """
+        verts, _ = make_noisy_icosphere(level, amplitude, seed)
+        vols, errs = ctx.batch_hull_volume([verts], algo=algo)
+        assert errs[0] == 0, f"error code {errs[0]}"
+        gpu_vol = float(vols[0])
+        scipy_vol = compute_hull_volume_scipy(verts)
+        rel_err = abs(gpu_vol - scipy_vol) / max(scipy_vol, 1e-12)
+        assert rel_err < 0.05, \
+            f"level={level}, amp={amplitude}: gpu={gpu_vol:.4f} scipy={scipy_vol:.4f} err={rel_err:.3%}"
+
+    @pytest.mark.parametrize("algo", [2])
+    def test_batch_noisy_icospheres_vs_scipy(self, ctx, algo):
+        """Batch of noisy icospheres with varying amplitudes, all vs scipy."""
+        pts_list = []
+        for i in range(8):
+            amp = 0.05 + 0.05 * i  # 0.05 to 0.40
+            verts, _ = make_noisy_icosphere(2, amp, seed=i)
+            pts_list.append(verts)
+        vols, errs = ctx.batch_hull_volume(pts_list, algo=algo)
+        for i in range(8):
+            assert errs[i] == 0, f"hull {i}: error {errs[i]}"
+            scipy_vol = compute_hull_volume_scipy(pts_list[i])
+            gpu_vol = float(vols[i])
+            rel_err = abs(gpu_vol - scipy_vol) / max(scipy_vol, 1e-12)
+            assert rel_err < 0.05, \
+                f"hull {i}: gpu={gpu_vol:.4f} scipy={scipy_vol:.4f} err={rel_err:.3%}"
 
 
 # ---------------------------------------------------------------------------

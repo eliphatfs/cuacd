@@ -141,9 +141,10 @@ class CoacdBuildExt(build_ext):
         ]
         ext.library_dirs = [_cuda_stubs_dir(cuda_home)]
         ext.libraries = ["cuda"]
-        ext.extra_compile_args = (
-            ["/std:c11"] if sys.platform == "win32" else ["-std=c11"]
-        )
+        c_args = ["/std:c11"] if sys.platform == "win32" else ["-std=c11"]
+        if os.environ.get("COACD_V2_DEBUG"):
+            c_args.append("-DCOACD_V2_DEBUG=1")
+        ext.extra_compile_args = c_args
 
         build_ext.build_extension(self, ext)
 

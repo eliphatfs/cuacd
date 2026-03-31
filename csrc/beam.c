@@ -11,6 +11,16 @@
 // Embedded fatbin — generated at build time by setup.py
 #include "kernels_fatbin.h"
 
+// Compile with -DCOACD_V2_DEBUG=1 (or COACD_V2_DEBUG=1 pip install -e .) for verbose V2 loop output.
+#ifndef COACD_V2_DEBUG
+#define COACD_V2_DEBUG 0
+#endif
+#if COACD_V2_DEBUG
+#define V2_DBG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define V2_DBG(...) ((void)0)
+#endif
+
 // Must match beam_kernels.cu
 #define BLOCK_SIZE 256
 #define MAX_BEAM 16
@@ -697,32 +707,36 @@ int beam_run_v2(
     // cost buffer, work scratch, D&C scratch, atomic counters
 
     int grid_max        = beam_width * num_planes;
-    // Hull mesh output limits (max vertices/triangles per extracted hull mesh).
-    // These must be small enough that pool allocations don't overflow.
-    int max_hull_verts_per_part = 64;
-    int max_hull_tris_per_part  = 128;
 
-    // Pool capacity: must hold all parts across all iterations.
-    // Total expansion blocks = max_iterations * beam_width * num_planes + num_planes (first iter).
-    // Each block creates 2 parts: 2 hull meshes + 2 mesh copies.
+    // Pool capacity: sized from available GPU memory.
+    // No arbitrary caps — let the GPU memory be the limit.
     int vert_capacity, tri_capacity, part_capacity;
     {
-        long long max_blocks = (long long)p.max_iterations * beam_width * num_planes + num_planes;
-        long long vc64 = (long long)(n_verts + n_hull_verts)
-            + max_blocks * (max_hull_verts_per_part * 2 + (n_verts + 32) * 2);
-        long long tc64 = (long long)(n_tris + n_hull_tris)
-            + max_blocks * (max_hull_tris_per_part * 2 + (n_tris + 16) * 3);
-        long long pc64 = 1 + max_blocks * 2;
-        if (vc64 > 4*1024*1024) vc64 = 4*1024*1024;
-        if (tc64 > 4*1024*1024) tc64 = 4*1024*1024;
-        if (pc64 > 128*1024)    pc64 = 128*1024;
-        // Minimum floor: original V1-style formula
+        size_t free_mem = 0, total_mem = 0;
+        cuMemGetInfo(&free_mem, &total_mem);
+        // Reserve 30% for scratch pool + overhead; use rest for pools.
+        // Pool memory split: ~45% verts, ~45% tris, ~10% parts+misc
+        size_t pool_budget = (size_t)(free_mem * 0.65);
+        size_t vp_budget = pool_budget * 45 / 100;
+        size_t tp_budget = pool_budget * 45 / 100;
+        size_t pp_budget = pool_budget * 10 / 100;
+
+        // vert entry = 3 floats = 12 bytes, tri entry = 3 ints = 12 bytes
+        // part entry = sizeof(PartInfoV2_host)
+        long long vc64 = (long long)(vp_budget / (3 * sizeof(float)));
+        long long tc64 = (long long)(tp_budget / (3 * sizeof(int)));
+        long long pc64 = (long long)(pp_budget / sizeof(struct PartInfoV2_host));
+
+        // Minimum floor
         long long vc_min = (long long)(n_verts + n_hull_verts + 4096) * beam_width * 8;
         long long tc_min = (long long)(n_tris + n_hull_tris + 4096) * beam_width * 8;
         long long pc_min = (long long)beam_width * MAX_PARTS_PER_BEAM * 4;
         vert_capacity  = (int)(vc64 > vc_min ? vc64 : vc_min);
         tri_capacity   = (int)(tc64 > tc_min ? tc64 : tc_min);
         part_capacity  = (int)(pc64 > pc_min ? pc64 : pc_min);
+
+        V2_DBG("[V2] pool budget: %.1f MB (free=%.1f MB), vert_cap=%d tri_cap=%d part_cap=%d\n",
+            pool_budget / 1e6, free_mem / 1e6, vert_capacity, tri_capacity, part_capacity);
     }
 
     // Compute total allocation
@@ -900,6 +914,8 @@ int beam_run_v2(
         float diff = fabsf(mesh_vol - hull_vol_norm);
         float rv = cbrtf(3.0f * diff / (4.0f * 3.14159265f)) * p.rv_k;
 
+        V2_DBG("[V2] init: mesh_vol=%.6f hull_vol=%.6f diff=%.6f rv=%.6f threshold=%.6f\n",
+            mesh_vol, hull_vol_norm, diff, rv, p.threshold);
         h_part.rv_cost = rv;
         h_part.mesh_volume = mesh_vol;
         h_part.hull_volume = hull_vol_norm;
@@ -941,6 +957,7 @@ int beam_run_v2(
         CHECK_CU(cuMemcpyHtoDAsync(d_result, &neg1, sizeof(int), s));
 
         for (int iter = 0; iter < p.max_iterations; iter++) {
+            V2_DBG("[V2] iter=%d num_items=%d\n", iter, num_items);
             // Kernel 2: Hausdorff for parts that need it
             // Build part index list on host
             {
@@ -1009,8 +1026,29 @@ int beam_run_v2(
                 goto cleanup;
             }
 
+#if COACD_V2_DEBUG
+            {
+                struct WorkItem_host dbg_wi;
+                CHECK_CU(cuMemcpyDtoHAsync(&dbg_wi, d_wi_cur, sizeof(struct WorkItem_host), s));
+                CHECK_CU(cuStreamSynchronize(s));
+                V2_DBG("[V2] iter=%d term=%d np=%d worst_idx=%d worst=%.6f\n",
+                    iter, result_val, dbg_wi.num_parts, dbg_wi.worst_part_idx, dbg_wi.worst_metric);
+                for (int pp = 0; pp < dbg_wi.num_parts && pp < 8; pp++) {
+                    struct PartInfoV2_host dbg_p;
+                    CHECK_CU(cuMemcpyDtoHAsync(&dbg_p,
+                        d_pp + (CUdeviceptr)(dbg_wi.part_indices[pp] * sizeof(struct PartInfoV2_host)),
+                        sizeof(struct PartInfoV2_host), s));
+                    CHECK_CU(cuStreamSynchronize(s));
+                    V2_DBG("[V2]   p[%d] gi=%d rv=%.6f hd=%.6f mv=%.6f hv=%.6f tc=%d vc=%d htc=%d hvc=%d\n",
+                        pp, dbg_wi.part_indices[pp], dbg_p.rv_cost, dbg_p.hausdorff,
+                        dbg_p.mesh_volume, dbg_p.hull_volume, dbg_p.tri_count, dbg_p.vert_count,
+                        dbg_p.hull_tri_count, dbg_p.hull_vert_count);
+                }
+            }
+#endif
+
             if (result_val >= 0) {
-                // Terminated — download the winning work item's parts
+                V2_DBG("[V2] iter=%d terminated winner=%d\n", iter, result_val);
                 break;
             }
 
@@ -1037,7 +1075,6 @@ int beam_run_v2(
                     &d_ws, &d_cost,
                     &d_wi_nxt, &beam_width,
                     &d_done_ctr,
-                    &max_hull_verts_per_part, &max_hull_tris_per_part,
                     &d_kerr
                 };
                 CHECK_CU(cuLaunchKernel(ctx->fn_beam_expansion,
@@ -1047,6 +1084,7 @@ int beam_run_v2(
             int kerr_exp = 0;
             CHECK_CU(cuMemcpyDtoHAsync(&kerr_exp, d_kerr, sizeof(int), s));
             CHECK_CU(cuStreamSynchronize(s));
+            V2_DBG("[V2] iter=%d expansion kerr=0x%x grid=%d\n", iter, kerr_exp, grid_size);
             if (kerr_exp) {
                 snprintf(ctx->last_error, sizeof(ctx->last_error),
                     "beam_expansion kernel error 0x%x at iter %d (SCRATCH_OOM=1,SPLIT_OOM=2,HULL_PTS_OOM=4,POOL_OOM=8,HULL_ERR=16)",
@@ -1055,9 +1093,11 @@ int beam_run_v2(
             }
 
             // Swap work item buffers
-            CUdeviceptr tmp = d_wi_cur;
-            d_wi_cur = d_wi_nxt;
-            d_wi_nxt = tmp;
+            {
+                CUdeviceptr tmp = d_wi_cur;
+                d_wi_cur = d_wi_nxt;
+                d_wi_nxt = tmp;
+            }
             num_items = beam_width;
         }
 
@@ -1067,6 +1107,8 @@ int beam_run_v2(
         CHECK_CU(cuStreamSynchronize(s));
 
         int np = h_final.num_parts;
+        V2_DBG("[V2] final: np=%d worst_idx=%d worst=%.6f\n",
+            np, h_final.worst_part_idx, h_final.worst_metric);
         if (np <= 0) np = 1;
 
         // Download all parts referenced by the winning work item
@@ -1138,6 +1180,239 @@ cleanup:
     cuMemFree(d_cost); cuMemFree(d_ws);
     cuMemFree(d_counters); cuMemFree(d_result);
     cuMemFree(d_norm); cuMemFree(d_pidx); cuMemFree(d_kerr);
+    cuMemFree(d_scratch_base); cuMemFree(d_scratch_off);
+    return 0;
+}
+
+// ============================================================================
+// Per-kernel test functions
+// ============================================================================
+
+int beam_test_termination(
+    beam_ctx_t ctx,
+    PartInfoV2* parts, int n_parts,
+    WorkItem* work_items, int n_items,
+    float threshold)
+{
+    CUstream s = NULL;
+    CUdeviceptr d_pp = 0, d_wi = 0, d_result = 0, d_kerr = 0;
+    int result_val = -1;
+
+    CHECK_CU(cuMemAlloc(&d_pp, (size_t)n_parts * sizeof(struct PartInfoV2_host)));
+    CHECK_CU(cuMemAlloc(&d_wi, (size_t)n_items * sizeof(struct WorkItem_host)));
+    CHECK_CU(cuMemAlloc(&d_result, sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_kerr, sizeof(int)));
+
+    CHECK_CU(cuMemcpyHtoDAsync(d_pp, parts, (size_t)n_parts * sizeof(struct PartInfoV2_host), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_wi, work_items, (size_t)n_items * sizeof(struct WorkItem_host), s));
+    int neg1 = -1;
+    CHECK_CU(cuMemcpyHtoDAsync(d_result, &neg1, sizeof(int), s));
+    int zero = 0;
+    CHECK_CU(cuMemcpyHtoDAsync(d_kerr, &zero, sizeof(int), s));
+
+    void* args[] = { &d_pp, &d_wi, &n_items, &threshold, &d_result, &d_kerr };
+    CHECK_CU(cuLaunchKernel(ctx->fn_beam_termination,
+        n_items, 1, 1, 32, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(&result_val, d_result, sizeof(int), s));
+    CHECK_CU(cuMemcpyDtoHAsync(work_items, d_wi, (size_t)n_items * sizeof(struct WorkItem_host), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_pp); cuMemFree(d_wi); cuMemFree(d_result); cuMemFree(d_kerr);
+    return result_val;
+}
+
+int beam_test_hausdorff_parts(
+    beam_ctx_t ctx,
+    const float* vertex_pool, int n_pool_verts,
+    const int* triangle_pool, int n_pool_tris,
+    PartInfoV2* parts, int n_parts,
+    const int* part_indices, int n_indices,
+    float threshold)
+{
+    CUstream s = NULL;
+    CUdeviceptr d_vp = 0, d_tp = 0, d_pp = 0, d_pidx = 0, d_kerr = 0;
+
+    CHECK_CU(cuMemAlloc(&d_vp, (size_t)n_pool_verts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_tp, (size_t)n_pool_tris * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_pp, (size_t)n_parts * sizeof(struct PartInfoV2_host)));
+    CHECK_CU(cuMemAlloc(&d_pidx, (size_t)n_indices * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_kerr, sizeof(int)));
+
+    CHECK_CU(cuMemcpyHtoDAsync(d_vp, vertex_pool, (size_t)n_pool_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tp, triangle_pool, (size_t)n_pool_tris * 3 * sizeof(int), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_pp, parts, (size_t)n_parts * sizeof(struct PartInfoV2_host), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_pidx, part_indices, (size_t)n_indices * sizeof(int), s));
+    int zero = 0;
+    CHECK_CU(cuMemcpyHtoDAsync(d_kerr, &zero, sizeof(int), s));
+
+    void* args[] = { &d_vp, &d_tp, &d_pp, &d_pidx, &n_indices, &threshold, &d_kerr };
+    CHECK_CU(cuLaunchKernel(ctx->fn_beam_hausdorff_parts,
+        n_indices, 1, 1, HAUSDORFF_BLOCK_SIZE, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(parts, d_pp, (size_t)n_parts * sizeof(struct PartInfoV2_host), s));
+    int kerr = 0;
+    CHECK_CU(cuMemcpyDtoHAsync(&kerr, d_kerr, sizeof(int), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_vp); cuMemFree(d_tp); cuMemFree(d_pp); cuMemFree(d_pidx); cuMemFree(d_kerr);
+    return kerr;
+}
+
+int beam_test_expansion(
+    beam_ctx_t ctx,
+    const float* vertex_pool, int n_pool_verts,
+    const int* triangle_pool, int n_pool_tris,
+    const PartInfoV2* parts, int n_parts,
+    const WorkItem* work_items, int n_items,
+    int cuts_per_axis, float rv_k, int beam_width,
+    size_t scratch_size,
+    WorkItem* out_work_items, PartInfoV2* out_parts, int out_parts_capacity,
+    int* out_parts_count,
+    float* out_vertex_pool, int out_vert_capacity,
+    int* out_triangle_pool, int out_tri_capacity,
+    int* out_vert_count, int* out_tri_count,
+    int* kernel_error)
+{
+    CUstream s = NULL;
+    int num_planes = 3 * cuts_per_axis;
+    int grid_size = n_items * num_planes;
+    if (beam_width > MAX_BEAM) beam_width = MAX_BEAM;
+
+    // Total pool capacities: input + output space
+    int vert_capacity = n_pool_verts + out_vert_capacity;
+    int tri_capacity = n_pool_tris + out_tri_capacity;
+    int part_capacity = n_parts + out_parts_capacity;
+
+    CUdeviceptr d_vp = 0, d_tp = 0, d_pp = 0;
+    CUdeviceptr d_wi_in = 0, d_wi_out = 0;
+    CUdeviceptr d_cost = 0, d_ws = 0;
+    CUdeviceptr d_counters = 0, d_kerr = 0;
+    CUdeviceptr d_scratch_base = 0, d_scratch_off = 0;
+
+    size_t vp_bytes = (size_t)vert_capacity * 3 * sizeof(float);
+    size_t tp_bytes = (size_t)tri_capacity * 3 * sizeof(int);
+    size_t pp_bytes = (size_t)part_capacity * sizeof(struct PartInfoV2_host);
+
+    CHECK_CU(cuMemAlloc(&d_vp, vp_bytes));
+    CHECK_CU(cuMemAlloc(&d_tp, tp_bytes));
+    CHECK_CU(cuMemAlloc(&d_pp, pp_bytes));
+    CHECK_CU(cuMemAlloc(&d_wi_in, (size_t)n_items * sizeof(struct WorkItem_host)));
+    CHECK_CU(cuMemAlloc(&d_wi_out, (size_t)beam_width * sizeof(struct WorkItem_host)));
+    CHECK_CU(cuMemAlloc(&d_cost, (size_t)grid_size * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_ws, (size_t)grid_size * sizeof(struct WorkItem_host)));
+    CHECK_CU(cuMemAlloc(&d_counters, 4 * sizeof(unsigned int)));
+    CHECK_CU(cuMemAlloc(&d_kerr, sizeof(int)));
+
+    // Scratch pool
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cuMemGetInfo(&free_mem, &total_mem);
+        size_t scratch_sz = (size_t)(free_mem * 0.7);
+        if (scratch_sz < 256 * 1024 * 1024) scratch_sz = 256 * 1024 * 1024;
+        if (scratch_sz > 4000000000ULL) scratch_sz = 4000000000ULL;
+        if (scratch_size > 0) scratch_sz = scratch_size;
+        CHECK_CU(cuMemAlloc(&d_scratch_base, scratch_sz));
+        CHECK_CU(cuMemAlloc(&d_scratch_off, sizeof(unsigned int)));
+        ctx->scratch.base = (char*)(uintptr_t)d_scratch_base;
+        ctx->scratch.offset = (unsigned int*)(uintptr_t)d_scratch_off;
+        ctx->scratch.capacity = (unsigned int)scratch_sz;
+    }
+
+    CHECK_CU(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, 8 * 1024));
+
+    // Upload input data
+    CHECK_CU(cuMemcpyHtoDAsync(d_vp, vertex_pool, (size_t)n_pool_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tp, triangle_pool, (size_t)n_pool_tris * 3 * sizeof(int), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_pp, parts, (size_t)n_parts * sizeof(struct PartInfoV2_host), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_wi_in, work_items, (size_t)n_items * sizeof(struct WorkItem_host), s));
+
+    // Init counters: vert=n_pool_verts, tri=n_pool_tris, part=n_parts, done=0
+    unsigned int counters[4] = {
+        (unsigned int)n_pool_verts,
+        (unsigned int)n_pool_tris,
+        (unsigned int)n_parts,
+        0
+    };
+    CHECK_CU(cuMemcpyHtoDAsync(d_counters, counters, sizeof(counters), s));
+
+    // Reset scratch offset and kernel error
+    unsigned int zero_u = 0;
+    CHECK_CU(cuMemcpyHtoDAsync(d_scratch_off, &zero_u, sizeof(unsigned int), s));
+    int zero_i = 0;
+    CHECK_CU(cuMemcpyHtoDAsync(d_kerr, &zero_i, sizeof(int), s));
+
+    CUdeviceptr d_vert_ctr = d_counters;
+    CUdeviceptr d_tri_ctr = d_counters + sizeof(unsigned int);
+    CUdeviceptr d_part_ctr = d_counters + 2 * sizeof(unsigned int);
+    CUdeviceptr d_done_ctr = d_counters + 3 * sizeof(unsigned int);
+
+    struct DevicePool sp = ctx->scratch;
+    unsigned int uvc = (unsigned int)vert_capacity;
+    unsigned int utc = (unsigned int)tri_capacity;
+    unsigned int upc = (unsigned int)part_capacity;
+
+    void* e_args[] = {
+        &d_vp, &d_tp, &d_pp, &d_wi_in,
+        &n_items, &cuts_per_axis, &rv_k,
+        &d_vp, &d_tp, &d_pp,
+        &d_vert_ctr, &d_tri_ctr, &d_part_ctr,
+        &uvc, &utc, &upc,
+        &sp,
+        &d_ws, &d_cost,
+        &d_wi_out, &beam_width,
+        &d_done_ctr,
+        &d_kerr
+    };
+    CHECK_CU(cuLaunchKernel(ctx->fn_beam_expansion,
+        grid_size, 1, 1, EXPANSION_BLOCK_SIZE, 1, 1, 0, s, e_args, NULL));
+
+    // Download results
+    int kerr_h = 0;
+    CHECK_CU(cuMemcpyDtoHAsync(&kerr_h, d_kerr, sizeof(int), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_work_items, d_wi_out, (size_t)beam_width * sizeof(struct WorkItem_host), s));
+    CHECK_CU(cuMemcpyDtoHAsync(counters, d_counters, sizeof(counters), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    *kernel_error = kerr_h;
+    int final_vert_count = (int)counters[0];
+    int final_tri_count = (int)counters[1];
+    int final_part_count = (int)counters[2];
+
+    *out_vert_count = final_vert_count - n_pool_verts;
+    *out_tri_count = final_tri_count - n_pool_tris;
+    *out_parts_count = final_part_count - n_parts;
+
+    // Download new parts
+    int new_parts = final_part_count - n_parts;
+    if (new_parts > out_parts_capacity) new_parts = out_parts_capacity;
+    if (new_parts > 0) {
+        CHECK_CU(cuMemcpyDtoHAsync(out_parts,
+            d_pp + (CUdeviceptr)((size_t)n_parts * sizeof(struct PartInfoV2_host)),
+            (size_t)new_parts * sizeof(struct PartInfoV2_host), s));
+    }
+
+    // Download new vertices and triangles
+    int new_verts = final_vert_count - n_pool_verts;
+    if (new_verts > out_vert_capacity) new_verts = out_vert_capacity;
+    if (new_verts > 0) {
+        CHECK_CU(cuMemcpyDtoHAsync(out_vertex_pool,
+            d_vp + (CUdeviceptr)((size_t)n_pool_verts * 3 * sizeof(float)),
+            (size_t)new_verts * 3 * sizeof(float), s));
+    }
+    int new_tris = final_tri_count - n_pool_tris;
+    if (new_tris > out_tri_capacity) new_tris = out_tri_capacity;
+    if (new_tris > 0) {
+        CHECK_CU(cuMemcpyDtoHAsync(out_triangle_pool,
+            d_tp + (CUdeviceptr)((size_t)n_pool_tris * 3 * sizeof(int)),
+            (size_t)new_tris * 3 * sizeof(int), s));
+    }
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_vp); cuMemFree(d_tp); cuMemFree(d_pp);
+    cuMemFree(d_wi_in); cuMemFree(d_wi_out);
+    cuMemFree(d_cost); cuMemFree(d_ws);
+    cuMemFree(d_counters); cuMemFree(d_kerr);
     cuMemFree(d_scratch_base); cuMemFree(d_scratch_off);
     return 0;
 }

@@ -79,9 +79,6 @@ __global__ void beam_expansion(
     int          beam_width,
     // Synchronization
     unsigned int* __restrict__ done_counter,
-    // Hull mesh limits
-    int          max_hull_verts_per_part,
-    int          max_hull_tris_per_part,
     // Error output (atomicOr)
     int*         __restrict__ kernel_error)
 {
@@ -449,15 +446,20 @@ __global__ void beam_expansion(
         hull_err_pos = 0; hull_err_neg = 0;
         hull_nv_pos = 0; hull_nt_pos = 0;
         hull_nv_neg = 0; hull_nt_neg = 0;
-        // Pre-allocate hull mesh output space
-        hull_vo_pos = atomicAdd(vert_counter, max_hull_verts_per_part * 2);
-        hull_to_pos = atomicAdd(tri_counter, max_hull_tris_per_part * 2);
-        hull_vo_neg = hull_vo_pos + max_hull_verts_per_part;
-        hull_to_neg = hull_to_pos + max_hull_tris_per_part;
-        // Bounds check: ensure output won't overflow the pools
+        // Allocate hull mesh output space using natural Euler bounds:
+        // n input points -> max n hull verts, max 2n-4 hull tris
+        int max_hv_pos = s_n_hull_pos;
+        int max_ht_pos = (s_n_hull_pos >= 4) ? (2 * s_n_hull_pos - 4) : 0;
+        int max_hv_neg = s_n_hull_neg;
+        int max_ht_neg = (s_n_hull_neg >= 4) ? (2 * s_n_hull_neg - 4) : 0;
+        hull_vo_pos = atomicAdd(vert_counter, max_hv_pos + max_hv_neg);
+        hull_to_pos = atomicAdd(tri_counter, max_ht_pos + max_ht_neg);
+        hull_vo_neg = hull_vo_pos + max_hv_pos;
+        hull_to_neg = hull_to_pos + max_ht_pos;
+        // Bounds check
         s_hull_pool_ok = 1;
-        if (hull_vo_pos + (unsigned int)(max_hull_verts_per_part * 2) > vert_pool_cap ||
-            hull_to_pos + (unsigned int)(max_hull_tris_per_part * 2) > tri_pool_cap) {
+        if (hull_vo_pos + (unsigned int)(max_hv_pos + max_hv_neg) > vert_pool_cap ||
+            hull_to_pos + (unsigned int)(max_ht_pos + max_ht_neg) > tri_pool_cap) {
             s_hull_pool_ok = 0;
             atomicOr(kernel_error, KERR_POOL_OOM);
         }
@@ -485,9 +487,11 @@ __global__ void beam_expansion(
             float* hv = out_vertex_pool + (long long)hull_vo_pos * 3;
             int* ht = out_triangle_pool + (long long)hull_to_pos * 3;
             int nhv = 0, nht = 0;
+            int max_hv_p = s_n_hull_pos;
+            int max_ht_p = (s_n_hull_pos >= 4) ? (2 * s_n_hull_pos - 4) : 0;
             float vol = hull_dandc_warp_mesh(
                 s_hull_pts_pos, s_n_hull_pos, lane, &wp, &err0,
-                hv, ht, max_hull_verts_per_part, max_hull_tris_per_part,
+                hv, ht, max_hv_p, max_ht_p,
                 &nhv, &nht);
             if (lane == 0) {
                 hull_vol_pos = vol;
@@ -517,9 +521,11 @@ __global__ void beam_expansion(
             float* hv = out_vertex_pool + (long long)hull_vo_neg * 3;
             int* ht = out_triangle_pool + (long long)hull_to_neg * 3;
             int nhv = 0, nht = 0;
+            int max_hv_n = s_n_hull_neg;
+            int max_ht_n = (s_n_hull_neg >= 4) ? (2 * s_n_hull_neg - 4) : 0;
             float vol = hull_dandc_warp_mesh(
                 s_hull_pts_neg, s_n_hull_neg, lane, &wp, &err1,
-                hv, ht, max_hull_verts_per_part, max_hull_tris_per_part,
+                hv, ht, max_hv_n, max_ht_n,
                 &nhv, &nht);
             if (lane == 0) {
                 hull_vol_neg = vol;
@@ -528,6 +534,16 @@ __global__ void beam_expansion(
                 if (hull_err_neg) atomicOr(kernel_error, KERR_HULL_ERR);
             }
         }
+    }
+    __syncthreads();
+
+    // --- Rebase hull triangle indices from 0-based to absolute pool indices ---
+    // hull_dandc_warp_mesh writes 0-based tri indices, but Hausdorff needs absolute.
+    if (s_hull_pool_ok) {
+        for (int i = tid; i < hull_nt_pos * 3; i += EXPANSION_BLOCK_SIZE)
+            out_triangle_pool[(long long)hull_to_pos * 3 + i] += (int)hull_vo_pos;
+        for (int i = tid; i < hull_nt_neg * 3; i += EXPANSION_BLOCK_SIZE)
+            out_triangle_pool[(long long)hull_to_neg * 3 + i] += (int)hull_vo_neg;
     }
     __syncthreads();
 

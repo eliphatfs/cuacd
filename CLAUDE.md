@@ -36,8 +36,10 @@ coacd_gpu/            # Python package (import name)
 tests/                # All tests
   test_extension.py   #   GPU smoke tests (Hausdorff, pairwise — standalone script)
   test_beam_v2.py     #   GPU beam search V2 tests (3-kernel architecture)
+  test_hull.py        #   Hull volume + mesh volume tests (CPU ref, GPU D&C vs scipy, noisy icosphere)
   test_hull_mesh.py   #   D&C hull mesh extraction tests (batch_hull_dandc_mesh)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling (gaussian points)
+  test_v2_kernels.py  #   Per-kernel tests for beam_expansion, beam_hausdorff_parts, beam_termination
   test_warp_sort.py   #   Tests for warp_sort_bp32 (bitonic + quicksort paths)
 CoACD/                # Reference C++ CoACD (submodule/external)
 ```
@@ -54,8 +56,11 @@ COACD_GPU_ARCHS="80;86" pip install -e .
 # Run GPU smoke tests
 python tests/test_extension.py
 
-# Run tests (ignore test_beam_v2 — still under development)
-python -m pytest tests/ -v --ignore=tests/test_beam_v2.py
+# Run all tests
+python -m pytest tests/ -v
+
+# Build with V2 beam loop debug output (iter/metric/kernel error per iteration)
+COACD_V2_DEBUG=1 pip install -e .
 
 # D&C hull benchmark (standalone, for profiling)
 python tests/bench_dandc.py --n_pts 200 --n_hulls 8
@@ -91,6 +96,9 @@ One extension is built by `setup.py`:
 - **No PyTorch dependency** — numpy arrays in/out. Reuses existing CUDA context if available.
 - **Single extension** — all GPU functionality (beam search + Hausdorff + merge cost) in one `_gpu` module. No cmake, no ctypes.
 - **Native CPython extension, not ctypes** — ctypes has fragile import path resolution, no type safety, no proper Python object lifecycle. The torchoptix pattern (native CPython extension with embedded fatbin) is the standard approach.
+- **No artificial limits** — Do not impose arbitrary caps (e.g., max hull verts/tris per part) that are not inherent to the algorithm. Convex hull output is bounded by Euler's formula (n verts → max 2n-4 triangles); use natural bounds from input size, not hardcoded constants.
+- **Evidence-based debugging** — Do not guess errors from partial or truncated output or code. Design and run experiments to confirm root causes with proof before making any fixes. When diagnosing a bug, first write a minimal reproducer or add instrumentation to observe the actual failure.
+- **No divergence without consent** — Do not change the algorithm design or add workarounds without explicit approval. If a fix requires a design change, describe the proposed change and wait for approval.
 - **Hull algorithm** — D&C (Preparata-Hong) is the primary hull algorithm, exposed via `batch_hull_volume` and `batch_hull_dandc_mesh` (volume + mesh extraction). `hull_dandc_warp_mesh` returns both volume and the extracted hull mesh (vertices + triangles). Volume and mesh extraction use BFS over the half-edge graph (Bullet getVertexCopy pattern) — no DFS stacks, no stack overflow. BFS queue allocated from pool (n pointers), rewound between mesh extraction and volume. Sort scratch and D&C stack are also rewound. `dandc_scratch_bytes` reports `presort + max(sort_scratch, persistent + max(dc_stack, bfs_queue))`. Edge pool sized at `6n` half-edges (exact: max live = `6n-12` by Euler's formula for triangulated convex hulls, confirmed empirically).
 
 ### Python API
@@ -309,7 +317,7 @@ nvcc crashed when compiling with `--generate-line-info` while `bt_computeInterna
 
 ### V2 Pool Capacity Formula
 
-V2's `beam_expansion` creates 2 new parts per block per iteration. Across `max_iterations × beam_width × num_planes` total expansion blocks, the original V1-style formula `(n_verts + 4096) × beam_width × 8` is far too small (e.g., 480 blocks × 4096 hull tris/block >> tri_capacity). New formula: `total_blocks × (max_hull_tris_per_part × 2 + n_tris × 3)`, capped at 4M entries. Hull output limits reduced to `max_hull_verts_per_part=64`, `max_hull_tris_per_part=128`.
+V2's `beam_expansion` creates 2 new parts per block per iteration. Hull output uses natural Euler bounds from actual hull input size (n input points → max n hull verts, max 2n-4 hull tris) — no artificial limits. Pool capacity is sized from available GPU memory (65% of free VRAM split 45/45/10 between vert/tri/part pools) — no arbitrary caps.
 
 ### V2 Kernel Error Reporting Pattern
 
@@ -327,25 +335,33 @@ Moving `query_dandc_scratch` before the large `cuMemcpyHtoDAsync` calls (to avoi
 - Two-warp reductions (`twowarp_reduce_sum/max/count`) — in reduce.cuh
 - Scratch rewinds (sort/D&C/BFS) + BFS graph traversal replacing DFS in D&C hull
 - Global DevicePool scratch allocation (`warppool_from_global`) — in hull_warp_common.cuh
-- V2 kernel compilation: beam_expansion, beam_hausdorff_parts, beam_termination — compiles
+- V2 kernel compilation: beam_expansion, beam_hausdorff_parts, beam_termination — compiles and individually tested
 - V2 host code (`beam_run_v2`) and Python API (`run_v2`, `run_beam_coacd_v2`) — compiles
-- V2 cube convexity early-exit path — **working** (5/6 tests pass)
+- V2 cube convexity early-exit path — **working**
+- V2 L-shape decomposition — **working** (7 parts at threshold=0.05)
+- V2 Octocat-v2 (20k verts) — **working** (37 parts at threshold=0.05, ~6s)
+- Per-kernel test infrastructure: `test_termination`, `test_hausdorff_parts`, `test_expansion` C API + Python wrappers (tests/test_v2_kernels.py — 14 tests pass)
 - Kernel-side error reporting: `KERR_*` bit flags in all 3 V2 kernels (`KERR_SCRATCH_OOM=1`, `KERR_SPLIT_OOM=2`, `KERR_HULL_PTS_OOM=4`, `KERR_POOL_OOM=8`, `KERR_HULL_ERR=16`); host async-downloads and checks after each launch
 - Pool OOM bounds checking in `beam_expansion` (hull pre-alloc and mesh copy both checked)
 - `CHECK_CU` macro now includes `beam.c:LINE` in error messages for faster diagnosis
 
 ### V2 Bugs Fixed
 - **Scipy hull winding**: `hull.simplices` have inconsistent winding → signed-tet sum ≈ 0 → rv non-zero for convex shapes → no early exit → pool overflow. Fixed in `beam.py`: orient each hull triangle outward using centroid dot-product check.
-- **Triangle pool overflow in `beam_expansion`**: `max_hull_tris_per_part=2048` × 480 blocks/iteration exhausted `tri_capacity`. Fixed by reducing to 128 and computing pool capacities from expected total expansion blocks (`max_iterations × beam_width × num_planes`) capped at 4M entries.
+- **Triangle pool overflow in `beam_expansion`**: Fixed by removing artificial `max_hull_verts_per_part`/`max_hull_tris_per_part` limits and using natural Euler bounds from actual hull input size. Pool capacities computed from worst-case per-block allocation.
 - Root cause of illegal memory access confirmed via `compute-sanitizer`: `bt_extractMesh` writing to `out_tris` past end of triangle pool in block 324/480 (second iteration).
 
+### V2 Bugs Fixed (cont.)
+- **Hull triangle index rebasing**: `hull_dandc_warp_mesh` writes 0-based triangle indices, but the Hausdorff kernel needs absolute pool indices. Missing rebase (`+= hull_vo_pos/neg`) caused Hausdorff to read wrong vertices → absurd distances (1.6 on normalized mesh) → termination never fired. Fixed by adding rebase loop in `beam_expansion` after D&C hull extraction.
+
 ### V2 Bugs Remaining
-- `test_decomposition` (L-shape, `len(parts) >= 2`) returns 0 parts — likely a kernel error or the download/result path is broken after one expansion iteration. Needs investigation with the new kernel error codes.
 - Hull mesh winding: `bt_extractMesh` produces mixed winding (mesh volume via signed tet = 0.667 for unit cube instead of 1.0). The D&C volume (via int128 arithmetic) is correct. Winding consistency in extracted mesh needs investigation.
 
+### V2 Scaling Note
+
+Every expansion block allocates O(n_verts) pool space for mesh copies + hull output, but only beam_width results survive selection. For large meshes (20k+ verts), this wastes significant pool space per iteration. A GPU-side pool compaction kernel (run between iterations) would reclaim dead space. Currently this is not a problem because pools are sized from available GPU memory (65% of free VRAM).
+
 ### Not Yet Implemented
-- V2 L-shape decomposition end-to-end (expansion path has a bug, see above)
-- Hausdorff validation in V2 beam loop (kernel exists, host wiring incomplete)
+- Pool compaction kernel (GPU-side, between iterations — reclaim dead pool space from non-winning expansion blocks)
 - Merge post-processing
 - Vertex compaction (parts carry superset of vertices)
 - `__cuda_array_interface__` support for GPU tensor input

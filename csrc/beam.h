@@ -200,6 +200,71 @@ int beam_batch_hull_dandc_mesh(
     int*         out_vert_counts,
     int*         out_tri_counts);
 
+// ---------------------------------------------------------------------------
+// Per-kernel test functions for V2 beam search
+// ---------------------------------------------------------------------------
+
+// Test beam_termination kernel in isolation.
+// parts: [n_parts] PartInfoV2 array (host)
+// work_items: [n_items] WorkItem array (host, modified in-place with worst_part_idx/worst_metric)
+// Returns: index of terminated work item (or -1 if none).
+int beam_test_termination(
+    beam_ctx_t       ctx,
+    PartInfoV2*      parts,
+    int              n_parts,
+    WorkItem*        work_items,
+    int              n_items,
+    float            threshold);
+
+// Test beam_hausdorff_parts kernel in isolation.
+// vertex_pool, triangle_pool: packed pools (host)
+// parts: [n_parts] PartInfoV2 array (host, hausdorff field updated in-place)
+// part_indices: [n_indices] indices into parts to process
+int beam_test_hausdorff_parts(
+    beam_ctx_t       ctx,
+    const float*     vertex_pool,
+    int              n_pool_verts,
+    const int*       triangle_pool,
+    int              n_pool_tris,
+    PartInfoV2*      parts,
+    int              n_parts,
+    const int*       part_indices,
+    int              n_indices,
+    float            threshold);
+
+// Test beam_expansion kernel in isolation (single iteration).
+// Input: mesh (vertex_pool, triangle_pool) + parts + work_items (1 item).
+// Output: out_work_items (up to beam_width), out_parts (newly created).
+// Returns number of output work items, or -1 on error.
+// out_parts_count: number of new PartInfoV2 entries created.
+// kernel_error: bit flags from KERR_* constants.
+int beam_test_expansion(
+    beam_ctx_t       ctx,
+    const float*     vertex_pool,
+    int              n_pool_verts,
+    const int*       triangle_pool,
+    int              n_pool_tris,
+    const PartInfoV2* parts,
+    int              n_parts,
+    const WorkItem*  work_items,
+    int              n_items,
+    int              cuts_per_axis,
+    float            rv_k,
+    int              beam_width,
+    size_t           scratch_size,
+    // Outputs (host buffers, caller-allocated)
+    WorkItem*        out_work_items,   // [beam_width]
+    PartInfoV2*      out_parts,        // [out_parts_capacity]
+    int              out_parts_capacity,
+    int*             out_parts_count,
+    float*           out_vertex_pool,  // [out_vert_capacity * 3]
+    int              out_vert_capacity,
+    int*             out_triangle_pool,// [out_tri_capacity * 3]
+    int              out_tri_capacity,
+    int*             out_vert_count,
+    int*             out_tri_count,
+    int*             kernel_error);
+
 #ifdef __cplusplus
 }
 #endif
