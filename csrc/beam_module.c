@@ -140,6 +140,33 @@ static PyObject* py_get_part_sizes(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// get_part_info(part_idx) -> (rv_cost, hausdorff, mesh_volume, hull_volume)
+// ---------------------------------------------------------------------------
+
+static PyObject* py_get_part_info(PyObject* self, PyObject* args) {
+    int part_idx;
+    if (!PyArg_ParseTuple(args, "i", &part_idx))
+        return NULL;
+    REQUIRE_CTX();
+
+    float rv_cost, hausdorff, mesh_volume, hull_volume;
+    int rc = beam_get_part_info(g_state.ctx, part_idx,
+                                &rv_cost, &hausdorff, &mesh_volume, &hull_volume);
+    if (rc != 0) {
+        PyErr_SetString(PyExc_IndexError, "part_idx out of range or no part info available");
+        return NULL;
+    }
+
+    PyObject* result = PyTuple_New(4);
+    if (!result) return NULL;
+    PyTuple_SetItem(result, 0, PyFloat_FromDouble(rv_cost));
+    PyTuple_SetItem(result, 1, PyFloat_FromDouble(hausdorff));
+    PyTuple_SetItem(result, 2, PyFloat_FromDouble(mesh_volume));
+    PyTuple_SetItem(result, 3, PyFloat_FromDouble(hull_volume));
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // get_part(part_idx, verts_ptr, n_verts, tris_ptr, n_tris) -> (n_verts, n_tris)
 // ---------------------------------------------------------------------------
 
@@ -439,6 +466,7 @@ static PyMethodDef gpu_methods[] = {
     { "run_v2",                 py_run_v2,                 METH_VARARGS, "Run V2 beam search (3-kernel)." },
     { "get_part_sizes",         py_get_part_sizes,         METH_VARARGS, "Get part vertex/triangle counts." },
     { "get_part",               py_get_part,               METH_VARARGS, "Copy part data to buffers." },
+    { "get_part_info",          py_get_part_info,          METH_VARARGS, "Get part diagnostic info (rv, hausdorff, mesh_vol, hull_vol)." },
     { "point_mesh_distances",   py_point_mesh_distances,   METH_VARARGS, "Compute point-to-mesh distances." },
     { "hausdorff",              py_hausdorff,              METH_VARARGS, "Compute Hausdorff distance." },
     { "pairwise_hausdorff",     py_pairwise_hausdorff,     METH_VARARGS, "Compute pairwise Hausdorff cost matrix." },

@@ -27,9 +27,9 @@
 #define MAX_PARTS_PER_BEAM 64
 
 struct DevicePool {
-    char*         base;
-    unsigned int* offset;
-    unsigned int  capacity;
+    char*               base;
+    unsigned long long* offset;
+    unsigned long long  capacity;
 };
 
 struct OutputPart {
@@ -67,6 +67,9 @@ struct beam_ctx {
 
     struct OutputPart* output_parts;
     int num_output_parts;
+
+    // Per-part info from the winning work item (for diagnostics)
+    struct PartInfoV2_host* output_part_infos;
 
     char last_error[256];
 };
@@ -155,6 +158,8 @@ static void free_output_parts(struct beam_ctx* ctx) {
         ctx->output_parts = NULL;
         ctx->num_output_parts = 0;
     }
+    free(ctx->output_part_infos);
+    ctx->output_part_infos = NULL;
 }
 
 void beam_destroy(beam_ctx_t ctx) {
@@ -679,6 +684,24 @@ struct WorkItem_host {
     float worst_metric;
 };
 
+int beam_get_part_info(
+    beam_ctx_t ctx,
+    int part_idx,
+    float* rv_cost,
+    float* hausdorff,
+    float* mesh_volume,
+    float* hull_volume)
+{
+    if (!ctx || !ctx->output_part_infos ||
+        part_idx < 0 || part_idx >= ctx->num_output_parts) return -1;
+    struct PartInfoV2_host* pi = &ctx->output_part_infos[part_idx];
+    if (rv_cost)     *rv_cost     = pi->rv_cost;
+    if (hausdorff)   *hausdorff   = pi->hausdorff;
+    if (mesh_volume) *mesh_volume = pi->mesh_volume;
+    if (hull_volume) *hull_volume = pi->hull_volume;
+    return 0;
+}
+
 int beam_run_v2(
     beam_ctx_t ctx,
     const float* vertices, int n_verts,
@@ -769,20 +792,19 @@ int beam_run_v2(
     CHECK_CU(cuMemAlloc(&d_norm, norm_bytes));
     CHECK_CU(cuMemAlloc(&d_pidx, pidx_bytes));
     CHECK_CU(cuMemAlloc(&d_kerr, sizeof(int)));
-    // Global scratch pool for split + D&C (2GB)
+    // Global scratch pool for split + D&C
     {
         size_t free_mem = 0, total_mem = 0;
         cuMemGetInfo(&free_mem, &total_mem);
         size_t scratch_sz = (size_t)(free_mem * 0.7);
         if (scratch_sz < 256 * 1024 * 1024) scratch_sz = 256 * 1024 * 1024;
-        if (scratch_sz > 4000000000ULL) scratch_sz = 4000000000ULL;
         if (scratch_size > 0) scratch_sz = scratch_size;
         CHECK_CU(cuMemAlloc(&d_scratch_base, scratch_sz));
-        CHECK_CU(cuMemAlloc(&d_scratch_off, sizeof(unsigned int)));
+        CHECK_CU(cuMemAlloc(&d_scratch_off, sizeof(unsigned long long)));
         // Build host-side DevicePool struct (passed by value to kernels)
         ctx->scratch.base = (char*)(uintptr_t)d_scratch_base;
-        ctx->scratch.offset = (unsigned int*)(uintptr_t)d_scratch_off;
-        ctx->scratch.capacity = (unsigned int)scratch_sz;
+        ctx->scratch.offset = (unsigned long long*)(uintptr_t)d_scratch_off;
+        ctx->scratch.capacity = (unsigned long long)scratch_sz;
     }
 
     // Set stack size for D&C
@@ -958,49 +980,8 @@ int beam_run_v2(
 
         for (int iter = 0; iter < p.max_iterations; iter++) {
             V2_DBG("[V2] iter=%d num_items=%d\n", iter, num_items);
-            // Kernel 2: Hausdorff for parts that need it
-            // Build part index list on host
-            {
-                struct WorkItem_host h_items[MAX_BEAM];
-                int n_to_read = (num_items < MAX_BEAM) ? num_items : MAX_BEAM;
-                CHECK_CU(cuMemcpyDtoHAsync(h_items, d_wi_cur,
-                    n_to_read * sizeof(struct WorkItem_host), s));
-                CHECK_CU(cuStreamSynchronize(s));
-
-                // Collect unique part indices
-                int pidx[MAX_BEAM * MAX_PARTS_PER_BEAM_V2];
-                int n_pidx = 0;
-                for (int i = 0; i < n_to_read; i++) {
-                    for (int j = 0; j < h_items[i].num_parts; j++) {
-                        int gi = h_items[i].part_indices[j];
-                        // Check uniqueness
-                        int found = 0;
-                        for (int k = 0; k < n_pidx; k++) {
-                            if (pidx[k] == gi) { found = 1; break; }
-                        }
-                        if (!found && n_pidx < MAX_BEAM * MAX_PARTS_PER_BEAM_V2)
-                            pidx[n_pidx++] = gi;
-                    }
-                }
-                if (n_pidx > 0) {
-                    CHECK_CU(cuMemcpyHtoDAsync(d_pidx, pidx, n_pidx * sizeof(int), s));
-                    unsigned int kerr_zero = 0;
-                    CHECK_CU(cuMemcpyHtoDAsync(d_kerr, &kerr_zero, sizeof(int), s));
-                    void* h_args[] = { &d_vp, &d_tp, &d_pp, &d_pidx, &n_pidx,
-                                       &p.threshold, &d_kerr };
-                    CHECK_CU(cuLaunchKernel(ctx->fn_beam_hausdorff_parts,
-                        n_pidx, 1, 1, HAUSDORFF_BLOCK_SIZE, 1, 1, 0, s, h_args, NULL));
-                    // Async download kernel error
-                    int kerr_h = 0;
-                    CHECK_CU(cuMemcpyDtoHAsync(&kerr_h, d_kerr, sizeof(int), s));
-                    CHECK_CU(cuStreamSynchronize(s));
-                    if (kerr_h) {
-                        snprintf(ctx->last_error, sizeof(ctx->last_error),
-                            "beam_hausdorff_parts kernel error 0x%x at iter %d", kerr_h, iter);
-                        goto cleanup;
-                    }
-                }
-            }
+            // Kernel 2: Hausdorff — SKIPPED for now (debugging Rv-only termination)
+            // TODO: re-enable Hausdorff kernel once Rv decomposition quality is validated
 
             // Kernel 3: Termination check
             {
@@ -1058,7 +1039,7 @@ int beam_run_v2(
                 // Reset done counter, scratch pool offset, and kernel error
                 unsigned int zero = 0;
                 CHECK_CU(cuMemcpyHtoDAsync(d_done_ctr, &zero, sizeof(unsigned int), s));
-                CHECK_CU(cuMemsetD32Async(d_scratch_off, 0, 1, s));
+                CHECK_CU(cuMemsetD32Async(d_scratch_off, 0, 2, s));
                 CHECK_CU(cuMemcpyHtoDAsync(d_kerr, &zero, sizeof(int), s));
 
                 struct DevicePool sp = ctx->scratch;
@@ -1171,7 +1152,9 @@ int beam_run_v2(
             for (int t = 0; t < nt * 3; t++)
                 tris[t] -= vo_adj;
         }
-        free(h_parts);
+        // Save part infos for diagnostics (accessible via get_part_info)
+        free(ctx->output_part_infos);
+        ctx->output_part_infos = h_parts;
     }
 
 cleanup:
@@ -1310,13 +1293,12 @@ int beam_test_expansion(
         cuMemGetInfo(&free_mem, &total_mem);
         size_t scratch_sz = (size_t)(free_mem * 0.7);
         if (scratch_sz < 256 * 1024 * 1024) scratch_sz = 256 * 1024 * 1024;
-        if (scratch_sz > 4000000000ULL) scratch_sz = 4000000000ULL;
         if (scratch_size > 0) scratch_sz = scratch_size;
         CHECK_CU(cuMemAlloc(&d_scratch_base, scratch_sz));
-        CHECK_CU(cuMemAlloc(&d_scratch_off, sizeof(unsigned int)));
+        CHECK_CU(cuMemAlloc(&d_scratch_off, sizeof(unsigned long long)));
         ctx->scratch.base = (char*)(uintptr_t)d_scratch_base;
-        ctx->scratch.offset = (unsigned int*)(uintptr_t)d_scratch_off;
-        ctx->scratch.capacity = (unsigned int)scratch_sz;
+        ctx->scratch.offset = (unsigned long long*)(uintptr_t)d_scratch_off;
+        ctx->scratch.capacity = (unsigned long long)scratch_sz;
     }
 
     CHECK_CU(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, 8 * 1024));
@@ -1337,8 +1319,8 @@ int beam_test_expansion(
     CHECK_CU(cuMemcpyHtoDAsync(d_counters, counters, sizeof(counters), s));
 
     // Reset scratch offset and kernel error
-    unsigned int zero_u = 0;
-    CHECK_CU(cuMemcpyHtoDAsync(d_scratch_off, &zero_u, sizeof(unsigned int), s));
+    unsigned long long zero_ull = 0;
+    CHECK_CU(cuMemcpyHtoDAsync(d_scratch_off, &zero_ull, sizeof(unsigned long long), s));
     int zero_i = 0;
     CHECK_CU(cuMemcpyHtoDAsync(d_kerr, &zero_i, sizeof(int), s));
 

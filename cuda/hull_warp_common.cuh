@@ -46,8 +46,8 @@ __device__ inline void* warp_pool_alloc(WarpPool* pool, int bytes, int lane) {
 __device__ inline int warppool_from_global(
     DevicePool* global, int size, WarpPool* out)
 {
-    unsigned int aligned = ((unsigned int)size + 15) & ~15;
-    unsigned int old = atomicAdd(global->offset, aligned);
+    unsigned long long aligned = (unsigned long long)((size + 15) & ~15);
+    unsigned long long old = atomicAdd(global->offset, aligned);
     if (old + aligned > global->capacity) {
         out->base = NULL; out->offset = 0; out->capacity = 0; out->error = 1;
         return 1;

@@ -287,9 +287,9 @@ V2 kernels allocate all scratch from a single global DevicePool (70% of free VRA
 
 ## Implementation Lessons
 
-### DevicePool Capacity is 32-bit
+### DevicePool offset/capacity are 64-bit
 
-`DevicePool.capacity` is `unsigned int`. With >4GB free GPU memory, 70% exceeds 4GB and wraps. Cap scratch at 4GB.
+`DevicePool.offset` and `DevicePool.capacity` are `unsigned long long`. Previously they were `unsigned int` (32-bit), causing silent wraparound when >4GB scratch was consumed by concurrent expansion blocks (480 blocks × ~15MB each = ~7GB). The wraparound made the OOM check pass on wrapped offsets, giving blocks overlapping memory regions → corrupted D&C edge pool free lists → illegal memory access. Fixed by widening to 64-bit; the 4GB scratch cap was also removed.
 
 ### D&C: Faithful Port of Bullet's btConvexHullComputer
 
@@ -352,9 +352,11 @@ Moving `query_dandc_scratch` before the large `cuMemcpyHtoDAsync` calls (to avoi
 
 ### V2 Bugs Fixed (cont.)
 - **Hull triangle index rebasing**: `hull_dandc_warp_mesh` writes 0-based triangle indices, but the Hausdorff kernel needs absolute pool indices. Missing rebase (`+= hull_vo_pos/neg`) caused Hausdorff to read wrong vertices → absurd distances (1.6 on normalized mesh) → termination never fired. Fixed by adding rebase loop in `beam_expansion` after D&C hull extraction.
+- **DevicePool 32-bit offset wraparound**: `DevicePool.offset` was `unsigned int`, causing silent wraparound when >4GB scratch was consumed by concurrent expansion blocks (480 blocks × ~15MB D&C scratch each). Blocks got overlapping memory → corrupted edge pool free lists → illegal memory access in `btpool_new`. Fixed by widening offset/capacity to `unsigned long long`; removed 4GB scratch cap.
 
 ### V2 Bugs Remaining
 - Hull mesh winding: `bt_extractMesh` produces mixed winding (mesh volume via signed tet = 0.667 for unit cube instead of 1.0). The D&C volume (via int128 arithmetic) is correct. Winding consistency in extracted mesh needs investigation.
+- Hausdorff kernel skipped in beam loop (debugging Rv-only termination quality first).
 
 ### V2 Scaling Note
 

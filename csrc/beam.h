@@ -41,6 +41,16 @@ int beam_get_part(
     int*       out_triangles,
     int*       out_n_tris);
 
+// Get per-part diagnostic info (rv_cost, hausdorff, mesh_volume, hull_volume).
+// Returns 0 on success, -1 if part_idx is out of range or no info available.
+int beam_get_part_info(
+    beam_ctx_t ctx,
+    int        part_idx,
+    float*     rv_cost,
+    float*     hausdorff,
+    float*     mesh_volume,
+    float*     hull_volume);
+
 const char* beam_last_error(beam_ctx_t ctx);
 
 // -----------------------------------------------------------------------

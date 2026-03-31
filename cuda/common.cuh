@@ -60,9 +60,9 @@ struct WorkItem {
 };
 
 struct DevicePool {
-    char*         base;
-    unsigned int* offset;
-    unsigned int  capacity;
+    char*               base;
+    unsigned long long* offset;
+    unsigned long long  capacity;
 };
 
 // ============================================================================
@@ -72,9 +72,9 @@ struct DevicePool {
 // See CLAUDE.md "Pool Allocator Pattern" for why.
 
 __device__ inline void* pool_alloc(DevicePool* pool, unsigned int size) {
-    size = (size + 15) & ~15;
-    unsigned int old = atomicAdd(pool->offset, size);
-    if (old + size > pool->capacity) return NULL;
+    unsigned long long aligned = (unsigned long long)((size + 15) & ~15);
+    unsigned long long old = atomicAdd(pool->offset, aligned);
+    if (old + aligned > pool->capacity) return NULL;
     return pool->base + old;
 }
 

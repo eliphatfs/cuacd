@@ -13,8 +13,8 @@
 __device__ inline void* global_alloc_warp(DevicePool* gpool, int bytes, int lane) {
     long long ptr_ll = 0LL;
     if (lane == 0) {
-        unsigned int aligned = ((unsigned int)bytes + 15) & ~15;
-        unsigned int old = atomicAdd(gpool->offset, aligned);
+        unsigned long long aligned = (unsigned long long)((bytes + 15) & ~15);
+        unsigned long long old = atomicAdd(gpool->offset, aligned);
         if (old + aligned <= gpool->capacity)
             ptr_ll = (long long)(gpool->base + old);
     }
@@ -24,8 +24,8 @@ __device__ inline void* global_alloc_warp(DevicePool* gpool, int bytes, int lane
 
 // Helper: thread-0-only alloc from DevicePool (for block-level use, NOT warp)
 __device__ inline void* global_alloc_t0(DevicePool* gpool, int bytes) {
-    unsigned int aligned = ((unsigned int)bytes + 15) & ~15;
-    unsigned int old = atomicAdd(gpool->offset, aligned);
+    unsigned long long aligned = (unsigned long long)((bytes + 15) & ~15);
+    unsigned long long old = atomicAdd(gpool->offset, aligned);
     if (old + aligned > gpool->capacity) return NULL;
     return gpool->base + old;
 }
