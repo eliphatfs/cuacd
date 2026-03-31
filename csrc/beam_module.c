@@ -193,91 +193,6 @@ static PyObject* py_get_part(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
-// point_mesh_distances(points_ptr, n_points, verts_ptr, n_verts,
-//                      tris_ptr, n_tris, dist_ptr) -> None
-// ---------------------------------------------------------------------------
-
-static PyObject* py_point_mesh_distances(PyObject* self, PyObject* args) {
-    unsigned long long points_ptr, verts_ptr, tris_ptr, dist_ptr;
-    int n_points, n_verts, n_tris;
-
-    if (!PyArg_ParseTuple(args, "KiKiKiK",
-            &points_ptr, &n_points,
-            &verts_ptr, &n_verts,
-            &tris_ptr, &n_tris,
-            &dist_ptr))
-        return NULL;
-    REQUIRE_CTX();
-
-    int rc = beam_point_mesh_distances(g_state.ctx,
-        (const float*)(uintptr_t)points_ptr, n_points,
-        (const float*)(uintptr_t)verts_ptr, n_verts,
-        (const int*)(uintptr_t)tris_ptr, n_tris,
-        (float*)(uintptr_t)dist_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
-// ---------------------------------------------------------------------------
-// hausdorff(sa_ptr, n_sa, va_ptr, n_va, ta_ptr, n_ta,
-//           sb_ptr, n_sb, vb_ptr, n_vb, tb_ptr, n_tb) -> float
-// ---------------------------------------------------------------------------
-
-static PyObject* py_hausdorff(PyObject* self, PyObject* args) {
-    unsigned long long sa_ptr, va_ptr, ta_ptr, sb_ptr, vb_ptr, tb_ptr;
-    int n_sa, n_va, n_ta, n_sb, n_vb, n_tb;
-
-    if (!PyArg_ParseTuple(args, "KiKiKiKiKiKi",
-            &sa_ptr, &n_sa, &va_ptr, &n_va, &ta_ptr, &n_ta,
-            &sb_ptr, &n_sb, &vb_ptr, &n_vb, &tb_ptr, &n_tb))
-        return NULL;
-    REQUIRE_CTX();
-
-    float result;
-    int rc = beam_hausdorff(g_state.ctx,
-        (const float*)(uintptr_t)sa_ptr, n_sa,
-        (const float*)(uintptr_t)va_ptr, n_va,
-        (const int*)(uintptr_t)ta_ptr, n_ta,
-        (const float*)(uintptr_t)sb_ptr, n_sb,
-        (const float*)(uintptr_t)vb_ptr, n_vb,
-        (const int*)(uintptr_t)tb_ptr, n_tb,
-        &result);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    return PyFloat_FromDouble((double)result);
-}
-
-// ---------------------------------------------------------------------------
-// pairwise_hausdorff(samples_ptr, soff_ptr, verts_ptr, tris_ptr,
-//                    toff_ptr, voff_ptr, n_parts, cost_ptr) -> None
-// ---------------------------------------------------------------------------
-
-static PyObject* py_pairwise_hausdorff(PyObject* self, PyObject* args) {
-    unsigned long long samples_ptr, soff_ptr, verts_ptr, tris_ptr;
-    unsigned long long toff_ptr, voff_ptr, cost_ptr;
-    int n_parts;
-
-    if (!PyArg_ParseTuple(args, "KKKKKKiK",
-            &samples_ptr, &soff_ptr,
-            &verts_ptr, &tris_ptr,
-            &toff_ptr, &voff_ptr,
-            &n_parts, &cost_ptr))
-        return NULL;
-    REQUIRE_CTX();
-
-    int rc = beam_pairwise_hausdorff(g_state.ctx,
-        (const float*)(uintptr_t)samples_ptr,
-        (const int*)(uintptr_t)soff_ptr,
-        (const float*)(uintptr_t)verts_ptr,
-        (const int*)(uintptr_t)tris_ptr,
-        (const int*)(uintptr_t)toff_ptr,
-        (const int*)(uintptr_t)voff_ptr,
-        n_parts,
-        (float*)(uintptr_t)cost_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
-// ---------------------------------------------------------------------------
 // test_warp_sort(pts_ptr, total_pts, offsets_ptr, n_arrays) -> None
 // ---------------------------------------------------------------------------
 
@@ -504,9 +419,6 @@ static PyMethodDef gpu_methods[] = {
     { "get_part_sizes",         py_get_part_sizes,         METH_VARARGS, "Get part vertex/triangle counts." },
     { "get_part",               py_get_part,               METH_VARARGS, "Copy part data to buffers." },
     { "get_part_info",          py_get_part_info,          METH_VARARGS, "Get part diagnostic info (rv, hausdorff, mesh_vol, hull_vol)." },
-    { "point_mesh_distances",   py_point_mesh_distances,   METH_VARARGS, "Compute point-to-mesh distances." },
-    { "hausdorff",              py_hausdorff,              METH_VARARGS, "Compute Hausdorff distance." },
-    { "pairwise_hausdorff",     py_pairwise_hausdorff,     METH_VARARGS, "Compute pairwise Hausdorff cost matrix." },
     { "test_warp_sort",             py_test_warp_sort,             METH_VARARGS, "Test warp sort BtPoint32." },
     { "batch_hull_volume",          py_batch_hull_volume,          METH_VARARGS, "Batch hull volume (three algorithms)." },
     { "batch_mesh_volume",          py_batch_mesh_volume,          METH_VARARGS, "Batch mesh volume (divergence theorem)." },

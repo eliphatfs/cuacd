@@ -3,7 +3,6 @@
 // Each module is self-contained (carries its own #include directives).
 
 #include "mesh_transform.cu"
-#include "hausdorff.cu"
 #include "hull_batch.cu"
 #include "test_warp_sort.cu"
 #include "beam_v2.cu"

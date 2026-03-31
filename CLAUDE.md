@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This repository contains:
 
 1. **CoACD** (`CoACD/`) — Collision-Aware Approximate Convex Decomposition (reference C++ implementation, SIGGRAPH 2022).
-2. **coacd_gpu** — GPU-accelerated convex decomposition via beam search. Single CPython extension (abi3, cp310+) via CUDA driver API. Includes beam search decomposition, Hausdorff distance, pairwise merge cost.
+2. **coacd_gpu** — GPU-accelerated convex decomposition via beam search. Single CPython extension (abi3, cp310+) via CUDA driver API. Includes beam search decomposition and Hausdorff distance (V2 kernel, in beam_v2.cu).
 
 ## Repository Layout
 
@@ -25,17 +25,15 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   hull_batch.cu       #   batch_hull_dandc + batch_hull_dandc_mesh + batch_mesh_volume kernels
   test_warp_sort.cu   #   Test kernel for warp_sort_bp32
   beam_v2.cu          #   V2 beam search: beam_expansion, beam_hausdorff_parts, beam_termination
-  plane_cut.cu        #   GPU plane cut kernel with cap triangulation (ear clipping, multi-hole bridging)
-  hausdorff.cu        #   Hausdorff kernels (point_mesh_distance, reduce_max, pairwise)
+  plane_cut.cu        #   GPU plane cut: plane_cut_block (__device__) + plane_cut_kernel thin wrapper
   mesh_transform.cu   #   Normalize/recover coordinate kernels
 csrc/                 # C host code
-  beam.h/.c           #   Host implementation (CUDA driver API) — beam search + Hausdorff
+  beam.h/.c           #   Host implementation (CUDA driver API) — beam search
   beam_module.c       #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
-  __init__.py         #   Context class (Hausdorff API) + re-exports BeamContext
+  __init__.py         #   Context class (hull/mesh volume API) + re-exports BeamContext
   beam.py             #   Python API for beam search (imports _gpu extension)
 tests/                # All tests
-  test_extension.py   #   GPU smoke tests (Hausdorff, pairwise — standalone script)
   test_beam_v2.py     #   GPU beam search V2 tests (3-kernel architecture)
   test_hull.py        #   Hull volume + mesh volume tests (CPU ref, GPU D&C vs scipy, noisy icosphere)
   test_hull_mesh.py   #   D&C hull mesh extraction tests (batch_hull_dandc_mesh)
@@ -46,6 +44,19 @@ tests/                # All tests
 CoACD/                # Reference C++ CoACD (submodule/external)
 ```
 
+## Git Usage
+
+Only stage project source files — never use `git add -A` or `git add .`. The repo contains directories that must not be committed:
+- `CoACD/` — embedded git repository (reference C++ implementation, not a submodule)
+- `compare_output/`, `octocat_output/`, `tmpcompare/` — temporary output directories
+- `*.ncu-rep` — NSight Compute profiling artifacts
+- Build artifacts (`*.fatbin`, `*.o`, `*.so`, `build/`, `*.egg-info/`)
+
+Before staging, always run `git status` and `git diff --stat` to verify only the expected tracked files appear as modified. Untracked files in the list above should remain unstaged. Then stage the exact files listed in `git status` as modified/deleted, e.g.:
+```bash
+git add CLAUDE.md coacd_gpu/__init__.py csrc/beam.c csrc/beam.h csrc/beam_module.c cuda/hull_batch.cu cuda/kernels.cu cuda/plane_cut.cu
+```
+
 ## Build Commands
 
 ```bash
@@ -54,9 +65,6 @@ pip install -e .
 
 # Override GPU architectures
 COACD_GPU_ARCHS="80;86" pip install -e .
-
-# Run GPU smoke tests
-python tests/test_extension.py
 
 # Run all tests
 python -m pytest tests/ -v
@@ -98,7 +106,7 @@ Each `.cu` kernel module is self-contained: it carries its own `#include` direct
 - **Fatbin embedding** — cubins for sm_80/86/89/90 + PTX for forward compat, embedded as C arrays.
 - **abi3 wheel** — `Py_LIMITED_API` targeting Python 3.10+. One wheel per platform.
 - **No PyTorch dependency** — numpy arrays in/out. Reuses existing CUDA context if available.
-- **Single extension** — all GPU functionality (beam search + Hausdorff + merge cost) in one `_gpu` module. No cmake, no ctypes.
+- **Single extension** — all GPU functionality (beam search + Hausdorff) in one `_gpu` module. No cmake, no ctypes.
 - **Native CPython extension, not ctypes** — ctypes has fragile import path resolution, no type safety, no proper Python object lifecycle. The torchoptix pattern (native CPython extension with embedded fatbin) is the standard approach.
 - **No artificial limits** — Do not impose arbitrary caps (e.g., max hull verts/tris per part) that are not inherent to the algorithm. Convex hull output is bounded by Euler's formula (n verts → max 2n-4 triangles); use natural bounds from input size, not hardcoded constants.
 - **Evidence-based debugging** — Do not guess errors from partial or truncated output or code. Design and run experiments to confirm root causes with proof before making any fixes. When diagnosing a bug, first write a minimal reproducer or add instrumentation to observe the actual failure.
@@ -108,12 +116,11 @@ Each `.cu` kernel module is self-contained: it carries its own `#include` direct
 ### Python API
 
 ```python
-# Hausdorff distance computation
+# Hull/mesh volume utilities
 import coacd_gpu
 with coacd_gpu.Context(device=0) as ctx:
-    dists = ctx.point_mesh_distances(points, vertices, triangles)
-    h = ctx.hausdorff(sa, va, ta, sb, vb, tb)
-    cost = ctx.pairwise_hausdorff(samples, s_off, verts, tris, t_off, v_off)
+    volumes, errors = ctx.batch_hull_volume(pts_list)
+    volumes = ctx.batch_mesh_volume(verts_list, tris_list)
 
 # Beam search decomposition (V2 — 3-kernel, D&C hull + Hausdorff)
 from coacd_gpu.beam import BeamContext, run_beam_coacd_v2
@@ -123,7 +130,7 @@ with BeamContext(device=0) as ctx:
 parts = run_beam_coacd_v2(vertices, triangles, threshold=0.05)
 ```
 
-Both `Context` and `BeamContext` share the same underlying `_gpu` extension and CUDA context.
+`Context` and `BeamContext` share the same underlying `_gpu` extension and CUDA context.
 
 ## Beam Search Algorithm Design
 
@@ -145,7 +152,7 @@ Rv = `(3 * |V_mesh - V_hull| / (4*pi))^(1/3) * k` where k = rv_k (default 0.3).
 
 - **Mesh volume**: parallel signed-tetrahedra reduction `V = (1/6) * sum p0.(p1 x p2)`. For open meshes after clipping, cap volume correction via divergence theorem: `V_cap = (d/3) * |A_boundary|` from boundary edge loop shoelace signed area.
 - **Hull volume**: D&C hull (`hull_dandc_warp_mesh`) — warp-parallel Preparata-Hong, unlimited vertices, exact Int128 arithmetic. Returns both volume and extracted mesh for Hausdorff.
-- **Cap triangulation**: ear-clipping cap triangulates the cut boundary to close meshes after each clip. Supports simple loop, ring (annular), and multi-hole topologies via boundary loop reconstruction + hole bridging. GPU kernel `plane_cut_kernel` (plane_cut.cu) handles all phases: parallel vertex classification → parallel triangle splitting with edge dedup via warp_sort → parallel directed-edge boundary detection via sort + binary search → thread-0 sequential loop chaining, hole bridging (rightmost-first), and ear clipping.
+- **Cap triangulation**: ear-clipping cap triangulates the cut boundary to close meshes after each clip. Supports simple loop, ring (annular), and multi-hole topologies via boundary loop reconstruction + hole bridging. `plane_cut_block` (plane_cut.cu, called via `plane_cut_kernel`) handles all phases: parallel vertex classification → parallel triangle splitting with edge dedup via warp_sort → parallel directed-edge boundary detection via sort + binary search → thread-0 sequential loop chaining, hole bridging (rightmost-first), and ear clipping.
 - **Threshold**: compatible with CoACD semantics. Convex shape -> Rv ~ 0. Threshold 0.05 typical.
 - **Scoring a cut**: `max(Rv_positive_half, Rv_negative_half)`. Beam search minimizes worst-case concavity.
 - **Per-part bounding box planes**: cutting planes uniformly distributed within each part's triangle-vertex bbox (not all-vertex bbox, not global). Odd cuts_per_axis (e.g., 15) ensures midpoint is always a candidate. No snapping to vertex coordinates.
@@ -198,14 +205,9 @@ If all 256 threads call `pool_alloc`, each gets a different offset (256x memory 
 | B3 | `block_reduce_max(val, smem, tid) -> float` | reduce.cuh |
 | B4 | `block_reduce_count(flag, smem_i, tid) -> int` | reduce.cuh |
 
-### F. Hausdorff (kernels + host helpers)
+### F. Hausdorff (V2 kernel, beam_v2.cu)
 
-| ID | Function | File |
-|----|----------|------|
-| F1 | `sample_surface` kernel | hausdorff.cu — area-weighted surface sampling |
-| F2 | `point_mesh_distance` kernel | hausdorff.cu — brute-force point-to-triangle, one thread per point |
-| F3 | `reduce_max` kernel | hausdorff.cu — shared-memory parallel max reduction |
-| F5 | `pairwise_hausdorff` kernel | hausdorff.cu — batch merge cost matrix |
+`beam_hausdorff_parts` — per-block bidirectional Hausdorff between part mesh and its D&C hull mesh. Skips parts where `hausdorff >= 0` or `rv_cost > 2*threshold`. Called as Kernel 2 in the V2 beam loop.
 
 ### G. Mesh Transform (kernels)
 
@@ -371,6 +373,7 @@ Moving `query_dandc_scratch` before the large `cuMemcpyHtoDAsync` calls (to avoi
 Every expansion block allocates O(n_verts) pool space for mesh copies + hull output, but only beam_width results survive selection. For large meshes (20k+ verts), this wastes significant pool space per iteration. A GPU-side pool compaction kernel (run between iterations) would reclaim dead space. Currently this is not a problem because pools are sized from available GPU memory (65% of free VRAM).
 
 ### Plane Cut Kernel (plane_cut.cu) — Working
+- `plane_cut_block` is the `__device__` function doing the real work; `plane_cut_kernel` is a thin `__global__` wrapper that calls it (enables future multi-block use)
 - GPU kernel `plane_cut_kernel`: 1 block × 64 threads (2 warps), handles one plane cut
 - Parallel phases: vertex classification, crossing edge collection, triangle splitting (with sorted edge dedup), directed edge collection, boundary detection (sort + binary search)
 - Warp 0 phases: sort crossing edges and directed edges via `warp_sort_t<Edge2i, Edge2iCmp>`

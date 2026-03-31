@@ -6,6 +6,7 @@
 
 #include "hull_warp_common.cuh"
 #include "hull_dandc.cuh"
+#include "geometry.cuh"
 
 // ---------------------------------------------------------------------------
 // batch_hull_dandc
