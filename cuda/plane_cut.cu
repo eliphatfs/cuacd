@@ -24,24 +24,26 @@
 #define PC_EPS   1e-6f
 
 // ============================================================================
-// Edge comparator for warp_sort_t: sort by (x, y, z, index)
+// Edge2i — compact 8-byte edge struct (two vertex indices)
 // ============================================================================
+
+struct Edge2i {
+    int a, b;
+};
 
 #ifdef __cplusplus
 extern "C++" {
 #endif
 
-struct EdgeCmp {
-    static __device__ inline int cmp(BtPoint32 a, BtPoint32 b) {
-        if (a.x != b.x) return (a.x < b.x) ? -1 : 1;
-        if (a.y != b.y) return (a.y < b.y) ? -1 : 1;
-        if (a.z != b.z) return (a.z < b.z) ? -1 : 1;
-        if (a.index != b.index) return (a.index < b.index) ? -1 : 1;
+struct Edge2iCmp {
+    static __device__ inline int cmp(Edge2i x, Edge2i y) {
+        if (x.a != y.a) return (x.a < y.a) ? -1 : 1;
+        if (x.b != y.b) return (x.b < y.b) ? -1 : 1;
         return 0;
     }
-    static __device__ inline BtPoint32 sentinel() {
-        BtPoint32 s;
-        s.x = 0x7fffffff; s.y = 0x7fffffff; s.z = 0x7fffffff; s.index = 0x7fffffff;
+    static __device__ inline Edge2i sentinel() {
+        Edge2i s;
+        s.a = 0x7fffffff; s.b = 0x7fffffff;
         return s;
     }
 };
@@ -54,19 +56,17 @@ struct EdgeCmp {
 // Device helpers
 // ============================================================================
 
-// Binary search for (key_x, key_y) in sorted BtPoint32 array (sorted by EdgeCmp).
+// Binary search for (key_a, key_b) in sorted Edge2i array.
 // Returns index of first match, or -1.
-__device__ inline int pc_edge_bsearch(const BtPoint32* arr, int n, int key_x, int key_y) {
+__device__ inline int pc_edge_bsearch(const Edge2i* arr, int n, int key_a, int key_b) {
+    Edge2i key = {key_a, key_b};
     int lo = 0, hi = n - 1;
     while (lo <= hi) {
         int mid = (lo + hi) >> 1;
-        int mx = arr[mid].x, my = arr[mid].y;
-        if (mx < key_x || (mx == key_x && my < key_y))
-            lo = mid + 1;
-        else if (mx > key_x || (mx == key_x && my > key_y))
-            hi = mid - 1;
-        else
-            return mid;
+        int c = Edge2iCmp::cmp(arr[mid], key);
+        if (c < 0)       lo = mid + 1;
+        else if (c > 0)  hi = mid - 1;
+        else              return mid;
     }
     return -1;
 }
@@ -155,21 +155,21 @@ __global__ void plane_cut_kernel(
     int total_verts = n_verts + max_new_verts;
     int max_cross_edges = n_tris * 2;
     int max_out_tris = n_tris * 3;
-    // Sort scratch: max_cross_edges * sizeof(BtPoint32) + WS_MAX_STACK * 2 * sizeof(int)
-    int sort_scratch_bytes = max_cross_edges * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int);
+    // Sort scratch: max_cross_edges * sizeof(Edge2i) + WS_MAX_STACK * 2 * sizeof(int)
+    int sort_scratch_bytes = max_cross_edges * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
     // Dir edges + sort: max_out_tris * 3 edges per side, but we only use pos side
     int max_dir_edges = max_out_tris * 3;
-    int dir_sort_bytes = max_dir_edges * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int);
+    int dir_sort_bytes = max_dir_edges * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
 
     int scratch_bytes =
         ((n_verts * (int)sizeof(int)) + 15) / 16 * 16 +           // signs
         ((total_verts * 3 * (int)sizeof(float)) + 15) / 16 * 16 + // all_verts
-        ((max_cross_edges * (int)sizeof(BtPoint32)) + 15) / 16 * 16 + // crossing_edges
+        ((max_cross_edges * (int)sizeof(Edge2i)) + 15) / 16 * 16 + // crossing_edges
         ((sort_scratch_bytes + 15) / 16 * 16) +                   // sort scratch (reused)
         ((max_cross_edges * (int)sizeof(int)) + 15) / 16 * 16 +   // isect_idx (per sorted edge)
         ((max_out_tris * 3 * (int)sizeof(int)) + 15) / 16 * 16 +  // pos_tris
         ((max_out_tris * 3 * (int)sizeof(int)) + 15) / 16 * 16 +  // neg_tris
-        ((max_dir_edges * (int)sizeof(BtPoint32)) + 15) / 16 * 16 + // dir_edges
+        ((max_dir_edges * (int)sizeof(Edge2i)) + 15) / 16 * 16 + // dir_edges
         ((dir_sort_bytes + 15) / 16 * 16) +                        // dir sort scratch
         ((max_dir_edges * (int)sizeof(int)) + 15) / 16 * 16 +      // boundary flags
         // Phase 10-12 scratch (sequential, small):
@@ -200,12 +200,12 @@ __global__ void plane_cut_kernel(
 
     int* signs        = (int*)(base + off);   off += ALIGN16(n_verts * (int)sizeof(int));
     float* all_verts  = (float*)(base + off); off += ALIGN16(total_verts * 3 * (int)sizeof(float));
-    BtPoint32* cross_edges = (BtPoint32*)(base + off); off += ALIGN16(max_cross_edges * (int)sizeof(BtPoint32));
+    Edge2i* cross_edges = (Edge2i*)(base + off); off += ALIGN16(max_cross_edges * (int)sizeof(Edge2i));
     char* sort_scratch_buf = base + off;                off += ALIGN16(sort_scratch_bytes);
     int* isect_idx    = (int*)(base + off);   off += ALIGN16(max_cross_edges * (int)sizeof(int));
     int* pos_tris     = (int*)(base + off);   off += ALIGN16(max_out_tris * 3 * (int)sizeof(int));
     int* neg_tris     = (int*)(base + off);   off += ALIGN16(max_out_tris * 3 * (int)sizeof(int));
-    BtPoint32* dir_edges = (BtPoint32*)(base + off); off += ALIGN16(max_dir_edges * (int)sizeof(BtPoint32));
+    Edge2i* dir_edges = (Edge2i*)(base + off); off += ALIGN16(max_dir_edges * (int)sizeof(Edge2i));
     char* dir_sort_buf= base + off;                  off += ALIGN16(dir_sort_bytes);
     int* boundary_flags = (int*)(base + off); off += ALIGN16(max_dir_edges * (int)sizeof(int));
     int* loop_verts   = (int*)(base + off);   off += ALIGN16(max_dir_edges * (int)sizeof(int));
@@ -245,7 +245,7 @@ __global__ void plane_cut_kernel(
 
     // === Phase 3: Collect crossing edges ===
     // For each triangle, identify edges that cross the plane.
-    // Write canonical (min, max) as BtPoint32{x=min, y=max, z=0, index=0}.
+    // Write canonical (min, max) as Edge2i{a=min, b=max}.
     // Duplicates are fine — dedup after sort.
     for (int t = tid; t < n_tris; t += PC_BLOCK) {
         int i0 = triangles[t*3], i1 = triangles[t*3+1], i2 = triangles[t*3+2];
@@ -262,10 +262,8 @@ __global__ void plane_cut_kernel(
                 int mx = (va < vb) ? vb : va;
                 int ci = atomicAdd(&counters[0], 1);
                 if (ci < max_cross_edges) {
-                    cross_edges[ci].x = mn;
-                    cross_edges[ci].y = mx;
-                    cross_edges[ci].z = 0;
-                    cross_edges[ci].index = 0;
+                    cross_edges[ci].a = mn;
+                    cross_edges[ci].b = mx;
                 }
             }
         }
@@ -316,7 +314,7 @@ __global__ void plane_cut_kernel(
     // === Phase 4: Sort crossing edges (warp 0) ===
     if (warp_id == 0) {
         #ifdef __cplusplus
-        int serr = warp_sort_t<BtPoint32, EdgeCmp>(cross_edges, sort_scratch_buf, n_cross, lane);
+        int serr = warp_sort_t<Edge2i, Edge2iCmp>(cross_edges, sort_scratch_buf, n_cross, lane);
         #else
         int serr = 0;
         #endif
@@ -331,9 +329,9 @@ __global__ void plane_cut_kernel(
         int n_unique = 0;
         int cur_isect = n_verts; // intersection vertices start after original
         for (int i = 0; i < n_cross; i++) {
-            if (i == 0 || cross_edges[i].x != cross_edges[i-1].x || cross_edges[i].y != cross_edges[i-1].y) {
+            if (i == 0 || cross_edges[i].a != cross_edges[i-1].a || cross_edges[i].b != cross_edges[i-1].b) {
                 // New unique edge — create intersection vertex
-                int va = cross_edges[i].x, vb = cross_edges[i].y;
+                int va = cross_edges[i].a, vb = cross_edges[i].b;
                 int idx = cur_isect++;
                 pc_intersect(all_verts, va, vb, pa, pb, pc_n, pd, &all_verts[idx * 3]);
                 isect_idx[i] = idx;
@@ -465,16 +463,16 @@ __global__ void plane_cut_kernel(
     for (int t = tid; t < n_pos; t += PC_BLOCK) {
         int a = pos_tris[t*3], b = pos_tris[t*3+1], c = pos_tris[t*3+2];
         int base_i = t * 3;
-        dir_edges[base_i  ] = (BtPoint32){a, b, 0, base_i};
-        dir_edges[base_i+1] = (BtPoint32){b, c, 0, base_i+1};
-        dir_edges[base_i+2] = (BtPoint32){c, a, 0, base_i+2};
+        dir_edges[base_i  ] = (Edge2i){a, b};
+        dir_edges[base_i+1] = (Edge2i){b, c};
+        dir_edges[base_i+2] = (Edge2i){c, a};
     }
     __syncthreads();
 
     // === Phase 8: Sort directed edges (warp 0) ===
     if (warp_id == 0) {
         #ifdef __cplusplus
-        int serr = warp_sort_t<BtPoint32, EdgeCmp>(dir_edges, dir_sort_buf, n_de, lane);
+        int serr = warp_sort_t<Edge2i, Edge2iCmp>(dir_edges, dir_sort_buf, n_de, lane);
         #else
         int serr = 0;
         #endif
@@ -485,7 +483,7 @@ __global__ void plane_cut_kernel(
     // === Phase 9: Binary search for boundary edges ===
     // A directed edge (a,b) is boundary if reverse (b,a) is not in the sorted array.
     for (int i = tid; i < n_de; i += PC_BLOCK) {
-        int a = dir_edges[i].x, b = dir_edges[i].y;
+        int a = dir_edges[i].a, b = dir_edges[i].b;
         int rev = pc_edge_bsearch(dir_edges, n_de, b, a);
         boundary_flags[i] = (rev < 0) ? 1 : 0;
     }
@@ -499,8 +497,8 @@ __global__ void plane_cut_kernel(
             if (boundary_flags[i]) {
                 // Reuse loop_verts for boundary edge storage: pairs (a, b)
                 // Store as: loop_verts[nb*2] = a, loop_verts[nb*2+1] = b
-                loop_verts[nb*2] = dir_edges[i].x;
-                loop_verts[nb*2+1] = dir_edges[i].y;
+                loop_verts[nb*2] = dir_edges[i].a;
+                loop_verts[nb*2+1] = dir_edges[i].b;
                 nb++;
             }
         }

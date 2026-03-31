@@ -303,7 +303,7 @@ Generic warp-cooperative quicksort template. All 32 lanes participate. Uses a gl
 
 **Template API**: `warp_sort_t<T, Cmp>(data, scratch, n, lane)` where `T` is any POD type with `sizeof(T) % 4 == 0`, and `Cmp` is a struct with `static __device__ int cmp(T, T)` (returns -1/0/1) and `static __device__ T sentinel()`. Generic shuffles via `ws_shfl_xor_t<T>` / `ws_shfl_t<T>` use a union-based approach to shuffle each 4-byte field. Template code is wrapped in `extern "C++"` to work inside `kernels.cu`'s `extern "C"` block.
 
-**Comparators**: `BtPoint32Cmp` sorts by (y,x,z,index) — used by D&C hull. `EdgeCmp` (in plane_cut.cu) sorts by (x,y,z,index) — used for directed edge sorting. **Legacy API**: `warp_sort_bp32`, `ws_cmp`, `ws_min`, `ws_max`, `ws_bitonic32` are thin wrappers calling the template with `BtPoint32Cmp`.
+**Comparators**: `BtPoint32Cmp` sorts by (y,x,z,index) — used by D&C hull. `Edge2iCmp` (in plane_cut.cu) sorts `Edge2i` structs (8 bytes: two ints `a,b`) by (a,b) — used for crossing edge dedup and directed edge boundary detection. **Legacy API**: `warp_sort_bp32`, `ws_cmp`, `ws_min`, `ws_max`, `ws_bitonic32` are thin wrappers calling the template with `BtPoint32Cmp`.
 
 ### btpool: Eager Warp-Parallel Init, No Lazy Allocation
 
@@ -371,7 +371,7 @@ Every expansion block allocates O(n_verts) pool space for mesh copies + hull out
 ### Plane Cut Kernel (plane_cut.cu) — Working
 - GPU kernel `plane_cut_kernel`: 1 block × 64 threads (2 warps), handles one plane cut
 - Parallel phases: vertex classification, crossing edge collection, triangle splitting (with sorted edge dedup), directed edge collection, boundary detection (sort + binary search)
-- Warp 0 phases: sort crossing edges and directed edges via `warp_sort_t<BtPoint32, EdgeCmp>`
+- Warp 0 phases: sort crossing edges and directed edges via `warp_sort_t<Edge2i, Edge2iCmp>`
 - Thread 0 sequential phases: boundary loop reconstruction, multi-hole bridging (sorted by rightmost vertex), ear clipping with bridge-duplicate-aware point-in-triangle
 - Cap winding determined from 2D projection convention (`e_pu × e_pv` cross product direction)
 - Tested: simple loop (cube cuts on all axes, off-center, sphere), non-convex cap (L-shape), ring topology (hollow tube), multi-hole (box with 2 through-holes), edge cases (plane through vertex/edge, diagonal plane) — 14 tests pass
