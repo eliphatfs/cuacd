@@ -468,8 +468,6 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
     // We report max of those two.
     int sort_scratch = BT_ALIGN16(n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int));
     int postsort = 0;
-    // postsort: originalVertices pointer array
-    postsort += BT_ALIGN16(n * (int)sizeof(BtVertex*));
     // postsort: pre-allocated vertex block
     postsort += BT_ALIGN16(n * (int)sizeof(BtVertex));
     // edgePool block (btpool_init, one block of 6n edges)
@@ -497,7 +495,7 @@ struct BtHullState {
     float scaling[3];
     float center[3];
     BtPool edgePool;
-    BtVertex** originalVertices;
+    BtVertex* vertexBase;
     int mergeStamp;
     int minAxis, medAxis, maxAxis;
     int usedEdgePairs;
@@ -1025,7 +1023,7 @@ __device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtInte
         result->minYx = NULL; result->maxYx = NULL;
         return;
     case 2: {
-        BtVertex* v = s->originalVertices[start];
+        BtVertex* v = &s->vertexBase[start];
         BtVertex* w = v + 1;
         if (bp32_ne(v->point, w->point)) {
             int dx = v->point.x - w->point.x;
@@ -1058,7 +1056,7 @@ __device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtInte
     }
     // fallthrough
     case 1: {
-        BtVertex* v = s->originalVertices[start];
+        BtVertex* v = &s->vertexBase[start];
         v->edges = NULL;
         v->next = v; v->prev = v;
         result->minXy = v; result->maxXy = v;
@@ -1102,9 +1100,9 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
             }
 
             int split0 = item.start + n / 2;
-            BtPoint32 p = s->originalVertices[split0 - 1]->point;
+            BtPoint32 p = s->vertexBase[split0 - 1].point;
             int split1 = split0;
-            while ((split1 < item.end) && bp32_eq(s->originalVertices[split1]->point, p)) split1++;
+            while ((split1 < item.end) && bp32_eq(s->vertexBase[split1].point, p)) split1++;
 
             // Push stage-1 merge item
             BtDCStackItem merge_item;
@@ -1518,21 +1516,16 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
 
 // Post-sort: allocate pools (all lanes), init vertices (all lanes), D&C (lane 0).
 __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count, int lane) {
-    // Lane 0: allocate origVerts and vblock
+    // Lane 0: allocate vblock
     BtVertex* vblock = NULL;
-    BtVertex** origVerts = NULL;
     if (lane == 0) {
-        origVerts = (BtVertex**)bt_alloc(s->wp, count * (int)sizeof(BtVertex*));
-        s->originalVertices = origVerts;
-        if (origVerts)
-            vblock = (BtVertex*)bt_alloc(s->wp, count * (int)sizeof(BtVertex));
+        vblock = (BtVertex*)bt_alloc(s->wp, count * (int)sizeof(BtVertex));
+        s->vertexBase = vblock;
     }
-    // Broadcast pointers
+    // Broadcast pointer
     long long vb = __shfl_sync(WARP_MASK, (long long)vblock, 0);
-    long long ov = __shfl_sync(WARP_MASK, (long long)origVerts, 0);
     vblock = (BtVertex*)vb;
-    origVerts = (BtVertex**)ov;
-    if (!vblock || !origVerts) return;
+    if (!vblock) return;
 
     // All lanes: init vertices in parallel
     BtInt128 zero128 = bt128_from_u64(0);
@@ -1547,7 +1540,6 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         v->point128.y = zero128;
         v->point128.z = zero128;
         v->point128.den = one128;
-        origVerts[i] = v;
     }
     __syncwarp();
 
