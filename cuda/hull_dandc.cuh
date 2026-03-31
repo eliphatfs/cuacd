@@ -431,12 +431,10 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 // Constants
 // ============================================================================
 
-#define BT_DFS_MAX_STACK 4096
 #define BT_DC_MAX_STACK  4096
 
 // Error codes (distinct from pool OOM = 1)
 #define BT_ERR_SORT_STACK  2
-#define BT_ERR_DFS_STACK   3
 
 // ============================================================================
 // Scratch size calculation
@@ -446,10 +444,9 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 #define BT_ALIGN16(x) (((x) + 15) & ~15)
 
 // Compute total WarpPool scratch bytes needed for D&C hull with n points.
-// Sort scratch is rewound after sort. Postsort: vblock + edgePool persist,
-// then D&C stack, volume DFS stack, and mesh extraction stacks are each
-// rewound after use, so they share the same high-water space.
-// Peak = presort + max(sort_scratch, postsort_persistent + max(rewindable_phases)).
+// Sort scratch is rewound after sort. D&C stack is rewound after computeInternal.
+// Volume/mesh BFS queues are allocated after D&C rewind, sharing that space.
+// Peak = presort + max(sort_scratch, persistent + max(dc_stack, bfs_queues)).
 __host__ __device__ inline int dandc_scratch_bytes(int n) {
     int total = 0;
     // presort: BtPoint32 array (persists through sort, NOT rewound)
@@ -463,20 +460,14 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
     // edgePool block (persists)
     postsort_persistent += BT_ALIGN16(6 * n * (int)sizeof(BtEdge));
 
-    // These three phases are each rewound after use, so only the max matters:
-    // Phase A: bt_computeInternal D&C stack
+    // These phases share space via rewind:
+    // Phase A: D&C stack (rewound after bt_computeInternal)
     int phase_dc = BT_ALIGN16(BT_DC_MAX_STACK * (int)sizeof(BtDCStackItem));
-    // Phase B: bt_extractMesh DFS stack + ordered_verts
-    int phase_mesh = BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*))
-                   + BT_ALIGN16(n * (int)sizeof(BtVertex*));
-    // Phase C: bt_computeVolume DFS stack
-    int phase_vol = BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
+    // Phase B: BFS queues for mesh extraction + volume (each n * sizeof(BtVertex*))
+    // mesh extraction queue is rewound before volume queue is allocated
+    int phase_bfs = BT_ALIGN16(n * (int)sizeof(BtVertex*));
 
-    // Max of the three rewindable phases
-    int rewindable_peak = phase_dc;
-    if (phase_mesh > rewindable_peak) rewindable_peak = phase_mesh;
-    if (phase_vol > rewindable_peak) rewindable_peak = phase_vol;
-
+    int rewindable_peak = phase_dc > phase_bfs ? phase_dc : phase_bfs;
     int postsort = postsort_persistent + rewindable_peak;
 
     total += (sort_scratch > postsort) ? sort_scratch : postsort;
@@ -497,6 +488,9 @@ struct BtHullState {
     int mergeStamp;
     int minAxis, medAxis, maxAxis;
     int usedEdgePairs;
+#ifdef TRACK_MAX_EDGE_PAIRS
+    int maxEdgePairs;
+#endif
     BtVertex* vertexList;
     WarpPool* wp;
 };
@@ -518,6 +512,11 @@ __device__ inline BtEdge* bt_newEdgePair(BtHullState* s, BtVertex* from, BtVerte
     e->next = NULL; e->prev = NULL;
     r->next = NULL; r->prev = NULL;
     s->usedEdgePairs++;
+#ifdef TRACK_MAX_EDGE_PAIRS
+    if (s->usedEdgePairs > s->maxEdgePairs) {
+        s->maxEdgePairs = s->usedEdgePairs;
+    }
+#endif
     return e;
 }
 
@@ -1171,58 +1170,46 @@ struct BtPointCmp {
 __device__ inline float bt_computeVolume(BtHullState* s) {
     if (!s->vertexList) return 0.0f;
 
-    int stamp = --s->mergeStamp;
+    // BFS over vertices (Bullet getVertexCopy pattern).
+    // Queue size bounded by number of hull vertices (≤ n), no stack overflow possible.
+    int vstamp = --s->mergeStamp;  // vertex visited stamp
+    int fstamp = --s->mergeStamp;  // face/edge visited stamp
 
-    // Use pool for DFS stack
-    // Count vertices first (traverse linked list)
-    int vcount = 0;
-    {
-        BtVertex* v = s->vertexList;
-        v->copy = stamp;
-        vcount = 1;
-        // Walk edges to count reachable vertices
-        // We'll use a simple DFS with a pre-allocated stack
-    }
+    // Allocate BFS queue from pool (n vertex pointers)
+    int n_verts_max = (int)((s->edgePool.blockSize + 5) / 6);  // n from 6*n edge pool
+    BtVertex** queue = (BtVertex**)bt_alloc(s->wp, n_verts_max * (int)sizeof(BtVertex*));
+    if (!queue) return -1.0f;
+    int qhead = 0, qtail = 0;
 
-    // Allocate a stack of vertex pointers
-    BtVertex** stack = (BtVertex**)bt_alloc(s->wp, BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
-    if (!stack) return -1.0f;
-
-    s->vertexList->copy = stamp;
-    stack[0] = s->vertexList;
-    int stackSize = 1;
+    s->vertexList->copy = vstamp;
+    queue[qtail++] = s->vertexList;
 
     BtPoint32 ref = s->vertexList->point;
     BtInt128 volume = bt128_from_u64(0);
 
-    while (stackSize > 0) {
-        BtVertex* v = stack[--stackSize];
+    while (qhead < qtail) {
+        BtVertex* v = queue[qhead++];
         BtEdge* e = v->edges;
         if (!e) continue;
         do {
-            if (e->target->copy != stamp) {
-                e->target->copy = stamp;
-                if (stackSize >= BT_DFS_MAX_STACK) {
-                    s->wp->error = BT_ERR_DFS_STACK;
-                    return -1.0f;
-                }
-                stack[stackSize++] = e->target;
+            if (e->target->copy != vstamp) {
+                e->target->copy = vstamp;
+                queue[qtail++] = e->target;
             }
-            if (e->copy != stamp) {
+            if (e->copy != fstamp) {
                 // Walk face: fan-triangulate from first vertex
                 BtVertex* a = NULL;
                 BtVertex* b = NULL;
                 BtEdge* f = e;
                 do {
                     if (a && b) {
-                        // Triangle: (v, a, b) — compute signed tet volume with ref
                         BtPoint32 va = bp32_sub(v->point, ref);
                         BtPoint32 pa = bp32_sub(a->point, ref);
                         BtPoint32 pb = bp32_sub(b->point, ref);
                         long long vol = bp32_dot64(va, bp32_cross(pa, pb));
                         volume = bt128_add(volume, bt128_from_i64(vol));
                     }
-                    f->copy = stamp;
+                    f->copy = fstamp;
                     a = b;
                     b = f->target;
                     f = f->reverse->prev;
@@ -1232,9 +1219,6 @@ __device__ inline float bt_computeVolume(BtHullState* s) {
         } while (e != v->edges);
     }
 
-    // Volume is in integer coordinates.
-    // Convert: float_volume = |volume_sum| * |sx * sy * sz| / 6.0
-    // where scaling = (max-min)/10216 with axis permutation.
     float sv = bt128_to_float(volume);
     float scale = s->scaling[0] * s->scaling[1] * s->scaling[2];
     float vol = fabsf(sv * scale) / 6.0f;
@@ -1245,9 +1229,9 @@ __device__ inline float bt_computeVolume(BtHullState* s) {
 // Mesh extraction from half-edge hull (lane 0 only, after bt_computeVolume)
 // ============================================================================
 
-// bt_extractMesh: DFS over the half-edge graph, assigns sequential indices to
-// vertices, converts BtPoint32/rational back to float world space, and
-// fan-triangulates each face.
+// bt_extractMesh: BFS over the half-edge graph (Bullet pattern), assigns
+// sequential indices to vertices, converts BtPoint32 back to float world
+// space, and fan-triangulates each face. No DFS stack needed.
 //
 // Axis permutation (same as bt_compute_presort):
 //   BtPoint32.x == medAxis world coordinate
@@ -1265,103 +1249,38 @@ __device__ inline int bt_extractMesh(BtHullState* s,
 
     if (!s->vertexList) return 0;
 
-    int stamp = --s->mergeStamp;
-
-    // Allocate DFS stack from pool
-    BtVertex** stack = (BtVertex**)bt_alloc(s->wp, BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
-    if (!stack) return -1;
-
-    // Allocate vertex index map: maps a vertex's sequential position back via copy field
-    // We use copy to store (stamp<<16 | vertex_index) but copy is only int.
-    // Simpler: allocate a separate int array of size max_verts, indexed by vertex order.
-    // We'll assign indices as we first visit each vertex, stored directly in v->copy.
-    // (copy values from previous calls have different stamps so we can distinguish.)
-
+    // BFS vertex discovery (Bullet getVertexCopy pattern).
+    // Queue doubles as ordered_verts for vertex emission and face iteration.
+    int n_verts_max = (int)((s->edgePool.blockSize + 5) / 6);
+    BtVertex** queue = (BtVertex**)bt_alloc(s->wp, n_verts_max * (int)sizeof(BtVertex*));
+    if (!queue) return -1;
     int n_verts = 0;
     int n_tris  = 0;
 
-    s->vertexList->copy = stamp; // mark as visited (index not yet assigned)
-    stack[0] = s->vertexList;
-    int stackSize = 1;
-
-    // First DFS pass: assign indices and emit vertices
-    // We need two passes or inline assignment. Use inline: assign on first encounter during edge walk.
-    // Reset copy to stamp-1 to indicate "visited but not indexed yet" — but that's fragile.
-    // Instead: use a separate array. Allocate int* vindex from pool.
-    // But vertices are pool-allocated with no stable integer ID...
-    // Best approach: do vertex indexing inline. When we first see a vertex (copy != stamp),
-    // set copy = stamp and store index in a separate array keyed by arrival order.
-    // We don't know the vertex count in advance, so just write vertices as we go.
-
-    // Re-start DFS cleanly:
-    // Reset stamp usage: use a fresh stamp for indexing.
-    // We'll use a two-step approach:
-    //   copy == stamp     -> vertex has been indexed, index = (copy_extra array)
-    // Since we can't embed the index in copy without losing the stamp info,
-    // allocate a BtVertex** ordered array to map order->vertex, then do two passes.
-    // But that requires knowing count first.
-    //
-    // Simplest correct approach: use copy to store (index + 1) using a stamp offset trick.
-    // Assign: v->copy = stamp_base + index, where stamp_base is a large negative number
-    // chosen to not collide with normal stamps.
-    // mergeStamp starts at -3 and goes negative. Let's use stamp directly as base.
-    // We'll encode: v->copy = stamp - n_verts (unique per stamp call).
-    // Then index = stamp - v->copy.
-    // But we also need a way to check "has been visited" vs "not visited".
-    // "Not visited" means copy != in range [stamp - max_verts, stamp].
-    // This is messy.
-    //
-    // Cleanest: allocate a BtVertex* ordered_verts[max_verts] from pool.
-    // Walk the graph twice: first to assign indices (copy=stamp), second to emit triangles.
-
-    BtVertex** ordered_verts = (BtVertex**)bt_alloc(s->wp, max_verts * (int)sizeof(BtVertex*));
-    if (!ordered_verts) return -1;
-
-    // Pass 1: assign vertex indices via DFS
-    // stamp is already decremented; use it as the "visited" marker.
-    // Encode vertex index in copy: copy = stamp * MAX + index would overflow.
-    // Use: copy >= stamp means visited (since mergeStamp only decrements).
-    // Actually stamp is negative and decreasing, so stamp < stamp_prev.
-    // We need copy == stamp to mean "visited in this call".
-    // Store index separately: ordered_verts[n_verts++] = v, then v->copy = stamp.
-
-    stackSize = 0;
-    // Fresh stamp for pass 1 (vertex discovery)
     int vstamp = --s->mergeStamp;
     s->vertexList->copy = vstamp;
-    ordered_verts[n_verts] = s->vertexList;
-    n_verts++;
-    stack[0] = s->vertexList;
-    stackSize = 1;
+    queue[n_verts++] = s->vertexList;
 
-    while (stackSize > 0) {
-        BtVertex* v = stack[--stackSize];
+    // Pass 1: BFS to discover all hull vertices via edge walks
+    int qhead = 0;
+    while (qhead < n_verts) {
+        BtVertex* v = queue[qhead++];
         BtEdge* e = v->edges;
         if (!e) continue;
         do {
             if (e->target->copy != vstamp) {
                 e->target->copy = vstamp;
                 if (n_verts >= max_verts) return -1;
-                ordered_verts[n_verts++] = e->target;
-                if (stackSize >= BT_DFS_MAX_STACK) {
-                    s->wp->error = BT_ERR_DFS_STACK;
-                    return -1;
-                }
-                stack[stackSize++] = e->target;
+                queue[n_verts++] = e->target;
             }
             e = e->next;
         } while (e != v->edges);
     }
 
-    // Build reverse map: pointer -> index via copy field
-    // Reuse vstamp: set v->copy = vstamp | (index << something)... copy is int.
-    // Instead, use a hash or linear search. For simplicity: store index in copy directly.
-    // Since vstamp is negative and index >= 0, use copy = vstamp - index - 1.
-    // Then index = vstamp - v->copy - 1. Check: copy == vstamp means index = -1 (invalid).
-    // Assign a new stamp for the index encoding.
-    int idx_base = --s->mergeStamp; // idx_base - index -> copy value
+    // Encode vertex index in copy field: copy = idx_base - index
+    int idx_base = --s->mergeStamp;
     for (int i = 0; i < n_verts; i++) {
-        ordered_verts[i]->copy = idx_base - i;
+        queue[i]->copy = idx_base - i;
     }
 
     // Emit vertices to out_verts
@@ -1371,9 +1290,8 @@ __device__ inline int bt_extractMesh(BtHullState* s,
     int medAx = s->medAxis, maxAx = s->maxAxis, minAx = s->minAxis;
 
     for (int i = 0; i < n_verts; i++) {
-        BtVertex* v = ordered_verts[i];
+        BtVertex* v = queue[i];
         float xyz[3];
-        // BtPoint32.x == medAx, .y == maxAx, .z == minAx
         xyz[medAx] = bv_xval(v) * sc[medAx] + cen[medAx];
         xyz[maxAx] = bv_yval(v) * sc[maxAx] + cen[maxAx];
         xyz[minAx] = bv_zval(v) * sc[minAx] + cen[minAx];
@@ -1382,40 +1300,20 @@ __device__ inline int bt_extractMesh(BtHullState* s,
         out_verts[i * 3 + 2] = xyz[2];
     }
 
-    // Pass 2: emit triangles via face DFS (use a fresh stamp for edge/face marking)
+    // Pass 2: emit triangles — iterate discovered vertices, fan-triangulate each face
     int fstamp = --s->mergeStamp;
-    stackSize = 0;
-    s->vertexList->copy = idx_base; // vertex 0 is already indexed; just use to restart DFS
-    // We need to visit faces, not vertices. Walk edges, mark edges with fstamp.
-    // Reuse stack for vertex DFS but check edge copy for face emission.
-
-    // Reset vertex copy back to idx_base encoding (already set above).
-    // For face DFS we need to visit each vertex's edge ring once.
-    // Use a vertex-visit stamp separate from face stamp.
-    int vdfs_stamp = --s->mergeStamp;
-    s->vertexList->copy = vdfs_stamp; // mark as visited for DFS
-    stack[0] = s->vertexList;
-    stackSize = 1;
-    // But we also need the index... copy is now vdfs_stamp, losing idx_base encoding.
-    // Solution: use ordered_verts array to get index: idx = idx_base - v->copy before overwrite.
-    // Actually we already have the vertices in ordered_verts. Let's just do face iteration differently.
-
-    // Simplest: iterate over ordered_verts, for each vertex walk its edge ring,
-    // for each edge emit its face if not already emitted (edge->copy != fstamp).
     for (int i = 0; i < n_verts; i++) {
-        BtVertex* v = ordered_verts[i];
+        BtVertex* v = queue[i];
         BtEdge* e = v->edges;
         if (!e) continue;
         do {
             if (e->copy != fstamp) {
-                // Emit this face: fan-triangulate from v
-                // Walk face: e->reverse->prev gives next edge in face
+                // Fan-triangulate this face from v
                 BtVertex* a = NULL;
                 BtVertex* b = NULL;
                 BtEdge* f = e;
                 do {
                     if (a && b) {
-                        // Triangle: (v, a, b)
                         if (n_tris >= max_tris) return -1;
                         int vi = idx_base - v->copy;
                         int ai = idx_base - a->copy;
@@ -1547,6 +1445,9 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     // Lane 0: D&C
     if (lane == 0) {
         s->usedEdgePairs = 0;
+#ifdef TRACK_MAX_EDGE_PAIRS
+        s->maxEdgePairs = 0;
+#endif
         s->mergeStamp = -3;
 
         // Save offset before D&C stack allocation so we can rewind after
@@ -1619,6 +1520,10 @@ __device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* po
             vol = bt_computeVolume(&state);
             if (pool->error) { *err = pool->error; vol = -1.0f; }
         }
+#ifdef TRACK_MAX_EDGE_PAIRS
+        printf("EDGE_TRACK n=%d maxEdgePairs=%d pool=%d final=%d\n",
+               n, state.maxEdgePairs, state.edgePool.blockSize, state.usedEdgePairs);
+#endif
     }
 
     // Broadcast results from lane 0
@@ -1695,8 +1600,7 @@ __device__ float hull_dandc_warp_mesh(
             *err = pool->error;
             vol = -1.0f;
         } else {
-            // Extract mesh first (uses the hull graph)
-            // Save offset so we can rewind mesh extraction stacks before volume
+            // Extract mesh first (allocates BFS queue from pool)
             int pre_mesh_offset = pool->offset;
             if (out_verts && out_tris && n_hull_verts && n_hull_tris) {
                 int mesh_err = bt_extractMesh(&state,
@@ -1708,7 +1612,7 @@ __device__ float hull_dandc_warp_mesh(
                     vol = -1.0f;
                 }
             }
-            // Rewind mesh extraction stacks (DFS stack + ordered_verts)
+            // Rewind BFS queue before volume computation allocates its own
             bt_rewind(pool, pre_mesh_offset);
             if (!pool->error && vol >= 0.0f) {
                 vol = bt_computeVolume(&state);

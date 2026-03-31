@@ -84,9 +84,13 @@ def _fatbin_gencode_flags():
 def _compile_fatbin(cuda_home, cu_file, fatbin_file, build_dir):
     nvcc = os.path.join(cuda_home, "bin", "nvcc")
     os.makedirs(build_dir, exist_ok=True)
+    extra_defines = []
+    if os.environ.get("COACD_TRACK_EDGES"):
+        extra_defines.append("-DTRACK_MAX_EDGE_PAIRS")
     subprocess.check_call([
         nvcc, cu_file, "--fatbin", "-O3", "--use_fast_math",
         "--generate-line-info",
+        *extra_defines,
         *_fatbin_gencode_flags(), "-o", fatbin_file,
     ])
 
