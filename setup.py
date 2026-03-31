@@ -88,7 +88,7 @@ def _compile_fatbin(cuda_home, cu_file, fatbin_file, build_dir):
         nvcc, cu_file, "--fatbin", "-O3", "--use_fast_math",
         "--generate-line-info",
         *_fatbin_gencode_flags(), "-o", fatbin_file,
-    ], cwd=build_dir)
+    ])
 
 
 def _fatbin_to_header(fatbin_file, header_file, symbol_name):

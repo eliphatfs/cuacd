@@ -110,6 +110,57 @@ static PyObject* py_run(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// run_v2(verts_ptr, n_verts, tris_ptr, n_tris,
+//        hull_verts_ptr, n_hull_verts, hull_tris_ptr, n_hull_tris,
+//        hull_volume, scratch_size,
+//        beam_width, cuts_per_axis, threshold, rv_k,
+//        max_parts, max_iterations, hausdorff_samples) -> int (num_parts)
+// ---------------------------------------------------------------------------
+
+static PyObject* py_run_v2(PyObject* self, PyObject* args) {
+    unsigned long long verts_ptr, tris_ptr, hull_verts_ptr, hull_tris_ptr;
+    int n_verts, n_tris, n_hull_verts, n_hull_tris;
+    float hull_volume;
+    unsigned long long scratch_size;
+    int beam_width, cuts_per_axis, max_parts, max_iterations, hausdorff_samples;
+    float threshold, rv_k;
+
+    if (!PyArg_ParseTuple(args, "KiKiKiKifKiiffiii",
+            &verts_ptr, &n_verts,
+            &tris_ptr, &n_tris,
+            &hull_verts_ptr, &n_hull_verts,
+            &hull_tris_ptr, &n_hull_tris,
+            &hull_volume, &scratch_size,
+            &beam_width, &cuts_per_axis,
+            &threshold, &rv_k,
+            &max_parts, &max_iterations, &hausdorff_samples))
+        return NULL;
+
+    REQUIRE_CTX();
+
+    beam_params_t params;
+    params.beam_width = beam_width;
+    params.cuts_per_axis = cuts_per_axis;
+    params.threshold = threshold;
+    params.rv_k = rv_k;
+    params.max_parts = max_parts;
+    params.max_iterations = max_iterations;
+    params.hausdorff_samples = hausdorff_samples;
+
+    int rc = beam_run_v2(g_state.ctx,
+                         (const float*)(uintptr_t)verts_ptr, n_verts,
+                         (const int*)(uintptr_t)tris_ptr, n_tris,
+                         (const float*)(uintptr_t)hull_verts_ptr, n_hull_verts,
+                         (const int*)(uintptr_t)hull_tris_ptr, n_hull_tris,
+                         hull_volume, (size_t)scratch_size,
+                         &params);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+
+    int num_parts = beam_get_num_parts(g_state.ctx);
+    return PyLong_FromLong(num_parts);
+}
+
+// ---------------------------------------------------------------------------
 // get_part_sizes(part_idx) -> (n_verts, n_tris)
 // ---------------------------------------------------------------------------
 
@@ -457,6 +508,36 @@ static PyObject* py_batch_mesh_volume(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// batch_hull_dandc_mesh(pts_ptr, total_pts, offsets_ptr, n_hulls,
+//   max_pts_per_hull, max_hull_verts, max_hull_tris,
+//   vols_ptr, errs_ptr, verts_ptr, tris_ptr, vc_ptr, tc_ptr) -> None
+// ---------------------------------------------------------------------------
+
+static PyObject* py_batch_hull_dandc_mesh(PyObject* self, PyObject* args) {
+    unsigned long long pts_ptr, offsets_ptr, vols_ptr, errs_ptr;
+    unsigned long long verts_ptr, tris_ptr, vc_ptr, tc_ptr;
+    int total_pts, n_hulls, max_pts_per_hull, max_hull_verts, max_hull_tris;
+    if (!PyArg_ParseTuple(args, "KiKiiiiKKKKKK",
+            &pts_ptr, &total_pts, &offsets_ptr, &n_hulls,
+            &max_pts_per_hull, &max_hull_verts, &max_hull_tris,
+            &vols_ptr, &errs_ptr, &verts_ptr, &tris_ptr, &vc_ptr, &tc_ptr))
+        return NULL;
+    REQUIRE_CTX();
+    int rc = beam_batch_hull_dandc_mesh(g_state.ctx,
+        (const float*)(uintptr_t)pts_ptr, total_pts,
+        (const int*)(uintptr_t)offsets_ptr, n_hulls,
+        max_pts_per_hull, max_hull_verts, max_hull_tris,
+        (float*)(uintptr_t)vols_ptr,
+        (int*)(uintptr_t)errs_ptr,
+        (float*)(uintptr_t)verts_ptr,
+        (int*)(uintptr_t)tris_ptr,
+        (int*)(uintptr_t)vc_ptr,
+        (int*)(uintptr_t)tc_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -464,6 +545,7 @@ static PyMethodDef gpu_methods[] = {
     { "init",                   py_init,                   METH_VARARGS, "Initialize GPU context." },
     { "destroy",                py_destroy,                METH_NOARGS,  "Destroy GPU context." },
     { "run",                    py_run,                    METH_VARARGS, "Run beam search decomposition." },
+    { "run_v2",                 py_run_v2,                 METH_VARARGS, "Run V2 beam search (3-kernel)." },
     { "get_part_sizes",         py_get_part_sizes,         METH_VARARGS, "Get part vertex/triangle counts." },
     { "get_part",               py_get_part,               METH_VARARGS, "Copy part data to buffers." },
     { "point_mesh_distances",   py_point_mesh_distances,   METH_VARARGS, "Compute point-to-mesh distances." },
@@ -481,6 +563,7 @@ static PyMethodDef gpu_methods[] = {
     { "test_warp_sort",             py_test_warp_sort,             METH_VARARGS, "Test warp sort BtPoint32." },
     { "batch_hull_volume",          py_batch_hull_volume,          METH_VARARGS, "Batch hull volume (three algorithms)." },
     { "batch_mesh_volume",          py_batch_mesh_volume,          METH_VARARGS, "Batch mesh volume (divergence theorem)." },
+    { "batch_hull_dandc_mesh",      py_batch_hull_dandc_mesh,      METH_VARARGS, "Batch D&C hull volume + mesh extraction." },
     { NULL, NULL, 0, NULL }
 };
 

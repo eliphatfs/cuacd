@@ -32,6 +32,33 @@ struct BeamItem {
     int cut_count;
 };
 
+// ============================================================================
+// New beam search data structures (V2)
+// ============================================================================
+
+#define EXPANSION_BLOCK_SIZE 64
+#define HAUSDORFF_BLOCK_SIZE 256
+#define MAX_BEAM_V2 64
+
+struct PartInfoV2 {
+    int vert_offset, vert_count;
+    int tri_offset, tri_count;
+    int hull_vert_offset, hull_vert_count;
+    int hull_tri_offset, hull_tri_count;
+    float bbox[6];       // xmin,xmax,ymin,ymax,zmin,zmax
+    float rv_cost;
+    float hausdorff;     // -1 = not yet computed
+    float mesh_volume;
+    float hull_volume;
+};
+
+struct WorkItem {
+    int part_indices[MAX_PARTS_PER_BEAM];  // indirect into PartInfoV2 array
+    int num_parts;
+    int worst_part_idx;    // index into part_indices
+    float worst_metric;    // max(rv, hausdorff) of worst part
+};
+
 struct DevicePool {
     char*         base;
     unsigned int* offset;

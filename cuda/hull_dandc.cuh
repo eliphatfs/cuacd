@@ -471,6 +471,12 @@ __device__ inline void* bt_alloc(WarpPool* wp, int bytes) {
     return ptr;
 }
 
+// Rewind WarpPool to a saved offset (lane 0 only).
+// Use to free the last allocation(s) back to the pool.
+__device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
+    wp->offset = saved_offset;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -490,27 +496,48 @@ __device__ inline void* bt_alloc(WarpPool* wp, int bytes) {
 #define BT_ALIGN16(x) (((x) + 15) & ~15)
 
 // Compute total WarpPool scratch bytes needed for D&C hull with n points.
-// Matches all bt_alloc / btpool_init allocations in presort, sort, postsort, volume.
+// Sort scratch is allocated then freed (rewound) so it doesn't count toward
+// the peak — only the max(sort_scratch, postsort_allocs) matters.
+// Since postsort allocs are always larger than sort scratch for n >= ~10,
+// we just count everything after sort rewind.
 __host__ __device__ inline int dandc_scratch_bytes(int n) {
     int total = 0;
-    // presort: BtPoint32 array
+    // presort: BtPoint32 array (persists through sort, NOT rewound)
     total += BT_ALIGN16(n * (int)sizeof(BtPoint32));
     // sort scratch: tmp array + two stack arrays
-    total += BT_ALIGN16(n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int));
+    // This IS rewound after sort, but we still need space for it at peak.
+    // Peak = presort + max(sort_scratch, postsort_onwards).
+    // Sort scratch = n*16 + WS_MAX_STACK*8.  Postsort onwards is much larger.
+    // So sort scratch doesn't increase peak. We include it for safety anyway
+    // since the rewind only saves space when postsort > sort scratch.
+    // Actually: presort (points) is NOT freed before sort, and sort uses
+    // the same points array. Sort scratch is separate.  After sort, we rewind
+    // the sort scratch. Then postsort allocates on top of presort.
+    // So peak = presort + sort_scratch during sort phase,
+    //    or    presort + postsort_onwards after rewind.
+    // We report max of those two.
+    int sort_scratch = BT_ALIGN16(n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int));
+    int postsort = 0;
     // postsort: originalVertices pointer array
-    total += BT_ALIGN16(n * (int)sizeof(BtVertex*));
+    postsort += BT_ALIGN16(n * (int)sizeof(BtVertex*));
     // postsort: pre-allocated vertex block
-    total += BT_ALIGN16(n * (int)sizeof(BtVertex));
+    postsort += BT_ALIGN16(n * (int)sizeof(BtVertex));
     // vertexPool block (btpool_init, one block of n vertices)
-    total += BT_ALIGN16(n * (int)sizeof(BtVertex));
+    postsort += BT_ALIGN16(n * (int)sizeof(BtVertex));
     // edgePool block (btpool_init, one block of 6n edges)
-    total += BT_ALIGN16(6 * n * (int)sizeof(BtEdge));
+    postsort += BT_ALIGN16(6 * n * (int)sizeof(BtEdge));
     // facePool block (btpool_init, one block of 2n faces)
-    total += BT_ALIGN16(2 * n * (int)sizeof(BtFace));
+    postsort += BT_ALIGN16(2 * n * (int)sizeof(BtFace));
     // bt_computeVolume: DFS stack
-    total += BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
+    postsort += BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
     // bt_computeInternal: iterative D&C stack
-    total += BT_ALIGN16(BT_DC_MAX_STACK * (int)sizeof(BtDCStackItem));
+    postsort += BT_ALIGN16(BT_DC_MAX_STACK * (int)sizeof(BtDCStackItem));
+    // bt_extractMesh: DFS stack
+    postsort += BT_ALIGN16(BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
+    // bt_extractMesh: ordered_verts array (max n vertices)
+    postsort += BT_ALIGN16(n * (int)sizeof(BtVertex*));
+
+    total += (sort_scratch > postsort) ? sort_scratch : postsort;
     // alignment padding headroom
     total += 32 * 1024;
     return total;
@@ -1278,6 +1305,205 @@ __device__ inline float bt_computeVolume(BtHullState* s) {
 }
 
 // ============================================================================
+// Mesh extraction from half-edge hull (lane 0 only, after bt_computeVolume)
+// ============================================================================
+
+// bt_extractMesh: DFS over the half-edge graph, assigns sequential indices to
+// vertices, converts BtPoint32/rational back to float world space, and
+// fan-triangulates each face.
+//
+// Axis permutation (same as bt_compute_presort):
+//   BtPoint32.x == medAxis world coordinate
+//   BtPoint32.y == maxAxis world coordinate
+//   BtPoint32.z == minAxis world coordinate
+//
+// Returns 0 on success, -1 on error (pool OOM or max_verts/max_tris exceeded).
+__device__ inline int bt_extractMesh(BtHullState* s,
+    float* out_verts, int* out_tris,
+    int max_verts, int max_tris,
+    int* n_verts_out, int* n_tris_out)
+{
+    *n_verts_out = 0;
+    *n_tris_out  = 0;
+
+    if (!s->vertexList) return 0;
+
+    int stamp = --s->mergeStamp;
+
+    // Allocate DFS stack from pool
+    BtVertex** stack = (BtVertex**)bt_alloc(s->wp, BT_DFS_MAX_STACK * (int)sizeof(BtVertex*));
+    if (!stack) return -1;
+
+    // Allocate vertex index map: maps a vertex's sequential position back via copy field
+    // We use copy to store (stamp<<16 | vertex_index) but copy is only int.
+    // Simpler: allocate a separate int array of size max_verts, indexed by vertex order.
+    // We'll assign indices as we first visit each vertex, stored directly in v->copy.
+    // (copy values from previous calls have different stamps so we can distinguish.)
+
+    int n_verts = 0;
+    int n_tris  = 0;
+
+    s->vertexList->copy = stamp; // mark as visited (index not yet assigned)
+    stack[0] = s->vertexList;
+    int stackSize = 1;
+
+    // First DFS pass: assign indices and emit vertices
+    // We need two passes or inline assignment. Use inline: assign on first encounter during edge walk.
+    // Reset copy to stamp-1 to indicate "visited but not indexed yet" — but that's fragile.
+    // Instead: use a separate array. Allocate int* vindex from pool.
+    // But vertices are pool-allocated with no stable integer ID...
+    // Best approach: do vertex indexing inline. When we first see a vertex (copy != stamp),
+    // set copy = stamp and store index in a separate array keyed by arrival order.
+    // We don't know the vertex count in advance, so just write vertices as we go.
+
+    // Re-start DFS cleanly:
+    // Reset stamp usage: use a fresh stamp for indexing.
+    // We'll use a two-step approach:
+    //   copy == stamp     -> vertex has been indexed, index = (copy_extra array)
+    // Since we can't embed the index in copy without losing the stamp info,
+    // allocate a BtVertex** ordered array to map order->vertex, then do two passes.
+    // But that requires knowing count first.
+    //
+    // Simplest correct approach: use copy to store (index + 1) using a stamp offset trick.
+    // Assign: v->copy = stamp_base + index, where stamp_base is a large negative number
+    // chosen to not collide with normal stamps.
+    // mergeStamp starts at -3 and goes negative. Let's use stamp directly as base.
+    // We'll encode: v->copy = stamp - n_verts (unique per stamp call).
+    // Then index = stamp - v->copy.
+    // But we also need a way to check "has been visited" vs "not visited".
+    // "Not visited" means copy != in range [stamp - max_verts, stamp].
+    // This is messy.
+    //
+    // Cleanest: allocate a BtVertex* ordered_verts[max_verts] from pool.
+    // Walk the graph twice: first to assign indices (copy=stamp), second to emit triangles.
+
+    BtVertex** ordered_verts = (BtVertex**)bt_alloc(s->wp, max_verts * (int)sizeof(BtVertex*));
+    if (!ordered_verts) return -1;
+
+    // Pass 1: assign vertex indices via DFS
+    // stamp is already decremented; use it as the "visited" marker.
+    // Encode vertex index in copy: copy = stamp * MAX + index would overflow.
+    // Use: copy >= stamp means visited (since mergeStamp only decrements).
+    // Actually stamp is negative and decreasing, so stamp < stamp_prev.
+    // We need copy == stamp to mean "visited in this call".
+    // Store index separately: ordered_verts[n_verts++] = v, then v->copy = stamp.
+
+    stackSize = 0;
+    // Fresh stamp for pass 1 (vertex discovery)
+    int vstamp = --s->mergeStamp;
+    s->vertexList->copy = vstamp;
+    ordered_verts[n_verts] = s->vertexList;
+    n_verts++;
+    stack[0] = s->vertexList;
+    stackSize = 1;
+
+    while (stackSize > 0) {
+        BtVertex* v = stack[--stackSize];
+        BtEdge* e = v->edges;
+        if (!e) continue;
+        do {
+            if (e->target->copy != vstamp) {
+                e->target->copy = vstamp;
+                if (n_verts >= max_verts) return -1;
+                ordered_verts[n_verts++] = e->target;
+                if (stackSize >= BT_DFS_MAX_STACK) {
+                    s->wp->error = BT_ERR_DFS_STACK;
+                    return -1;
+                }
+                stack[stackSize++] = e->target;
+            }
+            e = e->next;
+        } while (e != v->edges);
+    }
+
+    // Build reverse map: pointer -> index via copy field
+    // Reuse vstamp: set v->copy = vstamp | (index << something)... copy is int.
+    // Instead, use a hash or linear search. For simplicity: store index in copy directly.
+    // Since vstamp is negative and index >= 0, use copy = vstamp - index - 1.
+    // Then index = vstamp - v->copy - 1. Check: copy == vstamp means index = -1 (invalid).
+    // Assign a new stamp for the index encoding.
+    int idx_base = --s->mergeStamp; // idx_base - index -> copy value
+    for (int i = 0; i < n_verts; i++) {
+        ordered_verts[i]->copy = idx_base - i;
+    }
+
+    // Emit vertices to out_verts
+    float sc[3], cen[3];
+    sc[0]  = s->scaling[0]; sc[1]  = s->scaling[1]; sc[2]  = s->scaling[2];
+    cen[0] = s->center[0];  cen[1] = s->center[1];  cen[2] = s->center[2];
+    int medAx = s->medAxis, maxAx = s->maxAxis, minAx = s->minAxis;
+
+    for (int i = 0; i < n_verts; i++) {
+        BtVertex* v = ordered_verts[i];
+        float xyz[3];
+        // BtPoint32.x == medAx, .y == maxAx, .z == minAx
+        xyz[medAx] = bv_xval(v) * sc[medAx] + cen[medAx];
+        xyz[maxAx] = bv_yval(v) * sc[maxAx] + cen[maxAx];
+        xyz[minAx] = bv_zval(v) * sc[minAx] + cen[minAx];
+        out_verts[i * 3 + 0] = xyz[0];
+        out_verts[i * 3 + 1] = xyz[1];
+        out_verts[i * 3 + 2] = xyz[2];
+    }
+
+    // Pass 2: emit triangles via face DFS (use a fresh stamp for edge/face marking)
+    int fstamp = --s->mergeStamp;
+    stackSize = 0;
+    s->vertexList->copy = idx_base; // vertex 0 is already indexed; just use to restart DFS
+    // We need to visit faces, not vertices. Walk edges, mark edges with fstamp.
+    // Reuse stack for vertex DFS but check edge copy for face emission.
+
+    // Reset vertex copy back to idx_base encoding (already set above).
+    // For face DFS we need to visit each vertex's edge ring once.
+    // Use a vertex-visit stamp separate from face stamp.
+    int vdfs_stamp = --s->mergeStamp;
+    s->vertexList->copy = vdfs_stamp; // mark as visited for DFS
+    stack[0] = s->vertexList;
+    stackSize = 1;
+    // But we also need the index... copy is now vdfs_stamp, losing idx_base encoding.
+    // Solution: use ordered_verts array to get index: idx = idx_base - v->copy before overwrite.
+    // Actually we already have the vertices in ordered_verts. Let's just do face iteration differently.
+
+    // Simplest: iterate over ordered_verts, for each vertex walk its edge ring,
+    // for each edge emit its face if not already emitted (edge->copy != fstamp).
+    for (int i = 0; i < n_verts; i++) {
+        BtVertex* v = ordered_verts[i];
+        BtEdge* e = v->edges;
+        if (!e) continue;
+        do {
+            if (e->copy != fstamp) {
+                // Emit this face: fan-triangulate from v
+                // Walk face: e->reverse->prev gives next edge in face
+                BtVertex* a = NULL;
+                BtVertex* b = NULL;
+                BtEdge* f = e;
+                do {
+                    if (a && b) {
+                        // Triangle: (v, a, b)
+                        if (n_tris >= max_tris) return -1;
+                        int vi = idx_base - v->copy;
+                        int ai = idx_base - a->copy;
+                        int bi = idx_base - b->copy;
+                        out_tris[n_tris * 3 + 0] = vi;
+                        out_tris[n_tris * 3 + 1] = ai;
+                        out_tris[n_tris * 3 + 2] = bi;
+                        n_tris++;
+                    }
+                    f->copy = fstamp;
+                    a = b;
+                    b = f->target;
+                    f = f->reverse->prev;
+                } while (f != e);
+            }
+            e = e->next;
+        } while (e != v->edges);
+    }
+
+    *n_verts_out = n_verts;
+    *n_tris_out  = n_tris;
+    return 0;
+}
+
+// ============================================================================
 // Main entry: compute hull and return volume
 // ============================================================================
 
@@ -1427,7 +1653,9 @@ __device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* po
     BtPoint32* points = bt_compute_presort(&state, pts, n, lane);
     if (!points) { *err = 1; return -1.0f; }
 
-    // Allocate sort scratch (lane 0), broadcast
+    // Allocate sort scratch (lane 0), broadcast.
+    // Save offset before alloc so we can rewind after sort.
+    int pre_sort_offset = pool->offset; // all lanes see same value after presort
     char* sort_scratch = NULL;
     if (lane == 0) {
         int scratch_bytes = n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int);
@@ -1444,6 +1672,10 @@ __device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* po
     __syncwarp();
     if (sort_err) { *err = BT_ERR_SORT_STACK; return -1.0f; }
 
+    // Rewind sort scratch — it's no longer needed, postsort reuses the space.
+    if (lane == 0) bt_rewind(pool, pre_sort_offset);
+    __syncwarp();
+
     // --- Phase 3: post-sort D&C + volume (vertex init: all lanes, D&C: lane 0) ---
     bt_compute_postsort(&state, points, n, lane);
 
@@ -1454,6 +1686,98 @@ __device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* po
         } else {
             vol = bt_computeVolume(&state);
             if (pool->error) { *err = pool->error; vol = -1.0f; }
+        }
+    }
+
+    // Broadcast results from lane 0
+    vol = __shfl_sync(WARP_MASK, vol, 0);
+    int e = __shfl_sync(WARP_MASK, *err, 0);
+    *err = e;
+    return vol;
+}
+
+// ============================================================================
+// Warp entry point: compute hull volume + extract mesh (lane 0 executes mesh extraction)
+// ============================================================================
+
+// hull_dandc_warp_mesh: same as hull_dandc_warp but also extracts the hull mesh.
+// out_verts: float array [max_hull_verts * 3]
+// out_tris:  int array   [max_hull_tris * 3]
+// n_hull_verts, n_hull_tris: output counts
+// All 32 lanes must call this function with identical arguments.
+// Returns hull volume (>= 0) or -1.0f on error.
+__device__ float hull_dandc_warp_mesh(
+    const float* pts, int n, int lane, WarpPool* pool, int* err,
+    float* out_verts, int* out_tris,
+    int max_hull_verts, int max_hull_tris,
+    int* n_hull_verts, int* n_hull_tris)
+{
+    float vol = 0.0f;
+    *err = 0;
+    if (n_hull_verts) *n_hull_verts = 0;
+    if (n_hull_tris)  *n_hull_tris  = 0;
+
+    if (n < 4) {
+        return 0.0f;
+    }
+
+    // --- Phase 1: pre-sort (all lanes) ---
+    BtHullState state;
+    if (lane == 0) {
+        state.wp = pool;
+        state.vertexList = NULL;
+    }
+    __syncwarp();
+
+    BtPoint32* points = bt_compute_presort(&state, pts, n, lane);
+    if (!points) { *err = 1; return -1.0f; }
+
+    // Allocate sort scratch (lane 0), broadcast.
+    // Save offset before alloc so we can rewind after sort.
+    int pre_sort_offset_m = pool->offset;
+    char* sort_scratch = NULL;
+    if (lane == 0) {
+        int scratch_bytes = n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int);
+        sort_scratch = (char*)bt_alloc(pool, scratch_bytes);
+    }
+    {
+        long long sp = __shfl_sync(WARP_MASK, (long long)sort_scratch, 0);
+        sort_scratch = (char*)sp;
+    }
+    if (!sort_scratch) { *err = 1; return -1.0f; }
+
+    // --- Phase 2: warp-cooperative sort (all lanes) ---
+    int sort_err = warp_sort_bp32(points, sort_scratch, n, lane);
+    __syncwarp();
+    if (sort_err) { *err = BT_ERR_SORT_STACK; return -1.0f; }
+
+    // Rewind sort scratch — postsort reuses the space
+    if (lane == 0) bt_rewind(pool, pre_sort_offset_m);
+    __syncwarp();
+
+    // --- Phase 3: post-sort D&C (vertex init: all lanes, D&C: lane 0) ---
+    bt_compute_postsort(&state, points, n, lane);
+
+    if (lane == 0) {
+        if (pool->error) {
+            *err = pool->error;
+            vol = -1.0f;
+        } else {
+            // Extract mesh first (uses the hull graph)
+            if (out_verts && out_tris && n_hull_verts && n_hull_tris) {
+                int mesh_err = bt_extractMesh(&state,
+                    out_verts, out_tris,
+                    max_hull_verts, max_hull_tris,
+                    n_hull_verts, n_hull_tris);
+                if (mesh_err) {
+                    *err = 6; // mesh extraction error
+                    vol = -1.0f;
+                }
+            }
+            if (!pool->error && vol >= 0.0f) {
+                vol = bt_computeVolume(&state);
+                if (pool->error) { *err = pool->error; vol = -1.0f; }
+            }
         }
     }
 

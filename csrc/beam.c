@@ -82,8 +82,14 @@ struct beam_ctx {
     CUfunction fn_test_warp_sort;
 
     CUfunction fn_batch_hull_dandc;
+    CUfunction fn_batch_hull_dandc_mesh;
     CUfunction fn_query_dandc_scratch;
     CUfunction fn_batch_mesh_volume;
+
+    // V2 kernels
+    CUfunction fn_beam_expansion;
+    CUfunction fn_beam_hausdorff_parts;
+    CUfunction fn_beam_termination;
 
     struct MeshPool pool_a, pool_b;
     CUdeviceptr d_parts;
@@ -180,8 +186,14 @@ int beam_init(beam_ctx_t* out, int device_ordinal) {
     cuModuleGetFunction(&ctx->fn_test_block_reduce_bbox, ctx->module, "test_block_reduce_bbox");
     cuModuleGetFunction(&ctx->fn_test_warp_sort,        ctx->module, "test_warp_sort_kernel");
     cuModuleGetFunction(&ctx->fn_batch_hull_dandc,       ctx->module, "batch_hull_dandc");
+    cuModuleGetFunction(&ctx->fn_batch_hull_dandc_mesh, ctx->module, "batch_hull_dandc_mesh");
     cuModuleGetFunction(&ctx->fn_query_dandc_scratch,   ctx->module, "query_dandc_scratch");
     cuModuleGetFunction(&ctx->fn_batch_mesh_volume,      ctx->module, "batch_mesh_volume");
+
+    // V2 kernels
+    cuModuleGetFunction(&ctx->fn_beam_expansion,       ctx->module, "beam_expansion");
+    cuModuleGetFunction(&ctx->fn_beam_hausdorff_parts, ctx->module, "beam_hausdorff_parts");
+    cuModuleGetFunction(&ctx->fn_beam_termination,     ctx->module, "beam_termination");
 
     return 0;
 }
@@ -1341,5 +1353,525 @@ int beam_batch_mesh_volume(
 
     cuMemFree(d_verts); cuMemFree(d_tris); cuMemFree(d_toff); cuMemFree(d_vols);
     if (d_voff) cuMemFree(d_voff);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// beam_batch_hull_dandc_mesh
+// ---------------------------------------------------------------------------
+
+int beam_batch_hull_dandc_mesh(
+    beam_ctx_t   ctx,
+    const float* pts,
+    int          total_pts,
+    const int*   offsets,
+    int          n_hulls,
+    int          max_pts_per_hull,
+    int          max_hull_verts,
+    int          max_hull_tris,
+    float*       out_volumes,
+    int*         out_errors,
+    float*       out_verts,
+    int*         out_tris,
+    int*         out_vert_counts,
+    int*         out_tri_counts)
+{
+    if (!ctx || !ctx->fn_batch_hull_dandc_mesh) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_pts, d_off, d_vols, d_errs, d_scratch = 0;
+    CUdeviceptr d_overts, d_otris, d_ovc, d_otc;
+    CHECK_CU(cuMemAlloc(&d_pts,  (size_t)total_pts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_off,  (size_t)(n_hulls + 1) * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_vols, (size_t)n_hulls * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_errs, (size_t)n_hulls * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_overts, (size_t)n_hulls * max_hull_verts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_otris,  (size_t)n_hulls * max_hull_tris * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_ovc, (size_t)n_hulls * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_otc, (size_t)n_hulls * sizeof(int)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_pts, pts, (size_t)total_pts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_off, offsets, (size_t)(n_hulls + 1) * sizeof(int), s));
+
+    // Query scratch
+    CUdeviceptr d_qout;
+    CHECK_CU(cuMemAlloc(&d_qout, sizeof(int)));
+    int max_pts_i = max_pts_per_hull;
+    void* qargs[] = { &max_pts_i, &d_qout };
+    CHECK_CU(cuLaunchKernel(ctx->fn_query_dandc_scratch, 1, 1, 1,
+                            1, 1, 1, 0, s, qargs, NULL));
+    int scratch_result = 0;
+    CHECK_CU(cuMemcpyDtoHAsync(&scratch_result, d_qout, sizeof(int), s));
+    CHECK_CU(cuStreamSynchronize(s));
+    cuMemFree(d_qout);
+    size_t scratch_per = (size_t)scratch_result;
+
+    size_t total_scratch = (size_t)n_hulls * scratch_per;
+    CHECK_CU(cuMemAlloc(&d_scratch, total_scratch));
+    CHECK_CU(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, 8 * 1024));
+
+    int block_size = 32;
+    int n_blocks = n_hulls;
+    int scratch_per_i = (int)scratch_per;
+
+    void* args[] = { &d_pts, &d_off, &d_vols, &d_errs,
+                     &d_overts, &d_otris, &d_ovc, &d_otc,
+                     &d_scratch, &scratch_per_i, &n_hulls,
+                     &max_hull_verts, &max_hull_tris };
+    CHECK_CU(cuLaunchKernel(ctx->fn_batch_hull_dandc_mesh, n_blocks, 1, 1,
+                            block_size, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_volumes, d_vols, (size_t)n_hulls * sizeof(float), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_errors,  d_errs, (size_t)n_hulls * sizeof(int), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_verts, d_overts, (size_t)n_hulls * max_hull_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_tris, d_otris, (size_t)n_hulls * max_hull_tris * 3 * sizeof(int), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_vert_counts, d_ovc, (size_t)n_hulls * sizeof(int), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_tri_counts, d_otc, (size_t)n_hulls * sizeof(int), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_pts); cuMemFree(d_off); cuMemFree(d_vols); cuMemFree(d_errs);
+    cuMemFree(d_overts); cuMemFree(d_otris); cuMemFree(d_ovc); cuMemFree(d_otc);
+    if (d_scratch) cuMemFree(d_scratch);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// beam_run_v2 — 3-kernel architecture beam search
+// ---------------------------------------------------------------------------
+
+// PartInfoV2 and WorkItem must match common.cuh definitions
+#define MAX_PARTS_PER_BEAM_V2 64
+
+struct PartInfoV2_host {
+    int vert_offset, vert_count;
+    int tri_offset, tri_count;
+    int hull_vert_offset, hull_vert_count;
+    int hull_tri_offset, hull_tri_count;
+    float bbox[6];
+    float rv_cost;
+    float hausdorff;
+    float mesh_volume;
+    float hull_volume;
+};
+
+struct WorkItem_host {
+    int part_indices[MAX_PARTS_PER_BEAM_V2];
+    int num_parts;
+    int worst_part_idx;
+    float worst_metric;
+};
+
+int beam_run_v2(
+    beam_ctx_t ctx,
+    const float* vertices, int n_verts,
+    const int* triangles, int n_tris,
+    const float* hull_verts, int n_hull_verts,
+    const int* hull_tris, int n_hull_tris,
+    float hull_volume,
+    size_t scratch_size,
+    const beam_params_t* params)
+{
+    CUstream s = NULL;
+
+    beam_params_t p;
+    if (params) p = *params;
+    else beam_params_default(&p);
+
+    int beam_width = p.beam_width;
+    if (beam_width > MAX_BEAM) beam_width = MAX_BEAM;
+    int cpa = p.cuts_per_axis;
+    int num_planes = 3 * cpa;
+
+    free_output_parts(ctx);
+
+    // --- Memory layout: single large allocation ---
+    // Vertex pool, triangle pool, PartInfoV2 array, WorkItem arrays (double-buffered),
+    // cost buffer, work scratch, D&C scratch, atomic counters
+
+    int vert_capacity   = (n_verts + n_hull_verts + 4096) * beam_width * 8;
+    int tri_capacity    = (n_tris + n_hull_tris + 4096) * beam_width * 8;
+    int part_capacity   = beam_width * MAX_PARTS_PER_BEAM * 4;
+    int grid_max        = beam_width * num_planes;
+    // Hull mesh output limits (max vertices/triangles per extracted hull mesh)
+    // No limit on D&C hull input vertices — all unique vertices are fed in.
+    int max_hull_verts_per_part = 1024;
+    int max_hull_tris_per_part  = 2048;
+
+    // Compute total allocation
+    size_t vp_bytes   = (size_t)vert_capacity * 3 * sizeof(float);
+    size_t tp_bytes   = (size_t)tri_capacity * 3 * sizeof(int);
+    size_t pp_bytes   = (size_t)part_capacity * sizeof(struct PartInfoV2_host);
+    size_t wi_bytes   = (size_t)beam_width * sizeof(struct WorkItem_host) * 2; // double buffer
+    size_t cost_bytes = (size_t)grid_max * sizeof(float);
+    size_t ws_bytes   = (size_t)grid_max * sizeof(struct WorkItem_host);
+    size_t counter_bytes = 4 * sizeof(unsigned int); // vert, tri, part, done counters
+    size_t result_bytes  = sizeof(int);
+    size_t norm_bytes    = 7 * sizeof(float);
+    // Part indices for hausdorff
+    size_t pidx_bytes = (size_t)part_capacity * sizeof(int);
+
+    // Allocate everything separately for clarity
+    CUdeviceptr d_vp, d_tp, d_pp, d_wi_a, d_wi_b, d_cost, d_ws;
+    CUdeviceptr d_counters, d_result, d_norm, d_pidx;
+    CUdeviceptr d_scratch_base, d_scratch_off;
+
+    CHECK_CU(cuMemAlloc(&d_vp, vp_bytes));
+    CHECK_CU(cuMemAlloc(&d_tp, tp_bytes));
+    CHECK_CU(cuMemAlloc(&d_pp, pp_bytes));
+    CHECK_CU(cuMemAlloc(&d_wi_a, (size_t)beam_width * sizeof(struct WorkItem_host)));
+    CHECK_CU(cuMemAlloc(&d_wi_b, (size_t)beam_width * sizeof(struct WorkItem_host)));
+    CHECK_CU(cuMemAlloc(&d_cost, cost_bytes));
+    CHECK_CU(cuMemAlloc(&d_ws, ws_bytes));
+    CHECK_CU(cuMemAlloc(&d_counters, counter_bytes));
+    CHECK_CU(cuMemAlloc(&d_result, result_bytes));
+    CHECK_CU(cuMemAlloc(&d_norm, norm_bytes));
+    CHECK_CU(cuMemAlloc(&d_pidx, pidx_bytes));
+    // Global scratch pool for split + D&C (2GB)
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cuMemGetInfo(&free_mem, &total_mem);
+        size_t scratch_sz = (size_t)(free_mem * 0.7);
+        if (scratch_sz < 256 * 1024 * 1024) scratch_sz = 256 * 1024 * 1024;
+        if (scratch_sz > 4000000000ULL) scratch_sz = 4000000000ULL;
+        if (scratch_size > 0) scratch_sz = scratch_size;
+        CHECK_CU(cuMemAlloc(&d_scratch_base, scratch_sz));
+        CHECK_CU(cuMemAlloc(&d_scratch_off, sizeof(unsigned int)));
+        // Build host-side DevicePool struct (passed by value to kernels)
+        ctx->scratch.base = (char*)(uintptr_t)d_scratch_base;
+        ctx->scratch.offset = (unsigned int*)(uintptr_t)d_scratch_off;
+        ctx->scratch.capacity = (unsigned int)scratch_sz;
+    }
+
+    // Set stack size for D&C
+    CHECK_CU(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, 8 * 1024));
+
+    // Upload mesh to vertex/triangle pool
+    CHECK_CU(cuMemcpyHtoDAsync(d_vp, vertices, (size_t)n_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tp, triangles, (size_t)n_tris * 3 * sizeof(int), s));
+
+    // Upload hull mesh right after the original mesh
+    CHECK_CU(cuMemcpyHtoDAsync(
+        d_vp + (CUdeviceptr)((size_t)n_verts * 3 * sizeof(float)),
+        hull_verts, (size_t)n_hull_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(
+        d_tp + (CUdeviceptr)((size_t)n_tris * 3 * sizeof(int)),
+        hull_tris, (size_t)n_hull_tris * 3 * sizeof(int), s));
+
+    // Initialize counters: vert_counter = n_verts + n_hull_verts,
+    //                       tri_counter = n_tris + n_hull_tris,
+    //                       part_counter = 1, done_counter = 0
+    {
+        unsigned int counters[4];
+        counters[0] = (unsigned int)(n_verts + n_hull_verts);
+        counters[1] = (unsigned int)(n_tris + n_hull_tris);
+        counters[2] = 1;  // 1 part already exists
+        counters[3] = 0;  // done counter
+        CHECK_CU(cuMemcpyHtoDAsync(d_counters, counters, sizeof(counters), s));
+    }
+
+    // Normalize mesh
+    {
+        int total_nv = n_verts + n_hull_verts;
+        unsigned int smem = BLOCK_SIZE * 3 * sizeof(float) * 2;
+        void* args[] = { &d_vp, &total_nv, &d_norm };
+        CHECK_CU(cuLaunchKernel(ctx->fn_normalize_mesh,
+            1, 1, 1, BLOCK_SIZE, 1, 1, smem, s, args, NULL));
+    }
+
+    // Compute initial Rv from hull_volume and mesh volume
+    // mesh_volume: compute from signed tet volumes of the original mesh
+    // For now, use hull_volume directly (the caller computes both via scipy)
+    // The initial Rv is computed from the mesh volume and hull volume passed from Python
+
+    // Initialize first PartInfoV2
+    struct PartInfoV2_host h_part;
+    memset(&h_part, 0, sizeof(h_part));
+    h_part.vert_offset = 0;
+    h_part.vert_count = n_verts;
+    h_part.tri_offset = 0;
+    h_part.tri_count = n_tris;
+    h_part.hull_vert_offset = n_verts;
+    h_part.hull_vert_count = n_hull_verts;
+    h_part.hull_tri_offset = n_tris;
+    h_part.hull_tri_count = n_hull_tris;
+    for (int k = 0; k < 6; k++) h_part.bbox[k] = 0.0f;
+    // Compute Rv from volumes
+    {
+        // We need mesh volume — compute it from the normalized mesh on GPU
+        // Actually, hull_volume was computed on the original coordinates.
+        // After normalization the volumes change by scale^3.
+        // Simpler: just set rv_cost from the pre-computed hull_volume
+        // and let the first Hausdorff kernel refine it.
+        // For a first approximation: if hull_volume ~= mesh_volume, Rv ~= 0
+        float diff = fabsf(hull_volume - hull_volume);  // This is 0, wrong
+        // Actually we need the mesh volume too. The caller should pass it.
+        // For now, compute a rough Rv: since hull_volume >= mesh_volume for convex,
+        // and the caller passes hull_volume from scipy, approximate:
+        h_part.rv_cost = 0.0f;  // Will be computed by compute_part_costs
+        h_part.hausdorff = -1.0f;
+        h_part.mesh_volume = 0.0f;  // unknown at this point
+        h_part.hull_volume = hull_volume;
+    }
+    CHECK_CU(cuMemcpyHtoDAsync(d_pp, &h_part, sizeof(struct PartInfoV2_host), s));
+
+    // Initialize first WorkItem
+    struct WorkItem_host h_wi;
+    memset(&h_wi, 0, sizeof(h_wi));
+    h_wi.part_indices[0] = 0;
+    h_wi.num_parts = 1;
+    h_wi.worst_part_idx = 0;
+    h_wi.worst_metric = 1e30f;
+    CHECK_CU(cuMemcpyHtoDAsync(d_wi_a, &h_wi, sizeof(struct WorkItem_host), s));
+
+    // Compute initial Rv via the existing compute_part_costs kernel
+    // (Uses old structs — but we need to compute the initial Rv somehow)
+    // Alternative: use the V1 compute_part_costs for the initial part,
+    // or compute mesh volume on CPU. Let's use the GPU mesh volume kernel.
+    {
+        // Compute mesh volume using batch_mesh_volume kernel
+        CUdeviceptr d_mv_tri_off, d_mv_vert_off, d_mv_vol;
+        int tri_offsets[2] = {0, n_tris};
+        int vert_offsets[2] = {0, 0};  // no rebasing, tris already have absolute indices
+        CHECK_CU(cuMemAlloc(&d_mv_tri_off, 2 * sizeof(int)));
+        CHECK_CU(cuMemAlloc(&d_mv_vert_off, 2 * sizeof(int)));
+        CHECK_CU(cuMemAlloc(&d_mv_vol, sizeof(float)));
+        CHECK_CU(cuMemcpyHtoDAsync(d_mv_tri_off, tri_offsets, 2 * sizeof(int), s));
+        CHECK_CU(cuMemcpyHtoDAsync(d_mv_vert_off, vert_offsets, 2 * sizeof(int), s));
+
+        int n_meshes = 1;
+        void* mv_args[] = { &d_vp, &d_tp, &d_mv_tri_off, &d_mv_vert_off, &d_mv_vol, &n_meshes };
+        CHECK_CU(cuLaunchKernel(ctx->fn_batch_mesh_volume,
+            1, 1, 1, BLOCK_SIZE, 1, 1, 0, s, mv_args, NULL));
+
+        float mesh_vol = 0.0f;
+        CHECK_CU(cuMemcpyDtoHAsync(&mesh_vol, d_mv_vol, sizeof(float), s));
+        CHECK_CU(cuStreamSynchronize(s));
+        cuMemFree(d_mv_tri_off); cuMemFree(d_mv_vert_off); cuMemFree(d_mv_vol);
+
+        // Now we have mesh_vol (in normalized coordinates)
+        // hull_volume was passed in original coordinates; after normalization
+        // volumes scale by (2/range)^3. We can't easily match.
+        // Better approach: also compute hull volume on the normalized hull mesh.
+        int hull_tri_offsets[2] = {n_tris, n_tris + n_hull_tris};
+        int hull_vert_offsets[2] = {n_verts, n_verts};
+        CHECK_CU(cuMemAlloc(&d_mv_tri_off, 2 * sizeof(int)));
+        CHECK_CU(cuMemAlloc(&d_mv_vert_off, 2 * sizeof(int)));
+        CHECK_CU(cuMemAlloc(&d_mv_vol, sizeof(float)));
+        CHECK_CU(cuMemcpyHtoDAsync(d_mv_tri_off, hull_tri_offsets, 2 * sizeof(int), s));
+        CHECK_CU(cuMemcpyHtoDAsync(d_mv_vert_off, hull_vert_offsets, 2 * sizeof(int), s));
+        void* hv_args[] = { &d_vp, &d_tp, &d_mv_tri_off, &d_mv_vert_off, &d_mv_vol, &n_meshes };
+        CHECK_CU(cuLaunchKernel(ctx->fn_batch_mesh_volume,
+            1, 1, 1, BLOCK_SIZE, 1, 1, 0, s, hv_args, NULL));
+        float hull_vol_norm = 0.0f;
+        CHECK_CU(cuMemcpyDtoHAsync(&hull_vol_norm, d_mv_vol, sizeof(float), s));
+        CHECK_CU(cuStreamSynchronize(s));
+        cuMemFree(d_mv_tri_off); cuMemFree(d_mv_vert_off); cuMemFree(d_mv_vol);
+
+        // Compute Rv
+        float diff = fabsf(mesh_vol - hull_vol_norm);
+        float rv = cbrtf(3.0f * diff / (4.0f * 3.14159265f)) * p.rv_k;
+
+        h_part.rv_cost = rv;
+        h_part.mesh_volume = mesh_vol;
+        h_part.hull_volume = hull_vol_norm;
+        h_part.hausdorff = -1.0f;
+        CHECK_CU(cuMemcpyHtoDAsync(d_pp, &h_part, sizeof(struct PartInfoV2_host), s));
+
+        h_wi.worst_metric = rv;
+        CHECK_CU(cuMemcpyHtoDAsync(d_wi_a, &h_wi, sizeof(struct WorkItem_host), s));
+
+        // Check if already convex
+        if (rv <= p.threshold) {
+            // Download and return single part (original mesh)
+            ctx->num_output_parts = 1;
+            ctx->output_parts = (struct OutputPart*)calloc(1, sizeof(struct OutputPart));
+            ctx->output_parts[0].n_verts = n_verts;
+            ctx->output_parts[0].n_tris = n_tris;
+            ctx->output_parts[0].vertices = (float*)malloc(n_verts * 3 * sizeof(float));
+            ctx->output_parts[0].triangles = (int*)malloc(n_tris * 3 * sizeof(int));
+            memcpy(ctx->output_parts[0].vertices, vertices, n_verts * 3 * sizeof(float));
+            memcpy(ctx->output_parts[0].triangles, triangles, n_tris * 3 * sizeof(int));
+            goto cleanup;
+        }
+    }
+
+    // --- Main beam search loop ---
+    {
+        CUdeviceptr d_wi_cur = d_wi_a;
+        CUdeviceptr d_wi_nxt = d_wi_b;
+        int num_items = 1;
+
+        // Counters layout: [vert_counter, tri_counter, part_counter, done_counter]
+        CUdeviceptr d_vert_ctr  = d_counters;
+        CUdeviceptr d_tri_ctr   = d_counters + sizeof(unsigned int);
+        CUdeviceptr d_part_ctr  = d_counters + 2 * sizeof(unsigned int);
+        CUdeviceptr d_done_ctr  = d_counters + 3 * sizeof(unsigned int);
+
+        // Set result to -1
+        int neg1 = -1;
+        CHECK_CU(cuMemcpyHtoDAsync(d_result, &neg1, sizeof(int), s));
+
+        for (int iter = 0; iter < p.max_iterations; iter++) {
+            // Kernel 2: Hausdorff for parts that need it
+            // Build part index list on host
+            {
+                struct WorkItem_host h_items[MAX_BEAM];
+                int n_to_read = (num_items < MAX_BEAM) ? num_items : MAX_BEAM;
+                CHECK_CU(cuMemcpyDtoHAsync(h_items, d_wi_cur,
+                    n_to_read * sizeof(struct WorkItem_host), s));
+                CHECK_CU(cuStreamSynchronize(s));
+
+                // Collect unique part indices
+                int pidx[MAX_BEAM * MAX_PARTS_PER_BEAM_V2];
+                int n_pidx = 0;
+                for (int i = 0; i < n_to_read; i++) {
+                    for (int j = 0; j < h_items[i].num_parts; j++) {
+                        int gi = h_items[i].part_indices[j];
+                        // Check uniqueness
+                        int found = 0;
+                        for (int k = 0; k < n_pidx; k++) {
+                            if (pidx[k] == gi) { found = 1; break; }
+                        }
+                        if (!found && n_pidx < MAX_BEAM * MAX_PARTS_PER_BEAM_V2)
+                            pidx[n_pidx++] = gi;
+                    }
+                }
+                if (n_pidx > 0) {
+                    CHECK_CU(cuMemcpyHtoDAsync(d_pidx, pidx, n_pidx * sizeof(int), s));
+                    void* h_args[] = { &d_vp, &d_tp, &d_pp, &d_pidx, &n_pidx, &p.threshold };
+                    CHECK_CU(cuLaunchKernel(ctx->fn_beam_hausdorff_parts,
+                        n_pidx, 1, 1, HAUSDORFF_BLOCK_SIZE, 1, 1, 0, s, h_args, NULL));
+                }
+            }
+
+            // Kernel 3: Termination check
+            {
+                int neg1_v = -1;
+                CHECK_CU(cuMemcpyHtoDAsync(d_result, &neg1_v, sizeof(int), s));
+                void* t_args[] = { &d_pp, &d_wi_cur, &num_items, &p.threshold, &d_result };
+                CHECK_CU(cuLaunchKernel(ctx->fn_beam_termination,
+                    num_items, 1, 1, 32, 1, 1, 0, s, t_args, NULL));
+            }
+            CHECK_CU(cuStreamSynchronize(s));
+
+            // Check result
+            int result_val = -1;
+            CHECK_CU(cuMemcpyDtoHAsync(&result_val, d_result, sizeof(int), s));
+            CHECK_CU(cuStreamSynchronize(s));
+
+            if (result_val >= 0) {
+                // Terminated — download the winning work item's parts
+                break;
+            }
+
+            // Kernel 1: Expansion
+            int grid_size = num_items * num_planes;
+            {
+                // Reset done counter and scratch pool offset
+                unsigned int zero = 0;
+                CHECK_CU(cuMemcpyHtoDAsync(d_done_ctr, &zero, sizeof(unsigned int), s));
+                CHECK_CU(cuMemsetD32Async(d_scratch_off, 0, 1, s));
+
+                struct DevicePool sp = ctx->scratch;
+                void* e_args[] = {
+                    &d_vp, &d_tp, &d_pp, &d_wi_cur,
+                    &num_items, &cpa, &p.rv_k,
+                    &d_vp, &d_tp, &d_pp,
+                    &d_vert_ctr, &d_tri_ctr, &d_part_ctr,
+                    &sp,
+                    &d_ws, &d_cost,
+                    &d_wi_nxt, &beam_width,
+                    &d_done_ctr,
+                    &max_hull_verts_per_part, &max_hull_tris_per_part
+                };
+                CHECK_CU(cuLaunchKernel(ctx->fn_beam_expansion,
+                    grid_size, 1, 1, EXPANSION_BLOCK_SIZE, 1, 1, 0, s, e_args, NULL));
+            }
+            CHECK_CU(cuStreamSynchronize(s));
+
+            // Swap work item buffers
+            CUdeviceptr tmp = d_wi_cur;
+            d_wi_cur = d_wi_nxt;
+            d_wi_nxt = tmp;
+            num_items = beam_width;
+        }
+
+        // Download results
+        struct WorkItem_host h_final;
+        CHECK_CU(cuMemcpyDtoHAsync(&h_final, d_wi_cur, sizeof(struct WorkItem_host), s));
+        CHECK_CU(cuStreamSynchronize(s));
+
+        int np = h_final.num_parts;
+        if (np <= 0) np = 1;
+
+        // Download all parts referenced by the winning work item
+        struct PartInfoV2_host* h_parts = (struct PartInfoV2_host*)malloc(
+            np * sizeof(struct PartInfoV2_host));
+        for (int i = 0; i < np; i++) {
+            CHECK_CU(cuMemcpyDtoHAsync(&h_parts[i],
+                d_pp + (CUdeviceptr)(h_final.part_indices[i] * sizeof(struct PartInfoV2_host)),
+                sizeof(struct PartInfoV2_host), s));
+        }
+        CHECK_CU(cuStreamSynchronize(s));
+
+        // Recover coordinates
+        {
+            unsigned int h_vert_ctr;
+            CHECK_CU(cuMemcpyDtoHAsync(&h_vert_ctr, d_vert_ctr, sizeof(unsigned int), s));
+            CHECK_CU(cuStreamSynchronize(s));
+            int total_verts = (int)h_vert_ctr;
+            if (total_verts > 0) {
+                int grid = (total_verts + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                void* rc_args[] = { &d_vp, &total_verts, &d_norm };
+                CHECK_CU(cuLaunchKernel(ctx->fn_recover_coordinates,
+                    grid, 1, 1, BLOCK_SIZE, 1, 1, 0, s, rc_args, NULL));
+            }
+        }
+
+        // Download part meshes
+        ctx->num_output_parts = np;
+        ctx->output_parts = (struct OutputPart*)calloc(np, sizeof(struct OutputPart));
+
+        for (int i = 0; i < np; i++) {
+            struct PartInfoV2_host* pi = &h_parts[i];
+            int nv = pi->vert_count;
+            int nt = pi->tri_count;
+            if (nv <= 0 || nt <= 0) {
+                ctx->output_parts[i].n_verts = 0;
+                ctx->output_parts[i].n_tris = 0;
+                continue;
+            }
+            ctx->output_parts[i].n_verts = nv;
+            ctx->output_parts[i].n_tris = nt;
+            ctx->output_parts[i].vertices = (float*)malloc(nv * 3 * sizeof(float));
+            ctx->output_parts[i].triangles = (int*)malloc(nt * 3 * sizeof(int));
+
+            CUdeviceptr v_src = d_vp + (CUdeviceptr)((size_t)pi->vert_offset * 3 * sizeof(float));
+            CUdeviceptr t_src = d_tp + (CUdeviceptr)((size_t)pi->tri_offset * 3 * sizeof(int));
+            CHECK_CU(cuMemcpyDtoHAsync(ctx->output_parts[i].vertices, v_src,
+                nv * 3 * sizeof(float), s));
+            CHECK_CU(cuMemcpyDtoHAsync(ctx->output_parts[i].triangles, t_src,
+                nt * 3 * sizeof(int), s));
+        }
+        CHECK_CU(cuStreamSynchronize(s));
+
+        // Adjust triangle indices to be local (0-based) per part
+        for (int i = 0; i < np; i++) {
+            int vo_adj = h_parts[i].vert_offset;
+            int nt = ctx->output_parts[i].n_tris;
+            int* tris = ctx->output_parts[i].triangles;
+            if (!tris) continue;
+            for (int t = 0; t < nt * 3; t++)
+                tris[t] -= vo_adj;
+        }
+        free(h_parts);
+    }
+
+cleanup:
+    cuMemFree(d_vp); cuMemFree(d_tp); cuMemFree(d_pp);
+    cuMemFree(d_wi_a); cuMemFree(d_wi_b);
+    cuMemFree(d_cost); cuMemFree(d_ws);
+    cuMemFree(d_counters); cuMemFree(d_result);
+    cuMemFree(d_norm); cuMemFree(d_pidx);
+    cuMemFree(d_scratch_base); cuMemFree(d_scratch_off);
     return 0;
 }

@@ -40,6 +40,25 @@ __device__ inline void* warp_pool_alloc(WarpPool* pool, int bytes, int lane) {
     return (void*)ptr_ll;
 }
 
+// Allocate a WarpPool region from a global DevicePool via atomicAdd.
+// Call from lane 0 only. The returned WarpPool has its own bump offset at 0.
+// Returns 0 on success, 1 on OOM.
+__device__ inline int warppool_from_global(
+    DevicePool* global, int size, WarpPool* out)
+{
+    unsigned int aligned = ((unsigned int)size + 15) & ~15;
+    unsigned int old = atomicAdd(global->offset, aligned);
+    if (old + aligned > global->capacity) {
+        out->base = NULL; out->offset = 0; out->capacity = 0; out->error = 1;
+        return 1;
+    }
+    out->base = global->base + old;
+    out->offset = 0;
+    out->capacity = size;
+    out->error = 0;
+    return 0;
+}
+
 // ============================================================================
 // Warp reductions
 // ============================================================================

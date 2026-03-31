@@ -7,6 +7,7 @@
 #define BEAM_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -183,6 +184,78 @@ int beam_batch_mesh_volume(
     const int*   vert_offsets,
     int          n_meshes,
     float*       out_volumes);
+
+// ---------------------------------------------------------------------------
+// New V2 constants and structs (mirror of common.cuh V2 additions)
+// ---------------------------------------------------------------------------
+
+#define EXPANSION_BLOCK_SIZE 64
+#define HAUSDORFF_BLOCK_SIZE 256
+#define MAX_BEAM_V2 64
+#ifndef MAX_PARTS_PER_BEAM
+#define MAX_PARTS_PER_BEAM 64
+#endif
+
+typedef struct PartInfoV2 {
+    int vert_offset, vert_count;
+    int tri_offset, tri_count;
+    int hull_vert_offset, hull_vert_count;
+    int hull_tri_offset, hull_tri_count;
+    float bbox[6];       // xmin,xmax,ymin,ymax,zmin,zmax
+    float rv_cost;
+    float hausdorff;     // -1 = not yet computed
+    float mesh_volume;
+    float hull_volume;
+} PartInfoV2;
+
+typedef struct WorkItem {
+    int part_indices[MAX_PARTS_PER_BEAM];  // indirect into PartInfoV2 array
+    int num_parts;
+    int worst_part_idx;    // index into part_indices
+    float worst_metric;    // max(rv, hausdorff) of worst part
+} WorkItem;
+
+// ---------------------------------------------------------------------------
+// V2 beam search — 3-kernel architecture
+// ---------------------------------------------------------------------------
+// hull_verts/hull_tris: initial convex hull from scipy (CPU-side)
+// hull_volume: volume of initial hull from scipy
+// scratch_size: GPU scratch pool size (0 = auto)
+int beam_run_v2(
+    beam_ctx_t           ctx,
+    const float*         vertices,
+    int                  n_verts,
+    const int*           triangles,
+    int                  n_tris,
+    const float*         hull_verts,
+    int                  n_hull_verts,
+    const int*           hull_tris,
+    int                  n_hull_tris,
+    float                hull_volume,
+    size_t               scratch_size,
+    const beam_params_t* params);
+
+// ---------------------------------------------------------------------------
+// batch_hull_dandc_mesh — D&C hull volume + mesh extraction
+// ---------------------------------------------------------------------------
+// out_verts: [n_hulls * max_hull_verts * 3] float32
+// out_tris:  [n_hulls * max_hull_tris * 3]  int32
+// out_vert_counts, out_tri_counts: [n_hulls] int32
+int beam_batch_hull_dandc_mesh(
+    beam_ctx_t   ctx,
+    const float* pts,
+    int          total_pts,
+    const int*   offsets,
+    int          n_hulls,
+    int          max_pts_per_hull,
+    int          max_hull_verts,
+    int          max_hull_tris,
+    float*       out_volumes,
+    int*         out_errors,
+    float*       out_verts,
+    int*         out_tris,
+    int*         out_vert_counts,
+    int*         out_tri_counts);
 
 #ifdef __cplusplus
 }

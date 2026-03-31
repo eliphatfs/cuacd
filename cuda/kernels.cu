@@ -17,5 +17,6 @@ extern "C" {
 #include "test_kernels.cu"
 #include "hull_batch.cu"
 #include "test_warp_sort.cu"
+#include "beam_v2.cu"
 
 } // extern "C"
