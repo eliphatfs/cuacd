@@ -3,7 +3,7 @@
 // WarpPool bump allocator and warp-level reductions used by hull_dandc.cuh.
 
 #pragma once
-#include "structs.cuh"
+#include "common.cuh"
 
 #define WARP_SIZE 32
 #define WARP_MASK 0xffffffffu
