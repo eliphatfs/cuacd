@@ -1,5 +1,5 @@
 """
-coacd_gpu — GPU-accelerated convex decomposition.
+coacd_gpu — GPU hull volume, mesh volume, and plane cut utilities.
 
 Uses CUDA driver API via a native CPython extension. No PyTorch or CUDA runtime dependency.
 Only requires an NVIDIA GPU driver (libcuda.so / nvcuda.dll).
@@ -23,7 +23,7 @@ class Context:
 
         with coacd_gpu.Context() as ctx:
             vols, errs = ctx.batch_hull_volume(pts_list)
-            parts = ctx.decompose(verts, tris, threshold=0.05)
+            vols = ctx.batch_mesh_volume(verts_list, tris_list)
     """
 
     def __init__(self, device=-1):
@@ -146,41 +146,3 @@ class Context:
             results.append((hv, ht, float(volumes[i])))
         return results
 
-    # ------------------------------------------------------------------
-    # decompose — beam-search convex decomposition
-    # ------------------------------------------------------------------
-
-    def decompose(self, verts, tris, threshold=0.05,
-                  beam_width=30, cuts_per_axis=10, max_iters=64):
-        """Beam-search approximate convex decomposition (GPU-resident).
-
-        Args:
-            verts:         (N, 3) float32 vertex array
-            tris:          (T, 3) int32 triangle array (0-based)
-            threshold:     Rv concavity threshold (hull_vol - mesh_vol) / hull_vol
-            beam_width:    Maximum beam items kept per iteration (default 30)
-            cuts_per_axis: Candidate planes per axis (default 10)
-            max_iters:     Maximum iterations
-
-        Returns:
-            list of (hull_verts, hull_tris) for each decomposed part
-        """
-        verts = _as_f32(verts).reshape(-1, 3)
-        tris  = _as_i32(tris).reshape(-1, 3)
-
-        n_parts = _gpu.beam_decompose(
-            verts.ctypes.data, len(verts),
-            tris.ctypes.data,  len(tris),
-            float(threshold), int(beam_width),
-            int(cuts_per_axis), int(max_iters))
-
-        results = []
-        for i in range(n_parts):
-            nv, nt = _gpu.get_part_sizes(i)
-            if nv < 4 or nt < 4:
-                continue
-            hv = np.empty(nv * 3, dtype=np.float32)
-            ht = np.empty(nt * 3, dtype=np.int32)
-            _gpu.get_part(i, hv.ctypes.data, nv, ht.ctypes.data, nt)
-            results.append((hv.reshape(nv, 3), ht.reshape(nt, 3)))
-        return results

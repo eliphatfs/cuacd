@@ -3,20 +3,6 @@
 // Must stay in sync with csrc/structs.h (host-side mirrors).
 #pragma once
 
-struct PartInfo {
-    int vert_offset, vert_count;
-    int tri_offset, tri_count;
-    float bbox[6];    // xmin,xmax,ymin,ymax,zmin,zmax
-    float rv_cost;
-};
-
-struct BeamItem {
-    int num_parts;
-    int worst_part_idx;
-    float worst_cost;
-    int cut_count;
-};
-
 struct DevicePool {
     char*               base;
     unsigned long long* offset;

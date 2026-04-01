@@ -6,8 +6,6 @@
 // ============================================================================
 
 #define BLOCK_SIZE 256
-#define MAX_BEAM 16
-#define MAX_PARTS_PER_BEAM 64
 #define EPS 1e-6f
 #define PI_F 3.14159265358979323846f
 
