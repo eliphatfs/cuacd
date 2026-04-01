@@ -1,0 +1,40 @@
+// structs.cuh — shared device-side mesh/part/work-item structures.
+#pragma once
+
+// ============================================================================
+// Mesh
+// ============================================================================
+struct Mesh {
+    float* verts;      // interleaved xyz, nv * 3 floats
+    int*   tris;       // triangle indices, nt * 3 ints
+    int    nv;
+    int    nt;
+    float  volume;
+};
+
+// ============================================================================
+// Part — one convex piece with its hull and Hausdorff distance to the original
+// ============================================================================
+struct Part {
+    Mesh  mesh;
+    Mesh  hull;
+    float hausdorff;
+};
+
+// ============================================================================
+// WorkItem — a set of parts produced from one input mesh
+// ============================================================================
+#define WORK_ITEM_MAX_PARTS 512
+
+struct WorkItem {
+    Part parts[WORK_ITEM_MAX_PARTS];
+    int  nparts;
+};
+
+// ============================================================================
+// AlgoState — collection of work items
+// ============================================================================
+struct AlgoState {
+    WorkItem* items;
+    int       nitems;
+};
