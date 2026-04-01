@@ -9,15 +9,16 @@ struct Mesh {
     int*   tris;       // triangle indices, nt * 3 ints
     int    nv;
     int    nt;
-    float  volume;
 };
 
 // ============================================================================
-// Part — one convex piece with its hull and Hausdorff distance to the original
+// Part — one convex piece with its hull and costs
 // ============================================================================
 struct Part {
     Mesh  mesh;
     Mesh  hull;
+    float mesh_vol;
+    float hull_vol;
     float hausdorff;
 };
 
