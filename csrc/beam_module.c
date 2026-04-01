@@ -211,6 +211,116 @@ static PyObject* py_batch_hull_dandc_mesh(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// batch_plane_cut(verts_ptr, total_verts, tris_ptr, total_tris,
+//   cut_vo_ptr, cut_vc_ptr, cut_to_ptr, cut_tc_ptr, pp_ptr, n_cuts,
+//   out_vo_ptr, out_po_ptr, out_no_ptr,
+//   out_vc_ptr, out_pc_ptr, out_nc_ptr,
+//   total_out_v, total_out_p, total_out_n,
+//   out_verts_ptr, out_pos_ptr, out_neg_ptr,
+//   out_nv_ptr, out_np_ptr, out_nn_ptr) -> None
+// ---------------------------------------------------------------------------
+
+static PyObject* py_batch_plane_cut(PyObject* self, PyObject* args) {
+    unsigned long long verts_ptr, tris_ptr;
+    unsigned long long cvo, cvc, cto, ctc, pp;
+    unsigned long long ovo, opo, ono, ovc, opc, onc;
+    unsigned long long out_verts, out_pos, out_neg;
+    unsigned long long nv_ptr, np_ptr, nn_ptr;
+    int total_verts, total_tris, n_cuts;
+    int total_out_verts, total_out_pos, total_out_neg;
+
+    if (!PyArg_ParseTuple(args,
+            "KiKiKKKKKiKKKKKKiiiKKKKKK",
+            &verts_ptr, &total_verts, &tris_ptr, &total_tris,
+            &cvo, &cvc, &cto, &ctc, &pp, &n_cuts,
+            &ovo, &opo, &ono, &ovc, &opc, &onc,
+            &total_out_verts, &total_out_pos, &total_out_neg,
+            &out_verts, &out_pos, &out_neg,
+            &nv_ptr, &np_ptr, &nn_ptr))
+        return NULL;
+    REQUIRE_CTX();
+
+    int rc = beam_batch_plane_cut(g_state.ctx,
+        (const float*)(uintptr_t)verts_ptr, total_verts,
+        (const int*)  (uintptr_t)tris_ptr,  total_tris,
+        (const int*)  (uintptr_t)cvo, (const int*)(uintptr_t)cvc,
+        (const int*)  (uintptr_t)cto, (const int*)(uintptr_t)ctc,
+        (const float*)(uintptr_t)pp, n_cuts,
+        (const int*)  (uintptr_t)ovo, (const int*)(uintptr_t)opo, (const int*)(uintptr_t)ono,
+        (const int*)  (uintptr_t)ovc, (const int*)(uintptr_t)opc, (const int*)(uintptr_t)onc,
+        total_out_verts, total_out_pos, total_out_neg,
+        (float*)(uintptr_t)out_verts,
+        (int*)  (uintptr_t)out_pos,
+        (int*)  (uintptr_t)out_neg,
+        (int*)  (uintptr_t)nv_ptr,
+        (int*)  (uintptr_t)np_ptr,
+        (int*)  (uintptr_t)nn_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// batch_compact_mesh(in_v_ptr, total_iv, in_t_ptr, total_it,
+//   ivo_ptr, ivc_ptr, ito_ptr, itc_ptr, n_meshes,
+//   ovo_ptr, oto_ptr, total_ov, total_ot,
+//   out_v_ptr, out_t_ptr, out_bbox_ptr, out_nv_ptr, out_nt_ptr) -> None
+// ---------------------------------------------------------------------------
+
+static PyObject* py_batch_compact_mesh(PyObject* self, PyObject* args) {
+    unsigned long long iv_ptr, it_ptr;
+    unsigned long long ivo, ivc, ito, itc;
+    unsigned long long ovo, oto;
+    unsigned long long ov_ptr, ot_ptr, bbox_ptr, nv_ptr, nt_ptr;
+    int total_iv, total_it, n_meshes, total_ov, total_ot;
+
+    if (!PyArg_ParseTuple(args,
+            "KiKiKKKKiKKiiKKKKK",
+            &iv_ptr, &total_iv, &it_ptr, &total_it,
+            &ivo, &ivc, &ito, &itc, &n_meshes,
+            &ovo, &oto, &total_ov, &total_ot,
+            &ov_ptr, &ot_ptr, &bbox_ptr, &nv_ptr, &nt_ptr))
+        return NULL;
+    REQUIRE_CTX();
+
+    int rc = beam_batch_compact_mesh(g_state.ctx,
+        (const float*)(uintptr_t)iv_ptr, total_iv,
+        (const int*)  (uintptr_t)it_ptr, total_it,
+        (const int*)  (uintptr_t)ivo, (const int*)(uintptr_t)ivc,
+        (const int*)  (uintptr_t)ito, (const int*)(uintptr_t)itc,
+        n_meshes,
+        (const int*)  (uintptr_t)ovo, (const int*)(uintptr_t)oto,
+        total_ov, total_ot,
+        (float*)(uintptr_t)ov_ptr, (int*)(uintptr_t)ot_ptr,
+        (float*)(uintptr_t)bbox_ptr,
+        (int*)  (uintptr_t)nv_ptr, (int*)(uintptr_t)nt_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// batch_bbox(verts_ptr, total_verts, vo_ptr, vc_ptr, n_meshes, bbox_ptr) -> None
+// ---------------------------------------------------------------------------
+
+static PyObject* py_batch_bbox(PyObject* self, PyObject* args) {
+    unsigned long long verts_ptr, vo_ptr, vc_ptr, bbox_ptr;
+    int total_verts, n_meshes;
+
+    if (!PyArg_ParseTuple(args, "KiKKiK",
+            &verts_ptr, &total_verts, &vo_ptr, &vc_ptr, &n_meshes, &bbox_ptr))
+        return NULL;
+    REQUIRE_CTX();
+
+    int rc = beam_batch_bbox(g_state.ctx,
+        (const float*)(uintptr_t)verts_ptr, total_verts,
+        (const int*)  (uintptr_t)vo_ptr,
+        (const int*)  (uintptr_t)vc_ptr,
+        n_meshes,
+        (float*)(uintptr_t)bbox_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
 // test_plane_cut(verts_ptr, n_verts, tris_ptr, n_tris,
 //                pa, pb, pc, pd,
 //                out_v_ptr, out_v_cap, out_pt_ptr, out_pt_cap,
@@ -248,6 +358,39 @@ static PyObject* py_test_plane_cut(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// beam_decompose(verts_ptr, n_verts, tris_ptr, n_tris,
+//               threshold, beam_width, cuts_per_axis, max_iters) -> n_parts
+// ---------------------------------------------------------------------------
+
+static PyObject* py_beam_decompose(PyObject* self, PyObject* args) {
+    unsigned long long verts_ptr, tris_ptr;
+    int n_verts, n_tris;
+    float threshold;
+    int beam_width, cuts_per_axis, max_iters;
+
+    if (!PyArg_ParseTuple(args, "KiKifiii",
+            &verts_ptr, &n_verts, &tris_ptr, &n_tris,
+            &threshold, &beam_width, &cuts_per_axis, &max_iters))
+        return NULL;
+    REQUIRE_CTX();
+
+    beam_params_t params;
+    beam_params_default(&params);
+    params.threshold    = threshold;
+    params.beam_width   = beam_width;
+    params.cuts_per_axis = cuts_per_axis;
+    params.max_iterations = max_iters;
+
+    int rc = beam_decompose(g_state.ctx,
+        (const float*)(uintptr_t)verts_ptr, n_verts,
+        (const int*)  (uintptr_t)tris_ptr,  n_tris,
+        &params);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+
+    return PyLong_FromLong(beam_get_num_parts(g_state.ctx));
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -261,6 +404,10 @@ static PyMethodDef gpu_methods[] = {
     { "batch_mesh_volume",      py_batch_mesh_volume,      METH_VARARGS, "Batch mesh volume (divergence theorem)." },
     { "batch_hull_dandc_mesh",  py_batch_hull_dandc_mesh,  METH_VARARGS, "Batch D&C hull volume + mesh extraction." },
     { "test_plane_cut",         py_test_plane_cut,         METH_VARARGS, "GPU plane cut with cap triangulation." },
+    { "batch_plane_cut",        py_batch_plane_cut,        METH_VARARGS, "Batch GPU plane cut." },
+    { "batch_compact_mesh",     py_batch_compact_mesh,     METH_VARARGS, "Batch mesh compaction." },
+    { "batch_bbox",             py_batch_bbox,             METH_VARARGS, "Batch bbox computation." },
+    { "beam_decompose",         py_beam_decompose,         METH_VARARGS, "GPU beam-search convex decomposition." },
     { NULL, NULL, 0, NULL }
 };
 

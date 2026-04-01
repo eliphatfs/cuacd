@@ -23,6 +23,7 @@ class Context:
 
         with coacd_gpu.Context() as ctx:
             vols, errs = ctx.batch_hull_volume(pts_list)
+            parts = ctx.decompose(verts, tris, threshold=0.05)
     """
 
     def __init__(self, device=-1):
@@ -43,17 +44,12 @@ class Context:
     def __exit__(self, *args):
         self.close()
 
+    # ------------------------------------------------------------------
+    # batch_hull_volume
+    # ------------------------------------------------------------------
+
     def batch_hull_volume(self, pts_list, algo=2):
-        """Compute convex hull volume for a batch of point clouds.
-
-        Args:
-            pts_list: list of (N_i, 3) float32 arrays — one per hull
-            algo:     2=dandc (D&C Preparata-Hong; only supported algorithm)
-
-        Returns:
-            (volumes, errors) — float32[n_hulls], int32[n_hulls]
-            errors: 0=ok  1=OOM  2=sort_stack_overflow  3=dfs_stack_overflow  4=dc_stack_overflow  5=pool_exhaust
-        """
+        """Compute convex hull volume for a batch of point clouds."""
         n_hulls = len(pts_list)
         pts_arrays = [_as_f32(p) for p in pts_list]
         packed = np.concatenate([p.reshape(-1, 3) for p in pts_arrays], axis=0)
@@ -73,16 +69,12 @@ class Context:
             volumes.ctypes.data, errors.ctypes.data)
         return volumes, errors
 
+    # ------------------------------------------------------------------
+    # batch_mesh_volume
+    # ------------------------------------------------------------------
+
     def batch_mesh_volume(self, verts_list, tris_list):
-        """Compute mesh volume for a batch of watertight meshes.
-
-        Args:
-            verts_list: list of (V_i, 3) float32 vertex arrays
-            tris_list:  list of (T_i, 3) int32 triangle arrays (0-based per mesh)
-
-        Returns:
-            float32[n_meshes] volumes
-        """
+        """Compute mesh volume for a batch of watertight meshes."""
         n_meshes = len(verts_list)
         v_arrays = [_as_f32(v) for v in verts_list]
         t_arrays = [_as_i32(t) for t in tris_list]
@@ -105,3 +97,90 @@ class Context:
             n_meshes, volumes.ctypes.data)
         return volumes
 
+    # ------------------------------------------------------------------
+    # batch_hull_dandc_mesh — hull volume + mesh extraction
+    # ------------------------------------------------------------------
+
+    def batch_hull_dandc_mesh(self, pts_list):
+        """Compute D&C hull volume + mesh for a batch of point clouds.
+
+        Returns list of (hull_verts, hull_tris, hull_volume) per input.
+        Natural bounds: max_hull_verts = n_pts, max_hull_tris = 2*n_pts - 4.
+        """
+        n_hulls = len(pts_list)
+        if n_hulls == 0:
+            return []
+        pts_arrays = [_as_f32(p) for p in pts_list]
+        packed = np.concatenate([p.reshape(-1, 3) for p in pts_arrays], axis=0)
+        offsets = np.zeros(n_hulls + 1, dtype=np.int32)
+        for i, p in enumerate(pts_arrays):
+            offsets[i + 1] = offsets[i] + len(p)
+
+        ns = [len(p) for p in pts_arrays]
+        max_pts = max(ns)
+        max_hv = max_pts
+        max_ht = max(max(2 * n - 4 for n in ns), 4)
+        total_pts = int(offsets[-1])
+
+        volumes    = np.empty(n_hulls, dtype=np.float32)
+        errors     = np.empty(n_hulls, dtype=np.int32)
+        out_verts  = np.empty(n_hulls * max_hv * 3, dtype=np.float32)
+        out_tris   = np.empty(n_hulls * max_ht * 3, dtype=np.int32)
+        out_vc     = np.empty(n_hulls, dtype=np.int32)
+        out_tc     = np.empty(n_hulls, dtype=np.int32)
+
+        _gpu.batch_hull_dandc_mesh(
+            packed.ctypes.data, total_pts,
+            offsets.ctypes.data, n_hulls,
+            max_pts, max_hv, max_ht,
+            volumes.ctypes.data, errors.ctypes.data,
+            out_verts.ctypes.data, out_tris.ctypes.data,
+            out_vc.ctypes.data, out_tc.ctypes.data)
+
+        results = []
+        for i in range(n_hulls):
+            nv = int(out_vc[i])
+            nt = int(out_tc[i])
+            hv = out_verts[i * max_hv * 3 : i * max_hv * 3 + nv * 3].reshape(nv, 3).copy()
+            ht = out_tris [i * max_ht * 3 : i * max_ht * 3 + nt * 3].reshape(nt, 3).copy()
+            results.append((hv, ht, float(volumes[i])))
+        return results
+
+    # ------------------------------------------------------------------
+    # decompose — beam-search convex decomposition
+    # ------------------------------------------------------------------
+
+    def decompose(self, verts, tris, threshold=0.05,
+                  beam_width=30, cuts_per_axis=10, max_iters=64):
+        """Beam-search approximate convex decomposition (GPU-resident).
+
+        Args:
+            verts:         (N, 3) float32 vertex array
+            tris:          (T, 3) int32 triangle array (0-based)
+            threshold:     Rv concavity threshold (hull_vol - mesh_vol) / hull_vol
+            beam_width:    Maximum beam items kept per iteration (default 30)
+            cuts_per_axis: Candidate planes per axis (default 10)
+            max_iters:     Maximum iterations
+
+        Returns:
+            list of (hull_verts, hull_tris) for each decomposed part
+        """
+        verts = _as_f32(verts).reshape(-1, 3)
+        tris  = _as_i32(tris).reshape(-1, 3)
+
+        n_parts = _gpu.beam_decompose(
+            verts.ctypes.data, len(verts),
+            tris.ctypes.data,  len(tris),
+            float(threshold), int(beam_width),
+            int(cuts_per_axis), int(max_iters))
+
+        results = []
+        for i in range(n_parts):
+            nv, nt = _gpu.get_part_sizes(i)
+            if nv < 4 or nt < 4:
+                continue
+            hv = np.empty(nv * 3, dtype=np.float32)
+            ht = np.empty(nt * 3, dtype=np.int32)
+            _gpu.get_part(i, hv.ctypes.data, nv, ht.ctypes.data, nt)
+            results.append((hv.reshape(nv, 3), ht.reshape(nt, 3)))
+        return results
