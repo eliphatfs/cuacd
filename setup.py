@@ -158,6 +158,7 @@ _gpu_ext = Extension(
     sources=[
         os.path.join("csrc", "beam_module.c"),
         os.path.join("csrc", "beam.c"),
+        os.path.join("csrc", "test_beam.c"),
     ],
     py_limited_api=True,
 )

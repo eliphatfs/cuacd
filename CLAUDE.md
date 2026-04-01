@@ -16,18 +16,23 @@ setup.py              # Build config: setuptools builds _gpu extension
 pyproject.toml        # PEP 621 metadata
 cuda/                 # CUDA device code (compiled to single fatbin)
   kernels.cu          #   Root compilation unit — includes all .cu modules (each is self-contained)
-  common.cuh          #   Constants, data structures, pool allocator, atomics, global_alloc helpers
+  structs.cuh         #   Device-side structs: PartInfo, BeamItem, DevicePool (mirrors csrc/structs.h)
+  common.cuh          #   Constants, pool allocator, atomics, global_alloc helpers (includes structs.cuh)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
   hull_warp_common.cuh#   WarpPool allocator + warp reductions (used by D&C)
   hull_dandc.cuh      #   Preparata-Hong D&C hull volume (Bullet port, warp sort + lane-0 D&C)
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
-  hull_batch.cu       #   batch_hull_dandc + batch_hull_dandc_mesh + batch_mesh_volume kernels
+  hull_batch.cu       #   batch_hull_dandc + query_dandc_scratch + batch_mesh_volume kernels
   test_warp_sort.cu   #   Test kernel for warp_sort_bp32
+  test_hull_dandc.cu  #   Test kernel: batch_hull_dandc_mesh (hull volume + mesh extraction)
   plane_cut.cu        #   GPU plane cut: plane_cut_block (__device__) + plane_cut_kernel thin wrapper
   mesh_transform.cu   #   Normalize/recover coordinate kernels
 csrc/                 # C host code
-  beam.h/.c           #   Host implementation (CUDA driver API) — beam search
+  structs.h           #   Host-side structs: DevicePool, OutputPart, beam_ctx, DCPart/DCEpoch/DCItem
+  beam.h              #   Public C API (opaque beam_ctx_t, beam_init/destroy, batch ops, decompose)
+  beam.c              #   Production host implementation (CUDA driver API) — beam search, batch ops
+  test_beam.c         #   Test host launchers: beam_test_warp_sort, beam_batch_hull_dandc_mesh, beam_test_plane_cut
   beam_module.c       #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
   __init__.py         #   Context class (hull/mesh volume API)
@@ -92,7 +97,18 @@ cd CoACD && pip install -e .
 
 One extension is built by `setup.py`:
 
-**`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all self-contained `.cu` modules) -> fatbin -> xxd-style C header, then builds `csrc/beam_module.c` + `csrc/beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). No cmake involved. Fatbin is compiled with `--generate-line-info` for NCU source-level profiling.
+**`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all self-contained `.cu` modules) -> fatbin -> xxd-style C header, then builds `csrc/beam_module.c` + `csrc/beam.c` + `csrc/test_beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). No cmake involved. Fatbin is compiled with `--generate-line-info` for NCU source-level profiling.
+
+**Production vs test split:**
+- `cuda/hull_batch.cu` — production kernels: `batch_hull_dandc`, `query_dandc_scratch`, `batch_mesh_volume`
+- `cuda/test_hull_dandc.cu` — test kernel: `batch_hull_dandc_mesh` (hull volume + mesh extraction, used by Python `batch_hull_dandc_mesh` and tests)
+- `cuda/test_warp_sort.cu` — test kernel: `test_warp_sort_kernel`
+- `csrc/beam.c` — production host code: `beam_init/destroy`, `beam_batch_hull_volume`, `beam_batch_mesh_volume`, `beam_batch_plane_cut`, `beam_batch_compact_mesh`, `beam_batch_bbox`, `beam_decompose`
+- `csrc/test_beam.c` — test host launchers: `beam_test_warp_sort`, `beam_batch_hull_dandc_mesh`, `beam_test_plane_cut`, `beam_set_plane_cut_ctx`
+
+**Struct locations:**
+- `cuda/structs.cuh` — device-side: `PartInfo`, `BeamItem`, `DevicePool`; included by `common.cuh`
+- `csrc/structs.h` — host-side: `DevicePool`, `OutputPart`, `beam_ctx`, `DCPart`, `DCEpoch`, `DCItem`; included by `beam.c` and `test_beam.c`
 
 Each `.cu` kernel module is self-contained: it carries its own `#include` directives for all `.cuh` dependencies, and all `__global__` kernels are declared `extern "C"` directly on the function definition (no file-level `extern "C"` block). The `.cuh` headers also include their own dependencies (e.g. `reduce.cuh` includes `common.cuh`). This means any `.cu` file can be compiled standalone without relying on include order from `kernels.cu`.
 

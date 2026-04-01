@@ -5,5 +5,6 @@
 #include "mesh_transform.cu"
 #include "hull_batch.cu"
 #include "test_warp_sort.cu"
+#include "test_hull_dandc.cu"
 #include "plane_cut.cu"
 #include "decomp.cu"
