@@ -23,7 +23,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   hull_warp_common.cuh#   WarpPool allocator + warp reductions (used by D&C)
   hull_dandc.cuh      #   Preparata-Hong D&C hull (Bullet port, warp sort + lane-0 D&C)
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
-  plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs
+  plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   hull_batch.cu       #   batch_hull_dandc + query_dandc_scratch + batch_mesh_volume kernels
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: batch_hull_dandc_mesh (hull volume + mesh extraction)
@@ -102,6 +102,7 @@ After completing any code change, always build (`pip install -e .`) and run the 
 
 **Struct locations:**
 - `cuda/allocator.cuh` — device-side: `DevicePool`; included by `common.cuh`
+- `cuda/structs.cuh` — device-side: `Mesh`, `Part`, `PartPair`, `WorkItem`, `AlgoState`; included by `plane_cut.cuh` and future algo code
 - `csrc/structs.h` — host-side: `DevicePool`, `beam_ctx`; included by `beam.c` and `test_beam.c`
 
 Each `.cu` kernel module is self-contained: carries its own `#include` directives, all `__global__` kernels declared `extern "C"` directly on the function definition (no file-level block).
@@ -161,6 +162,19 @@ with coacd_gpu.Context(device=0) as ctx:
 |----|------|----------|
 | J1 | `compute_concavity_tris` in geometry.cuh | Bbox cube-root proxy, superseded by Rv |
 
+## plane_cut_block API
+
+`plane_cut_block(mesh, pa, pb, pc_n, pd, out, heap, scratch, kernel_error)` — device function, one block (64 threads).
+
+- **Input**: `const Mesh*` (replaces separate verts/tris/nv/nt params).
+- **Output**: writes a `PartPair*` (caller-allocated device memory); `out->pos.mesh` and `out->neg.mesh` point into a **single heap chunk** allocated from `DeviceHeap*`.
+- **Heap chunk layout** (one `heap_alloc` call): `[pos_verts | pos_tris | neg_verts | neg_tris]`, each section 16-byte aligned.
+- **Vertex compaction**: each side's `Mesh.verts` contains only the vertices actually referenced by that side's triangles — no loose vertices. Triangle indices are remapped accordingly.
+- **Counters** (`n_cross`, `n_all_verts`, `n_pos`, `n_neg`): stored in `__shared__ int s_counters[4]`; `atomicAdd` on shared memory. Removed from scratch pool.
+- **Early exit** (`n_cross == 0`): entire input mesh goes to one side; allocates one heap chunk for verts+tris, other side gets empty `Mesh {NULL,NULL,0,0}`.
+- **No-boundary / one-empty-side cases**: handled by natural fallthrough — compaction produces a 0-entry side correctly.
+- **Call sites** (`test_plane_cut.cu`, `test_beam.c`): not yet updated; will be overhauled separately.
+
 ## Pool Allocator Pattern
 
 All scratch memory in kernels is allocated from a global bump pool. **Critical**: only thread 0 calls `pool_alloc()`, stores pointer in `__shared__` memory, then all threads read after `__syncthreads()`:
@@ -209,7 +223,7 @@ nvcc crashed when compiling with `--generate-line-info` while `bt_computeInterna
 - D&C hull volume (`batch_hull_volume`) and mesh extraction (`batch_hull_dandc_mesh`) — tested (cube 8v/12t, tetra 4v/4t, gaussian)
 - Batch mesh volume (`batch_mesh_volume`) — divergence theorem, watertight meshes
 - Warp sort (`test_warp_sort`) — bitonic + quicksort paths, duplicates
-- Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests)
+- Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests); call sites not yet updated to new API
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input

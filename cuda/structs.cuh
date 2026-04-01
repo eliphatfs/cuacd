@@ -23,6 +23,14 @@ struct Part {
 };
 
 // ============================================================================
+// PartPair — the two halves produced by a plane cut
+// ============================================================================
+struct PartPair {
+    Part pos;  // positive half (plane normal side)
+    Part neg;  // negative half
+};
+
+// ============================================================================
 // WorkItem — a set of parts produced from one input mesh
 // ============================================================================
 #define WORK_ITEM_MAX_PARTS 512
