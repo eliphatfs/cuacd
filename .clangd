@@ -1,0 +1,14 @@
+CompileFlags:
+  Add:
+    - -x
+    - cuda
+    - --cuda-path=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6
+    - --cuda-gpu-arch=sm_86
+    - -LC:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\lib\x64
+    - -IC:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include
+    - -ID:\CondaM\Lib\site-packages\torch\include
+    - -ID:\CondaM\Lib\site-packages\torch\include\torch\csrc\api\include
+    - -ID:\CondaM\Lib\site-packages\torch\include\THC
+    - -ID:\CondaM\include
+    - -D_LIBCUDACXX_OBJECT_FORMAT_COFF=1
+    - -std=c++17

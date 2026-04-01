@@ -20,10 +20,7 @@
 //
 // Defines BtPoint32 (canonical definition used by hull_dandc.cuh too).
 // Requires: hull_warp_common.cuh (WARP_SIZE, WARP_MASK)
-
-#ifndef WARP_SORT_CUH
-#define WARP_SORT_CUH
-
+#pragma once
 #include "hull_warp_common.cuh"
 
 // ============================================================================
@@ -243,6 +240,3 @@ __device__ inline BtPoint32 ws_bitonic32(BtPoint32 val, int n, int lane) {
 __device__ inline int warp_sort_bp32(BtPoint32* points, char* scratch, int n, int lane) {
     return warp_sort_t<BtPoint32, BtPoint32Cmp>(points, scratch, n, lane);
 }
-
-
-#endif // WARP_SORT_CUH

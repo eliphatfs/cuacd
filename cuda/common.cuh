@@ -1,9 +1,6 @@
 // Shared constants, data structures, and device utilities.
 // Included by all kernel modules.
-
-#ifndef COMMON_CUH
-#define COMMON_CUH
-
+#pragma once
 // ============================================================================
 // Constants (must match beam.c)
 // ============================================================================
@@ -79,5 +76,3 @@ __device__ inline float atomicMaxF(float* addr, float value) {
     } while (old != expected);
     return __int_as_float(old);
 }
-
-#endif // COMMON_CUH

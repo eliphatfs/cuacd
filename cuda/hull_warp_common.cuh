@@ -2,10 +2,8 @@
 //
 // WarpPool bump allocator and warp-level reductions used by hull_dandc.cuh.
 
-#ifndef HULL_WARP_COMMON_CUH
-#define HULL_WARP_COMMON_CUH
-
-#include "common.cuh"
+#pragma once
+#include "structs.cuh"
 
 #define WARP_SIZE 32
 #define WARP_MASK 0xffffffffu
@@ -102,5 +100,3 @@ __device__ inline float warp_bcast_f(float val) {
 __device__ inline int warp_bcast_i(int val) {
     return __shfl_sync(WARP_MASK, val, 0);
 }
-
-#endif // HULL_WARP_COMMON_CUH

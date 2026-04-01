@@ -9,10 +9,7 @@
 // Returns hull volume (>= 0) or -1.0f on error.
 //
 // Requires: hull_warp_common.cuh
-
-#ifndef HULL_DANDC_CUH
-#define HULL_DANDC_CUH
-
+#pragma once
 #include "hull_warp_common.cuh"
 #include "warp_sort.cuh"
 
@@ -1627,5 +1624,3 @@ __device__ float hull_dandc_warp_mesh(
     *err = e;
     return vol;
 }
-
-#endif // HULL_DANDC_CUH

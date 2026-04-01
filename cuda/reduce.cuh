@@ -1,8 +1,5 @@
 // Block-level parallel reductions.
-
-#ifndef REDUCE_CUH
-#define REDUCE_CUH
-
+#pragma once
 #include "common.cuh"
 
 // Shared-memory parallel reduction (sum).
@@ -72,5 +69,3 @@ __device__ inline void block_reduce_bbox(
         __syncthreads();
     }
 }
-
-#endif // REDUCE_CUH

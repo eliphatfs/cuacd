@@ -16,8 +16,8 @@
 //  10-12 Chain loops, bridge holes, ear clip cap       (thread 0)
 //  13    Write cap + mesh triangles to output          (parallel, 64 threads)
 //
+#pragma once
 #include "common.cuh"
-#include "geometry.cuh"
 #include "warp_sort.cuh"
 
 #define PC_BLOCK 64
@@ -31,10 +31,6 @@ struct Edge2i {
     int a, b;
 };
 
-#ifdef __cplusplus
-extern "C++" {
-#endif
-
 struct Edge2iCmp {
     static __device__ inline int cmp(Edge2i x, Edge2i y) {
         if (x.a != y.a) return (x.a < y.a) ? -1 : 1;
@@ -47,10 +43,6 @@ struct Edge2iCmp {
         return s;
     }
 };
-
-#ifdef __cplusplus
-}
-#endif
 
 // ============================================================================
 // Device helpers
@@ -127,7 +119,7 @@ __device__ inline void pc_intersect(
 #define PC_KERR_POOL_OOM    2
 #define PC_KERR_SORT_ERR    4
 
-__device__ void plane_cut_block(
+__device__ inline void plane_cut_block(
     // Input
     const float* __restrict__ vertices,   // [n_verts * 3]
     const int*   __restrict__ triangles,  // [n_tris * 3]
@@ -313,11 +305,7 @@ __device__ void plane_cut_block(
 
     // === Phase 4: Sort crossing edges (warp 0) ===
     if (warp_id == 0) {
-        #ifdef __cplusplus
         int serr = warp_sort_t<Edge2i, Edge2iCmp>(cross_edges, sort_scratch_buf, n_cross, lane);
-        #else
-        int serr = 0;
-        #endif
         if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
     }
     __syncthreads();
@@ -471,11 +459,7 @@ __device__ void plane_cut_block(
 
     // === Phase 8: Sort directed edges (warp 0) ===
     if (warp_id == 0) {
-        #ifdef __cplusplus
         int serr = warp_sort_t<Edge2i, Edge2iCmp>(dir_edges, dir_sort_buf, n_de, lane);
-        #else
-        int serr = 0;
-        #endif
         if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
     }
     __syncthreads();
@@ -777,27 +761,4 @@ __device__ void plane_cut_block(
         out_pos_tris[i] = pos_tris[i];
     for (int i = tid; i < n_neg * 3; i += PC_BLOCK)
         out_neg_tris[i] = neg_tris[i];
-}
-
-extern "C" __global__ void plane_cut_kernel(
-    const float* __restrict__ vertices,
-    const int*   __restrict__ triangles,
-    int n_verts, int n_tris,
-    float pa, float pb, float pc_n, float pd,
-    float* __restrict__ out_verts,
-    int*   __restrict__ out_pos_tris,
-    int*   __restrict__ out_neg_tris,
-    int out_verts_cap, int out_pos_cap, int out_neg_cap,
-    int* __restrict__ out_n_verts,
-    int* __restrict__ out_n_pos_tris,
-    int* __restrict__ out_n_neg_tris,
-    DevicePool scratch,
-    int* __restrict__ kernel_error)
-{
-    plane_cut_block(vertices, triangles, n_verts, n_tris,
-                    pa, pb, pc_n, pd,
-                    out_verts, out_pos_tris, out_neg_tris,
-                    out_verts_cap, out_pos_cap, out_neg_cap,
-                    out_n_verts, out_n_pos_tris, out_n_neg_tris,
-                    scratch, kernel_error);
 }

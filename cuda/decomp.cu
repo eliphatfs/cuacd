@@ -9,6 +9,7 @@
 
 #include "common.cuh"
 #include "reduce.cuh"
+#include "plane_cut.cuh"
 
 // ============================================================================
 // compact_mesh_block — device function: vertex compaction for one mesh
