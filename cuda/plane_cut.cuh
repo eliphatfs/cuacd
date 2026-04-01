@@ -176,7 +176,7 @@ __device__ inline void plane_cut_block(
     __shared__ char* s_base;
     __shared__ int s_ok;
     if (tid == 0) {
-        s_base = (char*)global_alloc_t0(&scratch, scratch_bytes);
+        s_base = (char*)pool_alloc(&scratch, scratch_bytes);
         s_ok = (s_base != NULL) ? 1 : 0;
     }
     __syncthreads();

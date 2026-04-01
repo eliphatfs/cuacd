@@ -15,8 +15,8 @@ setup.py              # Build config: setuptools builds _gpu extension
 pyproject.toml        # PEP 621 metadata
 cuda/                 # CUDA device code (compiled to single fatbin)
   kernels.cu          #   Root compilation unit — includes all .cu modules (each is self-contained)
-  structs.cuh         #   Device-side struct: DevicePool (mirrors csrc/structs.h)
-  common.cuh          #   Constants, pool allocator, atomics, global_alloc helpers (includes structs.cuh)
+  allocator.cuh       #   DevicePool struct + pool_alloc (block) + global_alloc_warp (warp)
+  common.cuh          #   Constants, atomics (includes allocator.cuh)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
   hull_warp_common.cuh#   WarpPool allocator + warp reductions (used by D&C)
@@ -54,7 +54,7 @@ Only stage project source files — never use `git add -A` or `git add .`. The r
 
 Before staging, always run `git status` and `git diff --stat` to verify only the expected tracked files appear as modified. Untracked files in the list above should remain unstaged. Then stage the exact files listed in `git status` as modified/deleted, e.g.:
 ```bash
-git add CLAUDE.md coacd_gpu/__init__.py csrc/beam.c csrc/beam.h csrc/beam_module.c csrc/structs.h cuda/kernels.cu cuda/structs.cuh cuda/common.cuh
+git add CLAUDE.md coacd_gpu/__init__.py csrc/beam.c csrc/beam.h csrc/beam_module.c csrc/structs.h cuda/kernels.cu cuda/allocator.cuh cuda/common.cuh
 ```
 
 ## Build Commands
@@ -81,6 +81,10 @@ ncu --set full -o dandc_profile python tests/bench_dandc.py --n_pts 200 --n_hull
 
 Dependencies: `numpy`, `pytest` (test only), `trimesh` (comparison only), `manifold3d` (optional, ring/multi-hole plane cut tests).
 
+## Workflow Rule
+
+After completing any code change, always build (`pip install -e .`) and run the full test suite (`python -m pytest tests/ -v`), skipping any tests that were already failing before the change.
+
 ## Architecture
 
 ### Build System
@@ -96,7 +100,7 @@ Dependencies: `numpy`, `pytest` (test only), `trimesh` (comparison only), `manif
 - `csrc/test_beam.c` — `beam_test_warp_sort`, `beam_batch_hull_dandc_mesh`, `beam_test_plane_cut`, `beam_set_plane_cut_ctx`
 
 **Struct locations:**
-- `cuda/structs.cuh` — device-side: `DevicePool`; included by `common.cuh`
+- `cuda/allocator.cuh` — device-side: `DevicePool`; included by `common.cuh`
 - `csrc/structs.h` — host-side: `DevicePool`, `beam_ctx`; included by `beam.c` and `test_beam.c`
 
 Each `.cu` kernel module is self-contained: carries its own `#include` directives, all `__global__` kernels declared `extern "C"` directly on the function definition (no file-level block).
@@ -143,8 +147,9 @@ with coacd_gpu.Context(device=0) as ctx:
 
 | ID | Function | File |
 |----|----------|------|
-| I1 | `pool_alloc(pool, size) -> void*` | common.cuh |
-| I2 | `atomicMinF / atomicMaxF` | common.cuh |
+| I1 | `pool_alloc(pool, size) -> void*` | allocator.cuh |
+| I2 | `global_alloc_warp(pool, bytes, lane) -> void*` | allocator.cuh |
+| I3 | `atomicMinF / atomicMaxF` | common.cuh |
 
 ### J. Dead Code
 
