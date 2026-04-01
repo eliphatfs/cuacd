@@ -12,8 +12,11 @@
 // ============================================================================
 // Data structures (must match csrc/structs.h)
 // ============================================================================
-
-#include "structs.cuh"
+struct DevicePool {
+    char*               base;
+    unsigned long long* offset;
+    unsigned long long  capacity;
+};
 
 // ============================================================================
 // Pool allocator
