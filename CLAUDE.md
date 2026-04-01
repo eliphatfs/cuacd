@@ -16,6 +16,7 @@ pyproject.toml        # PEP 621 metadata
 cuda/                 # CUDA device code (compiled to single fatbin)
   kernels.cu          #   Root compilation unit — includes all .cu modules (each is self-contained)
   allocator.cuh       #   DevicePool struct + pool_alloc (block) + global_alloc_warp (warp)
+  heap_arena.cuh      #   DeviceHeap: 64-arena large-object heap (heap_alloc/free/compact)
   common.cuh          #   Constants, atomics (includes allocator.cuh)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
@@ -150,6 +151,9 @@ with coacd_gpu.Context(device=0) as ctx:
 | I1 | `pool_alloc(pool, size) -> void*` | allocator.cuh |
 | I2 | `global_alloc_warp(pool, bytes, lane) -> void*` | allocator.cuh |
 | I3 | `atomicMinF / atomicMaxF` | common.cuh |
+| I4 | `heap_alloc(heap, size, out) -> int` | heap_arena.cuh |
+| I5 | `heap_free(heap, ptr) -> int` | heap_arena.cuh |
+| I6 | `heap_compact(heap) -> int` | heap_arena.cuh |
 
 ### J. Dead Code
 
@@ -171,6 +175,19 @@ int* signs = s_signs;  // all threads see same pointer
 ```
 
 If all threads call `pool_alloc`, each gets a different offset → data corruption.
+
+## Heap Arena Allocator (heap_arena.cuh)
+
+`DeviceHeap` is a large-object heap backed by a `DevicePool`. Design:
+
+- **64 arenas** (`HEAP_NUM_ARENAS`), selected by `blockIdx.x % 64`. Each arena has a singly-linked free list and a spin-lock (`int lock`).
+- **Block layout**: `[HeapBlockHdr (16 B)][data (data_size B)]`. Free blocks store the next header address in `data[0..7]`.
+- **Allocation** (thread 0 only): align request to 4K, first-fit walk of free list with spin-lock, split remainder if ≥ header + 4K. If free list has no fit, bump-allocate a new slab (min 128 KB or next-pow-2 of request) from the pool, split remainder into free list.
+- **Free** (thread 0 only): push block to head of arena free list under spin-lock.
+- **Compact** (one block, no concurrent ops): (1) drain all arenas into `compact_buf`; (2) warp 0 sorts addresses with `warp_sort_t<unsigned long long, HeapAddrCmp>`; (3) tid 0 scans sorted list, coalesces physically adjacent blocks, re-inserts by page index.
+- `compact_buf` is 16 MB of dedicated device memory (not from the pool). The first half holds collected addresses; the second half is sort scratch. `HEAP_COMPACT_CAP ≈ 1M entries`.
+
+Host init: zero-init `DeviceHeap` (zero head = empty list, zero lock = unlocked), set `pool` and `compact_buf` pointers.
 
 ## Implementation Notes
 
