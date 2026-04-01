@@ -90,6 +90,18 @@ __device__ inline unsigned int heap_next_pow2(unsigned int v) {
     v--; v |= v>>1; v |= v>>2; v |= v>>4; v |= v>>8; v |= v>>16; return v + 1;
 }
 
+// MurmurHash3 finalizer — maps a block address to an arena index.
+// Provides uniform distribution even when blocks are all large (sparse page indices).
+__device__ inline int heap_arena_for_addr(unsigned long long addr) {
+    unsigned long long h = addr;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return (int)(h % (unsigned long long)HEAP_NUM_ARENAS);
+}
+
 // ============================================================================
 // heap_alloc — thread 0 only
 // ============================================================================
@@ -258,8 +270,7 @@ __device__ int heap_compact(DeviceHeap* heap) {
                 } else break;
             }
             ((HeapBlockHdr*)base)->data_size = ds;
-            // Distribute by 4K page index for even arena balance.
-            int aidx = (int)((base >> 12) % (unsigned long long)HEAP_NUM_ARENAS);
+            int aidx = heap_arena_for_addr(base);
             heap_set_next(base, heap->arenas[aidx].head);
             heap->arenas[aidx].head = base;
             i = j;
