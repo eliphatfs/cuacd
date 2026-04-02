@@ -39,7 +39,9 @@
 // Configuration
 // ============================================================================
 
+#ifndef HEAP_NUM_ARENAS
 #define HEAP_NUM_ARENAS     64
+#endif
 #define HEAP_NUM_SUBBINS    64
 #define HEAP_HDR_SIZE       16      // HeapBlockHdr bytes
 #define HEAP_FTR_SIZE       16      // HeapBlockFtr bytes (same layout)

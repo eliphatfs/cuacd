@@ -833,7 +833,7 @@ def benchmark_hull_volumes_gpu():
     rng = np.random.default_rng(0)
 
     try:
-        header = (f"{'Config':<20} {'Distribution':<16} {'GPU ms':>9} {'mean vol':>10}")
+        header = (f"{'Config':<20} {'Distribution':<16} {'GPU ms':>9} {'mean vol':>10} {'peak pool MB':>13}")
         print(f"\n{header}")
         print("-" * len(header))
 
@@ -848,7 +848,8 @@ def benchmark_hull_volumes_gpu():
                     t1 = time.perf_counter()
                     gpu_ms = (t1 - t0) * 1000.0
                     mean_vol = float(np.mean(vols))
-                    print(f"{cfg_name:<20} {dist_name:<16} {gpu_ms:>9.1f} {mean_vol:>10.4f}")
+                    peak_mb = ctx.pool_usage() / (1 << 20)
+                    print(f"{cfg_name:<20} {dist_name:<16} {gpu_ms:>9.1f} {mean_vol:>10.4f} {peak_mb:>12.1f}")
                 except Exception as e:
                     print(f"{cfg_name:<20} {dist_name:<16} ERROR: {e}")
 

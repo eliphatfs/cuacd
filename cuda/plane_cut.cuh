@@ -25,7 +25,7 @@
 //
 #pragma once
 #include "common.cuh"
-#include "heap_arena.cuh"
+#include "allocator.cuh"
 #include "structs.cuh"
 #include "warp_sort.cuh"
 

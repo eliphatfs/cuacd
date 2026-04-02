@@ -9,7 +9,7 @@
 // Each block is one warp (32 threads) for cooperative zeroing of heads/tails.
 // The pool back-pointer (heap.pool / scratch.pool) is set by block 0 of each heap.
 
-#include "heap_arena.cuh"   // transitively includes allocator.cuh
+#include "allocator.cuh"
 
 extern "C" __global__ void heap_init_kernel(DevicePool* pool) {
     int is_scratch = (blockIdx.x >= (unsigned int)HEAP_NUM_ARENAS) ? 1 : 0;

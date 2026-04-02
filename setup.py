@@ -87,6 +87,8 @@ def _compile_fatbin(cuda_home, cu_file, fatbin_file, build_dir):
     extra_defines = []
     if os.environ.get("COACD_TRACK_EDGES"):
         extra_defines.append("-DTRACK_MAX_EDGE_PAIRS")
+    if os.environ.get("COACD_GPU_ARENAS"):
+        extra_defines.append(f"-DHEAP_NUM_ARENAS={os.environ['COACD_GPU_ARENAS']}")
     subprocess.check_call([
         nvcc, cu_file, "--fatbin", "-O3", "--use_fast_math",
         "--generate-line-info",
@@ -144,6 +146,8 @@ class CoacdBuildExt(build_ext):
         c_args = ["/std:c11"] if sys.platform == "win32" else ["-std=c11"]
         if os.environ.get("COACD_V2_DEBUG"):
             c_args.append("-DCOACD_V2_DEBUG=1")
+        if os.environ.get("COACD_GPU_ARENAS"):
+            c_args.append(f"-DHEAP_NUM_ARENAS={os.environ['COACD_GPU_ARENAS']}")
         ext.extra_compile_args = c_args
 
         build_ext.build_extension(self, ext)

@@ -8,11 +8,11 @@
 // All 32 threads must call hull_dandc_warp_mesh with identical arguments.
 // Returns hull volume (>= 0) or -1.0f on error.
 //
-// Requires: hull_warp_common.cuh, heap_arena.cuh, structs.cuh
+// Requires: hull_warp_common.cuh, allocator.cuh, structs.cuh
 #pragma once
 #include "hull_warp_common.cuh"
 #include "warp_sort.cuh"
-#include "heap_arena.cuh"
+#include "allocator.cuh"
 #include "structs.cuh"
 
 // ============================================================================

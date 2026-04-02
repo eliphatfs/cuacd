@@ -113,8 +113,8 @@ int beam_init(beam_ctx_t* out, int device_ordinal, size_t pool_bytes) {
         CUdeviceptr d_pool = ctx->d_pool_struct;
         void* init_args[] = { &d_pool };
         CHECK_CU(cuLaunchKernel(ctx->fn_heap_init,
-            128, 1, 1,   // 128 blocks
-             32, 1, 1,   // 32 threads per block (1 warp)
+            HEAP_NUM_ARENAS * 2, 1, 1,   // 2 × HEAP_NUM_ARENAS blocks
+             32, 1, 1,                   // 32 threads per block (1 warp)
             0, s, init_args, NULL));
     }
 

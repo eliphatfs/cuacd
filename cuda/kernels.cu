@@ -2,7 +2,7 @@
 // Compiled to fatbin via nvcc, loaded at runtime via CUDA driver API.
 // Each module is self-contained (carries its own #include directives).
 
-#include "heap_arena.cuh"
+#include "allocator.cuh"
 #include "test_warp_sort.cu"
 #include "test_hull_dandc.cu"
 #include "test_mesh_volume.cu"

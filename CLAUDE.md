@@ -16,7 +16,6 @@ pyproject.toml        # PEP 621 metadata
 cuda/                 # CUDA device code (compiled to single fatbin)
   kernels.cu          #   Root compilation unit — includes all .cu modules (each is self-contained)
   allocator.cuh       #   DevicePool (bump alloc + embedded DeviceHeap×2) + pool_alloc + heap_alloc/free
-  heap_arena.cuh      #   Compatibility shim: #include "allocator.cuh"
   common.cuh          #   Constants, atomics (includes allocator.cuh)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
@@ -25,7 +24,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
-  mm.cu               #   heap_init_kernel: <<<128,32>>> initialises both embedded heaps in DevicePool
+  mm.cu               #   heap_init_kernel: <<<2×HEAP_NUM_ARENAS,32>>> initialises both embedded heaps in DevicePool
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel (hull mesh extraction)
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel (thin wrapper around plane_cut_block)
@@ -38,12 +37,15 @@ csrc/                 # C host code
 coacd_gpu/            # Python package (import name)
   __init__.py         #   Context class (batch_hull_volume, batch_mesh_volume, batch_hull_dandc_mesh)
 tests/                # All tests
-  test_hull.py        #   Hull volume + mesh volume tests (CPU ref, GPU D&C vs scipy, noisy icosphere)
+  test_hull.py        #   Hull volume + mesh volume tests (CPU ref, GPU D&C vs scipy, noisy icosphere); standalone mode prints GPU benchmark table with peak pool MB
   test_hull_mesh.py   #   D&C hull mesh extraction tests (batch_hull_dandc_mesh)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling (gaussian points)
   bench_mm.py         #   Memory management benchmark: compact overhead, pool growth, arena effects
+  bench_arena_sweep.py#   Arena count sweep: rebuild + run benchmark for each HEAP_NUM_ARENAS value
   test_warp_sort.py   #   Tests for warp_sort_bp32 (bitonic + quicksort paths)
   test_plane_cut.py   #   Plane cut tests: simple loop, ring, multi-hole, edge cases (14 tests)
+docs/                 # Analysis and benchmark results
+  arena_sweep.md      #   Arena count sweep results (HEAP_NUM_ARENAS ∈ {32,64,128,256})
 CoACD/                # Reference C++ CoACD (embedded repo, not a submodule)
 ```
 
@@ -95,7 +97,7 @@ After completing any code change, always build (`pip install -e .`) and run the 
 **`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all self-contained `.cu` modules) → fatbin → C header, then builds `csrc/beam_module.c` + `csrc/beam.c` + `csrc/test_beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). Fatbin compiled with `--generate-line-info` for NCU source-level profiling.
 
 **File split:**
-- `cuda/mm.cu` — `heap_init_kernel` (128 blocks × 32 threads; initialises both embedded heaps in DevicePool)
+- `cuda/mm.cu` — `heap_init_kernel` (2×HEAP_NUM_ARENAS blocks × 32 threads; initialises both embedded heaps in DevicePool)
 - `cuda/test_hull_dandc.cu` — `hull_dandc_kernel` (hull mesh extraction)
 - `cuda/test_warp_sort.cu` — `test_warp_sort_kernel`
 - `cuda/test_plane_cut.cu` — `plane_cut_kernel` (thin `__global__` wrapper around `plane_cut_block`)
@@ -233,8 +235,8 @@ If all threads call `pool_alloc`, each gets a different offset → data corrupti
 
 `DeviceHeap` is a large-object heap embedded directly in `DevicePool`. Design:
 
-- **64 arenas** (`HEAP_NUM_ARENAS`), selected by `blockIdx.x % 64`. Each arena has **64 sub-bin doubly-linked free lists**, a **64-bit occupancy bitmap**, and a spin-lock.
-- **Sub-bins**: 32 pow-of-2 bins × 2 linear halves. Bin b = `[4K·2^b, 8K·2^b)`. Sub-bin 2b = lower half `[4K·2^b, 6K·2^b)`, sub-bin 2b+1 = upper half `[6K·2^b, 8K·2^b)`.
+- **`HEAP_NUM_ARENAS` arenas** (default 64, overridable via `COACD_GPU_ARENAS=N pip install -e .`), selected by `blockIdx.x % HEAP_NUM_ARENAS`. Each arena has **64 sub-bin doubly-linked free lists**, a **64-bit occupancy bitmap**, and a spin-lock.
+- **Sub-bins**: 32 pow-of-2 bins × 2 linear halves. Bin b = `[512·2^b, 1024·2^b)`. Sub-bin 2b = lower half `[512·2^b, 768·2^b)`, sub-bin 2b+1 = upper half `[768·2^b, 1024·2^b)`. Minimum alignment: `HEAP_ALIGN = 512` bytes.
 - **Block layout**: `[HeapBlockHdr (16 B)][data (data_size B)][HeapBlockFtr (16 B)]`. `HeapBlockHdr`/`Ftr` store `data_size`, `arena_idx`, `is_free`. Free blocks store `prev`/`next` pointers in first 16 bytes of data.
 - **Slab layout**: each new pool slab has `[leading sentinel 32B][free block][trailing sentinel 32B]`. Sentinels (`is_free=0`, `data_size=0`) prevent coalescing across slab boundaries.
 - **Allocation** (thread 0 only): bitmap search for lowest eligible sub-bin (O(1) via `__ffsll`); pop head; split remainder if ≥ `HEAP_HDR_SIZE + HEAP_ALIGN + HEAP_FTR_SIZE`. If no sub-bin has a free block, allocate a new slab from the pool (min 128 KB or next-pow-2).
@@ -244,16 +246,17 @@ If all threads call `pool_alloc`, each gets a different offset → data corrupti
 **DevicePool layout** (must match `csrc/structs.h`):
 ```
 DevicePool { base, offset*, capacity, DeviceHeap heap, DeviceHeap scratch }
-DeviceHeap { DevicePool* pool (back-ptr set by heap_init_kernel), HeapArena arenas[64] }
+DeviceHeap { DevicePool* pool (back-ptr set by heap_init_kernel), HeapArena arenas[HEAP_NUM_ARENAS] }
 HeapArena  { bitmap, lock, _pad, heads[64], tails[64] }  // 1040 bytes each
 ```
-`sizeof(DevicePool)` ≈ 133 KB (bulk is the two embedded heap arrays).
+`sizeof(DevicePool)` ≈ 133 KB at default HEAP_NUM_ARENAS=64 (bulk is the two embedded heap arrays).
 
-Host init: allocate one `d_pool_struct` of `sizeof(struct DevicePool)`, set `base`/`offset`/`capacity`, then launch `heap_init_kernel<<<128,32>>>` which sets `heap.pool = scratch.pool = pool` and zeroes all arena state.
+Host init: allocate one `d_pool_struct` of `sizeof(struct DevicePool)`, set `base`/`offset`/`capacity`, then launch `heap_init_kernel<<<2*HEAP_NUM_ARENAS,32>>>` which sets `heap.pool = scratch.pool = pool` and zeroes all arena state.
 
-Benchmark results (100 hulls × 2000 pts/hull, 100 rounds gaussian):
-- **Pool stable at 158 MB** forever regardless of compact frequency (compact is a no-op).
+Benchmark results (100 hulls × 2000 pts/hull, gaussian, HEAP_NUM_ARENAS=64):
+- **Pool stable at ~172 MB** after first call regardless of compact frequency (compact is a no-op).
 - In the old allocator, compact-every-call caused pool to grow to ~5700 MB; this is fully resolved.
+- Arena count sweep (`docs/arena_sweep.md`): pool scales ~linearly with HEAP_NUM_ARENAS; throughput is unaffected. A=32 saves ~10% pool with no performance cost.
 
 ## Implementation Notes
 
@@ -288,6 +291,9 @@ python tests/bench_mm.py [--n_rounds 100] [--config 100x2000pts]
 
 # Configs (same range as test_hull, ordered fewer-large → more-small, gaussian only):
 #   10x20000pts, 100x2000pts, 1000x200pts, 10000x20pts
+
+# Arena count sweep: rebuild + benchmark for HEAP_NUM_ARENAS ∈ {32,64,128,256}
+python tests/bench_arena_sweep.py [--arenas 32,64,128,256] [--output docs/arena_sweep.md]
 
 # D&C hull benchmark for NCU profiling
 python tests/bench_dandc.py --n_pts 200 --n_hulls 8
