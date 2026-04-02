@@ -43,7 +43,7 @@
 #define HEAP_NUM_SUBBINS    64
 #define HEAP_HDR_SIZE       16      // HeapBlockHdr bytes
 #define HEAP_FTR_SIZE       16      // HeapBlockFtr bytes (same layout)
-#define HEAP_ALIGN          4096    // 4 KB minimum user-data alignment
+#define HEAP_ALIGN          512     // 512 B minimum user-data alignment
 #define HEAP_MIN_POOL_ALLOC 131072  // 128 KB minimum new slab from pool
 // Slab overhead: leading sentinel (32B) + block hdr+ftr (32B) + trailing sentinel (32B)
 #define HEAP_SLAB_OVERHEAD  96
@@ -141,29 +141,27 @@ __device__ inline void arena_unlock(HeapArena* a) {
 #define HEAP_BLK_PREV(blk) (*(unsigned long long*)((blk) + HEAP_HDR_SIZE))
 #define HEAP_BLK_NEXT(blk) (*(unsigned long long*)((blk) + HEAP_HDR_SIZE + 8))
 
-// Sub-bin index for a block of given data_size (handles non-4K-aligned sizes
-// that arise after coalescing adjacent blocks whose gap includes hdr+ftr = 32 B).
+// Sub-bin index for a block of given data_size.
+// Uses 512-byte units: bin b covers [512·2^b, 1024·2^b).
+// Sub-bin 2b = lower half [512·2^b, 768·2^b), sub-bin 2b+1 = upper half.
 __device__ inline int heap_subbin_for_size(unsigned int sz) {
-    unsigned int units = sz >> 12;
+    unsigned int units = sz >> 9;   // 512-byte units
     if (units == 0) return 0;
     int b = 31 - __clz(units);
-    if (b > 19) return HEAP_NUM_SUBBINS - 1;
     unsigned int lo  = 1u << b;
-    unsigned int mid = lo + (lo >> 1);  // 1.5 * lo in 4K units
+    unsigned int mid = lo + (lo >> 1);  // 1.5 * lo in 512-byte units
     int sub = 2 * b + (units >= mid ? 1 : 0);
     return (sub < HEAP_NUM_SUBBINS - 1) ? sub : HEAP_NUM_SUBBINS - 1;
 }
 
 // Minimum sub-bin whose lower_bound >= sz (any block in it satisfies the request).
-// Correct for non-4K-aligned sz.
 __device__ inline int heap_min_subbin_for_alloc(unsigned int sz) {
     if (sz <= (unsigned int)HEAP_ALIGN) return 0;
-    unsigned int units = sz >> 12;
+    unsigned int units = sz >> 9;   // 512-byte units
     if (units == 0) return 0;
     int b = 31 - __clz(units);
-    if (b > 19) return HEAP_NUM_SUBBINS - 1;
-    unsigned int lb_2b  = 4096u << b;   // lower_bound(sub-bin 2b)
-    unsigned int lb_2b1 = 6144u << b;   // lower_bound(sub-bin 2b+1)
+    unsigned long long lb_2b  = (unsigned long long)512 << b;  // lower_bound(sub-bin 2b)
+    unsigned long long lb_2b1 = (unsigned long long)768 << b;  // lower_bound(sub-bin 2b+1)
     int s;
     if      (lb_2b  >= sz) s = 2 * b;
     else if (lb_2b1 >= sz) s = 2 * b + 1;
