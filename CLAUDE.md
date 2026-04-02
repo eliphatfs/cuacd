@@ -238,13 +238,24 @@ PEP 621 requires `license = {text = "MIT"}` or `license = {file = "LICENSE"}`. T
 
 nvcc crashed when compiling with `--generate-line-info` while `bt_computeInternal` was recursive. Converting to an iterative explicit stack resolved the crash. Line info is now always enabled for NCU profiling.
 
+### plane_cut Loop Reconstruction: be_used / loop_starts Aliasing Bug
+
+In `plane_cut_block` phase 10, `be_used` was aliased to `loop_starts` to avoid an extra allocation. The code did:
+
+```cuda
+loop_starts[n_loops] = lvi;   // store start index
+be_used[start] = 1;           // start == n_loops → overwrites loop_starts[n_loops]!
+```
+
+Because `start == n_loops` at the beginning of each outer loop iteration, `be_used[start] = 1` immediately clobbered the stored start value, making every loop appear to start one vertex late (size N-1 instead of N). Fix: save `lvi_start` in a local variable and assign `loop_starts[n_loops] = lvi_start` **after** all `be_used` writes complete.
+
 ## Current Status
 
 ### Working
 - D&C hull volume (`batch_hull_volume`) and mesh extraction (`batch_hull_dandc_mesh`) — tested (cube 8v/12t, tetra 4v/4t, gaussian); call sites for hull_dandc_warp_mesh not yet updated to new API
 - Batch mesh volume (`batch_mesh_volume`) — divergence theorem, watertight meshes
 - Warp sort (`test_warp_sort`) — bitonic + quicksort paths, duplicates
-- Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests); call sites not yet updated to new API
+- Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests) — all 103 tests pass
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input

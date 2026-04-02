@@ -580,9 +580,9 @@ __device__ inline PartPair plane_cut_block(
                     int n_loops = 0, lvi = 0;
                     for (int start = 0; start < n_boundary; start++) {
                         if (be_used[start]) continue;
-                        loop_starts[n_loops] = lvi;
+                        int lvi_start = lvi;
                         int first = be_a[start*2], cur = be_a[start*2+1];
-                        be_used[start] = 1;
+                        be_used[start] = 1;  // aliases loop_starts[start]; loop_starts[n_loops] set below
                         lv[lvi++] = first;
                         int safety = n_boundary + 2;
                         while (cur != first && safety-- > 0) {
@@ -595,7 +595,8 @@ __device__ inline PartPair plane_cut_block(
                             }
                             if (!found) break;
                         }
-                        loop_sizes[n_loops] = lvi - loop_starts[n_loops];
+                        loop_starts[n_loops] = lvi_start;  // set after be_used writes (avoids alias clobber)
+                        loop_sizes[n_loops] = lvi - lvi_start;
                         n_loops++;
                     }
 

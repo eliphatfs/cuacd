@@ -1,5 +1,4 @@
-// CPython extension module for GPU-accelerated convex decomposition.
-// Provides beam search decomposition + Hausdorff distance computation.
+// CPython extension module for GPU-accelerated convex hull, mesh volume, and plane cut.
 // Uses Python Limited API (abi3) targeting Python 3.10+.
 // Compiled by setuptools, not cmake.
 
@@ -86,24 +85,49 @@ static PyObject* py_test_warp_sort(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
-// batch_hull_volume(pts_ptr, total_pts, offsets_ptr, n_hulls, algo,
-//                  max_pts_per_hull, vols_ptr, errs_ptr) -> None
+// hull_dandc(pts_ptr, total_pts, offsets_ptr, n_hulls,
+//            max_pts_per_hull, max_hull_verts, max_hull_tris,
+//            verts_ptr, tris_ptr, nv_ptr, nt_ptr, errors_ptr) -> None
 // ---------------------------------------------------------------------------
 
-static PyObject* py_batch_hull_volume(PyObject* self, PyObject* args) {
-    unsigned long long pts_ptr, offsets_ptr, vols_ptr, errs_ptr;
-    int total_pts, n_hulls, algo, max_pts_per_hull;
-    if (!PyArg_ParseTuple(args, "KiKiiiKK",
+static PyObject* py_hull_dandc(PyObject* self, PyObject* args) {
+    unsigned long long pts_ptr, offsets_ptr, verts_ptr, tris_ptr;
+    unsigned long long nv_ptr, nt_ptr, errors_ptr;
+    int total_pts, n_hulls, max_pts, max_hv, max_ht;
+    if (!PyArg_ParseTuple(args, "KiKiiiiKKKKK",
             &pts_ptr, &total_pts, &offsets_ptr, &n_hulls,
-            &algo, &max_pts_per_hull, &vols_ptr, &errs_ptr))
+            &max_pts, &max_hv, &max_ht,
+            &verts_ptr, &tris_ptr, &nv_ptr, &nt_ptr, &errors_ptr))
         return NULL;
     REQUIRE_CTX();
-    int rc = beam_batch_hull_volume(g_state.ctx,
+    int rc = beam_hull_dandc(g_state.ctx,
         (const float*)(uintptr_t)pts_ptr, total_pts,
         (const int*)  (uintptr_t)offsets_ptr, n_hulls,
-        algo, max_pts_per_hull,
-        (float*)(uintptr_t)vols_ptr,
-        (int*)  (uintptr_t)errs_ptr);
+        max_pts, max_hv, max_ht,
+        (float*)(uintptr_t)verts_ptr,
+        (int*)  (uintptr_t)tris_ptr,
+        (int*)  (uintptr_t)nv_ptr,
+        (int*)  (uintptr_t)nt_ptr,
+        (int*)  (uintptr_t)errors_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// test_mesh_volume(verts_ptr, n_verts, tris_ptr, n_tris, vol_ptr) -> None
+// ---------------------------------------------------------------------------
+
+static PyObject* py_test_mesh_volume(PyObject* self, PyObject* args) {
+    unsigned long long verts_ptr, tris_ptr, vol_ptr;
+    int n_verts, n_tris;
+    if (!PyArg_ParseTuple(args, "KiKiK",
+            &verts_ptr, &n_verts, &tris_ptr, &n_tris, &vol_ptr))
+        return NULL;
+    REQUIRE_CTX();
+    int rc = beam_test_mesh_volume(g_state.ctx,
+        (const float*)(uintptr_t)verts_ptr, n_verts,
+        (const int*)  (uintptr_t)tris_ptr,  n_tris,
+        (float*)      (uintptr_t)vol_ptr);
     if (rc != 0) return raise_error(g_state.ctx, rc);
     Py_RETURN_NONE;
 }
@@ -135,70 +159,44 @@ static PyObject* py_batch_mesh_volume(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
-// batch_hull_dandc_mesh(pts_ptr, total_pts, offsets_ptr, n_hulls,
-//   max_pts_per_hull, max_hull_verts, max_hull_tris,
-//   vols_ptr, errs_ptr, verts_ptr, tris_ptr, vc_ptr, tc_ptr) -> None
-// ---------------------------------------------------------------------------
-
-static PyObject* py_batch_hull_dandc_mesh(PyObject* self, PyObject* args) {
-    unsigned long long pts_ptr, offsets_ptr, vols_ptr, errs_ptr;
-    unsigned long long verts_ptr, tris_ptr, vc_ptr, tc_ptr;
-    int total_pts, n_hulls, max_pts_per_hull, max_hull_verts, max_hull_tris;
-    if (!PyArg_ParseTuple(args, "KiKiiiiKKKKKK",
-            &pts_ptr, &total_pts, &offsets_ptr, &n_hulls,
-            &max_pts_per_hull, &max_hull_verts, &max_hull_tris,
-            &vols_ptr, &errs_ptr, &verts_ptr, &tris_ptr, &vc_ptr, &tc_ptr))
-        return NULL;
-    REQUIRE_CTX();
-    int rc = beam_batch_hull_dandc_mesh(g_state.ctx,
-        (const float*)(uintptr_t)pts_ptr, total_pts,
-        (const int*)(uintptr_t)offsets_ptr, n_hulls,
-        max_pts_per_hull, max_hull_verts, max_hull_tris,
-        (float*)(uintptr_t)vols_ptr,
-        (int*)(uintptr_t)errs_ptr,
-        (float*)(uintptr_t)verts_ptr,
-        (int*)(uintptr_t)tris_ptr,
-        (int*)(uintptr_t)vc_ptr,
-        (int*)(uintptr_t)tc_ptr);
-    if (rc != 0) return raise_error(g_state.ctx, rc);
-    Py_RETURN_NONE;
-}
-
-// ---------------------------------------------------------------------------
 // test_plane_cut(verts_ptr, n_verts, tris_ptr, n_tris,
-//                pa, pb, pc, pd,
-//                out_v_ptr, out_v_cap, out_pt_ptr, out_pt_cap,
-//                out_nt_ptr, out_nt_cap) -> (n_verts, n_pos_tris, n_neg_tris)
+//               pa, pb, pc, pd,
+//               out_pv_ptr, out_pv_cap,
+//               out_pt_ptr, out_pt_cap,
+//               out_nv_ptr, out_nv_cap,
+//               out_nt_ptr, out_nt_cap)
+//   -> (n_pv, n_pt, n_nv, n_nt)
 // ---------------------------------------------------------------------------
 
 static PyObject* py_test_plane_cut(PyObject* self, PyObject* args) {
-    unsigned long long vp, tp, ovp, optp, ontp;
-    int nv, nt, ovc, optc, ontc;
+    unsigned long long vp, tp, opvp, optp, onvp, ontp;
+    int nv, nt, opvc, optc, onvc, ontc;
     float pa, pb, pc, pd;
 
-    if (!PyArg_ParseTuple(args, "KiKiffffKiKiKi",
+    if (!PyArg_ParseTuple(args, "KiKiffffKiKiKiKi",
             &vp, &nv, &tp, &nt,
             &pa, &pb, &pc, &pd,
-            &ovp, &ovc, &optp, &optc, &ontp, &ontc))
+            &opvp, &opvc, &optp, &optc,
+            &onvp, &onvc, &ontp, &ontc))
         return NULL;
 
     REQUIRE_CTX();
-    beam_set_plane_cut_ctx(g_state.ctx);
 
-    int out_nv = 0, out_npt = 0, out_nnt = 0;
-    int rc = beam_test_plane_cut(
+    int n_pv = 0, n_pt = 0, n_nv = 0, n_nt = 0;
+    int rc = beam_test_plane_cut(g_state.ctx,
         (const float*)(uintptr_t)vp, nv,
-        (const int*)(uintptr_t)tp, nt,
+        (const int*)  (uintptr_t)tp, nt,
         pa, pb, pc, pd,
-        (float*)(uintptr_t)ovp, ovc,
-        (int*)(uintptr_t)optp, optc,
-        (int*)(uintptr_t)ontp, ontc,
-        &out_nv, &out_npt, &out_nnt);
+        (float*)(uintptr_t)opvp, opvc,
+        (int*)  (uintptr_t)optp, optc,
+        (float*)(uintptr_t)onvp, onvc,
+        (int*)  (uintptr_t)ontp, ontc,
+        &n_pv, &n_pt, &n_nv, &n_nt);
     if (rc != 0) {
-        PyErr_SetString(PyExc_RuntimeError, "plane_cut failed (buffer overflow or alloc error)");
+        PyErr_SetString(PyExc_RuntimeError, "plane_cut failed");
         return NULL;
     }
-    return Py_BuildValue("iii", out_nv, out_npt, out_nnt);
+    return Py_BuildValue("iiii", n_pv, n_pt, n_nv, n_nt);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,13 +204,13 @@ static PyObject* py_test_plane_cut(PyObject* self, PyObject* args) {
 // ---------------------------------------------------------------------------
 
 static PyMethodDef gpu_methods[] = {
-    { "init",                   py_init,                   METH_VARARGS, "Initialize GPU context." },
-    { "destroy",                py_destroy,                METH_NOARGS,  "Destroy GPU context." },
-    { "test_warp_sort",         py_test_warp_sort,         METH_VARARGS, "Test warp sort BtPoint32." },
-    { "batch_hull_volume",      py_batch_hull_volume,      METH_VARARGS, "Batch hull volume (D&C)." },
-    { "batch_mesh_volume",      py_batch_mesh_volume,      METH_VARARGS, "Batch mesh volume (divergence theorem)." },
-    { "batch_hull_dandc_mesh",  py_batch_hull_dandc_mesh,  METH_VARARGS, "Batch D&C hull volume + mesh extraction." },
-    { "test_plane_cut",         py_test_plane_cut,         METH_VARARGS, "GPU plane cut with cap triangulation." },
+    { "init",               py_init,               METH_VARARGS, "Initialize GPU context." },
+    { "destroy",            py_destroy,            METH_NOARGS,  "Destroy GPU context." },
+    { "test_warp_sort",     py_test_warp_sort,     METH_VARARGS, "Test warp sort BtPoint32." },
+    { "hull_dandc",         py_hull_dandc,         METH_VARARGS, "D&C convex hull mesh extraction." },
+    { "test_mesh_volume",   py_test_mesh_volume,   METH_VARARGS, "Mesh volume (single mesh)." },
+    { "batch_mesh_volume",  py_batch_mesh_volume,  METH_VARARGS, "Batch mesh volume (divergence theorem)." },
+    { "test_plane_cut",     py_test_plane_cut,     METH_VARARGS, "GPU plane cut with cap triangulation." },
     { NULL, NULL, 0, NULL }
 };
 
@@ -229,7 +227,7 @@ static PyModuleDef_Slot gpu_slots[] = {
 static PyModuleDef gpu_module_def = {
     PyModuleDef_HEAD_INIT,
     "coacd_gpu._gpu",                             // module name
-    "GPU-accelerated convex decomposition",        // docstring
+    "GPU-accelerated convex hull and plane cut",   // docstring
     0,                                             // module state size
     NULL,                                          // methods (added via slot)
     gpu_slots,                                     // slots

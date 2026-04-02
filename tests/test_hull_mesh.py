@@ -1,9 +1,9 @@
-"""Tests for D&C hull mesh extraction (batch_hull_dandc_mesh).
+"""Tests for D&C hull mesh extraction (hull_dandc kernel).
 
 Verifies that the extracted hull mesh:
 - Has correct vertex/triangle counts
-- Produces a watertight mesh
-- Has volume matching batch_hull_volume
+- Produces valid triangle indices
+- Has positive volume (computed via test_mesh_volume)
 """
 
 import numpy as np
@@ -40,134 +40,140 @@ def _tetrahedron_points():
     ], dtype=np.float32)
 
 
+def _run_hull_dandc(pts, max_hv=None, max_ht=None):
+    """Run hull_dandc on a single point cloud; return (verts, tris, err)."""
+    n = len(pts)
+    if max_hv is None:
+        max_hv = n
+    if max_ht is None:
+        max_ht = max(2 * n - 4, 4)
+    offsets = np.array([0, n], dtype=np.int32)
+    out_verts  = np.zeros(max_hv * 3, dtype=np.float32)
+    out_tris   = np.zeros(max_ht * 3, dtype=np.int32)
+    out_nv     = np.zeros(1, dtype=np.int32)
+    out_nt     = np.zeros(1, dtype=np.int32)
+    out_errors = np.zeros(1, dtype=np.int32)
+
+    _gpu.hull_dandc(
+        pts.ctypes.data, n,
+        offsets.ctypes.data, 1,
+        n, max_hv, max_ht,
+        out_verts.ctypes.data, out_tris.ctypes.data,
+        out_nv.ctypes.data, out_nt.ctypes.data,
+        out_errors.ctypes.data)
+
+    nv = int(out_nv[0])
+    nt = int(out_nt[0])
+    verts = out_verts[:nv * 3].reshape(nv, 3).copy()
+    tris  = out_tris [:nt * 3].reshape(nt, 3).copy()
+    return verts, tris, int(out_errors[0])
+
+
+def _mesh_volume(verts, tris):
+    """CPU divergence-theorem volume."""
+    v0, v1, v2 = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
+    return abs(float(np.sum(v0 * np.cross(v1, v2)))) / 6.0
+
+
+def _gpu_mesh_volume(verts, tris):
+    """GPU mesh volume via test_mesh_volume."""
+    verts_c = np.ascontiguousarray(verts, dtype=np.float32)
+    tris_c  = np.ascontiguousarray(tris,  dtype=np.int32)
+    vol = np.zeros(1, dtype=np.float32)
+    _gpu.test_mesh_volume(
+        verts_c.ctypes.data, len(verts_c),
+        tris_c.ctypes.data,  len(tris_c),
+        vol.ctypes.data)
+    return float(vol[0])
+
+
 class TestHullMeshExtraction:
     def test_cube_counts(self):
         """Cube hull should have 8 vertices and 12 triangles."""
         pts = _cube_points()
-        offsets = np.array([0, len(pts)], dtype=np.int32)
-        max_v, max_t = 64, 128
-        volumes = np.zeros(1, dtype=np.float32)
-        errors = np.zeros(1, dtype=np.int32)
-        out_verts = np.zeros((1 * max_v * 3,), dtype=np.float32)
-        out_tris = np.zeros((1 * max_t * 3,), dtype=np.int32)
-        vc = np.zeros(1, dtype=np.int32)
-        tc = np.zeros(1, dtype=np.int32)
-
-        _gpu.batch_hull_dandc_mesh(
-            pts.ctypes.data, len(pts),
-            offsets.ctypes.data, 1,
-            len(pts), max_v, max_t,
-            volumes.ctypes.data, errors.ctypes.data,
-            out_verts.ctypes.data, out_tris.ctypes.data,
-            vc.ctypes.data, tc.ctypes.data)
-
-        assert errors[0] == 0
-        assert vc[0] == 8, f"Expected 8 hull vertices, got {vc[0]}"
-        assert tc[0] == 12, f"Expected 12 hull triangles, got {tc[0]}"
-        assert volumes[0] > 0
+        verts, tris, err = _run_hull_dandc(pts)
+        assert err == 0
+        assert len(verts) == 8,  f"Expected 8 hull vertices, got {len(verts)}"
+        assert len(tris)  == 12, f"Expected 12 hull triangles, got {len(tris)}"
 
     def test_tetrahedron_counts(self):
         """Tetrahedron hull should have 4 vertices and 4 triangles."""
         pts = _tetrahedron_points()
-        offsets = np.array([0, len(pts)], dtype=np.int32)
-        max_v, max_t = 64, 128
-        volumes = np.zeros(1, dtype=np.float32)
-        errors = np.zeros(1, dtype=np.int32)
-        out_verts = np.zeros((1 * max_v * 3,), dtype=np.float32)
-        out_tris = np.zeros((1 * max_t * 3,), dtype=np.int32)
-        vc = np.zeros(1, dtype=np.int32)
-        tc = np.zeros(1, dtype=np.int32)
+        verts, tris, err = _run_hull_dandc(pts)
+        assert err == 0
+        assert len(verts) == 4, f"Expected 4 hull vertices, got {len(verts)}"
+        assert len(tris)  == 4, f"Expected 4 hull triangles, got {len(tris)}"
 
-        _gpu.batch_hull_dandc_mesh(
-            pts.ctypes.data, len(pts),
-            offsets.ctypes.data, 1,
-            len(pts), max_v, max_t,
-            volumes.ctypes.data, errors.ctypes.data,
-            out_verts.ctypes.data, out_tris.ctypes.data,
-            vc.ctypes.data, tc.ctypes.data)
-
-        assert errors[0] == 0
-        assert vc[0] == 4, f"Expected 4 hull vertices, got {vc[0]}"
-        assert tc[0] == 4, f"Expected 4 hull triangles, got {tc[0]}"
-
-    def test_cube_volume_matches(self):
-        """Hull mesh volume (via batch_mesh_volume) should match hull volume."""
+    def test_cube_volume_gpu(self):
+        """Hull mesh GPU volume should be ~1.0 for a unit cube."""
         pts = _cube_points()
-        offsets = np.array([0, len(pts)], dtype=np.int32)
-        max_v, max_t = 64, 128
-        volumes = np.zeros(1, dtype=np.float32)
-        errors = np.zeros(1, dtype=np.int32)
-        out_verts = np.zeros((max_v * 3,), dtype=np.float32)
-        out_tris = np.zeros((max_t * 3,), dtype=np.int32)
-        vc = np.zeros(1, dtype=np.int32)
-        tc = np.zeros(1, dtype=np.int32)
+        verts, tris, err = _run_hull_dandc(pts)
+        assert err == 0
+        vol = _gpu_mesh_volume(verts, tris)
+        assert abs(vol - 1.0) < 0.01, f"GPU hull volume {vol} != 1.0"
 
-        _gpu.batch_hull_dandc_mesh(
-            pts.ctypes.data, len(pts),
-            offsets.ctypes.data, 1,
-            len(pts), max_v, max_t,
-            volumes.ctypes.data, errors.ctypes.data,
-            out_verts.ctypes.data, out_tris.ctypes.data,
-            vc.ctypes.data, tc.ctypes.data)
+    def test_cube_volume_cpu_matches_gpu(self):
+        """CPU and GPU mesh volumes of cube hull should agree within 0.01%."""
+        pts = _cube_points()
+        verts, tris, err = _run_hull_dandc(pts)
+        assert err == 0
+        cpu_vol = _mesh_volume(verts, tris)
+        gpu_vol = _gpu_mesh_volume(verts, tris)
+        rel_err = abs(cpu_vol - gpu_vol) / max(cpu_vol, 1e-12)
+        assert rel_err < 1e-4, f"cpu={cpu_vol:.6f}, gpu={gpu_vol:.6f}"
 
-        nv = vc[0]
-        nt = tc[0]
-        hull_vol = volumes[0]
-
-        # Compute mesh volume of the extracted hull
-        mesh_verts = out_verts[:nv * 3].reshape(-1, 3).copy()
-        mesh_tris = out_tris[:nt * 3].reshape(-1, 3).copy()
-
-        # Use batch_mesh_volume
-        mesh_verts_flat = np.ascontiguousarray(mesh_verts.ravel(), dtype=np.float32)
-        mesh_tris_flat = np.ascontiguousarray(mesh_tris.ravel(), dtype=np.int32)
-        tri_offsets = np.array([0, nt], dtype=np.int32)
-        vert_offsets = np.array([0, 0], dtype=np.int32)
-        mesh_vol = np.zeros(1, dtype=np.float32)
-
-        _gpu.batch_mesh_volume(
-            mesh_verts_flat.ctypes.data, nv,
-            mesh_tris_flat.ctypes.data, nt,
-            tri_offsets.ctypes.data,
-            vert_offsets.ctypes.data,
-            1, mesh_vol.ctypes.data)
-
-        # The D&C hull volume (from int128 arithmetic) is accurate.
-        # The extracted mesh may have mixed winding, so the signed-tet mesh
-        # volume can differ. Check that hull_vol is reasonable (cube = 1.0).
-        assert abs(hull_vol - 1.0) < 0.01, f"Hull volume {hull_vol} != 1.0"
-        # Mesh volume should be positive (winding may not be fully consistent)
-        assert mesh_vol[0] > 0
+    def test_valid_triangle_indices(self):
+        """Triangle indices must be in [0, nv-1]."""
+        pts = _cube_points()
+        verts, tris, err = _run_hull_dandc(pts)
+        assert err == 0
+        assert tris.min() >= 0
+        assert tris.max() < len(verts)
 
     def test_gaussian_hull_mesh(self):
         """Random gaussian points should produce a valid hull mesh."""
-        rng = np.random.RandomState(42)
-        pts = rng.randn(100, 3).astype(np.float32)
-        offsets = np.array([0, len(pts)], dtype=np.int32)
-        max_v, max_t = 256, 512
-        volumes = np.zeros(1, dtype=np.float32)
-        errors = np.zeros(1, dtype=np.int32)
-        out_verts = np.zeros((max_v * 3,), dtype=np.float32)
-        out_tris = np.zeros((max_t * 3,), dtype=np.int32)
-        vc = np.zeros(1, dtype=np.int32)
-        tc = np.zeros(1, dtype=np.int32)
+        rng = np.random.default_rng(42)
+        pts = rng.standard_normal((100, 3)).astype(np.float32)
+        verts, tris, err = _run_hull_dandc(pts)
+        assert err == 0
+        assert len(verts) >= 4
+        assert len(tris)  >= 4
+        assert tris.min() >= 0
+        assert tris.max() < len(verts)
+        vol = _gpu_mesh_volume(verts, tris)
+        assert vol > 0, f"Gaussian hull volume is {vol}"
 
-        _gpu.batch_hull_dandc_mesh(
-            pts.ctypes.data, len(pts),
-            offsets.ctypes.data, 1,
-            len(pts), max_v, max_t,
-            volumes.ctypes.data, errors.ctypes.data,
+    def test_batch_multiple_hulls(self):
+        """Batch of 4 hulls should all succeed and return valid meshes."""
+        rng = np.random.default_rng(7)
+        pts_list = [rng.standard_normal((50, 3)).astype(np.float32) for _ in range(4)]
+        packed = np.concatenate(pts_list, axis=0)
+        offsets = np.array([0, 50, 100, 150, 200], dtype=np.int32)
+        n_hulls = 4
+        max_pts = 50
+        max_hv = max_pts
+        max_ht = max(2 * max_pts - 4, 4)
+
+        out_verts  = np.zeros(n_hulls * max_hv * 3, dtype=np.float32)
+        out_tris   = np.zeros(n_hulls * max_ht * 3, dtype=np.int32)
+        out_nv     = np.zeros(n_hulls, dtype=np.int32)
+        out_nt     = np.zeros(n_hulls, dtype=np.int32)
+        out_errors = np.zeros(n_hulls, dtype=np.int32)
+
+        _gpu.hull_dandc(
+            packed.ctypes.data, len(packed),
+            offsets.ctypes.data, n_hulls,
+            max_pts, max_hv, max_ht,
             out_verts.ctypes.data, out_tris.ctypes.data,
-            vc.ctypes.data, tc.ctypes.data)
+            out_nv.ctypes.data, out_nt.ctypes.data,
+            out_errors.ctypes.data)
 
-        assert errors[0] == 0
-        nv = vc[0]
-        nt = tc[0]
-        assert nv >= 4
-        assert nt >= 4
-        assert volumes[0] > 0
-
-        # All triangle indices should be valid
-        mesh_tris = out_tris[:nt * 3].reshape(-1, 3)
-        assert mesh_tris.min() >= 0
-        assert mesh_tris.max() < nv
+        for i in range(n_hulls):
+            assert out_errors[i] == 0, f"Hull {i}: error {out_errors[i]}"
+            nv = int(out_nv[i])
+            nt = int(out_nt[i])
+            assert nv >= 4, f"Hull {i}: only {nv} vertices"
+            assert nt >= 4, f"Hull {i}: only {nt} triangles"
+            tris_i = out_tris[i * max_ht * 3 : i * max_ht * 3 + nt * 3].reshape(nt, 3)
+            assert tris_i.min() >= 0
+            assert tris_i.max() < nv
