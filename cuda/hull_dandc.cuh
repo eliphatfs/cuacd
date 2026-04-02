@@ -1,17 +1,19 @@
-// hull_dandc.cuh — Warp-based D&C convex hull volume.
+// hull_dandc.cuh — Warp-based D&C convex hull volume and mesh extraction.
 //
 // Faithful port of btConvexHullComputer by Ole Kniemeyer (MAXON, zlib license).
-// Runs entirely on lane 0 of the warp; other lanes idle.
-// All memory allocated from WarpPool bump allocator.
+// Runs entirely on lane 0 of the warp; other lanes idle (except AABB, vertex
+// init, and sort, which are warp-parallel).
 // Uses int32 coordinates with exact int64/int128 predicates.
 //
-// All 32 threads must call with the same arguments.
+// All 32 threads must call hull_dandc_warp_mesh with identical arguments.
 // Returns hull volume (>= 0) or -1.0f on error.
 //
-// Requires: hull_warp_common.cuh
+// Requires: hull_warp_common.cuh, heap_arena.cuh, structs.cuh
 #pragma once
 #include "hull_warp_common.cuh"
 #include "warp_sort.cuh"
+#include "heap_arena.cuh"
+#include "structs.cuh"
 
 // ============================================================================
 // Exact arithmetic types (ported from Bullet)
@@ -339,63 +341,61 @@ __device__ inline void bt_edge_link(BtEdge* a, BtEdge* n) {
 }
 
 // ============================================================================
-// Pool allocator backed by WarpPool (no templates for extern "C" compat)
+// Pool allocator backed by DeviceHeap (lane 0 only)
 // ============================================================================
 
 #define BT_ERR_POOL_EXHAUST 5
+#define BTPOOL_BLOCK_SIZE   8192   // edges per slab
+#define BTPOOL_MAX_BLOCKS   32     // max heap slabs tracked for cleanup
 
-// Generic pool: stores void* free list, object size, block size
+// BtPool: free list of fixed-size objects, backed by heap slabs.
+// All operations (init, new, free) are lane-0-only.
 struct BtPool {
-    void* freeList;
-    WarpPool* wp;
-    int blockSize;
-    int objSize;
+    void*       freeList;
+    DeviceHeap* scratch_heap;
+    int         objSize;    // padded to multiple of 4
+    int         error;
+    int         nblocks;
+    void*       blocks[BTPOOL_MAX_BLOCKS];
 };
 
-__device__ inline void btpool_init(BtPool* p, WarpPool* wp, int blockSize, int objSize, int lane) {
-    int padded = (objSize + 3) & ~3;  // pad to multiple of 4
-    // Lane 0: allocate block and init struct fields
-    char* block = NULL;
-    if (lane == 0) {
-        p->wp = wp;
-        p->blockSize = blockSize;
-        p->objSize = padded;
-        int bytes = blockSize * padded;
-        int aligned = (bytes + 15) & ~15;
-        if (wp->offset + aligned > wp->capacity) {
-            wp->error = 1;
-        } else {
-            block = wp->base + wp->offset;
-            wp->offset += aligned;
-        }
+// Allocate one slab of BTPOOL_BLOCK_SIZE objects from scratch_heap and prepend
+// to the free list. Serial (no warp parallelism). Lane 0 only.
+__device__ inline int btpool_add_block(BtPool* p) {
+    if (p->nblocks >= BTPOOL_MAX_BLOCKS) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
+    void* block = NULL;
+    if (heap_alloc(p->scratch_heap, (unsigned int)(BTPOOL_BLOCK_SIZE * p->objSize), &block) != HEAP_OK) {
+        p->error = BT_ERR_POOL_EXHAUST; return -1;
     }
-    // Broadcast block pointer to all lanes
-    long long blk = __shfl_sync(WARP_MASK, (long long)block, 0);
-    block = (char*)blk;
-    if (!block) return;
-    // All 32 lanes: set up next pointers in parallel (each slot points to previous slot)
-    for (int i = lane; i < blockSize; i += WARP_SIZE) {
-        void* slot = block + i * padded;
-        if (i == 0)
-            *(void**)slot = NULL;  // end of free list
-        else
-            *(void**)slot = block + (i - 1) * padded;
-    }
-    __syncwarp();
-    // Lane 0: set free list head to last slot
-    if (lane == 0) {
-        p->freeList = block + (blockSize - 1) * padded;
-    }
+    p->blocks[p->nblocks++] = block;
+    // slot[0] -> existing freeList; slot[i] -> slot[i-1] for i > 0
+    char* b = (char*)block;
+    int   padded = p->objSize;
+    *(void**)b = p->freeList;
+    for (int i = 1; i < BTPOOL_BLOCK_SIZE; i++)
+        *(void**)(b + i * padded) = b + (i - 1) * padded;
+    p->freeList = b + (BTPOOL_BLOCK_SIZE - 1) * padded;  // head = last slot
+    return 0;
+}
+
+// Initialise pool with 2 pre-allocated slabs. Lane 0 only.
+__device__ inline int btpool_init(BtPool* p, DeviceHeap* scratch_heap, int objSize) {
+    p->scratch_heap = scratch_heap;
+    p->objSize      = (objSize + 3) & ~3;
+    p->freeList     = NULL;
+    p->error        = 0;
+    p->nblocks      = 0;
+    if (btpool_add_block(p) < 0) return -1;
+    if (btpool_add_block(p) < 0) return -1;
+    return 0;
 }
 
 __device__ inline void* btpool_new(BtPool* p) {
     if (!p->freeList) {
-        p->wp->error = BT_ERR_POOL_EXHAUST;
-        return NULL;
+        if (btpool_add_block(p) < 0) return NULL;
     }
     void* obj = p->freeList;
     p->freeList = *(void**)obj;
-    // Zero-init
     int* c = (int*)obj;
     for (int i = 0; i < p->objSize / 4; i++) c[i] = 0;
     return obj;
@@ -406,8 +406,8 @@ __device__ inline void btpool_free(BtPool* p, void* obj) {
     p->freeList = obj;
 }
 
-// Typed wrappers
-__device__ inline BtEdge*   btpool_new_edge(BtPool* p)   { return (BtEdge*)btpool_new(p); }
+// Typed wrapper
+__device__ inline BtEdge* btpool_new_edge(BtPool* p) { return (BtEdge*)btpool_new(p); }
 
 // Simple alloc from WarpPool (lane 0 only)
 __device__ inline void* bt_alloc(WarpPool* wp, int bytes) {
@@ -442,7 +442,8 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 
 // Compute total WarpPool scratch bytes needed for D&C hull with n points.
 // Sort scratch is rewound after sort. D&C stack is rewound after computeInternal.
-// Volume/mesh BFS queues are allocated after D&C rewind, sharing that space.
+// BFS queues are allocated after D&C rewind, sharing that space.
+// Edge pool is now backed by DeviceHeap (scratch_heap), not included here.
 // Peak = presort + max(sort_scratch, persistent + max(dc_stack, bfs_queues)).
 __host__ __device__ inline int dandc_scratch_bytes(int n) {
     int total = 0;
@@ -452,10 +453,8 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
     int sort_scratch = BT_ALIGN16(n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int));
 
     int postsort_persistent = 0;
-    // postsort: pre-allocated vertex block (persists)
+    // postsort: vertex block (persists)
     postsort_persistent += BT_ALIGN16(n * (int)sizeof(BtVertex));
-    // edgePool block (persists)
-    postsort_persistent += BT_ALIGN16(6 * n * (int)sizeof(BtEdge));
 
     // These phases share space via rewind:
     // Phase A: D&C stack (rewound after bt_computeInternal)
@@ -489,7 +488,9 @@ struct BtHullState {
     int maxEdgePairs;
 #endif
     BtVertex* vertexList;
-    WarpPool* wp;
+    WarpPool*   wp;
+    DeviceHeap* scratch_heap;  // backing for edgePool slabs
+    int         npoints;       // original point count (queue size bound)
 };
 
 // ============================================================================
@@ -1173,8 +1174,7 @@ __device__ inline float bt_computeVolume(BtHullState* s) {
     int fstamp = --s->mergeStamp;  // face/edge visited stamp
 
     // Allocate BFS queue from pool (n vertex pointers)
-    int n_verts_max = (int)((s->edgePool.blockSize + 5) / 6);  // n from 6*n edge pool
-    BtVertex** queue = (BtVertex**)bt_alloc(s->wp, n_verts_max * (int)sizeof(BtVertex*));
+    BtVertex** queue = (BtVertex**)bt_alloc(s->wp, s->npoints * (int)sizeof(BtVertex*));
     if (!queue) return -1.0f;
     int qhead = 0, qtail = 0;
 
@@ -1226,19 +1226,17 @@ __device__ inline float bt_computeVolume(BtHullState* s) {
 // Mesh extraction from half-edge hull (lane 0 only, after bt_computeVolume)
 // ============================================================================
 
-// bt_extractMesh: BFS over the half-edge graph (Bullet pattern), assigns
-// sequential indices to vertices, converts BtPoint32 back to float world
-// space, and fan-triangulates each face. No DFS stack needed.
+// bt_extractMesh: BFS over the half-edge graph, assigns sequential indices to
+// vertices, converts BtPoint32 back to float world space, and fan-triangulates
+// each face. Lane 0 only.
 //
-// Axis permutation (same as bt_compute_presort):
-//   BtPoint32.x == medAxis world coordinate
-//   BtPoint32.y == maxAxis world coordinate
-//   BtPoint32.z == minAxis world coordinate
+// When out_verts == NULL: count-only mode — counts nv and nt without writing.
+// When out_verts != NULL: extract mode — writes vertices and triangles.
+// Callers rewind the WarpPool offset between count and extract passes.
 //
-// Returns 0 on success, -1 on error (pool OOM or max_verts/max_tris exceeded).
+// Returns 0 on success, -1 on pool OOM.
 __device__ inline int bt_extractMesh(BtHullState* s,
     float* out_verts, int* out_tris,
-    int max_verts, int max_tris,
     int* n_verts_out, int* n_tris_out)
 {
     *n_verts_out = 0;
@@ -1246,10 +1244,7 @@ __device__ inline int bt_extractMesh(BtHullState* s,
 
     if (!s->vertexList) return 0;
 
-    // BFS vertex discovery (Bullet getVertexCopy pattern).
-    // Queue doubles as ordered_verts for vertex emission and face iteration.
-    int n_verts_max = (int)((s->edgePool.blockSize + 5) / 6);
-    BtVertex** queue = (BtVertex**)bt_alloc(s->wp, n_verts_max * (int)sizeof(BtVertex*));
+    BtVertex** queue = (BtVertex**)bt_alloc(s->wp, s->npoints * (int)sizeof(BtVertex*));
     if (!queue) return -1;
     int n_verts = 0;
     int n_tris  = 0;
@@ -1258,7 +1253,7 @@ __device__ inline int bt_extractMesh(BtHullState* s,
     s->vertexList->copy = vstamp;
     queue[n_verts++] = s->vertexList;
 
-    // Pass 1: BFS to discover all hull vertices via edge walks
+    // BFS: discover all hull vertices
     int qhead = 0;
     while (qhead < n_verts) {
         BtVertex* v = queue[qhead++];
@@ -1267,67 +1262,74 @@ __device__ inline int bt_extractMesh(BtHullState* s,
         do {
             if (e->target->copy != vstamp) {
                 e->target->copy = vstamp;
-                if (n_verts >= max_verts) return -1;
                 queue[n_verts++] = e->target;
             }
             e = e->next;
         } while (e != v->edges);
     }
 
-    // Encode vertex index in copy field: copy = idx_base - index
-    int idx_base = --s->mergeStamp;
-    for (int i = 0; i < n_verts; i++) {
-        queue[i]->copy = idx_base - i;
-    }
+    if (out_verts) {
+        // Extract mode: encode vertex indices, write verts, fan-triangulate faces.
+        int idx_base = --s->mergeStamp;
+        for (int i = 0; i < n_verts; i++)
+            queue[i]->copy = idx_base - i;
 
-    // Emit vertices to out_verts
-    float sc[3], cen[3];
-    sc[0]  = s->scaling[0]; sc[1]  = s->scaling[1]; sc[2]  = s->scaling[2];
-    cen[0] = s->center[0];  cen[1] = s->center[1];  cen[2] = s->center[2];
-    int medAx = s->medAxis, maxAx = s->maxAxis, minAx = s->minAxis;
+        float sc[3]  = { s->scaling[0], s->scaling[1], s->scaling[2] };
+        float cen[3] = { s->center[0],  s->center[1],  s->center[2]  };
+        int medAx = s->medAxis, maxAx = s->maxAxis, minAx = s->minAxis;
+        for (int i = 0; i < n_verts; i++) {
+            BtVertex* v = queue[i];
+            float xyz[3];
+            xyz[medAx] = bv_xval(v) * sc[medAx] + cen[medAx];
+            xyz[maxAx] = bv_yval(v) * sc[maxAx] + cen[maxAx];
+            xyz[minAx] = bv_zval(v) * sc[minAx] + cen[minAx];
+            out_verts[i * 3 + 0] = xyz[0];
+            out_verts[i * 3 + 1] = xyz[1];
+            out_verts[i * 3 + 2] = xyz[2];
+        }
 
-    for (int i = 0; i < n_verts; i++) {
-        BtVertex* v = queue[i];
-        float xyz[3];
-        xyz[medAx] = bv_xval(v) * sc[medAx] + cen[medAx];
-        xyz[maxAx] = bv_yval(v) * sc[maxAx] + cen[maxAx];
-        xyz[minAx] = bv_zval(v) * sc[minAx] + cen[minAx];
-        out_verts[i * 3 + 0] = xyz[0];
-        out_verts[i * 3 + 1] = xyz[1];
-        out_verts[i * 3 + 2] = xyz[2];
-    }
-
-    // Pass 2: emit triangles — iterate discovered vertices, fan-triangulate each face
-    int fstamp = --s->mergeStamp;
-    for (int i = 0; i < n_verts; i++) {
-        BtVertex* v = queue[i];
-        BtEdge* e = v->edges;
-        if (!e) continue;
-        do {
-            if (e->copy != fstamp) {
-                // Fan-triangulate this face from v
-                BtVertex* a = NULL;
-                BtVertex* b = NULL;
-                BtEdge* f = e;
-                do {
-                    if (a && b) {
-                        if (n_tris >= max_tris) return -1;
-                        int vi = idx_base - v->copy;
-                        int ai = idx_base - a->copy;
-                        int bi = idx_base - b->copy;
-                        out_tris[n_tris * 3 + 0] = vi;
-                        out_tris[n_tris * 3 + 1] = ai;
-                        out_tris[n_tris * 3 + 2] = bi;
-                        n_tris++;
-                    }
-                    f->copy = fstamp;
-                    a = b;
-                    b = f->target;
-                    f = f->reverse->prev;
-                } while (f != e);
-            }
-            e = e->next;
-        } while (e != v->edges);
+        int fstamp = --s->mergeStamp;
+        for (int i = 0; i < n_verts; i++) {
+            BtVertex* v = queue[i];
+            BtEdge* e = v->edges;
+            if (!e) continue;
+            do {
+                if (e->copy != fstamp) {
+                    BtVertex* a = NULL, *b = NULL;
+                    BtEdge* f = e;
+                    do {
+                        if (a && b) {
+                            out_tris[n_tris * 3 + 0] = idx_base - v->copy;
+                            out_tris[n_tris * 3 + 1] = idx_base - a->copy;
+                            out_tris[n_tris * 3 + 2] = idx_base - b->copy;
+                            n_tris++;
+                        }
+                        f->copy = fstamp;
+                        a = b;
+                        b = f->target;
+                        f = f->reverse->prev;
+                    } while (f != e);
+                }
+                e = e->next;
+            } while (e != v->edges);
+        }
+    } else {
+        // Count-only mode: count triangles via fan formula (k edges → k-2 tris).
+        int fstamp = --s->mergeStamp;
+        for (int i = 0; i < n_verts; i++) {
+            BtVertex* v = queue[i];
+            BtEdge* e = v->edges;
+            if (!e) continue;
+            do {
+                if (e->copy != fstamp) {
+                    int k = 0;
+                    BtEdge* f = e;
+                    do { f->copy = fstamp; k++; f = f->reverse->prev; } while (f != e);
+                    if (k >= 3) n_tris += k - 2;
+                }
+                e = e->next;
+            } while (e != v->edges);
+        }
     }
 
     *n_verts_out = n_verts;
@@ -1436,8 +1438,14 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     }
     __syncwarp();
 
-    // All lanes: allocate edge and face pool blocks and set up free lists
-    btpool_init(&s->edgePool, s->wp, 6 * count, (int)sizeof(BtEdge), lane);
+    // Lane 0: init edge pool (2 slabs of BTPOOL_BLOCK_SIZE from scratch_heap)
+    // and run D&C.
+    if (lane == 0) {
+        s->npoints = count;
+        if (btpool_init(&s->edgePool, s->scratch_heap, (int)sizeof(BtEdge)) < 0)
+            s->wp->error = BT_ERR_POOL_EXHAUST;
+    }
+    __syncwarp();
 
     // Lane 0: D&C
     if (lane == 0) {
@@ -1461,166 +1469,141 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 }
 
 // ============================================================================
-// Warp entry point
+// Warp entry point: compute hull volume + extract mesh into heap-allocated Mesh
 // ============================================================================
 
-__device__ float hull_dandc_warp(const float* pts, int n, int lane, WarpPool* pool, int* err) {
-    float vol = 0.0f;
-    *err = 0;
-
-    if (n < 4) {
-        return 0.0f;
-    }
-
-    // --- Phase 1: pre-sort (all lanes) ---
-    BtHullState state;
-    if (lane == 0) {
-        state.wp = pool;
-        state.vertexList = NULL;
-    }
-    __syncwarp();
-
-    BtPoint32* points = bt_compute_presort(&state, pts, n, lane);
-    if (!points) { *err = 1; return -1.0f; }
-
-    // Allocate sort scratch (lane 0), broadcast.
-    // Save offset before alloc so we can rewind after sort.
-    int pre_sort_offset = pool->offset; // all lanes see same value after presort
-    char* sort_scratch = NULL;
-    if (lane == 0) {
-        int scratch_bytes = n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int);
-        sort_scratch = (char*)bt_alloc(pool, scratch_bytes);
-    }
-    {
-        long long sp = __shfl_sync(WARP_MASK, (long long)sort_scratch, 0);
-        sort_scratch = (char*)sp;
-    }
-    if (!sort_scratch) { *err = 1; return -1.0f; }
-
-    // --- Phase 2: warp-cooperative sort (all lanes) ---
-    int sort_err = warp_sort_bp32(points, sort_scratch, n, lane);
-    __syncwarp();
-    if (sort_err) { *err = BT_ERR_SORT_STACK; return -1.0f; }
-
-    // Rewind sort scratch — it's no longer needed, postsort reuses the space.
-    if (lane == 0) bt_rewind(pool, pre_sort_offset);
-    __syncwarp();
-
-    // --- Phase 3: post-sort D&C + volume (vertex init: all lanes, D&C: lane 0) ---
-    bt_compute_postsort(&state, points, n, lane);
-
-    if (lane == 0) {
-        if (pool->error) {
-            *err = pool->error;
-            vol = -1.0f;
-        } else {
-            vol = bt_computeVolume(&state);
-            if (pool->error) { *err = pool->error; vol = -1.0f; }
-        }
-#ifdef TRACK_MAX_EDGE_PAIRS
-        printf("EDGE_TRACK n=%d maxEdgePairs=%d pool=%d final=%d\n",
-               n, state.maxEdgePairs, state.edgePool.blockSize, state.usedEdgePairs);
-#endif
-    }
-
-    // Broadcast results from lane 0
-    vol = __shfl_sync(WARP_MASK, vol, 0);
-    int e = __shfl_sync(WARP_MASK, *err, 0);
-    *err = e;
-    return vol;
-}
-
-// ============================================================================
-// Warp entry point: compute hull volume + extract mesh (lane 0 executes mesh extraction)
-// ============================================================================
-
-// hull_dandc_warp_mesh: same as hull_dandc_warp but also extracts the hull mesh.
-// out_verts: float array [max_hull_verts * 3]
-// out_tris:  int array   [max_hull_tris * 3]
-// n_hull_verts, n_hull_tris: output counts
-// All 32 lanes must call this function with identical arguments.
-// Returns hull volume (>= 0) or -1.0f on error.
+// hull_dandc_warp_mesh: D&C convex hull volume + mesh extraction.
+// All 32 lanes must call with identical arguments.
+//
+// heap         — output heap: one chunk allocated for [verts | tris].
+// scratch_heap — scratch heap: WarpPool backing + edge pool slabs, all freed on return.
+// out_mesh     — written by lane 0 on success; {NULL,NULL,0,0} on error or n<4.
+//
+// Returns hull volume (>= 0.0f) or -1.0f on error.
 __device__ float hull_dandc_warp_mesh(
-    const float* pts, int n, int lane, WarpPool* pool, int* err,
-    float* out_verts, int* out_tris,
-    int max_hull_verts, int max_hull_tris,
-    int* n_hull_verts, int* n_hull_tris)
+    const float* pts, int n, int lane,
+    DeviceHeap* heap, DeviceHeap* scratch_heap,
+    Mesh* out_mesh, int* err)
 {
+    __shared__ WarpPool s_pool;
+    __shared__ void*    s_pool_backing;
+
     float vol = 0.0f;
     *err = 0;
-    if (n_hull_verts) *n_hull_verts = 0;
-    if (n_hull_tris)  *n_hull_tris  = 0;
+    if (out_mesh) { out_mesh->verts = NULL; out_mesh->tris = NULL;
+                    out_mesh->nv = 0; out_mesh->nt = 0; }
 
-    if (n < 4) {
-        return 0.0f;
+    if (n < 4) return 0.0f;
+
+    // --- Allocate WarpPool backing from scratch_heap (lane 0) ---
+    if (lane == 0) {
+        int sz = dandc_scratch_bytes(n);
+        void* bk = NULL;
+        if (heap_alloc(scratch_heap, (unsigned int)sz, &bk) == HEAP_OK) {
+            s_pool_backing  = bk;
+            s_pool.base     = (char*)bk;
+            s_pool.offset   = 0;
+            s_pool.capacity = sz;
+            s_pool.error    = 0;
+        } else {
+            s_pool_backing = NULL;
+            *err = 1;
+        }
+    }
+    __syncwarp();
+    if (!s_pool_backing) {
+        vol = __shfl_sync(WARP_MASK, vol, 0);
+        *err = __shfl_sync(WARP_MASK, *err, 0);
+        return -1.0f;
     }
 
     // --- Phase 1: pre-sort (all lanes) ---
     BtHullState state;
     if (lane == 0) {
-        state.wp = pool;
-        state.vertexList = NULL;
+        state.wp           = &s_pool;
+        state.scratch_heap = scratch_heap;
+        state.vertexList   = NULL;
     }
     __syncwarp();
 
     BtPoint32* points = bt_compute_presort(&state, pts, n, lane);
-    if (!points) { *err = 1; return -1.0f; }
+    if (!points) { *err = 1; goto done; }
 
-    // Allocate sort scratch (lane 0), broadcast.
-    // Save offset before alloc so we can rewind after sort.
-    int pre_sort_offset_m = pool->offset;
-    char* sort_scratch = NULL;
-    if (lane == 0) {
-        int scratch_bytes = n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int);
-        sort_scratch = (char*)bt_alloc(pool, scratch_bytes);
-    }
     {
-        long long sp = __shfl_sync(WARP_MASK, (long long)sort_scratch, 0);
-        sort_scratch = (char*)sp;
-    }
-    if (!sort_scratch) { *err = 1; return -1.0f; }
+        // --- Phase 2: sort (all lanes) ---
+        int pre_sort_offset = s_pool.offset;
+        char* sort_scratch = NULL;
+        if (lane == 0) {
+            int sb = n * (int)sizeof(BtPoint32) + WS_MAX_STACK * 2 * (int)sizeof(int);
+            sort_scratch = (char*)bt_alloc(&s_pool, sb);
+        }
+        { long long sp = __shfl_sync(WARP_MASK, (long long)sort_scratch, 0);
+          sort_scratch = (char*)sp; }
+        if (!sort_scratch) { *err = 1; goto done; }
 
-    // --- Phase 2: warp-cooperative sort (all lanes) ---
-    int sort_err = warp_sort_bp32(points, sort_scratch, n, lane);
-    __syncwarp();
-    if (sort_err) { *err = BT_ERR_SORT_STACK; return -1.0f; }
+        int sort_err = warp_sort_bp32(points, sort_scratch, n, lane);
+        __syncwarp();
+        if (sort_err) { *err = BT_ERR_SORT_STACK; goto done; }
 
-    // Rewind sort scratch — postsort reuses the space
-    if (lane == 0) bt_rewind(pool, pre_sort_offset_m);
-    __syncwarp();
+        if (lane == 0) bt_rewind(&s_pool, pre_sort_offset);
+        __syncwarp();
 
-    // --- Phase 3: post-sort D&C (vertex init: all lanes, D&C: lane 0) ---
-    bt_compute_postsort(&state, points, n, lane);
+        // --- Phase 3: post-sort D&C (vertex init: all lanes, D&C + edgePool init: lane 0) ---
+        bt_compute_postsort(&state, points, n, lane);
 
-    if (lane == 0) {
-        if (pool->error) {
-            *err = pool->error;
-            vol = -1.0f;
-        } else {
-            // Extract mesh first (allocates BFS queue from pool)
-            int pre_mesh_offset = pool->offset;
-            if (out_verts && out_tris && n_hull_verts && n_hull_tris) {
-                int mesh_err = bt_extractMesh(&state,
-                    out_verts, out_tris,
-                    max_hull_verts, max_hull_tris,
-                    n_hull_verts, n_hull_tris);
-                if (mesh_err) {
-                    *err = 6; // mesh extraction error
-                    vol = -1.0f;
+        if (lane == 0) {
+            if (s_pool.error || state.edgePool.error) {
+                *err = s_pool.error ? s_pool.error : state.edgePool.error;
+                goto done;
+            }
+
+            // Count pass: exact nv and nt without writing output
+            int pre_count = s_pool.offset;
+            int nv = 0, nt = 0;
+            if (bt_extractMesh(&state, NULL, NULL, &nv, &nt) < 0)
+                { *err = 6; goto done; }
+            bt_rewind(&s_pool, pre_count);
+
+            // Allocate output Mesh chunk from heap: [verts (16-byte aligned) | tris]
+            if (nv > 0) {
+                size_t vb = (size_t)nv * 3 * sizeof(float);
+                size_t va = (vb + 15) & ~(size_t)15;
+                size_t tb = (size_t)nt * 3 * sizeof(int);
+                void* chunk = NULL;
+                if (heap_alloc(heap, (unsigned int)(va + tb), &chunk) != HEAP_OK)
+                    { *err = 1; goto done; }
+                float* ov = (float*)chunk;
+                int*   ot = (int*)((char*)chunk + va);
+
+                // Extract pass
+                int pre_ext = s_pool.offset;
+                int nv2 = 0, nt2 = 0;
+                if (bt_extractMesh(&state, ov, ot, &nv2, &nt2) < 0)
+                    { *err = 6; goto done; }
+                bt_rewind(&s_pool, pre_ext);
+
+                if (out_mesh) {
+                    out_mesh->verts = ov; out_mesh->tris = ot;
+                    out_mesh->nv    = nv; out_mesh->nt   = nt;
                 }
             }
-            // Rewind BFS queue before volume computation allocates its own
-            bt_rewind(pool, pre_mesh_offset);
-            if (!pool->error && vol >= 0.0f) {
-                vol = bt_computeVolume(&state);
-                if (pool->error) { *err = pool->error; vol = -1.0f; }
-            }
+
+            // Volume
+            vol = bt_computeVolume(&state);
+            if (s_pool.error) { *err = s_pool.error; vol = -1.0f; }
         }
     }
 
-    // Broadcast results from lane 0
-    vol = __shfl_sync(WARP_MASK, vol, 0);
-    int e = __shfl_sync(WARP_MASK, *err, 0);
-    *err = e;
+done:
+    // Cleanup scratch: free WarpPool backing and all edge pool slabs (lane 0).
+    if (lane == 0) {
+        heap_free(scratch_heap, s_pool_backing);
+        for (int i = 0; i < state.edgePool.nblocks; i++)
+            heap_free(scratch_heap, state.edgePool.blocks[i]);
+    }
+    __syncwarp();
+
+    vol  = __shfl_sync(WARP_MASK, vol,  0);
+    *err = __shfl_sync(WARP_MASK, *err, 0);
     return vol;
 }

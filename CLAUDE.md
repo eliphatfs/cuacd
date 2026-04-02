@@ -21,7 +21,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
   hull_warp_common.cuh#   WarpPool allocator + warp reductions (used by D&C)
-  hull_dandc.cuh      #   Preparata-Hong D&C hull (Bullet port, warp sort + lane-0 D&C)
+  hull_dandc.cuh      #   Preparata-Hong D&C hull (Bullet port); hull_dandc_warp_mesh returns Mesh via heap
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   hull_batch.cu       #   batch_hull_dandc + query_dandc_scratch + batch_mesh_volume kernels
@@ -161,6 +161,7 @@ with coacd_gpu.Context(device=0) as ctx:
 | ID | What | Why dead |
 |----|------|----------|
 | J1 | `compute_concavity_tris` in geometry.cuh | Bbox cube-root proxy, superseded by Rv |
+| J2 | `hull_dandc_warp` | Removed; use `hull_dandc_warp_mesh` for all callers |
 
 ## plane_cut_block API
 
@@ -175,6 +176,19 @@ with coacd_gpu.Context(device=0) as ctx:
 - **Early exit** (`n_cross == 0`): entire input mesh goes to one side; allocates one heap chunk for verts+tris, other side gets empty `Mesh {NULL,NULL,0,0}`.
 - **No-boundary / one-empty-side cases**: handled by natural fallthrough — compaction produces a 0-entry side correctly.
 - **Call sites** (`test_plane_cut.cu`, `test_beam.c`): not yet updated; will be overhauled separately.
+
+## hull_dandc_warp_mesh API
+
+`hull_dandc_warp_mesh(pts, n, lane, heap, scratch_heap, out_mesh, err)` — warp device function (all 32 lanes call with identical args).
+
+- **Output**: allocates a single combined `[verts | tris]` chunk from `DeviceHeap* heap`; writes result into `Mesh* out_mesh` (lane 0). Returns hull volume as `float`.
+- **Heap chunk layout**: `[verts (nv*3 floats, 16-byte aligned) | tris (nt*3 ints)]`; exact sizes from a count pass.
+- **Scratch**: `DeviceHeap* scratch_heap` backs (a) the `WarpPool` (allocated as a single heap chunk via `dandc_scratch_bytes(n)`) and (b) `BtEdge` pool slabs (`BTPOOL_BLOCK_SIZE=8192` edges each, 2 initial + dynamic expansion). All scratch is heap-freed before return — scratch_heap is clean after call.
+- **WarpPool**: declared `__shared__`; backing allocated from scratch_heap by lane 0. Used for BtPoint32 array, vertex block, sort scratch, D&C stack, BFS queues (all rewound when done).
+- **BtPool (edge pool)**: starts with 2 slabs (16384 edges); expands one slab at a time via `heap_alloc(scratch_heap, ...)` when exhausted. Lane 0 only; free-list setup is serial. Up to `BTPOOL_MAX_BLOCKS=32` slabs tracked for cleanup.
+- **Two-pass mesh extraction**: count pass (`bt_extractMesh` with NULL buffers, counts nv/nt via fan formula) → `heap_alloc(heap, ...)` for exact output → extract pass (writes verts+tris). BFS queue rewound between passes.
+- **dandc_scratch_bytes**: no longer includes the `6*n*sizeof(BtEdge)` edge pool term (pool now comes from scratch_heap separately).
+- **Call sites** (`hull_batch.cu`, `test_hull_dandc.cu`): not yet updated; will be overhauled separately.
 
 ## Pool Allocator Pattern
 
@@ -221,7 +235,7 @@ nvcc crashed when compiling with `--generate-line-info` while `bt_computeInterna
 ## Current Status
 
 ### Working
-- D&C hull volume (`batch_hull_volume`) and mesh extraction (`batch_hull_dandc_mesh`) — tested (cube 8v/12t, tetra 4v/4t, gaussian)
+- D&C hull volume (`batch_hull_volume`) and mesh extraction (`batch_hull_dandc_mesh`) — tested (cube 8v/12t, tetra 4v/4t, gaussian); call sites for hull_dandc_warp_mesh not yet updated to new API
 - Batch mesh volume (`batch_mesh_volume`) — divergence theorem, watertight meshes
 - Warp sort (`test_warp_sort`) — bitonic + quicksort paths, duplicates
 - Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests); call sites not yet updated to new API
