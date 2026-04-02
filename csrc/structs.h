@@ -53,6 +53,18 @@ struct beam_ctx {
     CUfunction fn_mesh_volume;
     CUfunction fn_batch_mesh_volume;
     CUfunction fn_plane_cut;
+    CUfunction fn_heap_compact;
+
+    // Persistent device heaps — both share the same DevicePool backing.
+    // Pool grows via bump allocation; freed blocks return to heap free-lists.
+    // Call beam_heap_compact() to coalesce fragmented free blocks.
+    CUdeviceptr d_pool_mem;              // pool backing memory
+    CUdeviceptr d_pool_off;              // unsigned long long offset counter (device)
+    CUdeviceptr d_pool_struct;           // struct DevicePool on device (shared)
+    CUdeviceptr d_heap;                  // output DeviceHeap on device
+    CUdeviceptr d_heap_compact_buf;      // compact buffer for output heap
+    CUdeviceptr d_scratch;               // scratch DeviceHeap on device
+    CUdeviceptr d_scratch_compact_buf;   // compact buffer for scratch heap
 
     char last_error[256];
 };

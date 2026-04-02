@@ -7,3 +7,4 @@
 #include "test_hull_dandc.cu"
 #include "test_mesh_volume.cu"
 #include "test_plane_cut.cu"
+#include "mm.cu"

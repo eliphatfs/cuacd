@@ -33,16 +33,42 @@ class Context:
         with coacd_gpu.Context() as ctx:
             vols, errs = ctx.batch_hull_volume(pts_list)
             vols = ctx.batch_mesh_volume(verts_list, tris_list)
+
+    Parameters
+    ----------
+    device : int
+        GPU device ordinal. -1 reuses an existing CUDA context if present.
+    pool_bytes : int
+        Bytes to reserve for the shared device heap pool (output + scratch).
+        0 (default) → 70% of free device memory at init time.
     """
 
-    def __init__(self, device=-1):
-        _gpu.init(device)
+    def __init__(self, device=-1, pool_bytes=0):
+        _gpu.init(device, pool_bytes)
         self._alive = True
 
     def close(self):
         if self._alive:
             _gpu.destroy()
             self._alive = False
+
+    def heap_compact(self):
+        """Compact both persistent heaps (output + scratch).
+
+        Coalesces adjacent freed blocks so they can be reused for larger
+        allocations. Call periodically when running many kernel launches
+        to prevent fragmentation from exhausting the pool.
+        """
+        _gpu.heap_compact()
+
+    def pool_usage(self):
+        """Return bytes consumed from the shared device pool.
+
+        This is the peak (high-water mark) of device memory allocated from
+        the bump pool. It never decreases; freed blocks return to heap
+        free-lists rather than back to the pool.
+        """
+        return _gpu.pool_usage()
 
     def __del__(self):
         self.close()

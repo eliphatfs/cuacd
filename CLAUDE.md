@@ -25,14 +25,15 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
+  mm.cu               #   heap_compact_kernel: __global__ wrapper around heap_compact (1 block, 64 threads)
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
-  test_hull_dandc.cu  #   Test kernel: batch_hull_dandc_mesh (hull volume + mesh extraction)
+  test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel (hull mesh extraction)
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel (thin wrapper around plane_cut_block)
 csrc/                 # C host code
-  structs.h           #   Host-side structs: DevicePool, beam_ctx
-  beam.h              #   Public C API (beam_ctx_t, beam_init/destroy, batch ops)
-  beam.c              #   Host implementation: beam_init/destroy, beam_batch_hull_volume, beam_batch_mesh_volume
-  test_beam.c         #   Test host launchers: beam_test_warp_sort, beam_batch_hull_dandc_mesh, beam_test_plane_cut, beam_set_plane_cut_ctx
+  structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, beam_ctx (with persistent heaps)
+  beam.h              #   Public C API (beam_ctx_t, beam_init/destroy/compact/pool_usage, batch ops)
+  beam.c              #   Host implementation: beam_init/destroy, beam_heap_compact, beam_pool_usage
+  test_beam.c         #   Test host launchers: beam_test_warp_sort, beam_hull_dandc, beam_test_plane_cut
   beam_module.c       #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
   __init__.py         #   Context class (batch_hull_volume, batch_mesh_volume, batch_hull_dandc_mesh)
@@ -40,6 +41,7 @@ tests/                # All tests
   test_hull.py        #   Hull volume + mesh volume tests (CPU ref, GPU D&C vs scipy, noisy icosphere)
   test_hull_mesh.py   #   D&C hull mesh extraction tests (batch_hull_dandc_mesh)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling (gaussian points)
+  bench_mm.py         #   Memory management benchmark: compact overhead, pool growth, arena effects
   test_warp_sort.py   #   Tests for warp_sort_bp32 (bitonic + quicksort paths)
   test_plane_cut.py   #   Plane cut tests: simple loop, ring, multi-hole, edge cases (14 tests)
 CoACD/                # Reference C++ CoACD (embedded repo, not a submodule)
@@ -93,11 +95,12 @@ After completing any code change, always build (`pip install -e .`) and run the 
 **`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all self-contained `.cu` modules) → fatbin → C header, then builds `csrc/beam_module.c` + `csrc/beam.c` + `csrc/test_beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). Fatbin compiled with `--generate-line-info` for NCU source-level profiling.
 
 **File split:**
-- `cuda/test_hull_dandc.cu` — `batch_hull_dandc_mesh` (hull volume + mesh extraction)
+- `cuda/mm.cu` — `heap_compact_kernel` (1 block, 64 threads; wraps `heap_compact`)
+- `cuda/test_hull_dandc.cu` — `hull_dandc_kernel` (hull mesh extraction)
 - `cuda/test_warp_sort.cu` — `test_warp_sort_kernel`
 - `cuda/test_plane_cut.cu` — `plane_cut_kernel` (thin `__global__` wrapper around `plane_cut_block`)
-- `csrc/beam.c` — `beam_init/destroy`, `beam_batch_hull_volume`, `beam_batch_mesh_volume`
-- `csrc/test_beam.c` — `beam_test_warp_sort`, `beam_batch_hull_dandc_mesh`, `beam_test_plane_cut`, `beam_set_plane_cut_ctx`
+- `csrc/beam.c` — `beam_init/destroy`, `beam_heap_compact`, `beam_pool_usage`
+- `csrc/test_beam.c` — `beam_test_warp_sort`, `beam_hull_dandc`, `beam_test_plane_cut`
 
 **Struct locations:**
 - `cuda/allocator.cuh` — device-side: `DevicePool`; included by `common.cuh`
@@ -119,11 +122,26 @@ Each `.cu` kernel module is self-contained: carries its own `#include` directive
 
 ```python
 import coacd_gpu
-with coacd_gpu.Context(device=0) as ctx:
+# pool_bytes=0 → auto (70% of free VRAM at init time)
+with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
     volumes, errors = ctx.batch_hull_volume(pts_list)
     volumes = ctx.batch_mesh_volume(verts_list, tris_list)
     results = ctx.batch_hull_dandc_mesh(pts_list)  # list of (verts, tris, volume)
+    used = ctx.pool_usage()     # bytes consumed from shared pool (monotonic)
+    ctx.heap_compact()          # compact both heaps (see heap compact note)
 ```
+
+### Persistent Heaps
+
+`beam_init` allocates two `DeviceHeap` instances at startup that persist for the lifetime of the context. Both share a single `DevicePool` backing (one bump allocator, one large device allocation). Pool size defaults to 70% of free device memory.
+
+- **d_heap** — output heap: holds temporary per-kernel output (freed by kernel before return)
+- **d_scratch** — scratch heap: holds per-kernel working data (freed by kernel before return)
+- **Shared pool**: one `DevicePool` with a shared `atomicAdd` offset counter
+- **Pool offset never decreases**: freed blocks go to heap free-lists, not back to pool
+- **`beam_pool_usage()`**: reads back the pool offset — shows peak (high-water mark) of live device bytes
+
+Key property: both kernels (`hull_dandc_kernel` and `plane_cut_kernel`) call `heap_free` on all allocations before returning. Pool offset stabilizes after the first call and never grows without compact.
 
 ## Utility Function Inventory
 
@@ -218,11 +236,22 @@ If all threads call `pool_alloc`, each gets a different offset → data corrupti
 - **64 arenas** (`HEAP_NUM_ARENAS`), selected by `blockIdx.x % 64`. Each arena has a singly-linked free list and a spin-lock (`int lock`).
 - **Block layout**: `[HeapBlockHdr (16 B)][data (data_size B)]`. Free blocks store the next header address in `data[0..7]`.
 - **Allocation** (thread 0 only): align request to 4K, first-fit walk of free list with spin-lock, split remainder if ≥ header + 4K. If free list has no fit, bump-allocate a new slab (min 128 KB or next-pow-2 of request) from the pool, split remainder into free list.
-- **Free** (thread 0 only): push block to head of arena free list under spin-lock.
-- **Compact** (one block, no concurrent ops): (1) drain all arenas into `compact_buf`; (2) warp 0 sorts addresses with `warp_sort_t<unsigned long long, HeapAddrCmp>`; (3) tid 0 scans sorted list, coalesces physically adjacent blocks, re-inserts by page index.
+- **Free** (thread 0 only): push block to head of arena `blockIdx.x % 64` under spin-lock.
+- **Compact** (one block, no concurrent ops): (1) drain all arenas into `compact_buf`; (2) warp 0 sorts addresses with `warp_sort_t<unsigned long long, HeapAddrCmp>`; (3) tid 0 scans sorted list, coalesces physically adjacent blocks, **re-inserts by address hash** (`heap_arena_for_addr(ptr) % 64`).
 - `compact_buf` is 16 MB of dedicated device memory (not from the pool). The first half holds collected addresses; the second half is sort scratch. `HEAP_COMPACT_CAP ≈ 1M entries`.
 
 Host init: zero-init `DeviceHeap` (zero head = empty list, zero lock = unlocked), set `pool` and `compact_buf` pointers.
+
+### Arena Mismatch: Do Not Call heap_compact() Routinely
+
+**alloc/free use `blockIdx.x % 64`; compact re-inserts by `heap_arena_for_addr(ptr)` (address hash).** After compact, blocks land in address-hash arenas, not `blockIdx.x` arenas. The next kernel call finds its preferred arena empty and bump-allocates a new slab from the pool — pool grows on every call after compact.
+
+Benchmark results (100 hulls × 2000 pts/hull, 50 rounds gaussian):
+- **No compact**: pool stable at 158 MB forever (all blocks returned to correct arenas, reused perfectly)
+- **Compact every call**: pool grows to ~5700 MB, hull_dandc ~7% slower per call (arena miss overhead)
+- **Compact once at end**: pool 313 MB (double of no-compact), but at least doesn't grow unboundedly
+
+**Rule**: do NOT call `heap_compact()` as part of the normal call loop. Both kernels already free all heap allocations before returning, so the pool stabilizes naturally. `heap_compact()` is reserved for future streaming pipelines where data survives across calls (not yet implemented).
 
 ## Implementation Notes
 
@@ -249,13 +278,29 @@ be_used[start] = 1;           // start == n_loops → overwrites loop_starts[n_l
 
 Because `start == n_loops` at the beginning of each outer loop iteration, `be_used[start] = 1` immediately clobbered the stored start value, making every loop appear to start one vertex late (size N-1 instead of N). Fix: save `lvi_start` in a local variable and assign `loop_starts[n_loops] = lvi_start` **after** all `be_used` writes complete.
 
+## Benchmarking
+
+```bash
+# Memory management benchmark: compact overhead, pool usage, arena effects
+python tests/bench_mm.py [--n_rounds 100] [--config 100x2000pts]
+
+# Configs (same range as test_hull, ordered fewer-large → more-small, gaussian only):
+#   10x20000pts, 100x2000pts, 1000x200pts, 10000x20pts
+
+# D&C hull benchmark for NCU profiling
+python tests/bench_dandc.py --n_pts 200 --n_hulls 8
+ncu --set full -o dandc_profile python tests/bench_dandc.py --n_pts 200 --n_hulls 8
+```
+
 ## Current Status
 
 ### Working
-- D&C hull volume (`batch_hull_volume`) and mesh extraction (`batch_hull_dandc_mesh`) — tested (cube 8v/12t, tetra 4v/4t, gaussian); call sites for hull_dandc_warp_mesh not yet updated to new API
+- D&C hull volume (`batch_hull_volume`) and mesh extraction (`batch_hull_dandc_mesh`) — all 103 tests pass
 - Batch mesh volume (`batch_mesh_volume`) — divergence theorem, watertight meshes
 - Warp sort (`test_warp_sort`) — bitonic + quicksort paths, duplicates
-- Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests) — all 103 tests pass
+- Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests)
+- Persistent heaps (`beam_init` with `pool_bytes`): both heaps share one pool, all memory recycled by kernels, pool stable after first call
+- `ctx.pool_usage()` — peak device pool bytes (monotonic), `ctx.heap_compact()` — available but not needed normally
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input

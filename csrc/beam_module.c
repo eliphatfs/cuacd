@@ -35,12 +35,17 @@ static PyObject* raise_error(beam_ctx_t ctx, int rc) {
 } while (0)
 
 // ---------------------------------------------------------------------------
-// init(device=-1) -> None
+// init(device=-1, pool_bytes=0) -> None
+//   pool_bytes=0 → auto: 70% of free device memory at init time.
 // ---------------------------------------------------------------------------
 
-static PyObject* py_init(PyObject* self, PyObject* args) {
+static PyObject* py_init(PyObject* self, PyObject* args, PyObject* kwargs) {
+    static char* kwlist[] = {"device", "pool_bytes", NULL};
     int device = -1;
-    if (!PyArg_ParseTuple(args, "|i", &device))
+    unsigned long long pool_bytes = 0;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|iK", kwlist,
+                                     &device, &pool_bytes))
         return NULL;
 
     if (g_state.ctx) {
@@ -48,7 +53,7 @@ static PyObject* py_init(PyObject* self, PyObject* args) {
         g_state.ctx = NULL;
     }
 
-    int rc = beam_init(&g_state.ctx, device);
+    int rc = beam_init(&g_state.ctx, device, (size_t)pool_bytes);
     if (rc != 0) {
         return raise_error(g_state.ctx, rc);
     }
@@ -65,6 +70,29 @@ static PyObject* py_destroy(PyObject* self, PyObject* args) {
         g_state.ctx = NULL;
     }
     Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// heap_compact() -> None
+//   Coalesce free blocks in both persistent heaps (output + scratch).
+// ---------------------------------------------------------------------------
+
+static PyObject* py_heap_compact(PyObject* self, PyObject* args) {
+    REQUIRE_CTX();
+    int rc = beam_heap_compact(g_state.ctx);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// pool_usage() -> int
+//   Return bytes consumed from the shared device pool (monotonically increases).
+// ---------------------------------------------------------------------------
+
+static PyObject* py_pool_usage(PyObject* self, PyObject* args) {
+    REQUIRE_CTX();
+    size_t usage = beam_pool_usage(g_state.ctx);
+    return PyLong_FromSize_t(usage);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,8 +232,15 @@ static PyObject* py_test_plane_cut(PyObject* self, PyObject* args) {
 // ---------------------------------------------------------------------------
 
 static PyMethodDef gpu_methods[] = {
-    { "init",               py_init,               METH_VARARGS, "Initialize GPU context." },
+    { "init",               (PyCFunction)py_init,  METH_VARARGS | METH_KEYWORDS,
+      "Initialize GPU context. init(device=-1, pool_bytes=0)\n"
+      "pool_bytes=0 → auto: 70% of free device memory." },
     { "destroy",            py_destroy,            METH_NOARGS,  "Destroy GPU context." },
+    { "heap_compact",       py_heap_compact,       METH_NOARGS,
+      "Compact both persistent heaps (output + scratch). "
+      "Call periodically to coalesce fragmented free blocks." },
+    { "pool_usage",         py_pool_usage,         METH_NOARGS,
+      "Return bytes consumed from the shared device pool (peak usage, monotonic)." },
     { "test_warp_sort",     py_test_warp_sort,     METH_VARARGS, "Test warp sort BtPoint32." },
     { "hull_dandc",         py_hull_dandc,         METH_VARARGS, "D&C convex hull mesh extraction." },
     { "test_mesh_volume",   py_test_mesh_volume,   METH_VARARGS, "Mesh volume (single mesh)." },

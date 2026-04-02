@@ -15,10 +15,23 @@ extern "C" {
 // Opaque handle to GPU context
 typedef struct beam_ctx* beam_ctx_t;
 
-int  beam_init(beam_ctx_t* ctx, int device_ordinal);
+// pool_bytes: backing memory for both heaps combined.
+//   0 = auto: use 70% of free device memory at init time.
+int  beam_init(beam_ctx_t* ctx, int device_ordinal, size_t pool_bytes);
 void beam_destroy(beam_ctx_t ctx);
 
 const char* beam_last_error(beam_ctx_t ctx);
+
+// beam_heap_compact — coalesce free blocks in both persistent heaps.
+// Call periodically to recover fragmented memory between kernel launches.
+// Blocks until compaction is complete.
+int  beam_heap_compact(beam_ctx_t ctx);
+
+// beam_pool_usage — read back how many bytes have been bump-allocated from
+// the shared pool (= peak live device memory used by both heaps combined).
+// The offset never decreases; freed blocks go to heap free-lists, not back
+// to the pool. Returns 0 on error.
+size_t beam_pool_usage(beam_ctx_t ctx);
 
 // ---------------------------------------------------------------------------
 // Test: warp_sort — sort BtPoint32 sub-arrays in-place

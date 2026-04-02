@@ -21,80 +21,6 @@
 } while(0)
 
 // ---------------------------------------------------------------------------
-// BeamHeapD — device-side DeviceHeap allocation helper
-// ---------------------------------------------------------------------------
-
-typedef struct {
-    CUdeviceptr d_heap;       // struct DeviceHeap on device
-    CUdeviceptr d_pool;       // struct DevicePool on device
-    CUdeviceptr d_pool_mem;   // pool backing memory
-    CUdeviceptr d_pool_off;   // unsigned long long offset counter
-    CUdeviceptr d_compact;    // compact buffer (HEAP_COMPACT_BUF_BYTES)
-} BeamHeapD;
-
-// Allocate and zero-initialize a DeviceHeap with the given pool_size.
-// Returns CUDA_SUCCESS (0) on success.
-static int heap_alloc_d(beam_ctx_t ctx, BeamHeapD* bh, size_t pool_size, CUstream s)
-{
-    memset(bh, 0, sizeof(*bh));
-
-    CUresult r;
-    if ((r = cuMemAlloc(&bh->d_heap,     sizeof(struct DeviceHeap)))    != CUDA_SUCCESS) goto fail;
-    if ((r = cuMemAlloc(&bh->d_pool,     sizeof(struct DevicePool)))    != CUDA_SUCCESS) goto fail;
-    if ((r = cuMemAlloc(&bh->d_pool_mem, pool_size))                    != CUDA_SUCCESS) goto fail;
-    if ((r = cuMemAlloc(&bh->d_pool_off, sizeof(unsigned long long)))   != CUDA_SUCCESS) goto fail;
-    if ((r = cuMemAlloc(&bh->d_compact,  HEAP_COMPACT_BUF_BYTES))       != CUDA_SUCCESS) goto fail;
-
-    // Zero-fill DeviceHeap (clears all arenas: empty free lists + unlocked)
-    if ((r = cuMemsetD8(bh->d_heap, 0, sizeof(struct DeviceHeap)))      != CUDA_SUCCESS) goto fail;
-
-    // Init pool offset to 0
-    unsigned long long zero = 0;
-    if ((r = cuMemcpyHtoDAsync(bh->d_pool_off, &zero,
-                               sizeof(unsigned long long), s))           != CUDA_SUCCESS) goto fail;
-
-    // Build DevicePool on host and copy to device
-    struct DevicePool dp;
-    dp.base     = (char*)(uintptr_t)bh->d_pool_mem;
-    dp.offset   = (unsigned long long*)(uintptr_t)bh->d_pool_off;
-    dp.capacity = (unsigned long long)pool_size;
-    if ((r = cuMemcpyHtoDAsync(bh->d_pool, &dp,
-                               sizeof(struct DevicePool), s))            != CUDA_SUCCESS) goto fail;
-
-    // Build DeviceHeap on host (zero arenas already on device; patch pointers)
-    struct DeviceHeap dh;
-    memset(&dh, 0, sizeof(dh));
-    dh.pool        = (struct DevicePool*)(uintptr_t)bh->d_pool;
-    dh.compact_buf = (unsigned long long*)(uintptr_t)bh->d_compact;
-    if ((r = cuMemcpyHtoDAsync(bh->d_heap, &dh,
-                               sizeof(struct DeviceHeap), s))            != CUDA_SUCCESS) goto fail;
-
-    return 0;
-
-fail:
-    if (bh->d_heap)     cuMemFree(bh->d_heap);
-    if (bh->d_pool)     cuMemFree(bh->d_pool);
-    if (bh->d_pool_mem) cuMemFree(bh->d_pool_mem);
-    if (bh->d_pool_off) cuMemFree(bh->d_pool_off);
-    if (bh->d_compact)  cuMemFree(bh->d_compact);
-    memset(bh, 0, sizeof(*bh));
-    const char* _msg = NULL;
-    cuGetErrorString(r, &_msg);
-    snprintf(ctx->last_error, sizeof(ctx->last_error),
-             "heap_alloc_d failed at test_beam.c: %s", _msg ? _msg : "unknown");
-    return (int)r;
-}
-
-static void heap_free_d(BeamHeapD* bh) {
-    if (bh->d_heap)     cuMemFree(bh->d_heap);
-    if (bh->d_pool)     cuMemFree(bh->d_pool);
-    if (bh->d_pool_mem) cuMemFree(bh->d_pool_mem);
-    if (bh->d_pool_off) cuMemFree(bh->d_pool_off);
-    if (bh->d_compact)  cuMemFree(bh->d_compact);
-    memset(bh, 0, sizeof(*bh));
-}
-
-// ---------------------------------------------------------------------------
 // beam_test_warp_sort
 // ---------------------------------------------------------------------------
 // points: packed int[total_pts * 4] (x,y,z,index)
@@ -154,9 +80,8 @@ int beam_test_warp_sort(beam_ctx_t ctx,
 // beam_hull_dandc
 // ---------------------------------------------------------------------------
 // Extract convex hull mesh for each point cloud.
-// out_verts:  float[n_hulls * max_hull_verts * 3]
-// out_tris:   int[n_hulls * max_hull_tris * 3]
-// out_nv, out_nt, out_errors: int[n_hulls]
+// Uses persistent ctx->d_heap (output) and ctx->d_scratch (scratch).
+// Both heaps share the same pool; all allocations are freed by the kernel.
 
 int beam_hull_dandc(
     beam_ctx_t   ctx,
@@ -174,6 +99,11 @@ int beam_hull_dandc(
     int*         out_errors)
 {
     if (!ctx || !ctx->fn_hull_dandc) return -1;
+    if (!ctx->d_heap || !ctx->d_scratch) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "persistent heaps not initialized; call beam_init first");
+        return -1;
+    }
     CUstream s = NULL;
 
     // Query scratch bytes per hull (WarpPool portion)
@@ -189,26 +119,7 @@ int beam_hull_dandc(
         CHECK_CU(cuStreamSynchronize(s));
         cuMemFree(d_q);
     }
-
-    // Heap sizes: generous to handle concurrent warps
-    // Output heap: per hull ≈ (max_hull_verts + max_hull_tris) * 12 B + 8 KB overhead, 4 KB aligned
-    size_t per_hull_out = (size_t)(max_hull_verts * 3 * (int)sizeof(float)
-                                 + max_hull_tris  * 3 * (int)sizeof(int)) + 8192;
-    size_t heap_pool_size = (size_t)n_hulls * per_hull_out;
-    if (heap_pool_size < 16 * 1024 * 1024) heap_pool_size = 16 * 1024 * 1024;
-
-    // Scratch heap: warp scratch + generous extra for edge pool slabs (≈512KB per hull)
-    size_t per_hull_scratch = (size_t)warp_scratch + 512 * 1024;
-    size_t scratch_pool_size = (size_t)n_hulls * per_hull_scratch;
-    if (scratch_pool_size < 64 * 1024 * 1024) scratch_pool_size = 64 * 1024 * 1024;
-
-    BeamHeapD heap, scratch;
-    int rc;
-    if ((rc = heap_alloc_d(ctx, &heap,    heap_pool_size,    s)) != 0) return rc;
-    if ((rc = heap_alloc_d(ctx, &scratch, scratch_pool_size, s)) != 0) {
-        heap_free_d(&heap); return rc;
-    }
-    CHECK_CU(cuStreamSynchronize(s));
+    (void)warp_scratch;  // informational only; heaps are pre-allocated
 
     // Device buffers for input and output
     CUdeviceptr d_pts, d_off, d_overts, d_otris, d_onv, d_ont, d_oerr;
@@ -232,7 +143,7 @@ int beam_hull_dandc(
         &d_pts, &d_off, &n_hulls,
         &max_hull_verts, &max_hull_tris,
         &d_overts, &d_otris, &d_onv, &d_ont, &d_oerr,
-        &heap.d_heap, &scratch.d_heap
+        &ctx->d_heap, &ctx->d_scratch
     };
     CHECK_CU(cuLaunchKernel(ctx->fn_hull_dandc, n_blocks, 1, 1,
                             block_size, 1, 1, 0, s, args, NULL));
@@ -247,8 +158,6 @@ int beam_hull_dandc(
     cuMemFree(d_pts); cuMemFree(d_off);
     cuMemFree(d_overts); cuMemFree(d_otris);
     cuMemFree(d_onv); cuMemFree(d_ont); cuMemFree(d_oerr);
-    heap_free_d(&heap);
-    heap_free_d(&scratch);
     return 0;
 }
 
@@ -336,7 +245,8 @@ int beam_batch_mesh_volume(
 // ---------------------------------------------------------------------------
 // beam_test_plane_cut
 // ---------------------------------------------------------------------------
-// New API: separate pos and neg vertex arrays.
+// Uses persistent ctx->d_heap (output) and ctx->d_scratch (scratch).
+// Both heaps share the same pool; all allocations are freed by the kernel.
 
 int beam_test_plane_cut(
     beam_ctx_t   ctx,
@@ -351,6 +261,11 @@ int beam_test_plane_cut(
     int* out_n_nv, int* out_n_nt)
 {
     if (!ctx || !ctx->fn_plane_cut) return -1;
+    if (!ctx->d_heap || !ctx->d_scratch) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "persistent heaps not initialized; call beam_init first");
+        return -1;
+    }
 
     *out_n_pv = 0; *out_n_pt = 0;
     *out_n_nv = 0; *out_n_nt = 0;
@@ -359,21 +274,6 @@ int beam_test_plane_cut(
     CUdeviceptr d_verts = 0, d_tris = 0;
     CUdeviceptr d_opv = 0, d_opt = 0, d_onv = 0, d_ont = 0;
     CUdeviceptr d_counts = 0, d_kerr = 0;
-
-    // Heap sizes: generous
-    // Output: n_verts * 2 * 12 bytes + overhead; n_tris * 3 * 12 * 2 + overhead
-    size_t out_heap_size = (size_t)(n_verts * 2 + n_tris * 4) * 16 + 2 * 1024 * 1024;
-    size_t scratch_size  = (size_t)(n_tris * 8) * 16 + 32 * 1024 * 1024;
-    if (out_heap_size < 4  * 1024 * 1024) out_heap_size = 4  * 1024 * 1024;
-    if (scratch_size  < 32 * 1024 * 1024) scratch_size  = 32 * 1024 * 1024;
-
-    BeamHeapD heap, scratch;
-    int rc;
-    if ((rc = heap_alloc_d(ctx, &heap,    out_heap_size, s)) != 0) return rc;
-    if ((rc = heap_alloc_d(ctx, &scratch, scratch_size,  s)) != 0) {
-        heap_free_d(&heap); return rc;
-    }
-    CHECK_CU(cuStreamSynchronize(s));
 
     CHECK_CU(cuMemAlloc(&d_verts, (size_t)n_verts * 3 * sizeof(float)));
     CHECK_CU(cuMemAlloc(&d_tris,  (size_t)n_tris  * 3 * sizeof(int)));
@@ -402,7 +302,7 @@ int beam_test_plane_cut(
         &out_pos_verts_cap, &out_pos_tris_cap,
         &out_neg_verts_cap, &out_neg_tris_cap,
         &d_npv, &d_npt, &d_nnv, &d_nnt,
-        &heap.d_heap, &scratch.d_heap,
+        &ctx->d_heap, &ctx->d_scratch,
         &d_kerr
     };
     CHECK_CU(cuLaunchKernel(ctx->fn_plane_cut,
@@ -441,7 +341,6 @@ int beam_test_plane_cut(
     cuMemFree(d_opv); cuMemFree(d_opt);
     cuMemFree(d_onv); cuMemFree(d_ont);
     cuMemFree(d_counts); cuMemFree(d_kerr);
-    heap_free_d(&heap); heap_free_d(&scratch);
     return 0;
 
 cleanup_err:
@@ -449,6 +348,5 @@ cleanup_err:
     cuMemFree(d_opv); cuMemFree(d_opt);
     cuMemFree(d_onv); cuMemFree(d_ont);
     cuMemFree(d_counts); cuMemFree(d_kerr);
-    heap_free_d(&heap); heap_free_d(&scratch);
     return -1;
 }
