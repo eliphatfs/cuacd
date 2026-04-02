@@ -20,7 +20,7 @@
 //        Free dir_sort.
 //   9    Binary search for boundary edges              (parallel, 64 threads)
 //  10-12 Compact boundary → loops → polygon → ear-clip (thread 0)
-//  13    Compact verts per side, heap-alloc output     (thread 0)
+//  13    Compact verts per side, heap-alloc output     (parallel, 64 threads)
 //        Free all remaining scratch.
 //
 #pragma once
@@ -179,6 +179,21 @@ __device__ inline void plane_cut_block(
     __shared__ Edge2i* s_dir_edges;
     __shared__ char*   s_dir_sort;
     __shared__ int*    s_boundary_flags;
+
+    // Phase-13 broadcast and parallel-compaction scratch
+    __shared__ int    s_total_pos, s_total_neg;
+    __shared__ int    s_pnv, s_nnv;
+    __shared__ int*   s_pr_ptr;
+    __shared__ int*   s_nr_ptr;
+    __shared__ float* s_pvp;
+    __shared__ int*   s_ptp;
+    __shared__ float* s_nvp;
+    __shared__ int*   s_ntp;
+    __shared__ int    s_chunk_ok;
+    __shared__ int    s_pcount[PC_BLOCK];
+    __shared__ int    s_ncount[PC_BLOCK];
+    __shared__ int    s_pbase[PC_BLOCK];
+    __shared__ int    s_nbase[PC_BLOCK];
 
     if (tid == 0) {
         s_signs = NULL; s_all_verts = NULL;
@@ -491,19 +506,20 @@ __device__ inline void plane_cut_block(
     __syncthreads();
 
     // =========================================================================
-    // Phases 10-13: thread 0 only.
+    // Phases 10-12: thread 0 only.
     //
-    // All local scratch is allocated as void* locals (init NULL), freed at the
-    // single cleanup block at the bottom of this section.  kern_ok gates all
-    // work after the first failure; the cleanup block runs regardless.
+    // All local scratch is void* locals (init NULL), freed inline as early as
+    // possible.  kern_ok gates work after the first failure.
+    // At the end, kern_ok + total_pos/neg + remap ptrs are broadcast to all
+    // threads via shared memory for the parallel phase 13.
     // =========================================================================
     if (tid == 0) {
-        int kern_ok   = 1;
-        int n_cap     = 0;
+        int kern_ok    = 1;
+        int n_cap      = 0;
         int n_boundary = 0;
 
         // Thread-0-only scratch — all NULL so heap_free is always safe.
-        void* lv_ptr   = NULL;  // boundary edge pairs (be_a), then freed before loop recon
+        void* lv_ptr   = NULL;  // boundary edge pairs (be_a), freed after loop recon
         void* lv2_ptr  = NULL;  // loop vertex sequence (lv)
         void* ls_ptr   = NULL;  // loop_starts
         void* lsz_ptr  = NULL;  // loop_sizes
@@ -511,12 +527,8 @@ __device__ inline void plane_cut_block(
         void* cap_ptr  = NULL;  // cap_tris (ear-clip output)
         void* ep_ptr   = NULL;  // ear_prevnext
         void* sb_ptr   = NULL;  // inner sort buf (inner_idx + inner_max_u, 256 each)
-        void* pr_ptr   = NULL;  // pos_remap
-        void* nr_ptr   = NULL;  // neg_remap
 
         // --- Compact boundary edges into lv_ptr (packed a,b pairs) ---
-        // Upper bound on boundary edges: n_de.  Allocate n_de * 2 ints.
-        // (If n_de == 0, skip alloc; lv_ptr stays NULL, n_boundary stays 0.)
         if (n_de > 0) {
             if (heap_alloc(scratch_heap, (unsigned int)(n_de * 2 * (int)sizeof(int)), &lv_ptr) != HEAP_OK) {
                 kern_ok = 0; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);
@@ -538,17 +550,12 @@ __device__ inline void plane_cut_block(
 
             // --- Phase 10-12: loop reconstruction + polygon + ear-clip ---
             if (n_boundary > 0) {
-                // Alloc all loop-phase scratch up front; gate further work on success.
                 if (heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &ls_ptr)  != HEAP_OK) { kern_ok = 0; }
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &lsz_ptr) != HEAP_OK) { kern_ok = 0; }
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &lv2_ptr) != HEAP_OK) { kern_ok = 0; }
-                // polygon: outer + bridged holes; n_boundary*4+64 ints is a safe upper bound
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * (int)sizeof(int)), &poly_ptr) != HEAP_OK) { kern_ok = 0; }
-                // cap_tris: at most n_boundary-2 triangles × 3 ints
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * 3 * (int)sizeof(int)), &cap_ptr)  != HEAP_OK) { kern_ok = 0; }
-                // ear_prevnext: 2 × poly_max entries
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * 2 * (int)sizeof(int)), &ep_ptr)   != HEAP_OK) { kern_ok = 0; }
-                // inner sort buf: 256 int (inner_idx) + 256 float (inner_max_u)
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(256 * (int)sizeof(int) + 256 * (int)sizeof(float)), &sb_ptr) != HEAP_OK) { kern_ok = 0; }
                 if (!kern_ok) atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);
 
@@ -758,92 +765,23 @@ __device__ inline void plane_cut_block(
             } // n_boundary > 0
         } // kern_ok after lv alloc
 
-        // --- Phase 13: compact + single heap alloc + fill PartPair ---
+        // Broadcast phase-13 state.  Local scratch lv_ptr..sb_ptr are all NULL
+        // at this point (freed inline above); heap_free is NULL-safe.
+        s_total_pos = n_pos + n_cap;
+        s_total_neg = n_neg + n_cap;
+        s_alloc_ok  = kern_ok;   // repurpose flag for phase-13 gate
+        s_pr_ptr = NULL; s_nr_ptr = NULL;
         if (kern_ok) {
-            int total_pos = n_pos + n_cap;
-            int total_neg = n_neg + n_cap;
-
-            if (heap_alloc(scratch_heap, (unsigned int)(n_all * (int)sizeof(int)), &pr_ptr) != HEAP_OK ||
-                heap_alloc(scratch_heap, (unsigned int)(n_all * (int)sizeof(int)), &nr_ptr) != HEAP_OK) {
-                atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); kern_ok = 0;
-            }
-
-            if (kern_ok) {
-                int* pos_remap = (int*)pr_ptr;
-                int* neg_remap = (int*)nr_ptr;
-
-                // Compact pos
-                for (int i = 0; i < n_all; i++) pos_remap[i] = -1;
-                for (int t = 0; t < total_pos; t++) {
-                    pos_remap[pos_tris[t*3+0]] = 0;
-                    pos_remap[pos_tris[t*3+1]] = 0;
-                    pos_remap[pos_tris[t*3+2]] = 0;
-                }
-                int pnv = 0;
-                for (int i = 0; i < n_all; i++) if (pos_remap[i]==0) pos_remap[i]=pnv++;
-                for (int t = 0; t < total_pos; t++) {
-                    pos_tris[t*3+0]=pos_remap[pos_tris[t*3+0]];
-                    pos_tris[t*3+1]=pos_remap[pos_tris[t*3+1]];
-                    pos_tris[t*3+2]=pos_remap[pos_tris[t*3+2]];
-                }
-
-                // Compact neg
-                for (int i = 0; i < n_all; i++) neg_remap[i] = -1;
-                for (int t = 0; t < total_neg; t++) {
-                    neg_remap[neg_tris[t*3+0]] = 0;
-                    neg_remap[neg_tris[t*3+1]] = 0;
-                    neg_remap[neg_tris[t*3+2]] = 0;
-                }
-                int nnv = 0;
-                for (int i = 0; i < n_all; i++) if (neg_remap[i]==0) neg_remap[i]=nnv++;
-                for (int t = 0; t < total_neg; t++) {
-                    neg_tris[t*3+0]=neg_remap[neg_tris[t*3+0]];
-                    neg_tris[t*3+1]=neg_remap[neg_tris[t*3+1]];
-                    neg_tris[t*3+2]=neg_remap[neg_tris[t*3+2]];
-                }
-
-                // Single combined output allocation:
-                // [pos_verts | pos_tris | neg_verts | neg_tris], each 16-byte aligned
-                unsigned int pv_b=(unsigned int)PC_ALIGN16(pnv      *3*(int)sizeof(float));
-                unsigned int pt_b=(unsigned int)PC_ALIGN16(total_pos*3*(int)sizeof(int));
-                unsigned int nv_b=(unsigned int)PC_ALIGN16(nnv      *3*(int)sizeof(float));
-                unsigned int nt_b=(unsigned int)PC_ALIGN16(total_neg*3*(int)sizeof(int));
-                unsigned int sz = pv_b+pt_b+nv_b+nt_b; if (!sz) sz=1;
-
-                void* chunk = NULL;
-                if (heap_alloc(heap, sz, &chunk) != HEAP_OK) {
-                    atomicOr(kernel_error, PC_KERR_POOL_OOM);
-                } else {
-                    char*  cb  = (char*)chunk;
-                    float* pvp = (float*)(cb);
-                    int*   ptp = (int*)  (cb+pv_b);
-                    float* nvp = (float*)(cb+pv_b+pt_b);
-                    int*   ntp = (int*)  (cb+pv_b+pt_b+nv_b);
-
-                    for (int i = 0; i < n_all; i++) if (pos_remap[i]>=0) {
-                        int ni=pos_remap[i];
-                        pvp[ni*3+0]=all_verts[i*3+0]; pvp[ni*3+1]=all_verts[i*3+1]; pvp[ni*3+2]=all_verts[i*3+2];
-                    }
-                    for (int i = 0; i < total_pos*3; i++) ptp[i]=pos_tris[i];
-
-                    for (int i = 0; i < n_all; i++) if (neg_remap[i]>=0) {
-                        int ni=neg_remap[i];
-                        nvp[ni*3+0]=all_verts[i*3+0]; nvp[ni*3+1]=all_verts[i*3+1]; nvp[ni*3+2]=all_verts[i*3+2];
-                    }
-                    for (int i = 0; i < total_neg*3; i++) ntp[i]=neg_tris[i];
-
-                    pc_zero_part(&out->pos);
-                    out->pos.mesh.verts=pvp; out->pos.mesh.tris=ptp;
-                    out->pos.mesh.nv=pnv;    out->pos.mesh.nt=total_pos;
-
-                    pc_zero_part(&out->neg);
-                    out->neg.mesh.verts=nvp; out->neg.mesh.tris=ntp;
-                    out->neg.mesh.nv=nnv;    out->neg.mesh.nt=total_neg;
-                }
+            void* p;
+            if (heap_alloc(scratch_heap, (unsigned int)(n_all * (int)sizeof(int)), &p) == HEAP_OK)
+                s_pr_ptr = (int*)p;
+            else { s_alloc_ok = 0; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+            if (s_alloc_ok) {
+                if (heap_alloc(scratch_heap, (unsigned int)(n_all * (int)sizeof(int)), &p) == HEAP_OK)
+                    s_nr_ptr = (int*)p;
+                else { s_alloc_ok = 0; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
             }
         }
-
-        // --- Cleanup: free all remaining scratch (NULL-safe) ---
         heap_free(scratch_heap, lv_ptr);
         heap_free(scratch_heap, lv2_ptr);
         heap_free(scratch_heap, ls_ptr);
@@ -852,10 +790,153 @@ __device__ inline void plane_cut_block(
         heap_free(scratch_heap, cap_ptr);
         heap_free(scratch_heap, ep_ptr);
         heap_free(scratch_heap, sb_ptr);
-        heap_free(scratch_heap, pr_ptr);
-        heap_free(scratch_heap, nr_ptr);
-        PC_FREE_ALL_SHARED_SCRATCH();  // frees remaining shared ptrs (nulled-out ones are no-ops)
+    } // end if (tid == 0) phases 10-12
+    __syncthreads();
 
-    } // end if (tid == 0)
+    // =========================================================================
+    // Phase 13: compact verts per side, heap-alloc output, fill PartPair.
+    //           Parallel across all 64 threads.
+    //
+    // Steps:
+    //   A  Init remap[-1]           (strided, all threads)
+    //   B  Mark used verts [→ 0]    (strided, atomicMax, all threads)
+    //   C  Count per-thread chunk   (contiguous chunks, all threads)
+    //   D  Exclusive prefix scan    (thread 0, 64 iterations)
+    //   E  Assign new indices        (contiguous chunks, all threads)
+    //   F  Remap tris in-place      (strided, all threads)
+    //   G  Heap alloc + metadata    (thread 0)
+    //   H  Scatter verts to output  (strided, all threads)
+    //   I  Copy tris to output      (strided, all threads)
+    // =========================================================================
+    if (!s_alloc_ok) {
+        if (tid == 0) {
+            heap_free(scratch_heap, (void*)s_pr_ptr);
+            heap_free(scratch_heap, (void*)s_nr_ptr);
+            PC_FREE_ALL_SHARED_SCRATCH();
+        }
+        return;
+    }
+
+    {
+        int   total_pos = s_total_pos;
+        int   total_neg = s_total_neg;
+        int*  pos_remap = s_pr_ptr;
+        int*  neg_remap = s_nr_ptr;
+
+        // Step A: init remap to -1 (parallel)
+        for (int i = tid; i < n_all; i += PC_BLOCK) { pos_remap[i] = -1; neg_remap[i] = -1; }
+        __syncthreads();
+
+        // Step B: mark vertices used by each side (atomicMax -1 → 0, parallel)
+        for (int t = tid; t < total_pos; t += PC_BLOCK) {
+            atomicMax(&pos_remap[pos_tris[t*3+0]], 0);
+            atomicMax(&pos_remap[pos_tris[t*3+1]], 0);
+            atomicMax(&pos_remap[pos_tris[t*3+2]], 0);
+        }
+        for (int t = tid; t < total_neg; t += PC_BLOCK) {
+            atomicMax(&neg_remap[neg_tris[t*3+0]], 0);
+            atomicMax(&neg_remap[neg_tris[t*3+1]], 0);
+            atomicMax(&neg_remap[neg_tris[t*3+2]], 0);
+        }
+        __syncthreads();
+
+        // Step C: each thread counts marked verts in its contiguous chunk
+        {
+            int chunk = (n_all + PC_BLOCK - 1) / PC_BLOCK;
+            int lo = tid * chunk, hi = lo + chunk; if (hi > n_all) hi = n_all;
+            int pc = 0, nc = 0;
+            for (int i = lo; i < hi; i++) {
+                pc += (pos_remap[i] == 0);
+                nc += (neg_remap[i] == 0);
+            }
+            s_pcount[tid] = pc;
+            s_ncount[tid] = nc;
+        }
+        __syncthreads();
+
+        // Step D: exclusive prefix scan over 64 counts (thread 0, O(64))
+        if (tid == 0) {
+            int sp = 0, sn = 0;
+            for (int i = 0; i < PC_BLOCK; i++) {
+                s_pbase[i] = sp; sp += s_pcount[i];
+                s_nbase[i] = sn; sn += s_ncount[i];
+            }
+            s_pnv = sp; s_nnv = sn;
+        }
+        __syncthreads();
+
+        // Step E: assign new sequential indices within each thread's chunk
+        {
+            int chunk = (n_all + PC_BLOCK - 1) / PC_BLOCK;
+            int lo = tid * chunk, hi = lo + chunk; if (hi > n_all) hi = n_all;
+            int pb = s_pbase[tid], nb = s_nbase[tid];
+            for (int i = lo; i < hi; i++) {
+                if (pos_remap[i] == 0) pos_remap[i] = pb++;
+                if (neg_remap[i] == 0) neg_remap[i] = nb++;
+            }
+        }
+        __syncthreads();
+
+        // Step F: remap triangle indices in place (parallel)
+        for (int i = tid; i < total_pos * 3; i += PC_BLOCK) pos_tris[i] = pos_remap[pos_tris[i]];
+        for (int i = tid; i < total_neg * 3; i += PC_BLOCK) neg_tris[i] = neg_remap[neg_tris[i]];
+        __syncthreads();
+
+        // Step G: single combined heap alloc + output metadata (thread 0)
+        // [pos_verts | pos_tris | neg_verts | neg_tris], each 16-byte aligned
+        if (tid == 0) {
+            int pnv = s_pnv, nnv = s_nnv;
+            unsigned int pv_b=(unsigned int)PC_ALIGN16(pnv      *3*(int)sizeof(float));
+            unsigned int pt_b=(unsigned int)PC_ALIGN16(total_pos*3*(int)sizeof(int));
+            unsigned int nv_b=(unsigned int)PC_ALIGN16(nnv      *3*(int)sizeof(float));
+            unsigned int nt_b=(unsigned int)PC_ALIGN16(total_neg*3*(int)sizeof(int));
+            unsigned int sz = pv_b+pt_b+nv_b+nt_b; if (!sz) sz=1;
+            void* chunk = NULL;
+            s_chunk_ok = 0;
+            if (heap_alloc(heap, sz, &chunk) == HEAP_OK) {
+                s_chunk_ok = 1;
+                char* cb = (char*)chunk;
+                s_pvp = (float*)(cb);
+                s_ptp = (int*)  (cb+pv_b);
+                s_nvp = (float*)(cb+pv_b+pt_b);
+                s_ntp = (int*)  (cb+pv_b+pt_b+nv_b);
+                pc_zero_part(&out->pos);
+                out->pos.mesh.verts=s_pvp; out->pos.mesh.tris=s_ptp;
+                out->pos.mesh.nv=pnv;      out->pos.mesh.nt=total_pos;
+                pc_zero_part(&out->neg);
+                out->neg.mesh.verts=s_nvp; out->neg.mesh.tris=s_ntp;
+                out->neg.mesh.nv=nnv;      out->neg.mesh.nt=total_neg;
+            } else {
+                atomicOr(kernel_error, PC_KERR_POOL_OOM);
+                s_pvp=NULL; s_ptp=NULL; s_nvp=NULL; s_ntp=NULL;
+            }
+        }
+        __syncthreads();
+
+        // Steps H-I: scatter verts and copy tris (parallel)
+        if (s_chunk_ok) {
+            float* pvp = s_pvp; int* ptp = s_ptp;
+            float* nvp = s_nvp; int* ntp = s_ntp;
+
+            for (int i = tid; i < n_all; i += PC_BLOCK) {
+                int ni = pos_remap[i];
+                if (ni >= 0) { pvp[ni*3+0]=all_verts[i*3+0]; pvp[ni*3+1]=all_verts[i*3+1]; pvp[ni*3+2]=all_verts[i*3+2]; }
+            }
+            for (int i = tid; i < n_all; i += PC_BLOCK) {
+                int ni = neg_remap[i];
+                if (ni >= 0) { nvp[ni*3+0]=all_verts[i*3+0]; nvp[ni*3+1]=all_verts[i*3+1]; nvp[ni*3+2]=all_verts[i*3+2]; }
+            }
+            for (int i = tid; i < total_pos * 3; i += PC_BLOCK) ptp[i] = pos_tris[i];
+            for (int i = tid; i < total_neg * 3; i += PC_BLOCK) ntp[i] = neg_tris[i];
+        }
+        __syncthreads();
+    }
+
+    // Cleanup: free remap scratch and remaining shared scratch (NULL-safe).
+    if (tid == 0) {
+        heap_free(scratch_heap, (void*)s_pr_ptr);
+        heap_free(scratch_heap, (void*)s_nr_ptr);
+        PC_FREE_ALL_SHARED_SCRATCH();
+    }
     __syncthreads();
 }
