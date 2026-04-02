@@ -2,20 +2,9 @@
 //
 // Kernels:
 //   hull_dandc_kernel       — extract hull mesh (verts + tris)
-//   query_dandc_scratch     — query scratch bytes per hull
 
 #include "hull_dandc.cuh"
 #include "mesh_volume.cuh"
-
-// ---------------------------------------------------------------------------
-// query_dandc_scratch — return scratch bytes needed per hull (1 thread)
-// ---------------------------------------------------------------------------
-
-extern "C" __global__ void query_dandc_scratch(int n, int* out)
-{
-    if (threadIdx.x == 0)
-        *out = dandc_scratch_bytes(n);
-}
 
 // ---------------------------------------------------------------------------
 // hull_dandc_kernel

@@ -112,21 +112,6 @@ int beam_hull_dandc(
     }
     CUstream s = NULL;
 
-    // Query scratch bytes per hull (WarpPool portion)
-    int warp_scratch = 0;
-    {
-        CUdeviceptr d_q;
-        CHECK_CU(cuMemAlloc(&d_q, sizeof(int)));
-        int mpi = max_pts_per_hull;
-        void* qargs[] = { &mpi, &d_q };
-        CHECK_CU(cuLaunchKernel(ctx->fn_query_dandc_scratch, 1, 1, 1,
-                                1, 1, 1, 0, s, qargs, NULL));
-        CHECK_CU(cuMemcpyDtoHAsync(&warp_scratch, d_q, sizeof(int), s));
-        CHECK_CU(cuStreamSynchronize(s));
-        cuMemFree(d_q);
-    }
-    (void)warp_scratch;  // informational only; heaps are pre-allocated
-
     // Device addresses of embedded heaps within d_pool_struct
     CUdeviceptr d_heap    = D_HEAP(ctx);
     CUdeviceptr d_scratch = D_SCRATCH(ctx);

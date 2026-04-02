@@ -78,7 +78,6 @@ struct beam_ctx {
 
     CUfunction fn_test_warp_sort;
     CUfunction fn_hull_dandc;
-    CUfunction fn_query_dandc_scratch;
     CUfunction fn_mesh_volume;
     CUfunction fn_batch_mesh_volume;
     CUfunction fn_plane_cut;

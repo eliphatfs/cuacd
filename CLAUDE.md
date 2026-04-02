@@ -187,6 +187,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 | J1 | `compute_concavity_tris` in geometry.cuh | Bbox cube-root proxy, superseded by Rv |
 | J2 | `hull_dandc_warp` | Removed; use `hull_dandc_warp_mesh` for all callers |
 | J3 | `heap_compact(heap) -> int` | Removed from allocator.cuh; `beam_heap_compact()` is now a no-op |
+| J4 | `query_dandc_scratch` kernel | Removed from test_hull_dandc.cu, beam.c, structs.h, test_beam.c; scratch is heap-managed, no pre-query needed |
 
 ## plane_cut_block API
 

@@ -65,7 +65,6 @@ int beam_init(beam_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     // Resolve kernel functions
     cuModuleGetFunction(&ctx->fn_test_warp_sort,     ctx->module, "test_warp_sort_kernel");
     cuModuleGetFunction(&ctx->fn_hull_dandc,          ctx->module, "hull_dandc_kernel");
-    cuModuleGetFunction(&ctx->fn_query_dandc_scratch, ctx->module, "query_dandc_scratch");
     cuModuleGetFunction(&ctx->fn_mesh_volume,         ctx->module, "mesh_volume_kernel");
     cuModuleGetFunction(&ctx->fn_batch_mesh_volume,   ctx->module, "batch_mesh_volume_kernel");
     cuModuleGetFunction(&ctx->fn_plane_cut,           ctx->module, "plane_cut_kernel");
