@@ -240,7 +240,11 @@ __device__ int heap_alloc(DeviceHeap* h, unsigned int req_size, void** out) {
     // --- Allocate new slab from pool if no free block found ---
     if (!blk) {
         DevicePool* pool = h->pool;
-        unsigned int need_total = aligned + HEAP_SLAB_OVERHEAD;
+        // Allocate 2x the needed data so that after the user frees the allocated
+        // portion and it coalesces with the remainder, the merged free block is
+        // always in a strictly higher sub-bin than heap_min_subbin_for_alloc(aligned)
+        // requires — guaranteeing it will be found on the next same-size request.
+        unsigned int need_total = aligned * 2 + HEAP_SLAB_OVERHEAD;
         unsigned int slab_total = (need_total > HEAP_MIN_POOL_ALLOC)
                                 ? heap_next_pow2_u32(need_total)
                                 : (unsigned int)HEAP_MIN_POOL_ALLOC;
