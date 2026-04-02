@@ -24,7 +24,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   hull_dandc.cuh      #   Preparata-Hong D&C hull (Bullet port); hull_dandc_warp_mesh returns Mesh via heap
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
-  hull_batch.cu       #   batch_hull_dandc + query_dandc_scratch + batch_mesh_volume kernels
+  mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: batch_hull_dandc_mesh (hull volume + mesh extraction)
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel (thin wrapper around plane_cut_block)
@@ -93,7 +93,6 @@ After completing any code change, always build (`pip install -e .`) and run the 
 **`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all self-contained `.cu` modules) → fatbin → C header, then builds `csrc/beam_module.c` + `csrc/beam.c` + `csrc/test_beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). Fatbin compiled with `--generate-line-info` for NCU source-level profiling.
 
 **File split:**
-- `cuda/hull_batch.cu` — `batch_hull_dandc`, `query_dandc_scratch`, `batch_mesh_volume`
 - `cuda/test_hull_dandc.cu` — `batch_hull_dandc_mesh` (hull volume + mesh extraction)
 - `cuda/test_warp_sort.cu` — `test_warp_sort_kernel`
 - `cuda/test_plane_cut.cu` — `plane_cut_kernel` (thin `__global__` wrapper around `plane_cut_block`)
@@ -145,6 +144,12 @@ with coacd_gpu.Context(device=0) as ctx:
 | B3 | `block_reduce_max(val, smem, tid) -> float` | reduce.cuh |
 | B4 | `block_reduce_count(flag, smem_i, tid) -> int` | reduce.cuh |
 
+### W. Warp-Level Functions (all 32 lanes call)
+
+| ID | Function | File |
+|----|----------|------|
+| W1 | `mesh_volume_warp(mesh, lane) -> float` | mesh_volume.cuh |
+
 ### I. Memory / Infrastructure
 
 | ID | Function | File |
@@ -189,7 +194,7 @@ with coacd_gpu.Context(device=0) as ctx:
 - **BtPool (edge pool)**: starts with 2 slabs (16384 edges); expands one slab at a time via `heap_alloc(scratch_heap, ...)` when exhausted. Lane 0 only; free-list setup is serial. Up to `BTPOOL_MAX_BLOCKS=32` slabs tracked for cleanup.
 - **Two-pass mesh extraction**: count pass (`bt_extractMesh` with NULL buffers, counts nv/nt via fan formula) → `heap_alloc(heap, ...)` for exact output → extract pass (writes verts+tris). BFS queue rewound between passes.
 - **dandc_scratch_bytes**: no longer includes the `6*n*sizeof(BtEdge)` edge pool term (pool now comes from scratch_heap separately).
-- **Call sites** (`hull_batch.cu`, `test_hull_dandc.cu`): not yet updated; will be overhauled separately.
+- **Call sites** (`test_hull_dandc.cu`): not yet updated; will be overhauled separately.
 
 ## Pool Allocator Pattern
 
