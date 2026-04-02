@@ -225,8 +225,9 @@ __device__ int heap_alloc(DeviceHeap* h, unsigned int req_size, void** out) {
     int        aidx  = (int)(blockIdx.x % (unsigned int)HEAP_NUM_ARENAS);
     HeapArena* arena = &h->arenas[aidx];
 
-    // --- Search free lists via bitmap ---
     arena_lock(arena);
+
+    // --- Search free lists via bitmap ---
     int s_start = heap_min_subbin_for_alloc(aligned);
     unsigned long long avail = arena->bitmap & (~0ULL << s_start);
     unsigned long long blk   = 0;
@@ -234,14 +235,7 @@ __device__ int heap_alloc(DeviceHeap* h, unsigned int req_size, void** out) {
         int s = __ffsll((long long)avail) - 1;
         blk = arena->heads[s];
         subbin_remove(arena, s, blk);
-        // Mark is_free=0 under the lock to prevent TOCTOU: another thread
-        // freeing an adjacent block must not see this block as free between
-        // subbin_remove and the is_free update done later in the split section.
-        unsigned int blk_ds = ((HeapBlockHdr*)blk)->data_size;
-        ((HeapBlockHdr*)blk)->is_free = 0;
-        ((HeapBlockFtr*)(blk + HEAP_HDR_SIZE + blk_ds))->is_free = 0;
     }
-    arena_unlock(arena);
 
     // --- Allocate new slab from pool if no free block found ---
     if (!blk) {
@@ -253,7 +247,10 @@ __device__ int heap_alloc(DeviceHeap* h, unsigned int req_size, void** out) {
         unsigned int slab_data = slab_total - HEAP_SLAB_OVERHEAD;
 
         unsigned long long off = atomicAdd(pool->offset, (unsigned long long)slab_total);
-        if (off + slab_total > pool->capacity) return HEAP_ERR_OOM;
+        if (off + slab_total > pool->capacity) {
+            arena_unlock(arena);
+            return HEAP_ERR_OOM;
+        }
 
         unsigned long long base = (unsigned long long)pool->base + off;
 
@@ -289,10 +286,7 @@ __device__ int heap_alloc(DeviceHeap* h, unsigned int req_size, void** out) {
         bh->data_size = aligned; bh->is_free = 0;
 
         // Push remainder into its sub-bin.
-        int rs = heap_subbin_for_size(rem_data);
-        arena_lock(arena);
-        subbin_push_head(arena, rs, rem_hdr);
-        arena_unlock(arena);
+        subbin_push_head(arena, heap_subbin_for_size(rem_data), rem_hdr);
     } else {
         // No split: mark full block allocated (keeps blk_sz as data_size).
         HeapBlockHdr* bh = (HeapBlockHdr*)blk;
@@ -301,6 +295,7 @@ __device__ int heap_alloc(DeviceHeap* h, unsigned int req_size, void** out) {
         bf->is_free = 0;
     }
 
+    arena_unlock(arena);
     *out = (void*)(blk + HEAP_HDR_SIZE);
     return HEAP_OK;
 }
