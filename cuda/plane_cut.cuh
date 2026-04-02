@@ -136,12 +136,10 @@ __device__ inline void pc_zero_part(Part* p) {
     heap_free(scratch_heap, (void*)s_boundary_flags);               \
 } while(0)
 
-__device__ inline void plane_cut_block(
+__device__ inline PartPair plane_cut_block(
     // Input
     const Mesh* __restrict__ mesh,
     float pa, float pb, float pc_n, float pd,
-    // Output
-    PartPair* __restrict__ out,
     DeviceHeap* heap,          // output heap (persistent mesh data)
     DeviceHeap* scratch_heap,  // scratch heap (all allocs freed within this call)
     int* __restrict__ kernel_error)
@@ -180,6 +178,9 @@ __device__ inline void plane_cut_block(
     __shared__ char*   s_dir_sort;
     __shared__ int*    s_boundary_flags;
 
+    // Return value — written by thread 0, returned by all threads.
+    __shared__ PartPair s_result;
+
     // Phase-13 broadcast and parallel-compaction scratch
     __shared__ int    s_total_pos, s_total_neg;
     __shared__ int    s_pnv, s_nnv;
@@ -202,6 +203,8 @@ __device__ inline void plane_cut_block(
         s_dir_edges = NULL; s_dir_sort = NULL; s_boundary_flags = NULL;
         s_counters[0] = 0; s_counters[1] = n_verts;
         s_counters[2] = 0; s_counters[3] = 0;
+        pc_zero_part(&s_result.pos);
+        pc_zero_part(&s_result.neg);
     }
     __syncthreads();
 
@@ -222,7 +225,7 @@ __device__ inline void plane_cut_block(
     __syncthreads();
     if (!s_alloc_ok) {
         if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
-        return;
+        return s_result;
     }
 
     int*   signs     = s_signs;
@@ -260,7 +263,7 @@ __device__ inline void plane_cut_block(
     __syncthreads();
     if (!s_alloc_ok) {
         if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
-        return;
+        return s_result;
     }
 
     Edge2i* cross_edges = s_cross_edges;
@@ -312,8 +315,8 @@ __device__ inline void plane_cut_block(
                 int*   pt = (int*)((char*)chunk + vb);
                 for (int i = 0; i < n_verts * 3; i++) pv[i] = vertices[i];
                 for (int i = 0; i < n_tris  * 3; i++) pt[i] = triangles[i];
-                Part* side  = is_neg ? &out->neg : &out->pos;
-                Part* empty = is_neg ? &out->pos : &out->neg;
+                Part* side  = is_neg ? &s_result.neg : &s_result.pos;
+                Part* empty = is_neg ? &s_result.pos : &s_result.neg;
                 pc_zero_part(side);
                 side->mesh.verts = pv; side->mesh.tris = pt;
                 side->mesh.nv = n_verts; side->mesh.nt = n_tris;
@@ -322,7 +325,7 @@ __device__ inline void plane_cut_block(
             PC_FREE_ALL_SHARED_SCRATCH();
         }
         __syncthreads();
-        return;
+        return s_result;
     }
 
     // === Phase 4: Sort crossing edges (warp 0) ===
@@ -364,7 +367,7 @@ __device__ inline void plane_cut_block(
     __syncthreads();
     if (!s_alloc_ok) {
         if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
-        return;
+        return s_result;
     }
 
     int  n_all    = s_counters[1];
@@ -470,7 +473,7 @@ __device__ inline void plane_cut_block(
     __syncthreads();
     if (!s_alloc_ok) {
         if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
-        return;
+        return s_result;
     }
 
     int     n_pos          = s_n_pos, n_neg = s_n_neg;
@@ -814,7 +817,7 @@ __device__ inline void plane_cut_block(
             heap_free(scratch_heap, (void*)s_nr_ptr);
             PC_FREE_ALL_SHARED_SCRATCH();
         }
-        return;
+        return s_result;
     }
 
     {
@@ -900,12 +903,12 @@ __device__ inline void plane_cut_block(
                 s_ptp = (int*)  (cb+pv_b);
                 s_nvp = (float*)(cb+pv_b+pt_b);
                 s_ntp = (int*)  (cb+pv_b+pt_b+nv_b);
-                pc_zero_part(&out->pos);
-                out->pos.mesh.verts=s_pvp; out->pos.mesh.tris=s_ptp;
-                out->pos.mesh.nv=pnv;      out->pos.mesh.nt=total_pos;
-                pc_zero_part(&out->neg);
-                out->neg.mesh.verts=s_nvp; out->neg.mesh.tris=s_ntp;
-                out->neg.mesh.nv=nnv;      out->neg.mesh.nt=total_neg;
+                pc_zero_part(&s_result.pos);
+                s_result.pos.mesh.verts=s_pvp; s_result.pos.mesh.tris=s_ptp;
+                s_result.pos.mesh.nv=pnv;      s_result.pos.mesh.nt=total_pos;
+                pc_zero_part(&s_result.neg);
+                s_result.neg.mesh.verts=s_nvp; s_result.neg.mesh.tris=s_ntp;
+                s_result.neg.mesh.nv=nnv;      s_result.neg.mesh.nt=total_neg;
             } else {
                 atomicOr(kernel_error, PC_KERR_POOL_OOM);
                 s_pvp=NULL; s_ptp=NULL; s_nvp=NULL; s_ntp=NULL;
@@ -939,4 +942,5 @@ __device__ inline void plane_cut_block(
         PC_FREE_ALL_SHARED_SCRATCH();
     }
     __syncthreads();
+    return s_result;
 }

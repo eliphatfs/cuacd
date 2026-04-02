@@ -165,10 +165,10 @@ with coacd_gpu.Context(device=0) as ctx:
 
 ## plane_cut_block API
 
-`plane_cut_block(mesh, pa, pb, pc_n, pd, out, heap, scratch_heap, kernel_error)` — device function, one block (64 threads).
+`plane_cut_block(mesh, pa, pb, pc_n, pd, heap, scratch_heap, kernel_error) -> PartPair` — device function, one block (64 threads).
 
 - **Input**: `const Mesh*` (replaces separate verts/tris/nv/nt params).
-- **Output**: writes a `PartPair*` (caller-allocated device memory); `out->pos.mesh` and `out->neg.mesh` point into a **single heap chunk** allocated from `DeviceHeap* heap`.
+- **Output**: returns a `PartPair` directly (stored in `__shared__ PartPair s_result`); `pos.mesh` and `neg.mesh` point into a **single heap chunk** allocated from `DeviceHeap* heap`.
 - **Heap chunk layout** (one `heap_alloc` call on `heap`): `[pos_verts | pos_tris | neg_verts | neg_tris]`, each section 16-byte aligned.
 - **Scratch**: all temporary buffers (signs, all_verts, cross_edges, sort_scratch, isect_idx, pos_tris, neg_tris, dir_edges, dir_sort, boundary_flags, and per-loop working buffers) are allocated from `DeviceHeap* scratch_heap` and freed individually as soon as each buffer's last use completes. Nothing from scratch_heap survives the call.
 - **Vertex compaction** (phase 13, parallel): phases 1-12 run on thread 0 or warp 0; phase 13 runs across all 64 threads. Steps: init remap[]=-1 (strided), mark used verts via `atomicMax` (strided), count per contiguous chunk, exclusive prefix scan (thread 0, 64 iters), assign new indices per chunk, remap tris in-place (strided), heap alloc (thread 0), scatter verts + copy tris (strided). Each side's `Mesh.verts` contains only the vertices actually referenced — no loose vertices.
