@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <math.h>
 
 // Embedded fatbin — generated at build time by setup.py
@@ -32,45 +33,6 @@
         return (int)_r; \
     } \
 } while(0)
-
-// ---------------------------------------------------------------------------
-// Internal: allocate and init one DeviceHeap on device, sharing d_pool_struct.
-// d_heap_out and d_compact_out are outputs (device ptrs).
-// ---------------------------------------------------------------------------
-
-static int _init_heap(beam_ctx_t ctx, CUstream s,
-                      CUdeviceptr d_pool_struct,
-                      CUdeviceptr* d_heap_out,
-                      CUdeviceptr* d_compact_out)
-{
-    CUresult r;
-
-    if ((r = cuMemAlloc(d_heap_out,    sizeof(struct DeviceHeap)))    != CUDA_SUCCESS) goto fail;
-    if ((r = cuMemAlloc(d_compact_out, HEAP_COMPACT_BUF_BYTES))       != CUDA_SUCCESS) goto fail;
-
-    // Zero-fill DeviceHeap (clears all arenas: empty free lists + unlocked)
-    if ((r = cuMemsetD8(*d_heap_out, 0, sizeof(struct DeviceHeap)))   != CUDA_SUCCESS) goto fail;
-
-    // Build DeviceHeap on host and patch in pool + compact_buf pointers
-    struct DeviceHeap dh;
-    memset(&dh, 0, sizeof(dh));
-    dh.pool        = (struct DevicePool*)(uintptr_t)d_pool_struct;
-    dh.compact_buf = (unsigned long long*)(uintptr_t)*d_compact_out;
-    if ((r = cuMemcpyHtoDAsync(*d_heap_out, &dh,
-                               sizeof(struct DeviceHeap), s))         != CUDA_SUCCESS) goto fail;
-
-    return 0;
-
-fail: {
-    const char* _msg = NULL;
-    cuGetErrorString(r, &_msg);
-    snprintf(ctx->last_error, sizeof(ctx->last_error),
-             "_init_heap failed at beam.c: %s", _msg ? _msg : "unknown");
-    if (*d_heap_out)    { cuMemFree(*d_heap_out);    *d_heap_out    = 0; }
-    if (*d_compact_out) { cuMemFree(*d_compact_out); *d_compact_out = 0; }
-    return (int)r;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Init / Destroy
@@ -101,13 +63,13 @@ int beam_init(beam_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     CHECK_CU(cuModuleLoadFatBinary(&ctx->module, kernels_fatbin));
 
     // Resolve kernel functions
-    cuModuleGetFunction(&ctx->fn_test_warp_sort,      ctx->module, "test_warp_sort_kernel");
-    cuModuleGetFunction(&ctx->fn_hull_dandc,           ctx->module, "hull_dandc_kernel");
-    cuModuleGetFunction(&ctx->fn_query_dandc_scratch,  ctx->module, "query_dandc_scratch");
-    cuModuleGetFunction(&ctx->fn_mesh_volume,          ctx->module, "mesh_volume_kernel");
-    cuModuleGetFunction(&ctx->fn_batch_mesh_volume,    ctx->module, "batch_mesh_volume_kernel");
-    cuModuleGetFunction(&ctx->fn_plane_cut,            ctx->module, "plane_cut_kernel");
-    cuModuleGetFunction(&ctx->fn_heap_compact,         ctx->module, "heap_compact_kernel");
+    cuModuleGetFunction(&ctx->fn_test_warp_sort,     ctx->module, "test_warp_sort_kernel");
+    cuModuleGetFunction(&ctx->fn_hull_dandc,          ctx->module, "hull_dandc_kernel");
+    cuModuleGetFunction(&ctx->fn_query_dandc_scratch, ctx->module, "query_dandc_scratch");
+    cuModuleGetFunction(&ctx->fn_mesh_volume,         ctx->module, "mesh_volume_kernel");
+    cuModuleGetFunction(&ctx->fn_batch_mesh_volume,   ctx->module, "batch_mesh_volume_kernel");
+    cuModuleGetFunction(&ctx->fn_plane_cut,           ctx->module, "plane_cut_kernel");
+    cuModuleGetFunction(&ctx->fn_heap_init,           ctx->module, "heap_init_kernel");
 
     // Determine pool size: default to 70% of free device memory
     if (pool_bytes == 0) {
@@ -119,32 +81,42 @@ int beam_init(beam_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     }
     DBG("[beam] pool_bytes = %zu MB\n", pool_bytes >> 20);
 
-    // Allocate shared pool backing: pool_mem + offset counter + DevicePool struct
     CUstream s = NULL;
-    CHECK_CU(cuMemAlloc(&ctx->d_pool_mem,    pool_bytes));
-    CHECK_CU(cuMemAlloc(&ctx->d_pool_off,    sizeof(unsigned long long)));
+
+    // Allocate pool backing memory and offset counter
+    CHECK_CU(cuMemAlloc(&ctx->d_pool_mem, pool_bytes));
+    CHECK_CU(cuMemAlloc(&ctx->d_pool_off, sizeof(unsigned long long)));
+
+    // Allocate and zero-fill DevicePool struct (contains embedded heaps, ~133 KB)
     CHECK_CU(cuMemAlloc(&ctx->d_pool_struct, sizeof(struct DevicePool)));
+    CHECK_CU(cuMemsetD8Async(ctx->d_pool_struct, 0, sizeof(struct DevicePool), s));
 
-    // Zero pool offset
-    unsigned long long zero = 0;
-    CHECK_CU(cuMemcpyHtoDAsync(ctx->d_pool_off, &zero, sizeof(unsigned long long), s));
-
-    // Build and upload shared DevicePool
+    // Build host-side DevicePool (only scalar fields; heaps zeroed by memset above)
     struct DevicePool dp;
+    memset(&dp, 0, sizeof(dp));
     dp.base     = (char*)(uintptr_t)ctx->d_pool_mem;
     dp.offset   = (unsigned long long*)(uintptr_t)ctx->d_pool_off;
     dp.capacity = (unsigned long long)pool_bytes;
-    CHECK_CU(cuMemcpyHtoDAsync(ctx->d_pool_struct, &dp, sizeof(struct DevicePool), s));
 
-    // Init output heap
-    int rc = _init_heap(ctx, s, ctx->d_pool_struct,
-                        &ctx->d_heap, &ctx->d_heap_compact_buf);
-    if (rc != 0) return rc;
+    // Upload base/offset/capacity (first 3 fields, before the embedded heaps)
+    CHECK_CU(cuMemcpyHtoDAsync(ctx->d_pool_struct, &dp,
+                               offsetof(struct DevicePool, heap), s));
 
-    // Init scratch heap (shares same pool)
-    rc = _init_heap(ctx, s, ctx->d_pool_struct,
-                    &ctx->d_scratch, &ctx->d_scratch_compact_buf);
-    if (rc != 0) return rc;
+    // Zero the pool offset counter
+    unsigned long long zero = 0;
+    CHECK_CU(cuMemcpyHtoDAsync(ctx->d_pool_off, &zero, sizeof(unsigned long long), s));
+
+    // Launch heap_init_kernel: 128 blocks × 32 threads (1 warp per arena per heap).
+    // Initialises both pool->heap and pool->scratch: sets pool back-pointers and
+    // zeroes all arena state (bitmap, lock, heads, tails).
+    {
+        CUdeviceptr d_pool = ctx->d_pool_struct;
+        void* init_args[] = { &d_pool };
+        CHECK_CU(cuLaunchKernel(ctx->fn_heap_init,
+            128, 1, 1,   // 128 blocks
+             32, 1, 1,   // 32 threads per block (1 warp)
+            0, s, init_args, NULL));
+    }
 
     CHECK_CU(cuStreamSynchronize(s));
 
@@ -154,14 +126,9 @@ int beam_init(beam_ctx_t* out, int device_ordinal, size_t pool_bytes) {
 void beam_destroy(beam_ctx_t ctx) {
     if (!ctx) return;
 
-    // Free persistent heap resources
-    if (ctx->d_heap)                cuMemFree(ctx->d_heap);
-    if (ctx->d_heap_compact_buf)    cuMemFree(ctx->d_heap_compact_buf);
-    if (ctx->d_scratch)             cuMemFree(ctx->d_scratch);
-    if (ctx->d_scratch_compact_buf) cuMemFree(ctx->d_scratch_compact_buf);
-    if (ctx->d_pool_struct)         cuMemFree(ctx->d_pool_struct);
-    if (ctx->d_pool_off)            cuMemFree(ctx->d_pool_off);
-    if (ctx->d_pool_mem)            cuMemFree(ctx->d_pool_mem);
+    if (ctx->d_pool_struct) cuMemFree(ctx->d_pool_struct);
+    if (ctx->d_pool_off)    cuMemFree(ctx->d_pool_off);
+    if (ctx->d_pool_mem)    cuMemFree(ctx->d_pool_mem);
 
     if (ctx->module)                cuModuleUnload(ctx->module);
     if (ctx->owns_context && ctx->cuda_ctx) cuCtxDestroy(ctx->cuda_ctx);
@@ -186,25 +153,14 @@ size_t beam_pool_usage(beam_ctx_t ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// beam_heap_compact
+// beam_heap_compact — no-op (coalescing now happens in-place on free)
 // ---------------------------------------------------------------------------
-// Compact both heaps (output and scratch) sequentially.
-// Both share the same pool, so coalescing adjacent freed blocks is
-// the primary way to recover fragmented memory for future allocations.
+// The binned heap with boundary sentinels performs O(1) coalescing in heap_free,
+// so no offline compaction pass is required. This function is retained for API
+// compatibility; callers that previously relied on compact to recover fragmented
+// memory will benefit automatically from the new allocator.
 
 int beam_heap_compact(beam_ctx_t ctx) {
-    if (!ctx || !ctx->fn_heap_compact) return -1;
-    if (!ctx->d_heap || !ctx->d_scratch) return -1;
-
-    CUstream s = NULL;
-
-    void* args_out[]     = { &ctx->d_heap };
-    void* args_scratch[] = { &ctx->d_scratch };
-
-    CHECK_CU(cuLaunchKernel(ctx->fn_heap_compact,
-        1, 1, 1, 64, 1, 1, 0, s, args_out, NULL));
-    CHECK_CU(cuLaunchKernel(ctx->fn_heap_compact,
-        1, 1, 1, 64, 1, 1, 0, s, args_scratch, NULL));
-    CHECK_CU(cuStreamSynchronize(s));
+    (void)ctx;
     return 0;
 }

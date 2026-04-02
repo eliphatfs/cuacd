@@ -1,7 +1,13 @@
 // Host-side data structures for GPU kernels.
 // Included by beam.c and test_beam.c.
-// DevicePool, HeapArena, DeviceHeap must stay in sync with device-side definitions
-// in cuda/allocator.cuh and cuda/heap_arena.cuh.
+// DevicePool, DeviceHeap, HeapArena must stay in sync with cuda/allocator.cuh.
+//
+// NOTE: beam.c update pending (next phase) to match the new DevicePool layout:
+//   - DevicePool now embeds both DeviceHeap instances as direct fields.
+//   - DeviceHeap has a DevicePool* pool back-pointer (set by heap_init_kernel).
+//   - sizeof(DevicePool) is now much larger; allocate d_pool_struct accordingly.
+//   - heap_compact_kernel removed; replaced by heap_init_kernel<<<128,32>>>.
+//   - d_heap, d_scratch, d_heap_compact_buf, d_scratch_compact_buf removed from beam_ctx.
 
 #ifndef STRUCTS_H
 #define STRUCTS_H
@@ -9,37 +15,58 @@
 #include <cuda.h>
 
 // ---------------------------------------------------------------------------
-// GPU scratch pool (host-side view — base/offset are device pointers)
+// Constants (must match cuda/allocator.cuh)
 // ---------------------------------------------------------------------------
-struct DevicePool {
-    char*               base;
-    unsigned long long* offset;
-    unsigned long long  capacity;
+#define HEAP_NUM_ARENAS  64
+#define HEAP_NUM_SUBBINS 64
+
+// ---------------------------------------------------------------------------
+// Block header/footer (16 bytes each, same layout)
+// ---------------------------------------------------------------------------
+struct HeapBlockHdr {
+    unsigned int   data_size;
+    unsigned short arena_idx;
+    unsigned char  is_free;
+    unsigned char  _reserved;
+    unsigned int   _pad;
 };
+typedef struct HeapBlockHdr HeapBlockFtr;
 
 // ---------------------------------------------------------------------------
-// Heap arena free list (must match cuda/heap_arena.cuh HeapArena)
+// Per-arena free lists (1040 bytes each)
 // ---------------------------------------------------------------------------
-#define HEAP_NUM_ARENAS        64
-#define HEAP_COMPACT_BUF_BYTES (16 << 20)   // 16 MB
-
 struct HeapArena {
-    unsigned long long head;   // free-list head (device ptr), 0 = empty
-    int                lock;   // spin-lock: 0 = unlocked
+    unsigned long long bitmap;                   // sub-bin occupancy bitmap
+    int                lock;                     // spin-lock: 0=unlocked
     int                _pad;
+    unsigned long long heads[HEAP_NUM_SUBBINS];  // free-list heads
+    unsigned long long tails[HEAP_NUM_SUBBINS];  // free-list tails
 };
 
+// Forward declaration for circular reference.
+struct DevicePool;
+
 // ---------------------------------------------------------------------------
-// Device heap (host-side mirror of cuda/heap_arena.cuh DeviceHeap)
+// Heap allocator: pool back-pointer + 64 arenas
 // ---------------------------------------------------------------------------
 struct DeviceHeap {
-    struct DevicePool*  pool;                        // device ptr to DevicePool
-    struct HeapArena    arenas[HEAP_NUM_ARENAS];     // zero = empty, unlocked
-    unsigned long long* compact_buf;                 // device ptr to compact buffer
+    struct DevicePool* pool;                     // back-pointer set by heap_init_kernel
+    struct HeapArena   arenas[HEAP_NUM_ARENAS];  // 64 * 1040 = 66560 bytes
 };
 
 // ---------------------------------------------------------------------------
-// Main GPU context
+// DevicePool: bump allocator + two embedded heap allocators
+// ---------------------------------------------------------------------------
+struct DevicePool {
+    char*               base;      // bump alloc base (device ptr)
+    unsigned long long* offset;    // bump alloc offset counter (device ptr)
+    unsigned long long  capacity;  // pool capacity in bytes
+    struct DeviceHeap   heap;      // output heap  (heap.pool = this)
+    struct DeviceHeap   scratch;   // scratch heap (scratch.pool = this)
+};
+
+// ---------------------------------------------------------------------------
+// Main GPU context  (beam.c update pending — see note above)
 // ---------------------------------------------------------------------------
 struct beam_ctx {
     CUdevice   device;
@@ -53,18 +80,13 @@ struct beam_ctx {
     CUfunction fn_mesh_volume;
     CUfunction fn_batch_mesh_volume;
     CUfunction fn_plane_cut;
-    CUfunction fn_heap_compact;
+    CUfunction fn_heap_init;      // replaces fn_heap_compact; beam.c update pending
 
-    // Persistent device heaps — both share the same DevicePool backing.
-    // Pool grows via bump allocation; freed blocks return to heap free-lists.
-    // Call beam_heap_compact() to coalesce fragmented free blocks.
-    CUdeviceptr d_pool_mem;              // pool backing memory
-    CUdeviceptr d_pool_off;              // unsigned long long offset counter (device)
-    CUdeviceptr d_pool_struct;           // struct DevicePool on device (shared)
-    CUdeviceptr d_heap;                  // output DeviceHeap on device
-    CUdeviceptr d_heap_compact_buf;      // compact buffer for output heap
-    CUdeviceptr d_scratch;               // scratch DeviceHeap on device
-    CUdeviceptr d_scratch_compact_buf;   // compact buffer for scratch heap
+    // Heaps embedded in d_pool_struct (beam.c update pending).
+    // Fields d_heap, d_scratch, d_heap_compact_buf, d_scratch_compact_buf removed.
+    CUdeviceptr d_pool_mem;       // pool backing memory (user allocations)
+    CUdeviceptr d_pool_off;       // unsigned long long offset counter (device)
+    CUdeviceptr d_pool_struct;    // struct DevicePool on device (much larger now)
 
     char last_error[256];
 };

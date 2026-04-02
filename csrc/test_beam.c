@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
 
 #define CHECK_CU(call) do { \
     CUresult _r = (call); \
@@ -19,6 +20,11 @@
         return (int)_r; \
     } \
 } while(0)
+
+// Device addresses of the two embedded DeviceHeap instances inside d_pool_struct.
+// These are passed as DeviceHeap* to kernel functions.
+#define D_HEAP(ctx)    ((ctx)->d_pool_struct + offsetof(struct DevicePool, heap))
+#define D_SCRATCH(ctx) ((ctx)->d_pool_struct + offsetof(struct DevicePool, scratch))
 
 // ---------------------------------------------------------------------------
 // beam_test_warp_sort
@@ -80,7 +86,7 @@ int beam_test_warp_sort(beam_ctx_t ctx,
 // beam_hull_dandc
 // ---------------------------------------------------------------------------
 // Extract convex hull mesh for each point cloud.
-// Uses persistent ctx->d_heap (output) and ctx->d_scratch (scratch).
+// Uses persistent pool->heap (output) and pool->scratch (scratch).
 // Both heaps share the same pool; all allocations are freed by the kernel.
 
 int beam_hull_dandc(
@@ -99,7 +105,7 @@ int beam_hull_dandc(
     int*         out_errors)
 {
     if (!ctx || !ctx->fn_hull_dandc) return -1;
-    if (!ctx->d_heap || !ctx->d_scratch) {
+    if (!ctx->d_pool_struct) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
                  "persistent heaps not initialized; call beam_init first");
         return -1;
@@ -120,6 +126,10 @@ int beam_hull_dandc(
         cuMemFree(d_q);
     }
     (void)warp_scratch;  // informational only; heaps are pre-allocated
+
+    // Device addresses of embedded heaps within d_pool_struct
+    CUdeviceptr d_heap    = D_HEAP(ctx);
+    CUdeviceptr d_scratch = D_SCRATCH(ctx);
 
     // Device buffers for input and output
     CUdeviceptr d_pts, d_off, d_overts, d_otris, d_onv, d_ont, d_oerr;
@@ -143,7 +153,7 @@ int beam_hull_dandc(
         &d_pts, &d_off, &n_hulls,
         &max_hull_verts, &max_hull_tris,
         &d_overts, &d_otris, &d_onv, &d_ont, &d_oerr,
-        &ctx->d_heap, &ctx->d_scratch
+        &d_heap, &d_scratch
     };
     CHECK_CU(cuLaunchKernel(ctx->fn_hull_dandc, n_blocks, 1, 1,
                             block_size, 1, 1, 0, s, args, NULL));
@@ -245,7 +255,7 @@ int beam_batch_mesh_volume(
 // ---------------------------------------------------------------------------
 // beam_test_plane_cut
 // ---------------------------------------------------------------------------
-// Uses persistent ctx->d_heap (output) and ctx->d_scratch (scratch).
+// Uses persistent pool->heap (output) and pool->scratch (scratch).
 // Both heaps share the same pool; all allocations are freed by the kernel.
 
 int beam_test_plane_cut(
@@ -261,7 +271,7 @@ int beam_test_plane_cut(
     int* out_n_nv, int* out_n_nt)
 {
     if (!ctx || !ctx->fn_plane_cut) return -1;
-    if (!ctx->d_heap || !ctx->d_scratch) {
+    if (!ctx->d_pool_struct) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
                  "persistent heaps not initialized; call beam_init first");
         return -1;
@@ -295,6 +305,10 @@ int beam_test_plane_cut(
     CUdeviceptr d_nnv = d_counts + 2 * sizeof(int);
     CUdeviceptr d_nnt = d_counts + 3 * sizeof(int);
 
+    // Device addresses of embedded heaps within d_pool_struct
+    CUdeviceptr d_heap    = D_HEAP(ctx);
+    CUdeviceptr d_scratch = D_SCRATCH(ctx);
+
     void* args[] = {
         &d_verts, &d_tris, &n_verts, &n_tris,
         &pa, &pb, &pc_n, &pd,
@@ -302,7 +316,7 @@ int beam_test_plane_cut(
         &out_pos_verts_cap, &out_pos_tris_cap,
         &out_neg_verts_cap, &out_neg_tris_cap,
         &d_npv, &d_npt, &d_nnv, &d_nnt,
-        &ctx->d_heap, &ctx->d_scratch,
+        &d_heap, &d_scratch,
         &d_kerr
     };
     CHECK_CU(cuLaunchKernel(ctx->fn_plane_cut,

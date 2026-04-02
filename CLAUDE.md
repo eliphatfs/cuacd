@@ -15,8 +15,8 @@ setup.py              # Build config: setuptools builds _gpu extension
 pyproject.toml        # PEP 621 metadata
 cuda/                 # CUDA device code (compiled to single fatbin)
   kernels.cu          #   Root compilation unit — includes all .cu modules (each is self-contained)
-  allocator.cuh       #   DevicePool struct + pool_alloc (block) + global_alloc_warp (warp)
-  heap_arena.cuh      #   DeviceHeap: 64-arena large-object heap (heap_alloc/free/compact)
+  allocator.cuh       #   DevicePool (bump alloc + embedded DeviceHeap×2) + pool_alloc + heap_alloc/free
+  heap_arena.cuh      #   Compatibility shim: #include "allocator.cuh"
   common.cuh          #   Constants, atomics (includes allocator.cuh)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
@@ -25,7 +25,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
-  mm.cu               #   heap_compact_kernel: __global__ wrapper around heap_compact (1 block, 64 threads)
+  mm.cu               #   heap_init_kernel: <<<128,32>>> initialises both embedded heaps in DevicePool
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel (hull mesh extraction)
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel (thin wrapper around plane_cut_block)
@@ -95,7 +95,7 @@ After completing any code change, always build (`pip install -e .`) and run the 
 **`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all self-contained `.cu` modules) → fatbin → C header, then builds `csrc/beam_module.c` + `csrc/beam.c` + `csrc/test_beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). Fatbin compiled with `--generate-line-info` for NCU source-level profiling.
 
 **File split:**
-- `cuda/mm.cu` — `heap_compact_kernel` (1 block, 64 threads; wraps `heap_compact`)
+- `cuda/mm.cu` — `heap_init_kernel` (128 blocks × 32 threads; initialises both embedded heaps in DevicePool)
 - `cuda/test_hull_dandc.cu` — `hull_dandc_kernel` (hull mesh extraction)
 - `cuda/test_warp_sort.cu` — `test_warp_sort_kernel`
 - `cuda/test_plane_cut.cu` — `plane_cut_kernel` (thin `__global__` wrapper around `plane_cut_block`)
@@ -103,7 +103,7 @@ After completing any code change, always build (`pip install -e .`) and run the 
 - `csrc/test_beam.c` — `beam_test_warp_sort`, `beam_hull_dandc`, `beam_test_plane_cut`
 
 **Struct locations:**
-- `cuda/allocator.cuh` — device-side: `DevicePool`; included by `common.cuh`
+- `cuda/allocator.cuh` — device-side: `DevicePool` (with embedded `DeviceHeap heap/scratch`), `HeapArena`, `heap_alloc/free`; included by `common.cuh`
 - `cuda/structs.cuh` — device-side: `Mesh`, `Part`, `PartPair`, `WorkItem`, `AlgoState`; included by `plane_cut.cuh` and future algo code
 - `csrc/structs.h` — host-side: `DevicePool`, `beam_ctx`; included by `beam.c` and `test_beam.c`
 
@@ -133,15 +133,15 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 
 ### Persistent Heaps
 
-`beam_init` allocates two `DeviceHeap` instances at startup that persist for the lifetime of the context. Both share a single `DevicePool` backing (one bump allocator, one large device allocation). Pool size defaults to 70% of free device memory.
+`beam_init` allocates one `DevicePool` (`d_pool_struct`, ~133 KB on device) that contains both embedded `DeviceHeap` instances. Both share the same bump-allocator backing. Pool size defaults to 70% of free device memory.
 
-- **d_heap** — output heap: holds temporary per-kernel output (freed by kernel before return)
-- **d_scratch** — scratch heap: holds per-kernel working data (freed by kernel before return)
-- **Shared pool**: one `DevicePool` with a shared `atomicAdd` offset counter
-- **Pool offset never decreases**: freed blocks go to heap free-lists, not back to pool
+- **pool->heap** — output heap: holds temporary per-kernel output (freed by kernel before return)
+- **pool->scratch** — scratch heap: holds per-kernel working data (freed by kernel before return)
+- **Shared pool**: one `DevicePool.base/offset/capacity` with a shared `atomicAdd` counter
+- **Pool offset never decreases**: freed blocks coalesce in free-lists (not returned to pool)
 - **`beam_pool_usage()`**: reads back the pool offset — shows peak (high-water mark) of live device bytes
 
-Key property: both kernels (`hull_dandc_kernel` and `plane_cut_kernel`) call `heap_free` on all allocations before returning. Pool offset stabilizes after the first call and never grows without compact.
+`heap_free` now performs O(1) coalescing with adjacent free blocks (via boundary sentinels + doubly-linked free lists), so `heap_compact()` is a no-op and need not be called. Both kernels call `heap_free` on all allocations before returning; pool offset stabilizes after the first call.
 
 ## Utility Function Inventory
 
@@ -175,9 +175,8 @@ Key property: both kernels (`hull_dandc_kernel` and `plane_cut_kernel`) call `he
 | I1 | `pool_alloc(pool, size) -> void*` | allocator.cuh |
 | I2 | `global_alloc_warp(pool, bytes, lane) -> void*` | allocator.cuh |
 | I3 | `atomicMinF / atomicMaxF` | common.cuh |
-| I4 | `heap_alloc(heap, size, out) -> int` | heap_arena.cuh |
-| I5 | `heap_free(heap, ptr) -> int` | heap_arena.cuh |
-| I6 | `heap_compact(heap) -> int` | heap_arena.cuh |
+| I4 | `heap_alloc(heap, size, out) -> int` | allocator.cuh |
+| I5 | `heap_free(heap, ptr) -> int` | allocator.cuh |
 
 ### J. Dead Code
 
@@ -185,6 +184,7 @@ Key property: both kernels (`hull_dandc_kernel` and `plane_cut_kernel`) call `he
 |----|------|----------|
 | J1 | `compute_concavity_tris` in geometry.cuh | Bbox cube-root proxy, superseded by Rv |
 | J2 | `hull_dandc_warp` | Removed; use `hull_dandc_warp_mesh` for all callers |
+| J3 | `heap_compact(heap) -> int` | Removed from allocator.cuh; `beam_heap_compact()` is now a no-op |
 
 ## plane_cut_block API
 
@@ -198,7 +198,7 @@ Key property: both kernels (`hull_dandc_kernel` and `plane_cut_kernel`) call `he
 - **Counters** (`n_cross`, `n_all_verts`, `n_pos`, `n_neg`): stored in `__shared__ int s_counters[4]`; `atomicAdd` on shared memory. Not on heap.
 - **Early exit** (`n_cross == 0`): entire input mesh goes to one side; allocates one heap chunk for verts+tris, other side gets empty `Mesh {NULL,NULL,0,0}`.
 - **No-boundary / one-empty-side cases**: handled by natural fallthrough — compaction produces a 0-entry side correctly.
-- **Call sites** (`test_plane_cut.cu`, `test_beam.c`): not yet updated; will be overhauled separately.
+- **Call sites**: `test_plane_cut.cu` (thin `__global__` wrapper) and `test_beam.c` (host launcher) pass `DeviceHeap*` pointers into the embedded heaps of `DevicePool`.
 
 ## hull_dandc_warp_mesh API
 
@@ -212,7 +212,7 @@ Key property: both kernels (`hull_dandc_kernel` and `plane_cut_kernel`) call `he
 - **BtPool (edge pool)**: starts with 2 slabs (16384 edges); expands one slab at a time via `heap_alloc(scratch_heap, ...)` when exhausted. Lane 0 only; free-list setup is serial. Up to `BTPOOL_MAX_BLOCKS=32` slabs tracked for cleanup.
 - **Two-pass mesh extraction**: count pass (`bt_extractMesh` with NULL buffers, counts nv/nt via fan formula) → `heap_alloc(heap, ...)` for exact output → extract pass (writes verts+tris). BFS queue rewound between passes.
 - **dandc_scratch_bytes**: no longer includes the `6*n*sizeof(BtEdge)` edge pool term (pool now comes from scratch_heap separately).
-- **Call sites** (`test_hull_dandc.cu`): not yet updated; will be overhauled separately.
+- **Call sites**: `test_hull_dandc.cu` (kernel) and `test_beam.c` (host launcher) pass `DeviceHeap*` pointers into the embedded heaps of `DevicePool`.
 
 ## Pool Allocator Pattern
 
@@ -229,29 +229,31 @@ int* signs = s_signs;  // all threads see same pointer
 
 If all threads call `pool_alloc`, each gets a different offset → data corruption.
 
-## Heap Arena Allocator (heap_arena.cuh)
+## Heap Arena Allocator (allocator.cuh)
 
-`DeviceHeap` is a large-object heap backed by a `DevicePool`. Design:
+`DeviceHeap` is a large-object heap embedded directly in `DevicePool`. Design:
 
-- **64 arenas** (`HEAP_NUM_ARENAS`), selected by `blockIdx.x % 64`. Each arena has a singly-linked free list and a spin-lock (`int lock`).
-- **Block layout**: `[HeapBlockHdr (16 B)][data (data_size B)]`. Free blocks store the next header address in `data[0..7]`.
-- **Allocation** (thread 0 only): align request to 4K, first-fit walk of free list with spin-lock, split remainder if ≥ header + 4K. If free list has no fit, bump-allocate a new slab (min 128 KB or next-pow-2 of request) from the pool, split remainder into free list.
-- **Free** (thread 0 only): push block to head of arena `blockIdx.x % 64` under spin-lock.
-- **Compact** (one block, no concurrent ops): (1) drain all arenas into `compact_buf`; (2) warp 0 sorts addresses with `warp_sort_t<unsigned long long, HeapAddrCmp>`; (3) tid 0 scans sorted list, coalesces physically adjacent blocks, **re-inserts by address hash** (`heap_arena_for_addr(ptr) % 64`).
-- `compact_buf` is 16 MB of dedicated device memory (not from the pool). The first half holds collected addresses; the second half is sort scratch. `HEAP_COMPACT_CAP ≈ 1M entries`.
+- **64 arenas** (`HEAP_NUM_ARENAS`), selected by `blockIdx.x % 64`. Each arena has **64 sub-bin doubly-linked free lists**, a **64-bit occupancy bitmap**, and a spin-lock.
+- **Sub-bins**: 32 pow-of-2 bins × 2 linear halves. Bin b = `[4K·2^b, 8K·2^b)`. Sub-bin 2b = lower half `[4K·2^b, 6K·2^b)`, sub-bin 2b+1 = upper half `[6K·2^b, 8K·2^b)`.
+- **Block layout**: `[HeapBlockHdr (16 B)][data (data_size B)][HeapBlockFtr (16 B)]`. `HeapBlockHdr`/`Ftr` store `data_size`, `arena_idx`, `is_free`. Free blocks store `prev`/`next` pointers in first 16 bytes of data.
+- **Slab layout**: each new pool slab has `[leading sentinel 32B][free block][trailing sentinel 32B]`. Sentinels (`is_free=0`, `data_size=0`) prevent coalescing across slab boundaries.
+- **Allocation** (thread 0 only): bitmap search for lowest eligible sub-bin (O(1) via `__ffsll`); pop head; split remainder if ≥ `HEAP_HDR_SIZE + HEAP_ALIGN + HEAP_FTR_SIZE`. If no sub-bin has a free block, allocate a new slab from the pool (min 128 KB or next-pow-2).
+- **Free** (thread 0 only): inspect prev footer and next header; coalesce adjacent free blocks via doubly-linked O(1) removal; insert merged block into correct sub-bin. Arena for insertion = block's stored `arena_idx` (all blocks in a slab share the same arena, so coalescing is always intra-arena).
+- **No compact**: `beam_heap_compact()` is a no-op — coalescing is handled in-place by `heap_free`. Pool remains stable across all calls.
 
-Host init: zero-init `DeviceHeap` (zero head = empty list, zero lock = unlocked), set `pool` and `compact_buf` pointers.
+**DevicePool layout** (must match `csrc/structs.h`):
+```
+DevicePool { base, offset*, capacity, DeviceHeap heap, DeviceHeap scratch }
+DeviceHeap { DevicePool* pool (back-ptr set by heap_init_kernel), HeapArena arenas[64] }
+HeapArena  { bitmap, lock, _pad, heads[64], tails[64] }  // 1040 bytes each
+```
+`sizeof(DevicePool)` ≈ 133 KB (bulk is the two embedded heap arrays).
 
-### Arena Mismatch: Do Not Call heap_compact() Routinely
+Host init: allocate one `d_pool_struct` of `sizeof(struct DevicePool)`, set `base`/`offset`/`capacity`, then launch `heap_init_kernel<<<128,32>>>` which sets `heap.pool = scratch.pool = pool` and zeroes all arena state.
 
-**alloc/free use `blockIdx.x % 64`; compact re-inserts by `heap_arena_for_addr(ptr)` (address hash).** After compact, blocks land in address-hash arenas, not `blockIdx.x` arenas. The next kernel call finds its preferred arena empty and bump-allocates a new slab from the pool — pool grows on every call after compact.
-
-Benchmark results (100 hulls × 2000 pts/hull, 50 rounds gaussian):
-- **No compact**: pool stable at 158 MB forever (all blocks returned to correct arenas, reused perfectly)
-- **Compact every call**: pool grows to ~5700 MB, hull_dandc ~7% slower per call (arena miss overhead)
-- **Compact once at end**: pool 313 MB (double of no-compact), but at least doesn't grow unboundedly
-
-**Rule**: do NOT call `heap_compact()` as part of the normal call loop. Both kernels already free all heap allocations before returning, so the pool stabilizes naturally. `heap_compact()` is reserved for future streaming pipelines where data survives across calls (not yet implemented).
+Benchmark results (100 hulls × 2000 pts/hull, 100 rounds gaussian):
+- **Pool stable at 158 MB** forever regardless of compact frequency (compact is a no-op).
+- In the old allocator, compact-every-call caused pool to grow to ~5700 MB; this is fully resolved.
 
 ## Implementation Notes
 
