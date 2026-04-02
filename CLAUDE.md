@@ -179,10 +179,11 @@ with coacd_gpu.Context(device=0) as ctx:
 
 ## hull_dandc_warp_mesh API
 
-`hull_dandc_warp_mesh(pts, n, lane, heap, scratch_heap, out_mesh, err)` — warp device function (all 32 lanes call with identical args).
+`hull_dandc_warp_mesh(pts, n, lane, heap, scratch_heap, err) -> Mesh` — warp device function (all 32 lanes call with identical args).
 
-- **Output**: allocates a single combined `[verts | tris]` chunk from `DeviceHeap* heap`; writes result into `Mesh* out_mesh` (lane 0). Returns hull volume as `float`.
+- **Output**: returns a `Mesh` struct directly. Allocates a single combined `[verts | tris]` chunk from `DeviceHeap* heap`. Returns `{NULL,NULL,0,0}` on error or n<4.
 - **Heap chunk layout**: `[verts (nv*3 floats, 16-byte aligned) | tris (nt*3 ints)]`; exact sizes from a count pass.
+- **No volume**: `bt_computeVolume` is not called; the function only produces the mesh.
 - **Scratch**: `DeviceHeap* scratch_heap` backs (a) the `WarpPool` (allocated as a single heap chunk via `dandc_scratch_bytes(n)`) and (b) `BtEdge` pool slabs (`BTPOOL_BLOCK_SIZE=8192` edges each, 2 initial + dynamic expansion). All scratch is heap-freed before return — scratch_heap is clean after call.
 - **WarpPool**: declared `__shared__`; backing allocated from scratch_heap by lane 0. Used for BtPoint32 array, vertex block, sort scratch, D&C stack, BFS queues (all rewound when done).
 - **BtPool (edge pool)**: starts with 2 slabs (16384 edges); expands one slab at a time via `heap_alloc(scratch_heap, ...)` when exhausted. Lane 0 only; free-list setup is serial. Up to `BTPOOL_MAX_BLOCKS=32` slabs tracked for cleanup.

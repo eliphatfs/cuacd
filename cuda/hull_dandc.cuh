@@ -1469,31 +1469,31 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 }
 
 // ============================================================================
-// Warp entry point: compute hull volume + extract mesh into heap-allocated Mesh
+// Warp entry point: extract hull mesh into heap-allocated Mesh
 // ============================================================================
 
-// hull_dandc_warp_mesh: D&C convex hull volume + mesh extraction.
+// hull_dandc_warp_mesh: D&C convex hull mesh extraction.
 // All 32 lanes must call with identical arguments.
 //
 // heap         — output heap: one chunk allocated for [verts | tris].
 // scratch_heap — scratch heap: WarpPool backing + edge pool slabs, all freed on return.
-// out_mesh     — written by lane 0 on success; {NULL,NULL,0,0} on error or n<4.
 //
-// Returns hull volume (>= 0.0f) or -1.0f on error.
-__device__ float hull_dandc_warp_mesh(
+// Returns a Mesh with verts/tris in heap. Returns {NULL,NULL,0,0} on error or n<4.
+// *err is set to a nonzero error code on failure (all lanes see the same value).
+__device__ Mesh hull_dandc_warp_mesh(
     const float* pts, int n, int lane,
     DeviceHeap* heap, DeviceHeap* scratch_heap,
-    Mesh* out_mesh, int* err)
+    int* err)
 {
     __shared__ WarpPool s_pool;
     __shared__ void*    s_pool_backing;
+    __shared__ Mesh     s_result;
 
-    float vol = 0.0f;
     *err = 0;
-    if (out_mesh) { out_mesh->verts = NULL; out_mesh->tris = NULL;
-                    out_mesh->nv = 0; out_mesh->nt = 0; }
+    if (lane == 0) { s_result.verts = NULL; s_result.tris = NULL;
+                     s_result.nv = 0; s_result.nt = 0; }
 
-    if (n < 4) return 0.0f;
+    if (n < 4) { __syncwarp(); return s_result; }
 
     // --- Allocate WarpPool backing from scratch_heap (lane 0) ---
     if (lane == 0) {
@@ -1512,9 +1512,8 @@ __device__ float hull_dandc_warp_mesh(
     }
     __syncwarp();
     if (!s_pool_backing) {
-        vol = __shfl_sync(WARP_MASK, vol, 0);
         *err = __shfl_sync(WARP_MASK, *err, 0);
-        return -1.0f;
+        return s_result;
     }
 
     // --- Phase 1: pre-sort (all lanes) ---
@@ -1582,15 +1581,9 @@ __device__ float hull_dandc_warp_mesh(
                     { *err = 6; goto done; }
                 bt_rewind(&s_pool, pre_ext);
 
-                if (out_mesh) {
-                    out_mesh->verts = ov; out_mesh->tris = ot;
-                    out_mesh->nv    = nv; out_mesh->nt   = nt;
-                }
+                s_result.verts = ov; s_result.tris = ot;
+                s_result.nv    = nv; s_result.nt   = nt;
             }
-
-            // Volume
-            vol = bt_computeVolume(&state);
-            if (s_pool.error) { *err = s_pool.error; vol = -1.0f; }
         }
     }
 
@@ -1603,7 +1596,6 @@ done:
     }
     __syncwarp();
 
-    vol  = __shfl_sync(WARP_MASK, vol,  0);
     *err = __shfl_sync(WARP_MASK, *err, 0);
-    return vol;
+    return s_result;
 }
