@@ -1,11 +1,15 @@
-// beam.cu — beam search expansion kernel.
+// beam.cu — beam search expansion kernels.
 //
 // beam_expansion: 3*cuts_per_axis*current->nitems blocks, PC_BLOCK threads each.
 // Each block cuts the last part of one WorkItem along an axis-aligned plane,
 // adds the two halves to a new WorkItem in next.
+//
+// beam_hull: 2*current->nitems blocks, 32 threads each.
+// Each block computes the convex hull of one of the last two parts of each WorkItem.
 
 #include "plane_cut.cuh"
 #include "warp_common.cuh"
+#include "hull_dandc.cuh"
 
 // Error code for exceeding WORK_ITEM_MAX_PARTS (distinct from plane_cut errors).
 #define BEAM_ERR_OVERFLOW 0x10000
@@ -110,4 +114,37 @@ extern "C" __global__ void beam_expansion(
         wo->parts[np]     = pp.neg;
         wo->nparts        = np + 1;
     }
+}
+
+// beam_hull: <<<2*current->nitems, 32>>>
+// Each block (one warp) computes the convex hull of one of the last two parts
+// of a WorkItem and stores it in Part.hull.
+// Block b: item_idx = b / 2, part_offset = b % 2 (0 = nparts-2, 1 = nparts-1).
+// Early-exits (no error) if item_idx >= nitems or hull already computed.
+extern "C" __global__ void beam_hull(
+    AlgoState*  current,
+    DevicePool* pool,
+    int*        err)
+{
+    int lane     = threadIdx.x;  // 0..31
+    int item_idx = blockIdx.x / 2;
+    int part_off = blockIdx.x % 2;  // 0 = second-to-last, 1 = last
+
+    if (item_idx >= current->nitems) return;
+
+    WorkItem* wi = &current->items[item_idx];
+    int       np = wi->nparts;
+    // Need at least 2 parts for part_off=0 to make sense; for safety clamp:
+    int part_idx = np - 2 + part_off;
+    if (part_idx < 0 || part_idx >= np) return;
+
+    Part* p = &wi->parts[part_idx];
+    if (p->hull.verts != NULL) return;  // already computed
+
+    Mesh hull = hull_dandc_warp_mesh(
+        p->mesh.verts, p->mesh.nv, lane,
+        &pool->heap, &pool->scratch, err);
+
+    if (lane == 0)
+        p->hull = hull;
 }

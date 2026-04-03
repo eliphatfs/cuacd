@@ -25,7 +25,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   mm.cu               #   heap_init_kernel: <<<2×HEAP_NUM_ARENAS,32>>> initialises both embedded heaps in DevicePool
-  beam.cu             #   beam_expansion kernel: <<<3×cuts_per_axis×nitems, 64>>> cuts last part of each WorkItem
+  beam.cu             #   beam_expansion kernel: <<<3×cuts_per_axis×nitems, 64>>> cuts last part of each WorkItem; beam_hull kernel: <<<2×nitems, 32>>> fills Part.hull via D&C convex hull
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel (hull mesh extraction)
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel (thin wrapper around plane_cut_block)
@@ -215,6 +215,15 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **Overflow**: `BEAM_ERR_OVERFLOW = 0x10000` — `atomicOr`'d into `err` if `nparts+1 > WORK_ITEM_MAX_PARTS`. Distinct from any plane_cut error code (those are small integers).
 - **Part copy**: bulk int-copy of `parts[0..nparts-2]` in parallel; thread 0 appends `pp.pos` and `pp.neg`, sets `nparts = old_nparts + 1`.
 - **`next->nitems`**: incremented atomically (thread 0) only for successful cuts; caller must pre-zero it and ensure sufficient `items` capacity.
+
+## beam_hull API
+
+`beam_hull<<<2*current->nitems, 32>>>(current, pool, err)` — one block (one warp) per part; fills `Part.hull` with the convex hull mesh.
+
+- **Block mapping**: `item_idx = blockIdx.x / 2`, `part_off = blockIdx.x % 2` → `part_idx = nparts - 2 + part_off` (0 = second-to-last, 1 = last part).
+- **Early exit** (no error): if `item_idx >= nitems`, or `part_idx` out of range, or `part->hull.verts != NULL` (hull already computed).
+- **Calls `hull_dandc_warp_mesh`** on `p->mesh.verts` / `p->mesh.nv` using `pool->heap` (output) and `pool->scratch` (scratch). All 32 lanes call.
+- **Stores result**: lane 0 writes the returned `Mesh` into `p->hull`. Returns `{NULL,NULL,0,0}` on error or < 4 points (error code set in `*err`).
 
 ## hull_dandc_warp_mesh API
 
