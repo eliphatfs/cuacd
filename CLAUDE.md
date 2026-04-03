@@ -25,7 +25,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   mm.cu               #   heap_init_kernel: <<<2×HEAP_NUM_ARENAS,32>>> initialises both embedded heaps in DevicePool
-  beam.cu             #   beam_expansion kernel: <<<3×cuts_per_axis×nitems, 64>>> cuts last part of each WorkItem; beam_hull kernel: <<<2×nitems, 32>>> fills Part.hull via D&C convex hull
+  beam.cu             #   beam_expansion kernel: <<<3×cuts_per_axis×nitems, 64>>> cuts last part of each WorkItem; beam_hull kernel: <<<2×nitems, 32>>> fills Part.hull via D&C convex hull; beam_sort kernel: <<<nitems, 32>>> sorts parts by max(hausdorff, mesh_vol/(hull_vol+eps))
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel (hull mesh extraction)
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel (thin wrapper around plane_cut_block)
@@ -226,6 +226,15 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **Calls `hull_dandc_warp_mesh`** on `p->mesh.verts` / `p->mesh.nv` using `pool->heap` (output) and `pool->scratch` (scratch). All 32 lanes call.
 - **Stores result**: lane 0 writes the returned `Mesh` into `p->hull`. Returns `{NULL,NULL,0,0}` on error or < 4 points (error code set in `*err`).
 - **Hull volume**: if `hull.nt > 0`, all 32 lanes call `mesh_volume_warp(&hull, lane)`; lane 0 writes result to `p->hull_vol`.
+
+## beam_sort API
+
+`beam_sort<<<current->nitems, 32>>>(current, pool, err)` — one block (one warp) per WorkItem; sorts `parts[0..nparts-1]` in ascending order of `max(hausdorff, mesh_vol / (hull_vol + eps))`.
+
+- **Block mapping**: `item_idx = blockIdx.x`. Early-exit if `item_idx >= nitems` or `nparts <= 1`.
+- **Sort key**: `PartKeyCmp::key(p) = fmaxf(p.hausdorff, p.mesh_vol / (p.hull_vol + 1e-6f))`, ascending. Uses `warp_sort_t<Part, PartKeyCmp>` from `warp_sort.cuh`; sorts `wi->parts` in-place.
+- **Scratch**: lane 0 allocates `nparts * sizeof(Part) + WS_MAX_STACK * 2 * sizeof(int)` bytes from `pool->scratch` via `heap_alloc`; freed by lane 0 before return.
+- **Error codes**: `BEAM_ERR_SORT_OOM = 0x20000` if scratch allocation fails; `BEAM_ERR_SORT_STACK = 0x40000` if `warp_sort_t` stack overflows (both `atomicOr`'d into `*err`).
 
 ## hull_dandc_warp_mesh API
 

@@ -11,9 +11,34 @@
 #include "warp_common.cuh"
 #include "hull_dandc.cuh"
 #include "mesh_volume.cuh"
+#include "warp_sort.cuh"
 
 // Error code for exceeding WORK_ITEM_MAX_PARTS (distinct from plane_cut errors).
-#define BEAM_ERR_OVERFLOW 0x10000
+#define BEAM_ERR_OVERFLOW  0x10000
+// Error codes for beam_sort.
+#define BEAM_ERR_SORT_OOM  0x20000  // scratch heap allocation failed
+#define BEAM_ERR_SORT_STACK 0x40000 // warp_sort_t stack overflow
+
+// Comparator for sorting Parts by max(hausdorff, mesh_vol / (hull_vol + eps)), ascending.
+struct PartKeyCmp {
+    static __device__ inline float key(const Part& p) {
+        const float eps = 1e-6f;
+        return fmaxf(p.hausdorff, p.mesh_vol / (p.hull_vol + eps));
+    }
+    static __device__ inline int cmp(Part a, Part b) {
+        float ka = key(a), kb = key(b);
+        if (ka < kb) return -1;
+        if (ka > kb) return  1;
+        return 0;
+    }
+    static __device__ inline Part sentinel() {
+        Part s = {};
+        s.hausdorff = 1e30f;
+        s.mesh_vol  = 1e30f;
+        s.hull_vol  = 0.0f;
+        return s;
+    }
+};
 
 extern "C" __global__ void beam_expansion(
     AlgoState*  current,
@@ -166,4 +191,44 @@ extern "C" __global__ void beam_hull(
         if (lane == 0)
             p->hull_vol = hvol;
     }
+}
+
+// beam_sort: <<<current->nitems, 32>>>
+// Each block (one warp) sorts the parts of one WorkItem in ascending order of
+// max(hausdorff, mesh_vol / (hull_vol + eps)) using warp_sort_t.
+// Scratch is allocated from pool->scratch and freed before return.
+// Sets BEAM_ERR_SORT_OOM if scratch allocation fails, BEAM_ERR_SORT_STACK on
+// warp_sort_t stack overflow.
+extern "C" __global__ void beam_sort(
+    AlgoState*  current,
+    DevicePool* pool,
+    int*        err)
+{
+    int lane     = threadIdx.x;  // 0..31
+    int item_idx = blockIdx.x;
+
+    if (item_idx >= current->nitems) return;
+
+    WorkItem* wi = &current->items[item_idx];
+    int np = wi->nparts;
+    if (np <= 1) return;
+
+    // Allocate sort scratch from scratch heap (lane 0 only).
+    __shared__ char* s_scratch;
+    if (lane == 0) {
+        int nb = np * (int)sizeof(Part) + WS_MAX_STACK * 2 * (int)sizeof(int);
+        if (heap_alloc(&pool->scratch, nb, (void**)&s_scratch) != 0) {
+            s_scratch = NULL;
+            atomicOr(err, BEAM_ERR_SORT_OOM);
+        }
+    }
+    __syncwarp();
+    if (s_scratch == NULL) return;
+
+    int rc = warp_sort_t<Part, PartKeyCmp>(wi->parts, s_scratch, np, lane);
+    if (rc != 0 && lane == 0)
+        atomicOr(err, BEAM_ERR_SORT_STACK);
+
+    if (lane == 0)
+        heap_free(&pool->scratch, s_scratch);
 }
