@@ -206,7 +206,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 
 ## beam_expansion API
 
-`beam_expansion<<<3*cuts_per_axis*current->nitems, 64>>>(current, next, pool, cuts_per_axis, err)` — one block per (item, cut); produces candidate WorkItems in `next`.
+`beam_expansion<<<3*cuts_per_axis*current->nitems, 64>>>(current, next, pool, cuts_per_axis, err)` — one block per (item, cut); produces candidate WorkItems in `next`. Returns immediately if `*err` is non-zero on entry.
 
 - **Block mapping**: `item_idx = blockIdx.x / (3*cuts_per_axis)`, `axis = (blockIdx.x % (3*cuts_per_axis)) / cuts_per_axis`, `slice = … % cuts_per_axis`.
 - **Plane**: axis-aligned at `(slice+1)/(cuts_per_axis+1)` fraction of the last part's bounding box. Bbox via three-stage reduction: per-thread local min/max → `warp_min_f`/`warp_max_f` → lane-0-per-warp `atomicMinF`/`atomicMaxF` into shared memory.
@@ -219,7 +219,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 
 ## beam_hull API
 
-`beam_hull<<<2*current->nitems, 32>>>(current, pool, err)` — one block (one warp) per part; fills `Part.hull` with the convex hull mesh.
+`beam_hull<<<2*current->nitems, 32>>>(current, pool, err)` — one block (one warp) per part; fills `Part.hull` with the convex hull mesh. Returns immediately if `*err` is non-zero on entry.
 
 - **Block mapping**: `item_idx = blockIdx.x / 2`, `part_off = blockIdx.x % 2` → `part_idx = nparts - 2 + part_off` (0 = second-to-last, 1 = last part).
 - **Early exit** (no error): if `item_idx >= nitems`, or `part_idx` out of range, or `part->hull.verts != NULL` (hull already computed).
@@ -229,7 +229,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 
 ## beam_sort API
 
-`beam_sort<<<current->nitems, 32>>>(current, pool, err)` — one block (one warp) per WorkItem; sorts `parts[0..nparts-1]` in ascending order of `max(hausdorff, mesh_vol / (hull_vol + eps))`.
+`beam_sort<<<current->nitems, 32>>>(current, pool, err)` — one block (one warp) per WorkItem; sorts `parts[0..nparts-1]` in ascending order of `max(hausdorff, mesh_vol / (hull_vol + eps))`. Returns immediately if `*err` is non-zero on entry.
 
 - **Block mapping**: `item_idx = blockIdx.x`. Early-exit if `item_idx >= nitems` or `nparts <= 1`.
 - **Sort key**: `PartKeyCmp::key(p) = fmaxf(p.hausdorff, p.mesh_vol / (p.hull_vol + 1e-6f))`, ascending. Uses `warp_sort_t<Part, PartKeyCmp>` from `warp_sort.cuh`; sorts `wi->parts` in-place.

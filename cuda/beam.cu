@@ -47,6 +47,8 @@ extern "C" __global__ void beam_expansion(
     int         cuts_per_axis,
     int*        err)
 {
+    if (*err) return;
+
     int tid      = threadIdx.x;
     int cpa3     = 3 * cuts_per_axis;
     int item_idx = blockIdx.x / cpa3;
@@ -170,6 +172,8 @@ extern "C" __global__ void beam_hull(
     DevicePool* pool,
     int*        err)
 {
+    if (*err) return;
+
     int lane     = threadIdx.x;  // 0..31
     int item_idx = blockIdx.x / 2;
     int part_off = blockIdx.x % 2;  // 0 = second-to-last, 1 = last
@@ -210,6 +214,8 @@ extern "C" __global__ void beam_sort(
     DevicePool* pool,
     int*        err)
 {
+    if (*err) return;
+
     int lane     = threadIdx.x;  // 0..31
     int item_idx = blockIdx.x;
 
