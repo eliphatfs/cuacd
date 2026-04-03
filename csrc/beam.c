@@ -163,3 +163,318 @@ int beam_heap_compact(beam_ctx_t ctx) {
     (void)ctx;
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// beam_decompose — full beam-search convex decomposition
+// ---------------------------------------------------------------------------
+
+// Host-side mirrors of CUDA device structs from cuda/structs.cuh.
+// Pointer fields use CUdeviceptr (uint64) to match 64-bit device pointers.
+// Padding matches the device struct layout automatically via C alignment rules.
+#define WORK_ITEM_MAX_PARTS 512
+
+struct Mesh_h {
+    CUdeviceptr verts;     // float* on device
+    CUdeviceptr tris;      // int*   on device
+    int         nv;
+    int         nt;
+    CUdeviceptr refcount;  // int*   on device
+};
+
+struct Part_h {
+    struct Mesh_h mesh;
+    struct Mesh_h hull;
+    float mesh_vol;
+    float hull_vol;
+    float hausdorff;
+    // 4 bytes trailing padding added by compiler to reach alignment of 8
+};
+
+struct WorkItem_h {
+    struct Part_h parts[WORK_ITEM_MAX_PARTS];
+    int nparts;
+    // 4 bytes trailing padding added by compiler
+};
+
+struct AlgoState_h {
+    CUdeviceptr items;   // WorkItem* on device
+    int         nitems;
+    // 4 bytes trailing padding added by compiler
+};
+
+// Read back the best WorkItem from d_current into out.
+// Caller must have synced the stream before calling.
+static int decomp_read_result(
+    beam_ctx_t ctx, CUdeviceptr d_current, struct beam_result* out, CUstream s)
+{
+    struct AlgoState_h h_state;
+    CUresult r = cuMemcpyDtoH(&h_state, d_current, sizeof(h_state));
+    if (r != CUDA_SUCCESS) {
+        const char* msg = NULL;
+        cuGetErrorString(r, &msg);
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "read AlgoState failed: %s", msg ? msg : "unknown");
+        return (int)r;
+    }
+
+    if (h_state.nitems == 0) {
+        out->nparts = 0;
+        out->parts  = NULL;
+        return 0;
+    }
+
+    struct WorkItem_h wi;
+    r = cuMemcpyDtoH(&wi, h_state.items, sizeof(wi));
+    if (r != CUDA_SUCCESS) {
+        const char* msg = NULL;
+        cuGetErrorString(r, &msg);
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "read WorkItem failed: %s", msg ? msg : "unknown");
+        return (int)r;
+    }
+
+    int np = wi.nparts;
+    out->nparts = np;
+    if (np == 0) { out->parts = NULL; return 0; }
+
+    out->parts = (struct beam_part_result*)calloc(np, sizeof(struct beam_part_result));
+    if (!out->parts) return -1;
+
+    // Allocate all host buffers and issue async D2H copies for every part.
+    for (int i = 0; i < np; i++) {
+        struct Part_h*           p  = &wi.parts[i];
+        struct beam_part_result* pr = &out->parts[i];
+
+        pr->nv        = p->mesh.nv;
+        pr->nt        = p->mesh.nt;
+        pr->mesh_vol  = p->mesh_vol;
+        pr->hull_vol  = p->hull_vol;
+        pr->hausdorff = p->hausdorff;
+
+        if (pr->nv > 0 && p->mesh.verts) {
+            pr->verts = (float*)malloc((size_t)pr->nv * 3 * sizeof(float));
+            if (!pr->verts) return -1;
+            r = cuMemcpyDtoHAsync(pr->verts, p->mesh.verts,
+                                  (size_t)pr->nv * 3 * sizeof(float), s);
+            if (r != CUDA_SUCCESS) return (int)r;
+        }
+        if (pr->nt > 0 && p->mesh.tris) {
+            pr->tris = (int*)malloc((size_t)pr->nt * 3 * sizeof(int));
+            if (!pr->tris) return -1;
+            r = cuMemcpyDtoHAsync(pr->tris, p->mesh.tris,
+                                  (size_t)pr->nt * 3 * sizeof(int), s);
+            if (r != CUDA_SUCCESS) return (int)r;
+        }
+    }
+
+    // Single sync after all async copies have been enqueued.
+    r = cuStreamSynchronize(s);
+    if (r != CUDA_SUCCESS) return (int)r;
+    return 0;
+}
+
+int beam_decompose(
+    beam_ctx_t   ctx,
+    const float* verts,      int nv,
+    const int*   tris,       int nt,
+    const float* hull_verts, int hull_nv,
+    const int*   hull_tris,  int hull_nt,
+    int max_iters, int cuts_per_axis, float threshold, int max_keep,
+    struct beam_result* out)
+{
+    // Local CHECK that sets result_code and jumps to cleanup.
+#define LCHECK(call) do { \
+    CUresult _r = (call); \
+    if (_r != CUDA_SUCCESS) { \
+        const char* _msg = NULL; \
+        cuGetErrorString(_r, &_msg); \
+        snprintf(ctx->last_error, sizeof(ctx->last_error), \
+                 "%s failed at beam.c:%d: %s", #call, __LINE__, _msg ? _msg : "unknown"); \
+        result_code = (int)_r; \
+        goto cleanup; \
+    } \
+} while(0)
+
+    CUstream s = NULL;  // default (legacy) stream
+    int result_code = 0;
+
+    CUdeviceptr d_verts      = 0, d_tris       = 0;
+    CUdeviceptr d_hverts     = 0, d_htris       = 0;
+    CUdeviceptr d_wi_a       = 0, d_wi_b        = 0;
+    CUdeviceptr d_state_a    = 0, d_state_b     = 0;
+    CUdeviceptr d_err        = 0, d_finish      = 0;
+
+    // Resolve beam kernels
+    CUfunction fn_init = NULL, fn_expand = NULL, fn_hull = NULL,
+               fn_sort = NULL, fn_finalize = NULL;
+    LCHECK(cuModuleGetFunction(&fn_init,     ctx->module, "beam_initialize"));
+    LCHECK(cuModuleGetFunction(&fn_expand,   ctx->module, "beam_expansion"));
+    LCHECK(cuModuleGetFunction(&fn_hull,     ctx->module, "beam_hull"));
+    LCHECK(cuModuleGetFunction(&fn_sort,     ctx->module, "beam_sort"));
+    LCHECK(cuModuleGetFunction(&fn_finalize, ctx->module, "beam_finalize"));
+
+    // ------------------------------------------------------------------
+    // Allocate and upload input mesh + hull buffers
+    // ------------------------------------------------------------------
+    LCHECK(cuMemAllocAsync(&d_verts,  (size_t)nv     * 3 * sizeof(float), s));
+    LCHECK(cuMemAllocAsync(&d_tris,   (size_t)nt     * 3 * sizeof(int),   s));
+    LCHECK(cuMemAllocAsync(&d_hverts, (size_t)hull_nv * 3 * sizeof(float), s));
+    LCHECK(cuMemAllocAsync(&d_htris,  (size_t)hull_nt * 3 * sizeof(int),   s));
+
+    LCHECK(cuMemcpyHtoDAsync(d_verts,  verts,      (size_t)nv     * 3 * sizeof(float), s));
+    LCHECK(cuMemcpyHtoDAsync(d_tris,   tris,       (size_t)nt     * 3 * sizeof(int),   s));
+    LCHECK(cuMemcpyHtoDAsync(d_hverts, hull_verts, (size_t)hull_nv * 3 * sizeof(float), s));
+    LCHECK(cuMemcpyHtoDAsync(d_htris,  hull_tris,  (size_t)hull_nt * 3 * sizeof(int),   s));
+
+    // ------------------------------------------------------------------
+    // Allocate double-buffered WorkItem arrays and AlgoState structs
+    // max_expand: maximum WorkItems that can exist after one expansion round
+    // ------------------------------------------------------------------
+    int max_expand = 3 * cuts_per_axis * max_keep;
+    size_t wi_pool_bytes = (size_t)max_expand * sizeof(struct WorkItem_h);
+
+    LCHECK(cuMemAllocAsync(&d_wi_a, wi_pool_bytes, s));
+    LCHECK(cuMemAllocAsync(&d_wi_b, wi_pool_bytes, s));
+    LCHECK(cuMemsetD8Async(d_wi_a, 0, wi_pool_bytes, s));
+    LCHECK(cuMemsetD8Async(d_wi_b, 0, wi_pool_bytes, s));
+
+    LCHECK(cuMemAllocAsync(&d_state_a, sizeof(struct AlgoState_h), s));
+    LCHECK(cuMemAllocAsync(&d_state_b, sizeof(struct AlgoState_h), s));
+
+    struct AlgoState_h ha, hb;
+    memset(&ha, 0, sizeof(ha)); ha.items = d_wi_a; ha.nitems = 0;
+    memset(&hb, 0, sizeof(hb)); hb.items = d_wi_b; hb.nitems = 0;
+    LCHECK(cuMemcpyHtoDAsync(d_state_a, &ha, sizeof(ha), s));
+    LCHECK(cuMemcpyHtoDAsync(d_state_b, &hb, sizeof(hb), s));
+
+    // ------------------------------------------------------------------
+    // Allocate error / finish scalars
+    // ------------------------------------------------------------------
+    LCHECK(cuMemAllocAsync(&d_err,    sizeof(int), s));
+    LCHECK(cuMemAllocAsync(&d_finish, sizeof(int), s));
+    LCHECK(cuMemsetD32Async(d_err,    0, 1, s));
+    LCHECK(cuMemsetD32Async(d_finish, 0, 1, s));
+
+    // ------------------------------------------------------------------
+    // Seed: beam_initialize <<<3, 32>>>
+    // ------------------------------------------------------------------
+    {
+        void* args[] = { &d_verts, &d_tris, &nv, &nt,
+                         &d_hverts, &d_htris, &hull_nv, &hull_nt,
+                         &d_state_a };
+        LCHECK(cuLaunchKernel(fn_init, 3, 1, 1, 32, 1, 1, 0, s, args, NULL));
+    }
+
+    // Double-buffer pointers: current holds the live beam, prev is empty scratch.
+    CUdeviceptr d_current = d_state_a;
+    CUdeviceptr d_prev    = d_state_b;
+    int cur_nitems        = 1;  // beam_initialize always produces exactly 1 item
+
+    // ------------------------------------------------------------------
+    // Main loop
+    // ------------------------------------------------------------------
+    for (int iter = 0; iter < max_iters; iter++) {
+
+        // ---- beam_finalize: clear prev, compact current to max_keep ----
+        {
+            void* args[] = { &d_prev, &d_current,
+                             &ctx->d_pool_struct, &d_finish, &d_err,
+                             &max_keep, &threshold };
+            LCHECK(cuLaunchKernel(fn_finalize,
+                                  max_keep, 1, 1, 1024, 1, 1,
+                                  0, s, args, NULL));
+        }
+        // Batch three D2H transfers async, then sync once before reading any.
+        int h_finish = 0, h_err = 0;
+        struct AlgoState_h h_st;
+        memset(&h_st, 0, sizeof(h_st));
+        LCHECK(cuMemcpyDtoHAsync(&h_finish, d_finish,  sizeof(int),            s));
+        LCHECK(cuMemcpyDtoHAsync(&h_err,    d_err,     sizeof(int),            s));
+        LCHECK(cuMemcpyDtoHAsync(&h_st,     d_current, sizeof(struct AlgoState_h), s));
+        LCHECK(cuStreamSynchronize(s));
+
+        if (h_err) {
+            snprintf(ctx->last_error, sizeof(ctx->last_error),
+                     "beam_decompose: GPU error 0x%x at iter %d", h_err, iter);
+            result_code = h_err;
+            goto cleanup;
+        }
+
+        if (h_finish) {
+            result_code = decomp_read_result(ctx, d_current, out, s);
+            goto cleanup;
+        }
+
+        cur_nitems = h_st.nitems;
+
+        // ---- beam_expansion: current → prev (now repurposed as next) ----
+        // d_prev was cleared by beam_finalize; repurpose as "next".
+        {
+            void* args[] = { &d_current, &d_prev,
+                             &ctx->d_pool_struct, &cuts_per_axis, &d_err };
+            int nblocks = 3 * cuts_per_axis * cur_nitems;
+            if (nblocks < 1) nblocks = 1;
+            LCHECK(cuLaunchKernel(fn_expand, nblocks, 1, 1, 64, 1, 1,
+                                  0, s, args, NULL));
+        }
+
+        // Swap: next (d_prev) becomes current; old current becomes prev.
+        CUdeviceptr tmp = d_current;
+        d_current = d_prev;
+        d_prev    = tmp;
+
+        // ---- beam_hull: over-provisioned grid, self-checks nitems ----
+        // Max possible new items: 3*cuts_per_axis*cur_nitems; 2 blocks per item.
+        {
+            void* args[] = { &d_current, &ctx->d_pool_struct, &d_err };
+            int nblocks = 2 * 3 * cuts_per_axis * cur_nitems;
+            if (nblocks < 1) nblocks = 1;
+            LCHECK(cuLaunchKernel(fn_hull, nblocks, 1, 1, 32, 1, 1,
+                                  0, s, args, NULL));
+        }
+
+        // ---- beam_sort: over-provisioned grid, self-checks nitems ----
+        {
+            void* args[] = { &d_current, &ctx->d_pool_struct, &d_err };
+            int nblocks = 3 * cuts_per_axis * cur_nitems;
+            if (nblocks < 1) nblocks = 1;
+            LCHECK(cuLaunchKernel(fn_sort, nblocks, 1, 1, 32, 1, 1,
+                                  0, s, args, NULL));
+        }
+        // No sync here — beam_finalize at the top of the next iteration
+        // will consume these results after its own ordering dependency.
+    }
+
+    // Iterations exhausted — read back current state.
+    LCHECK(cuStreamSynchronize(s));
+    result_code = decomp_read_result(ctx, d_current, out, s);
+
+cleanup:
+    // Ensure stream is idle before releasing buffers.
+    cuStreamSynchronize(s);
+    if (d_verts)   cuMemFreeAsync(d_verts,   s);
+    if (d_tris)    cuMemFreeAsync(d_tris,    s);
+    if (d_hverts)  cuMemFreeAsync(d_hverts,  s);
+    if (d_htris)   cuMemFreeAsync(d_htris,   s);
+    if (d_wi_a)    cuMemFreeAsync(d_wi_a,    s);
+    if (d_wi_b)    cuMemFreeAsync(d_wi_b,    s);
+    if (d_state_a) cuMemFreeAsync(d_state_a, s);
+    if (d_state_b) cuMemFreeAsync(d_state_b, s);
+    if (d_err)     cuMemFreeAsync(d_err,     s);
+    if (d_finish)  cuMemFreeAsync(d_finish,  s);
+    cuStreamSynchronize(s);
+
+#undef LCHECK
+    return result_code;
+}
+
+void beam_result_free(struct beam_result* result) {
+    if (!result) return;
+    for (int i = 0; i < result->nparts; i++) {
+        free(result->parts[i].verts);
+        free(result->parts[i].tris);
+    }
+    free(result->parts);
+    result->parts  = NULL;
+    result->nparts = 0;
+}

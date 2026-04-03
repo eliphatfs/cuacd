@@ -96,6 +96,46 @@ int beam_batch_mesh_volume(
     float*       out_volumes);
 
 // ---------------------------------------------------------------------------
+// beam_decompose — full beam-search convex decomposition
+// ---------------------------------------------------------------------------
+// Inputs: mesh (verts/tris) and its precomputed convex hull (hull_verts/hull_tris).
+// Hyperparams:
+//   max_iters:      outer iteration cap
+//   cuts_per_axis:  number of candidate planes per axis (3 axes)
+//   threshold:      stop when best-part cost falls below this value
+//   max_keep:       beam width (max WorkItems retained per round)
+//
+// Output: beam_result filled with the parts of the best WorkItem.
+//   All verts/tris in beam_part_result are malloc'd; call beam_result_free to release.
+//   Returns 0 on success, non-zero on error (see beam_last_error).
+
+struct beam_part_result {
+    float* verts;     // malloc'd, nv*3 floats
+    int*   tris;      // malloc'd, nt*3 ints
+    int    nv;
+    int    nt;
+    float  mesh_vol;
+    float  hull_vol;
+    float  hausdorff;
+};
+
+struct beam_result {
+    struct beam_part_result* parts;  // malloc'd array of nparts entries
+    int nparts;
+};
+
+int beam_decompose(
+    beam_ctx_t   ctx,
+    const float* verts,      int nv,
+    const int*   tris,       int nt,
+    const float* hull_verts, int hull_nv,
+    const int*   hull_tris,  int hull_nt,
+    int max_iters, int cuts_per_axis, float threshold, int max_keep,
+    struct beam_result* out);
+
+void beam_result_free(struct beam_result* result);
+
+// ---------------------------------------------------------------------------
 // test_plane_cut — GPU plane cut with cap triangulation
 // ---------------------------------------------------------------------------
 // Returns separate pos and neg vertex + triangle arrays.
