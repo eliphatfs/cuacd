@@ -34,6 +34,7 @@
 //
 // Must stay in sync with csrc/structs.h.
 #pragma once
+#include "common.cuh"
 
 // ============================================================================
 // Configuration
@@ -317,6 +318,11 @@ __device__ inline int heap_free(DeviceHeap* h, void* ptr) {
     unsigned long long blk = (unsigned long long)ptr - HEAP_HDR_SIZE;
     unsigned int ds = ((HeapBlockHdr*)blk)->data_size;
     int        aidx  = (int)((HeapBlockHdr*)blk)->arena_idx;
+
+    if (aidx < 0 || aidx >= HEAP_NUM_ARENAS) {
+        return 2;  // HEAP_ERR_CORRUPT — caller should report
+    }
+
     HeapArena* arena = &h->arenas[aidx];
 
     arena_lock(arena);
@@ -327,6 +333,11 @@ __device__ inline int heap_free(DeviceHeap* h, void* ptr) {
         if (prev_ftr->is_free) {
             unsigned int       prev_ds  = prev_ftr->data_size;
             unsigned long long prev_blk = blk - HEAP_FTR_SIZE - prev_ds - HEAP_HDR_SIZE;
+            int prev_aidx = (int)((HeapBlockHdr*)prev_blk)->arena_idx;
+            if (prev_aidx < 0 || prev_aidx >= HEAP_NUM_ARENAS) {
+                arena_unlock(arena);
+                return 3;  // HEAP_ERR_CORRUPT_PREV
+            }
             subbin_remove(arena, heap_subbin_for_size(prev_ds), prev_blk);
             ds  = prev_ds + HEAP_FTR_SIZE + HEAP_HDR_SIZE + ds;
             blk = prev_blk;
@@ -338,9 +349,14 @@ __device__ inline int heap_free(DeviceHeap* h, void* ptr) {
         unsigned long long next_blk = blk + HEAP_HDR_SIZE + ds + HEAP_FTR_SIZE;
         HeapBlockHdr* next_hdr = (HeapBlockHdr*)next_blk;
         if (next_hdr->is_free) {
+            int next_aidx = (int)next_hdr->arena_idx;
             unsigned int next_ds = next_hdr->data_size;
-            subbin_remove(arena, heap_subbin_for_size(next_ds), next_blk);
-            ds = ds + HEAP_FTR_SIZE + HEAP_HDR_SIZE + next_ds;
+            if (next_aidx < 0 || next_aidx >= HEAP_NUM_ARENAS) {
+                // skip next coalesce — block is corrupt
+            } else {
+                subbin_remove(arena, heap_subbin_for_size(next_ds), next_blk);
+                ds = ds + HEAP_FTR_SIZE + HEAP_HDR_SIZE + next_ds;
+            }
         }
     }
 

@@ -13,12 +13,6 @@
 #include "mesh_volume.cuh"
 #include "warp_sort.cuh"
 
-#ifdef COACD_BEAM_DEBUG
-#  define DPRINTF(...) printf(__VA_ARGS__)
-#else
-#  define DPRINTF(...) ((void)0)
-#endif
-
 // Error code for exceeding WORK_ITEM_MAX_PARTS (distinct from plane_cut errors).
 #define BEAM_ERR_OVERFLOW      0x10000
 // Error codes for beam_sort.
@@ -139,6 +133,18 @@ extern "C" __global__ void beam_expansion(
     WorkItem* wi   = &current->items[item_idx];
     int       np   = wi->nparts;
     Mesh*     mesh = &wi->parts[np - 1].mesh;
+
+    // Validate mesh before use — detect freed/corrupted meshes early.
+    if (tid == 0 && (mesh->nv <= 0 || mesh->nt <= 0 ||
+                     mesh->nv > 1000000 || mesh->nt > 1000000 ||
+                     mesh->verts == NULL || mesh->tris == NULL)) {
+        DPRINTF("[expand] BAD MESH block=%d item=%d np=%d nv=%d nt=%d verts=%p tris=%p rc=%p\n",
+               blockIdx.x, item_idx, np, mesh->nv, mesh->nt,
+               mesh->verts, mesh->tris, mesh->refcount);
+        if (mesh->refcount) DPRINTF("[expand]   *refcount=%d\n", *mesh->refcount);
+        atomicOr(err, 0x100000);  // custom error code
+        return;
+    }
 
     // Compute bounding box — three-stage reduction:
     //   1. Each thread accumulates its own lo/hi over its strided vertices.
@@ -382,10 +388,16 @@ extern "C" __global__ void beam_finalize(
             Part* p = &wi->parts[i];
             if (p->mesh.refcount) {
                 int old = atomicAdd(p->mesh.refcount, -1);
+                if (old <= 0)
+                    DPRINTF("[fin-p1] REFCOUNT BUG: prev block=%d part=%d mesh old_rc=%d verts=%p\n",
+                           blockIdx.x, i, old, p->mesh.verts);
                 if (old == 1) heap_free(&pool->heap, (void*)p->mesh.verts);
             }
             if (p->hull.refcount) {
                 int old = atomicAdd(p->hull.refcount, -1);
+                if (old <= 0)
+                    DPRINTF("[fin-p1] REFCOUNT BUG: prev block=%d part=%d hull old_rc=%d verts=%p\n",
+                           blockIdx.x, i, old, p->hull.verts);
                 if (old == 1) heap_free(&pool->heap, (void*)p->hull.verts);
             }
         }
@@ -532,10 +544,16 @@ extern "C" __global__ void beam_finalize(
             Part* p = &wi->parts[i];
             if (p->mesh.refcount) {
                 int old = atomicAdd(p->mesh.refcount, -1);
+                if (old <= 0)
+                    DPRINTF("[fin-p2d] REFCOUNT BUG: item=%d part=%d mesh old_rc=%d verts=%p\n",
+                           wi_local, i, old, p->mesh.verts);
                 if (old == 1) heap_free(&pool->heap, (void*)p->mesh.verts);
             }
             if (p->hull.refcount) {
                 int old = atomicAdd(p->hull.refcount, -1);
+                if (old <= 0)
+                    DPRINTF("[fin-p2d] REFCOUNT BUG: item=%d part=%d hull old_rc=%d verts=%p\n",
+                           wi_local, i, old, p->hull.verts);
                 if (old == 1) heap_free(&pool->heap, (void*)p->hull.verts);
             }
         }

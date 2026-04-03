@@ -157,9 +157,12 @@ __device__ inline PartPair plane_cut_block(
     int max_new_verts      = n_tris * 2;
     int total_verts_cap    = n_verts + max_new_verts;
     int max_cross_edges    = n_tris * 2;
-    int max_out_tris       = n_tris * 3;
+    int max_out_tris       = n_tris * 3;   // phase-6 upper bound; also sizes dir_edges
+    // Cap triangles (ear-clip) are appended to pos_tris/neg_tris at index n_pos/n_neg.
+    // poly_n <= 2*n_boundary <= 4*n_tris, so n_cap <= 4*n_tris + 1024.
+    int max_cap_tris       = n_tris * 4 + 1024;
     int sort_scratch_bytes = max_cross_edges * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
-    int max_dir_edges      = max_out_tris * 3;
+    int max_dir_edges      = max_out_tris * 3;  // dir_edges only needs phase-6 counts
     int dir_sort_bytes     = max_dir_edges * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
 
     // s_counters: [0]=n_cross, [1]=n_all_verts, [2]=n_pos, [3]=n_neg
@@ -228,8 +231,8 @@ __device__ inline PartPair plane_cut_block(
         return s_result;
     }
 
-    int*   signs     = s_signs;
-    float* all_verts = s_all_verts;
+    PC_BUF(int,   signs,     s_signs,     n_verts);
+    PC_BUF(float, all_verts, s_all_verts, total_verts_cap * 3);
 
     // === Phase 1: Classify vertices ===
     for (int v = tid; v < n_verts; v += PC_BLOCK) {
@@ -266,8 +269,8 @@ __device__ inline PartPair plane_cut_block(
         return s_result;
     }
 
-    Edge2i* cross_edges = s_cross_edges;
-    int*    isect_idx   = s_isect_idx;
+    PC_BUF(Edge2i, cross_edges, s_cross_edges, max_cross_edges);
+    PC_BUF(int,    isect_idx,   s_isect_idx,   max_cross_edges);
 
     // === Phase 3: Collect crossing edges ===
     for (int t = tid; t < n_tris; t += PC_BLOCK) {
@@ -334,7 +337,7 @@ __device__ inline PartPair plane_cut_block(
 
     // === Phase 4: Sort crossing edges (warp 0) ===
     if (warp_id == 0) {
-        int serr = warp_sort_t<Edge2i, Edge2iCmp>(cross_edges, s_sort_scratch, n_cross, lane);
+        int serr = warp_sort_t<Edge2i, Edge2iCmp>(cross_edges.raw(), s_sort_scratch, n_cross, lane);
         if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
     }
     __syncthreads();
@@ -348,11 +351,11 @@ __device__ inline PartPair plane_cut_block(
 
         void* p;
         s_alloc_ok = 1;
-        if (heap_alloc(scratch_heap, (unsigned int)(max_out_tris * 3 * (int)sizeof(int)), &p) != HEAP_OK)
+        if (heap_alloc(scratch_heap, (unsigned int)((max_out_tris + max_cap_tris) * 3 * (int)sizeof(int)), &p) != HEAP_OK)
             { s_alloc_ok = 0; p = NULL; }
         s_pos_tris = (int*)p;
 
-        if (heap_alloc(scratch_heap, (unsigned int)(max_out_tris * 3 * (int)sizeof(int)), &p) != HEAP_OK)
+        if (heap_alloc(scratch_heap, (unsigned int)((max_out_tris + max_cap_tris) * 3 * (int)sizeof(int)), &p) != HEAP_OK)
             { s_alloc_ok = 0; p = NULL; }
         s_neg_tris = (int*)p;
 
@@ -360,7 +363,7 @@ __device__ inline PartPair plane_cut_block(
         for (int i = 0; i < n_cross; i++) {
             if (i == 0 || cross_edges[i].a != cross_edges[i-1].a || cross_edges[i].b != cross_edges[i-1].b) {
                 int va = cross_edges[i].a, vb = cross_edges[i].b;
-                pc_intersect(all_verts, va, vb, pa, pb, pc_n, pd, &all_verts[cur_isect * 3]);
+                pc_intersect(all_verts.raw(), va, vb, pa, pb, pc_n, pd, &all_verts[cur_isect * 3]);
                 isect_idx[i] = cur_isect++;
             } else {
                 isect_idx[i] = isect_idx[i - 1];
@@ -375,8 +378,9 @@ __device__ inline PartPair plane_cut_block(
     }
 
     int  n_all    = s_counters[1];
-    int* pos_tris = s_pos_tris;
-    int* neg_tris = s_neg_tris;
+    int  tris_cap = (max_out_tris + max_cap_tris) * 3;
+    PC_BUF(int, pos_tris, s_pos_tris, tris_cap);
+    PC_BUF(int, neg_tris, s_neg_tris, tris_cap);
 
     // === Phase 6: Split triangles ===
     for (int t = tid; t < n_tris; t += PC_BLOCK) {
@@ -405,7 +409,7 @@ __device__ inline PartPair plane_cut_block(
 
         #define FIND_ISECT(va, vb) ({ \
             int _mn=((va)<(vb))?(va):(vb), _mx=((va)<(vb))?(vb):(va); \
-            int _fi=pc_edge_bsearch(cross_edges, n_cross, _mn, _mx); \
+            int _fi=pc_edge_bsearch(cross_edges.raw(), n_cross, _mn, _mx); \
             (_fi>=0)?isect_idx[_fi]:-1; \
         })
 
@@ -480,9 +484,9 @@ __device__ inline PartPair plane_cut_block(
         return s_result;
     }
 
-    int     n_pos          = s_n_pos, n_neg = s_n_neg;
-    Edge2i* dir_edges      = s_dir_edges;
-    int*    boundary_flags = s_boundary_flags;
+    int n_pos = s_n_pos, n_neg = s_n_neg;
+    PC_BUF(Edge2i, dir_edges,      s_dir_edges,      max_dir_edges);
+    PC_BUF(int,    boundary_flags, s_boundary_flags,  max_dir_edges);
 
     // === Phase 7: Collect directed edges from pos_tris ===
     int n_de = n_pos * 3;
@@ -497,18 +501,20 @@ __device__ inline PartPair plane_cut_block(
 
     // === Phase 8: Sort directed edges (warp 0) ===
     if (warp_id == 0) {
-        int serr = warp_sort_t<Edge2i, Edge2iCmp>(dir_edges, s_dir_sort, n_de, lane);
+        int serr = warp_sort_t<Edge2i, Edge2iCmp>(dir_edges.raw(), s_dir_sort, n_de, lane);
         if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
     }
     __syncthreads();
 
     // Free dir_sort — not needed after sort.
-    if (tid == 0) { heap_free(scratch_heap, (void*)s_dir_sort); s_dir_sort = NULL; }
+    if (tid == 0) {
+        heap_free(scratch_heap, (void*)s_dir_sort); s_dir_sort = NULL;
+    }
 
     // === Phase 9: Binary search for boundary edges ===
     for (int i = tid; i < n_de; i += PC_BLOCK) {
         int a = dir_edges[i].a, b = dir_edges[i].b;
-        boundary_flags[i] = (pc_edge_bsearch(dir_edges, n_de, b, a) < 0) ? 1 : 0;
+        boundary_flags[i] = (pc_edge_bsearch(dir_edges.raw(), n_de, b, a) < 0) ? 1 : 0;
     }
     __syncthreads();
 
@@ -543,7 +549,7 @@ __device__ inline PartPair plane_cut_block(
         }
 
         if (kern_ok) {
-            int* be_a = (int*)lv_ptr;
+            PC_BUF(int, be_a, lv_ptr, n_de * 2);
             for (int i = 0; i < n_de; i++) {
                 if (boundary_flags[i]) {
                     be_a[n_boundary*2]   = dir_edges[i].a;
@@ -552,8 +558,8 @@ __device__ inline PartPair plane_cut_block(
                 }
             }
             // dir_edges and boundary_flags no longer needed.
-            heap_free(scratch_heap, (void*)s_dir_edges);      s_dir_edges      = NULL;
-            heap_free(scratch_heap, (void*)s_boundary_flags); s_boundary_flags = NULL;
+            heap_free(scratch_heap, (void*)s_dir_edges);       s_dir_edges      = NULL;
+            heap_free(scratch_heap, (void*)s_boundary_flags);  s_boundary_flags = NULL;
 
             // --- Phase 10-12: loop reconstruction + polygon + ear-clip ---
             if (n_boundary > 0) {
@@ -567,41 +573,44 @@ __device__ inline PartPair plane_cut_block(
                 if (!kern_ok) atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);
 
                 if (kern_ok) {
-                    int*   loop_starts  = (int*)ls_ptr;
-                    int*   loop_sizes   = (int*)lsz_ptr;
-                    int*   lv           = (int*)lv2_ptr;
-                    int*   polygon      = (int*)poly_ptr;
-                    int*   cap_tris     = (int*)cap_ptr;
-                    int*   ear_prevnext = (int*)ep_ptr;
-                    int*   inner_idx    = (int*)sb_ptr;
+                    int poly_cap = n_boundary * 4 + 64;
+                    PC_BUF(int,   loop_starts,  ls_ptr,   n_boundary);
+                    PC_BUF(int,   loop_sizes,   lsz_ptr,  n_boundary);
+                    PC_BUF(int,   lv,           lv2_ptr,  n_boundary);
+                    PC_BUF(int,   polygon,      poly_ptr, poly_cap);
+                    PC_BUF(int,   cap_tris,     cap_ptr,  poly_cap * 3);
+                    PC_BUF(int,   ear_prevnext, ep_ptr,   poly_cap * 2);
+                    PC_BUF(int,   inner_idx,    sb_ptr,   256);
                     float* inner_max_u  = (float*)((int*)sb_ptr + 256);
 
                     // Phase 10: reconstruct loops from boundary edge pairs
-                    int* be_a    = (int*)lv_ptr;
-                    int* be_used = loop_starts;  // borrow before it's filled
+                    PC_BUF(int, be_a2, lv_ptr, n_de * 2);
+                    int* be_used = loop_starts.raw();  // borrow before it's filled
                     for (int i = 0; i < n_boundary; i++) be_used[i] = 0;
 
                     int n_loops = 0, lvi = 0;
                     for (int start = 0; start < n_boundary; start++) {
                         if (be_used[start]) continue;
                         int lvi_start = lvi;
-                        int first = be_a[start*2], cur = be_a[start*2+1];
+                        int first = be_a2[start*2], cur = be_a2[start*2+1];
                         be_used[start] = 1;  // aliases loop_starts[start]; loop_starts[n_loops] set below
+                        if (lvi >= n_boundary) break;
                         lv[lvi++] = first;
                         int safety = n_boundary + 2;
                         while (cur != first && safety-- > 0) {
+                            if (lvi >= n_boundary) break;
                             lv[lvi++] = cur;
                             int found = 0;
                             for (int i = 0; i < n_boundary; i++) {
-                                if (!be_used[i] && be_a[i*2] == cur) {
-                                    cur = be_a[i*2+1]; be_used[i] = 1; found = 1; break;
+                                if (!be_used[i] && be_a2[i*2] == cur) {
+                                    cur = be_a2[i*2+1]; be_used[i] = 1; found = 1; break;
                                 }
                             }
                             if (!found) break;
                         }
                         loop_starts[n_loops] = lvi_start;  // set after be_used writes (avoids alias clobber)
                         loop_sizes[n_loops] = lvi - lvi_start;
-                        n_loops++;
+                        if (loop_sizes[n_loops] > 0) n_loops++;
                     }
 
                     // be_a (lv_ptr) no longer needed — free to reclaim memory.
@@ -622,20 +631,20 @@ __device__ inline PartPair plane_cut_block(
                         for (int i = 0; i < loop_sizes[0]; i++)
                             polygon[i] = lv[loop_starts[0]+i];
                         poly_n = loop_sizes[0];
-                        if (pc_signed_area(all_verts, polygon, poly_n, pu, pv_ax) < 0)
-                            pc_reverse(polygon, poly_n);
+                        if (pc_signed_area(all_verts.raw(), polygon.raw(), poly_n, pu, pv_ax) < 0)
+                            pc_reverse(polygon.raw(), poly_n);
                     } else if (n_loops > 1) {
                         int outer_i = 0; float max_abs = 0;
                         for (int i = 0; i < n_loops; i++) {
-                            float a = pc_signed_area(all_verts, lv+loop_starts[i], loop_sizes[i], pu, pv_ax);
+                            float a = pc_signed_area(all_verts.raw(), lv.raw()+loop_starts[i], loop_sizes[i], pu, pv_ax);
                             if (fabsf(a) > max_abs) { max_abs=fabsf(a); outer_i=i; }
                         }
-                        if (pc_signed_area(all_verts, lv+loop_starts[outer_i], loop_sizes[outer_i], pu, pv_ax) < 0)
-                            pc_reverse(lv+loop_starts[outer_i], loop_sizes[outer_i]);
+                        if (pc_signed_area(all_verts.raw(), lv.raw()+loop_starts[outer_i], loop_sizes[outer_i], pu, pv_ax) < 0)
+                            pc_reverse(lv.raw()+loop_starts[outer_i], loop_sizes[outer_i]);
                         for (int i = 0; i < n_loops; i++) {
                             if (i == outer_i) continue;
-                            if (pc_signed_area(all_verts, lv+loop_starts[i], loop_sizes[i], pu, pv_ax) > 0)
-                                pc_reverse(lv+loop_starts[i], loop_sizes[i]);
+                            if (pc_signed_area(all_verts.raw(), lv.raw()+loop_starts[i], loop_sizes[i], pu, pv_ax) > 0)
+                                pc_reverse(lv.raw()+loop_starts[i], loop_sizes[i]);
                         }
 
                         // Sort inner holes by rightmost vertex (descending u)
@@ -667,7 +676,7 @@ __device__ inline PartPair plane_cut_block(
                         // Bridge each inner hole
                         for (int ii = 0; ii < n_inner; ii++) {
                             int hi = inner_idx[ii], hs = loop_sizes[hi];
-                            int* hole = lv + loop_starts[hi];
+                            int* hole = lv.raw() + loop_starts[hi];
                             int m_idx = 0; float max_u = -1e30f;
                             for (int j = 0; j < hs; j++) {
                                 float u = all_verts[hole[j]*3+pu];
@@ -702,14 +711,15 @@ __device__ inline PartPair plane_cut_block(
                     }
 
                     // lv, loop_starts, loop_sizes, sort buf no longer needed
-                    heap_free(scratch_heap, lv2_ptr);  lv2_ptr = NULL;
-                    heap_free(scratch_heap, ls_ptr);   ls_ptr  = NULL;
-                    heap_free(scratch_heap, lsz_ptr);  lsz_ptr = NULL;
-                    heap_free(scratch_heap, sb_ptr);   sb_ptr  = NULL;
+                    heap_free(scratch_heap, lv2_ptr);   lv2_ptr = NULL;
+                    heap_free(scratch_heap, ls_ptr);     ls_ptr  = NULL;
+                    heap_free(scratch_heap, lsz_ptr);    lsz_ptr = NULL;
+                    heap_free(scratch_heap, sb_ptr);      sb_ptr  = NULL;
 
                     // Phase 12: Ear clipping
                     if (poly_n >= 3) {
-                        int* prev_a = ear_prevnext, *next_a = ear_prevnext + poly_n;
+                        CheckedBuf<int> prev_a = ear_prevnext.slice(0, poly_n);
+                        CheckedBuf<int> next_a = ear_prevnext.slice(poly_n, poly_n);
                         for (int i = 0; i < poly_n; i++) {
                             prev_a[i]=(i+poly_n-1)%poly_n; next_a[i]=(i+1)%poly_n;
                         }
@@ -828,8 +838,8 @@ __device__ inline PartPair plane_cut_block(
     {
         int   total_pos = s_total_pos;
         int   total_neg = s_total_neg;
-        int*  pos_remap = s_pr_ptr;
-        int*  neg_remap = s_nr_ptr;
+        PC_BUF(int, pos_remap, s_pr_ptr, n_all);
+        PC_BUF(int, neg_remap, s_nr_ptr, n_all);
 
         // Step A: init remap to -1 (parallel)
         for (int i = tid; i < n_all; i += PC_BLOCK) { pos_remap[i] = -1; neg_remap[i] = -1; }
@@ -837,14 +847,16 @@ __device__ inline PartPair plane_cut_block(
 
         // Step B: mark vertices used by each side (atomicMax -1 → 0, parallel)
         for (int t = tid; t < total_pos; t += PC_BLOCK) {
-            atomicMax(&pos_remap[pos_tris[t*3+0]], 0);
-            atomicMax(&pos_remap[pos_tris[t*3+1]], 0);
-            atomicMax(&pos_remap[pos_tris[t*3+2]], 0);
+            int vi0=pos_tris[t*3+0], vi1=pos_tris[t*3+1], vi2=pos_tris[t*3+2];
+            atomicMax(&pos_remap[vi0], 0);
+            atomicMax(&pos_remap[vi1], 0);
+            atomicMax(&pos_remap[vi2], 0);
         }
         for (int t = tid; t < total_neg; t += PC_BLOCK) {
-            atomicMax(&neg_remap[neg_tris[t*3+0]], 0);
-            atomicMax(&neg_remap[neg_tris[t*3+1]], 0);
-            atomicMax(&neg_remap[neg_tris[t*3+2]], 0);
+            int vi0=neg_tris[t*3+0], vi1=neg_tris[t*3+1], vi2=neg_tris[t*3+2];
+            atomicMax(&neg_remap[vi0], 0);
+            atomicMax(&neg_remap[vi1], 0);
+            atomicMax(&neg_remap[vi2], 0);
         }
         __syncthreads();
 
@@ -886,8 +898,14 @@ __device__ inline PartPair plane_cut_block(
         __syncthreads();
 
         // Step F: remap triangle indices in place (parallel)
-        for (int i = tid; i < total_pos * 3; i += PC_BLOCK) pos_tris[i] = pos_remap[pos_tris[i]];
-        for (int i = tid; i < total_neg * 3; i += PC_BLOCK) neg_tris[i] = neg_remap[neg_tris[i]];
+        for (int i = tid; i < total_pos * 3; i += PC_BLOCK) {
+            int vi = pos_tris[i];
+            pos_tris[i] = pos_remap[vi];
+        }
+        for (int i = tid; i < total_neg * 3; i += PC_BLOCK) {
+            int vi = neg_tris[i];
+            neg_tris[i] = neg_remap[vi];
+        }
         __syncthreads();
 
         // Step G: two separate heap allocs (pos and neg), each with own refcount.

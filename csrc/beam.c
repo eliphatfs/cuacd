@@ -440,6 +440,23 @@ int beam_decompose(
                                   0, s, args, NULL));
         }
 
+        // DEBUG: sync + check after expansion
+        {
+            CUresult _sr = cuStreamSynchronize(s);
+            if (_sr != CUDA_SUCCESS) {
+                const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
+                fprintf(stderr, "[beam] iter %d EXPAND CRASH: %s\n", iter, _msg ? _msg : "?");
+                result_code = (int)_sr; goto cleanup;
+            }
+            int _he = 0;
+            cuMemcpyDtoH(&_he, d_err, sizeof(int));
+            if (_he) {
+                fprintf(stderr, "[beam] iter %d EXPAND err=0x%x\n", iter, _he);
+                result_code = _he; goto cleanup;
+            }
+            fprintf(stderr, "[beam] iter %d: expand OK\n", iter);
+        }
+
         // Swap: next (d_prev) becomes current; old current becomes prev.
         CUdeviceptr tmp = d_current;
         d_current = d_prev;
@@ -455,6 +472,23 @@ int beam_decompose(
                                   0, s, args, NULL));
         }
 
+        // DEBUG: sync + check after hull
+        {
+            CUresult _sr = cuStreamSynchronize(s);
+            if (_sr != CUDA_SUCCESS) {
+                const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
+                fprintf(stderr, "[beam] iter %d HULL CRASH: %s\n", iter, _msg ? _msg : "?");
+                result_code = (int)_sr; goto cleanup;
+            }
+            int _he = 0;
+            cuMemcpyDtoH(&_he, d_err, sizeof(int));
+            if (_he) {
+                fprintf(stderr, "[beam] iter %d HULL err=0x%x\n", iter, _he);
+                result_code = _he; goto cleanup;
+            }
+            fprintf(stderr, "[beam] iter %d: hull OK\n", iter);
+        }
+
         // ---- beam_sort: over-provisioned grid, self-checks nitems ----
         {
             void* args[] = { &d_current, &ctx->d_pool_struct, &d_err };
@@ -463,8 +497,23 @@ int beam_decompose(
             LCHECK(cuLaunchKernel(fn_sort, nblocks, 1, 1, 32, 1, 1,
                                   0, s, args, NULL));
         }
-        // No sync here — beam_finalize at the top of the next iteration
-        // will consume these results after its own ordering dependency.
+
+        // DEBUG: sync + check after sort
+        {
+            CUresult _sr = cuStreamSynchronize(s);
+            if (_sr != CUDA_SUCCESS) {
+                const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
+                fprintf(stderr, "[beam] iter %d SORT CRASH: %s\n", iter, _msg ? _msg : "?");
+                result_code = (int)_sr; goto cleanup;
+            }
+            int _he = 0;
+            cuMemcpyDtoH(&_he, d_err, sizeof(int));
+            if (_he) {
+                fprintf(stderr, "[beam] iter %d SORT err=0x%x\n", iter, _he);
+                result_code = _he; goto cleanup;
+            }
+            fprintf(stderr, "[beam] iter %d: sort OK\n", iter);
+        }
     }
 
     // Iterations exhausted — read back current state.

@@ -15,7 +15,7 @@ setup.py              # Build config: setuptools builds _gpu extension
 pyproject.toml        # PEP 621 metadata
 cuda/                 # CUDA device code (compiled to single fatbin)
   allocator.cuh       #   DevicePool (bump alloc + embedded DeviceHeap×2) + pool_alloc + heap_alloc/free
-  common.cuh          #   Constants, atomics (includes allocator.cuh)
+  common.cuh          #   Constants, atomics, CheckedBuf<T> (includes allocator.cuh)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
   warp_common.cuh     #   WarpPool allocator + warp reductions (warp_min_f, warp_max_f, etc.)
@@ -184,6 +184,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 | I1 | `pool_alloc(pool, size) -> void*` | allocator.cuh |
 | I2 | `global_alloc_warp(pool, bytes, lane) -> void*` | allocator.cuh |
 | I3 | `atomicMinF / atomicMaxF` | common.cuh |
+| I6 | `CheckedBuf<T>` — debug-mode bounds-checked buffer | common.cuh |
 | I4 | `heap_alloc(heap, size, out) -> int` | allocator.cuh |
 | I5 | `heap_free(heap, ptr) -> int` | allocator.cuh |
 
@@ -372,6 +373,21 @@ Because `start == n_loops` at the beginning of each outer loop iteration, `be_us
 
 Use-1 can exceed `n_boundary * 3` when the merged polygon grows during bridging, overwriting adjacent scratch heap block headers → corrupted `arena_idx` → OOB arena lock in `heap_free`. Fix: allocate `cap_ptr` as `(n_boundary*4+64) * sizeof(int)` to match `poly_ptr`.
 
+### plane_cut Phase 10: lv Buffer Overflow in Loop Reconstruction
+
+`lv` (loop vertex sequence) was allocated with `n_boundary` elements. When boundary edges don't form clean closed loops (e.g., non-manifold geometry, safety counter exhaustion), the while loop in phase 10 could write past the buffer end. Writing one element beyond `lv` corrupts the adjacent heap block's header, causing cascading failures: corrupted output meshes with -1 vertex indices → OOB `all_verts` accesses → misaligned address errors (CUDA error 716) in subsequent iterations. Fix: guard `lvi >= n_boundary` before each `lv[lvi++]` write.
+
+### CheckedBuf<T> — Debug-Mode Bounds-Checked Buffers
+
+`CheckedBuf<T>` in `common.cuh` wraps `T*` + element count. Enabled by `COACD_BEAM_DEBUG`:
+- `operator[]` bounds-checks and prints `[OOB] name: idx=N count=M blk=B tid=T`, clamping to element 0 to prevent faults.
+- `slice(offset, len)` returns a sub-buffer (also bounds-checked in debug).
+- `raw()` returns the underlying pointer (for passing to sort, `pc_signed_area`, etc.).
+- Release mode: struct contains only `T* ptr_`, all methods inline to raw access (zero overhead).
+- `PC_BUF(type, name, ptr, count)` convenience macro constructs a `CheckedBuf` with `#name` as the label.
+
+All scratch buffers in `plane_cut_block` are wrapped with `CheckedBuf` for OOB detection.
+
 ### Using compute-sanitizer for CUDA Memory Errors
 
 When a CUDA kernel crashes with error 716 (misaligned address) or 700 (illegal memory access), use `compute-sanitizer --tool memcheck` to find the exact source location:
@@ -408,11 +424,7 @@ ncu --set full -o dandc_profile python tests/bench_dandc.py --n_pts 200 --n_hull
 - Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests)
 - Persistent heaps (`beam_init` with `pool_bytes`): both heaps share one pool, all memory recycled by kernels, pool stable after first call
 - `ctx.pool_usage()` — peak device pool bytes (monotonic), `ctx.heap_compact()` — available but not needed normally
-- `beam_decompose` (cube, lshape): cube → 1 part, lshape → 2 parts ✓
-
-### In Progress
-- `beam_decompose` (octocat): `beam_initialize` computes `hull_vol` incorrectly (0.0 for cube, 0.246 for lshape vs correct 8.0/1.48 from Python). Python-side scipy hull volumes are correct (verified via numpy divergence theorem). GPU `mesh_volume_warp` gives correct result for the input mesh but wrong for the hull mesh. Root cause TBD — currently under investigation.
-  - `part_cost = fmaxf(k_rv * cbrtf(max(hull_vol − mesh_vol, 0)), hausdorff)` — if `hull_vol < mesh_vol`, cost = 0 < threshold → algorithm exits with 1 part on iteration 0.
+- `beam_decompose` (cube, lshape, octocat): cube → 1 part, lshape → 2 parts, octocat → 16 parts ✓
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input

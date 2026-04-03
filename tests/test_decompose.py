@@ -197,31 +197,37 @@ def test_octocat_decompose():
 
 
 def test_export_glb():
-    """Decompose all three shapes and export combined GLB."""
-    os.makedirs(os.path.dirname(OUTPUT_GLB), exist_ok=True)
-
-    all_parts = []
+    """Decompose all three shapes and export one GLB each."""
+    outdir = os.path.dirname(OUTPUT_GLB)
+    os.makedirs(outdir, exist_ok=True)
 
     # Cube
     v, t = _make_cube()
-    all_parts.append(("cube",   _decompose_shape(v, t, "cube")))
+    parts = _decompose_shape(v, t, "cube")
+    path = os.path.join(outdir, "cube.glb")
+    _build_scene([("cube", parts)]).export(path)
+    print(f"\nExported {path}")
+    assert os.path.exists(path)
 
     # L-shape
     v, t = _make_lshape()
-    all_parts.append(("lshape", _decompose_shape(v, t, "lshape")))
+    parts = _decompose_shape(v, t, "lshape")
+    path = os.path.join(outdir, "lshape.glb")
+    _build_scene([("lshape", parts)]).export(path)
+    print(f"\nExported {path}")
+    assert os.path.exists(path)
 
     # Octocat (skip quietly if missing)
     if os.path.exists(OCTOCAT_OBJ):
         mesh = trimesh.load(OCTOCAT_OBJ, force="mesh")
         v = np.array(mesh.vertices, dtype=np.float32)
         t = np.array(mesh.faces,    dtype=np.int32)
-        all_parts.append(("octocat", _decompose_shape(v, t, "octocat",
-                                                      max_iters=100,
-                                                      cuts_per_axis=10,
-                                                      threshold=0.05,
-                                                      max_keep=32)))
-
-    scene = _build_scene(all_parts)
-    scene.export(OUTPUT_GLB)
-    print(f"\nExported {OUTPUT_GLB}")
-    assert os.path.exists(OUTPUT_GLB)
+        parts = _decompose_shape(v, t, "octocat",
+                                 max_iters=100,
+                                 cuts_per_axis=10,
+                                 threshold=0.05,
+                                 max_keep=32)
+        path = os.path.join(outdir, "octocat.glb")
+        _build_scene([("octocat", parts)]).export(path)
+        print(f"\nExported {path}")
+        assert os.path.exists(path)

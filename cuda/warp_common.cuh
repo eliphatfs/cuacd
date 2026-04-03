@@ -4,6 +4,7 @@
 
 #pragma once
 #include "common.cuh"
+#include "allocator.cuh"
 
 #define WARP_SIZE 32
 #define WARP_MASK 0xffffffffu
