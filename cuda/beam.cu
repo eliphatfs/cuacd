@@ -21,10 +21,14 @@
 // Error codes for beam_finalize.
 #define BEAM_ERR_FINALIZE_OOM  0x80000  // scratch heap allocation failed
 
-// Cost of a Part: the primary metric for deciding which parts to cut next.
+// CoACD k_rv weight: scales the concavity radius rv = cbrt(3/(4pi)*(hull_vol-mesh_vol)).
+#define PART_COST_K_RV 0.3f
+
+// Cost of a Part: max(k_rv * rv, hausdorff) where rv converts volume difference to distance.
 static __device__ inline float part_cost(const Part& p) {
-    const float eps = 1e-6f;
-    return fmaxf(p.hausdorff, p.mesh_vol / (p.hull_vol + eps));
+    const float pi = 3.14159265358979f;
+    float rv = cbrtf((3.0f / (4.0f * pi)) * fmaxf(p.hull_vol - p.mesh_vol, 0.0f));
+    return fmaxf(PART_COST_K_RV * rv, p.hausdorff);
 }
 
 // Comparator for sorting Parts by part_cost, ascending.
