@@ -89,6 +89,8 @@ def _compile_fatbin(cuda_home, cu_file, fatbin_file, build_dir):
         extra_defines.append("-DTRACK_MAX_EDGE_PAIRS")
     if os.environ.get("COACD_GPU_ARENAS"):
         extra_defines.append(f"-DHEAP_NUM_ARENAS={os.environ['COACD_GPU_ARENAS']}")
+    if os.environ.get("COACD_BEAM_DEBUG"):
+        extra_defines.append("-DCOACD_BEAM_DEBUG")
     subprocess.check_call([
         nvcc, cu_file, "--fatbin", "-O3", "--use_fast_math",
         "--generate-line-info",

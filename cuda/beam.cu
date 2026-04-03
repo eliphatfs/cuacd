@@ -13,6 +13,12 @@
 #include "mesh_volume.cuh"
 #include "warp_sort.cuh"
 
+#ifdef COACD_BEAM_DEBUG
+#  define DPRINTF(...) printf(__VA_ARGS__)
+#else
+#  define DPRINTF(...) ((void)0)
+#endif
+
 // Error code for exceeding WORK_ITEM_MAX_PARTS (distinct from plane_cut errors).
 #define BEAM_ERR_OVERFLOW      0x10000
 // Error codes for beam_sort.
@@ -77,7 +83,7 @@ extern "C" __global__ void beam_initialize(
         m.refcount = NULL;
         float vol = mesh_volume_warp(&m, lane);
         if (lane == 0) {
-            printf("[init] mesh nv=%d nt=%d verts=%p tris=%p vol=%.6f\n",
+            DPRINTF("[init] mesh nv=%d nt=%d verts=%p tris=%p vol=%.6f\n",
                    m.nv, m.nt, m.verts, m.tris, vol);
             current->items[0].parts[0].mesh_vol = vol;
         }
@@ -90,7 +96,7 @@ extern "C" __global__ void beam_initialize(
         h.refcount = NULL;
         float vol = mesh_volume_warp(&h, lane);
         if (lane == 0) {
-            printf("[init] hull nv=%d nt=%d verts=%p tris=%p vol=%.6f\n",
+            DPRINTF("[init] hull nv=%d nt=%d verts=%p tris=%p vol=%.6f\n",
                    h.nv, h.nt, h.verts, h.tris, vol);
             current->items[0].parts[0].hull_vol = vol;
         }
@@ -404,10 +410,10 @@ extern "C" __global__ void beam_finalize(
     if (tid == 0) {
         s_nitems = current->nitems;
         s_k      = (max_keep < s_nitems) ? max_keep : s_nitems;
-        printf("[finalize-enter] nitems=%d items_ptr=%p\n", s_nitems, current->items);
+        DPRINTF("[finalize-enter] nitems=%d items_ptr=%p\n", s_nitems, current->items);
         if (s_nitems > 0) {
             WorkItem* wi0 = &current->items[0];
-            printf("[finalize-enter] wi0.nparts=%d wi0.parts[0].mesh_vol=%.6f wi0.parts[0].hull_vol=%.6f\n",
+            DPRINTF("[finalize-enter] wi0.nparts=%d wi0.parts[0].mesh_vol=%.6f wi0.parts[0].hull_vol=%.6f\n",
                    wi0->nparts, wi0->parts[0].mesh_vol, wi0->parts[0].hull_vol);
         }
         if (s_nitems == 0) { s_keys = NULL; s_key_scratch = NULL; }
@@ -507,7 +513,7 @@ extern "C" __global__ void beam_finalize(
             Part* best_last = &best->parts[best_np - 1];
             const float pi = 3.14159265358979f;
             float best_rv = cbrtf((3.0f / (4.0f * pi)) * fmaxf(best_last->hull_vol - best_last->mesh_vol, 0.0f));
-            printf("[finalize] nitems=%d k=%d best_idx=%d best_nparts=%d best_cost=%.6f threshold=%.6f "
+            DPRINTF("[finalize] nitems=%d k=%d best_idx=%d best_nparts=%d best_cost=%.6f threshold=%.6f "
                    "mesh_vol=%.6f hull_vol=%.6f hausdorff=%.6f rv=%.6f\n",
                    nitems, k, s_keys[0].idx, best_np, s_keys[0].cost, threshold,
                    best_last->mesh_vol, best_last->hull_vol, best_last->hausdorff, best_rv);

@@ -25,7 +25,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   mm.cu               #   heap_init_kernel: <<<2×HEAP_NUM_ARENAS,32>>> initialises both embedded heaps in DevicePool
-  beam.cu             #   beam_expansion kernel: <<<3×cuts_per_axis×nitems, 64>>> cuts last part of each WorkItem; beam_hull kernel: <<<2×nitems, 32>>> fills Part.hull via D&C convex hull; beam_sort kernel: <<<nitems, 32>>> sorts parts by part_cost; beam_finalize kernel: <<<max_keep, 1024>>> clears prev AlgoState and compacts current to best max_keep items
+  beam.cu             #   beam_expansion kernel: <<<3×cuts_per_axis×nitems, 64>>> cuts last part of each WorkItem; beam_hull kernel: <<<2×nitems, 32>>> fills Part.hull via D&C convex hull; beam_sort kernel: <<<nitems, 32>>> sorts parts by part_cost; beam_finalize kernel: <<<max_keep, 1024>>> clears prev AlgoState and compacts current to best max_keep items; DPRINTF macro (device printf gated on COACD_BEAM_DEBUG compile flag)
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel (hull mesh extraction)
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel (thin wrapper around plane_cut_block)
@@ -77,6 +77,9 @@ python -m pytest tests/ -v
 
 # Build with verbose host-side debug output
 COACD_DEBUG=1 pip install -e .
+
+# Build with device-side beam debug printfs (DPRINTF in beam.cu)
+COACD_BEAM_DEBUG=1 pip install -e .
 
 # D&C hull benchmark (standalone, for profiling)
 python tests/bench_dandc.py --n_pts 200 --n_hulls 8
