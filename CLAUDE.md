@@ -25,7 +25,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   mm.cu               #   heap_init_kernel: <<<2×HEAP_NUM_ARENAS,32>>> initialises both embedded heaps in DevicePool
-  beam.cu             #   beam_expansion kernel: <<<3×cuts_per_axis×nitems, 64>>> cuts last part of each WorkItem; beam_hull kernel: <<<2×nitems, 32>>> fills Part.hull via D&C convex hull; beam_sort kernel: <<<nitems, 32>>> sorts parts by max(hausdorff, mesh_vol/(hull_vol+eps))
+  beam.cu             #   beam_expansion kernel: <<<3×cuts_per_axis×nitems, 64>>> cuts last part of each WorkItem; beam_hull kernel: <<<2×nitems, 32>>> fills Part.hull via D&C convex hull; beam_sort kernel: <<<nitems, 32>>> sorts parts by part_cost; beam_finalize kernel: <<<max_keep, 1024>>> clears prev AlgoState and compacts current to best max_keep items
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel (hull mesh extraction)
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel (thin wrapper around plane_cut_block)
@@ -232,9 +232,26 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 `beam_sort<<<current->nitems, 32>>>(current, pool, err)` — one block (one warp) per WorkItem; sorts `parts[0..nparts-1]` in ascending order of `max(hausdorff, mesh_vol / (hull_vol + eps))`. Returns immediately if `*err` is non-zero on entry.
 
 - **Block mapping**: `item_idx = blockIdx.x`. Early-exit if `item_idx >= nitems` or `nparts <= 1`.
-- **Sort key**: `PartKeyCmp::key(p) = fmaxf(p.hausdorff, p.mesh_vol / (p.hull_vol + 1e-6f))`, ascending. Uses `warp_sort_t<Part, PartKeyCmp>` from `warp_sort.cuh`; sorts `wi->parts` in-place.
+- **Sort key**: `part_cost(p) = fmaxf(p.hausdorff, p.mesh_vol / (p.hull_vol + 1e-6f))`, ascending. `PartKeyCmp::key` delegates to `part_cost`. Uses `warp_sort_t<Part, PartKeyCmp>`; sorts `wi->parts` in-place.
 - **Scratch**: lane 0 allocates `nparts * sizeof(Part) + WS_MAX_STACK * 2 * sizeof(int)` bytes from `pool->scratch` via `heap_alloc`; freed by lane 0 before return.
 - **Error codes**: `BEAM_ERR_SORT_OOM = 0x20000` if scratch allocation fails; `BEAM_ERR_SORT_STACK = 0x40000` if `warp_sort_t` stack overflows (both `atomicOr`'d into `*err`).
+
+## beam_finalize API
+
+`beam_finalize<<<max_keep, 1024>>>(prev, current, pool, finish, err, max_keep, threshold)` — clears `prev` AlgoState and compacts `current` to the best `max_keep` WorkItems. Returns immediately if `*err` is non-zero on entry.
+
+- **Block mapping**: each of the `max_keep` blocks clears `prev->items[blockIdx.x]`. Block 0 additionally does all compaction work on `current`.
+- **Phase 1 (all blocks)**: parallel over parts (1024 threads strided); `atomicAdd(-1)` on `mesh.refcount` / `hull.refcount` if non-null; `heap_free(&pool->heap, verts)` if old value was 1; thread 0 sets `nparts = 0`.
+- **Phase 2a (block 0)**: allocate `WIKey[nitems]` sort buffer + warp_sort scratch from `pool->scratch`; fill with `{part_cost(last_part), idx}` in parallel; warp 0 sorts ascending via `warp_sort_t<WIKey, WIKeyCmp>`; free sort scratch.
+- **Phase 2b**: allocate `max_keep × sizeof(WorkItem)` scratch from `pool->scratch`. Each warp moves one top-k source item (`current->items[sorted_idx]`) into scratch: lane 0 writes `dst->nparts`, `__syncwarp()`, all lanes copy parts, lane 0 sets `src->nparts = 0`, `__syncwarp()`.
+- **Phase 2c**: thread 0 checks `keys[0].cost < threshold`; sets `*finish = 1` if so. Frees key buffer.
+- **Phase 2d**: each warp clears one item in `current` (all nitems, strided). Moved items have `nparts = 0` — inner loop is a no-op. Non-moved items: `atomicAdd(-1)` on refcounts, `heap_free` if old == 1; lane 0 sets `nparts = 0`, `__syncwarp()`.
+- **Phase 2e**: each warp moves one scratch item back to `current->items[0..k-1]`: lane 0 writes `dst->nparts`, `__syncwarp()`, all lanes copy parts, `__syncwarp()`.
+- **Phase 2f**: thread 0 frees WorkItem scratch; sets `prev->nitems = 0`, `current->nitems = k` where `k = min(max_keep, nitems)`.
+- **`part_cost` helper**: `static __device__ inline float part_cost(const Part&)` defined in `beam.cu`; returns `fmaxf(hausdorff, mesh_vol / (hull_vol + 1e-6f))`. Used by `PartKeyCmp`, `WIKeyCmp`, and `beam_finalize` directly.
+- **`WIKey` / `WIKeyCmp`**: sort struct `{float cost; int idx}`, ascending by cost, ties broken by index. `sentinel = {1e30f, 0x7fffffff}`.
+- **Error codes**: `BEAM_ERR_FINALIZE_OOM = 0x80000` on scratch OOM; `BEAM_ERR_SORT_STACK` reused for WIKey sort stack overflow. All `atomicOr`'d into `*err`; scratch freed before early return.
+- **`__syncwarp()` discipline**: every `if (wlane == 0)` write to global memory is immediately followed by `__syncwarp()` to make the write visible to all lanes before proceeding.
 
 ## hull_dandc_warp_mesh API
 

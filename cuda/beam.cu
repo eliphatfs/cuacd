@@ -14,17 +14,22 @@
 #include "warp_sort.cuh"
 
 // Error code for exceeding WORK_ITEM_MAX_PARTS (distinct from plane_cut errors).
-#define BEAM_ERR_OVERFLOW  0x10000
+#define BEAM_ERR_OVERFLOW      0x10000
 // Error codes for beam_sort.
-#define BEAM_ERR_SORT_OOM  0x20000  // scratch heap allocation failed
-#define BEAM_ERR_SORT_STACK 0x40000 // warp_sort_t stack overflow
+#define BEAM_ERR_SORT_OOM      0x20000  // scratch heap allocation failed
+#define BEAM_ERR_SORT_STACK    0x40000  // warp_sort_t stack overflow
+// Error codes for beam_finalize.
+#define BEAM_ERR_FINALIZE_OOM  0x80000  // scratch heap allocation failed
 
-// Comparator for sorting Parts by max(hausdorff, mesh_vol / (hull_vol + eps)), ascending.
+// Cost of a Part: the primary metric for deciding which parts to cut next.
+static __device__ inline float part_cost(const Part& p) {
+    const float eps = 1e-6f;
+    return fmaxf(p.hausdorff, p.mesh_vol / (p.hull_vol + eps));
+}
+
+// Comparator for sorting Parts by part_cost, ascending.
 struct PartKeyCmp {
-    static __device__ inline float key(const Part& p) {
-        const float eps = 1e-6f;
-        return fmaxf(p.hausdorff, p.mesh_vol / (p.hull_vol + eps));
-    }
+    static __device__ inline float key(const Part& p) { return part_cost(p); }
     static __device__ inline int cmp(Part a, Part b) {
         float ka = key(a), kb = key(b);
         if (ka < kb) return -1;
@@ -243,4 +248,230 @@ extern "C" __global__ void beam_sort(
 
     if (lane == 0)
         heap_free(&pool->scratch, s_scratch);
+}
+
+// WorkItem sort key: sort by cost of last (worst) part, break ties by index.
+struct WIKey { float cost; int idx; };
+struct WIKeyCmp {
+    static __device__ inline int cmp(WIKey a, WIKey b) {
+        if (a.cost < b.cost) return -1;
+        if (a.cost > b.cost) return  1;
+        return (a.idx < b.idx) ? -1 : (a.idx > b.idx) ? 1 : 0;
+    }
+    static __device__ inline WIKey sentinel() {
+        WIKey s; s.cost = 1e30f; s.idx = 0x7fffffff; return s;
+    }
+};
+
+// beam_finalize: <<<max_keep, 1024>>>
+// Clears prev AlgoState and compacts current to the best max_keep WorkItems.
+//
+// Phase 1 (all blocks): clear prev->items[blockIdx.x] — decrement mesh/hull
+//   refcounts and heap_free chunks that reach zero; thread 0 sets nparts=0.
+// Phase 2 (block 0 only):
+//   a. Allocate WIKey sort buffer + scratch; fill with {cost-of-last-part, idx};
+//      warp 0 sorts ascending. Free sort scratch.
+//   b. Allocate WorkItem scratch (max_keep items). Each warp moves one top-k
+//      source item (by sorted order) into scratch; set source nparts=0.
+//   c. Thread 0 checks best cost vs threshold; sets *finish=1 if below.
+//      Frees key buffer.
+//   d. Each warp clears one item in current (decrement refcounts, free if 0,
+//      set nparts=0) — moved items are already empty (nparts=0), no-op.
+//   e. Each warp moves one scratch item back to current->items[0..k-1].
+//   f. Thread 0 frees scratch; sets prev->nitems=0, current->nitems=k.
+//
+// Error codes: BEAM_ERR_FINALIZE_OOM on scratch OOM, BEAM_ERR_SORT_STACK on
+// sort stack overflow (both atomicOr'd into *err; early-exits on any error).
+extern "C" __global__ void beam_finalize(
+    AlgoState*  prev,
+    AlgoState*  current,
+    DevicePool* pool,
+    int*        finish,
+    int*        err,
+    int         max_keep,
+    float       threshold)
+{
+    if (*err) return;
+
+    int tid       = threadIdx.x;
+    int warp_id   = tid / WARP_SIZE;
+    int wlane     = tid & (WARP_SIZE - 1);
+    int num_warps = blockDim.x / WARP_SIZE;
+
+    // =========================================================================
+    // Phase 1: clear prev->items[blockIdx.x]
+    // =========================================================================
+    {
+        WorkItem* wi = &prev->items[blockIdx.x];
+        int np = wi->nparts;
+        for (int i = tid; i < np; i += blockDim.x) {
+            Part* p = &wi->parts[i];
+            if (p->mesh.refcount) {
+                int old = atomicAdd(p->mesh.refcount, -1);
+                if (old == 1) heap_free(&pool->heap, (void*)p->mesh.verts);
+            }
+            if (p->hull.refcount) {
+                int old = atomicAdd(p->hull.refcount, -1);
+                if (old == 1) heap_free(&pool->heap, (void*)p->hull.verts);
+            }
+        }
+        __syncthreads();
+        if (tid == 0) wi->nparts = 0;
+    }
+
+    if (blockIdx.x != 0) return;
+    __syncthreads();  // fence before block-0-only work
+
+    // =========================================================================
+    // Block 0 only
+    // =========================================================================
+
+    __shared__ int      s_nitems;
+    __shared__ int      s_k;
+    __shared__ WIKey*   s_keys;
+    __shared__ char*    s_key_scratch;
+    __shared__ WorkItem* s_scratch_items;
+
+    // Phase 2a: allocate sort buffers
+    if (tid == 0) {
+        s_nitems = current->nitems;
+        s_k      = (max_keep < s_nitems) ? max_keep : s_nitems;
+        if (s_nitems == 0) { s_keys = NULL; s_key_scratch = NULL; }
+        else {
+            int key_bytes  = s_nitems * (int)sizeof(WIKey);
+            int sort_bytes = key_bytes + WS_MAX_STACK * 2 * (int)sizeof(int);
+            void *p1 = NULL, *p2 = NULL;
+            if (heap_alloc(&pool->scratch, (unsigned int)key_bytes,  &p1) != HEAP_OK ||
+                heap_alloc(&pool->scratch, (unsigned int)sort_bytes, &p2) != HEAP_OK) {
+                if (p1) heap_free(&pool->scratch, p1);
+                if (p2) heap_free(&pool->scratch, p2);
+                s_keys = NULL; s_key_scratch = NULL;
+                atomicOr(err, BEAM_ERR_FINALIZE_OOM);
+            } else {
+                s_keys        = (WIKey*)p1;
+                s_key_scratch = (char*)p2;
+            }
+        }
+    }
+    __syncthreads();
+    if (*err) return;
+
+    int nitems = s_nitems;
+    int k      = s_k;
+
+    if (nitems == 0) {
+        if (tid == 0) { prev->nitems = 0; current->nitems = 0; }
+        return;
+    }
+
+    // Fill key buffer
+    for (int i = tid; i < nitems; i += blockDim.x) {
+        WorkItem* wi = &current->items[i];
+        int np = wi->nparts;
+        float cost = (np > 0) ? part_cost(wi->parts[np - 1]) : 0.0f;
+        s_keys[i].cost = cost;
+        s_keys[i].idx  = i;
+    }
+    __syncthreads();
+
+    // Sort with warp 0
+    if (warp_id == 0) {
+        int rc = warp_sort_t<WIKey, WIKeyCmp>(s_keys, s_key_scratch, nitems, wlane);
+        if (rc != 0 && wlane == 0)
+            atomicOr(err, BEAM_ERR_SORT_STACK);
+    }
+    __syncthreads();
+    if (*err) {
+        if (tid == 0) {
+            heap_free(&pool->scratch, (void*)s_keys);
+            heap_free(&pool->scratch, (void*)s_key_scratch);
+        }
+        return;
+    }
+
+    // Free sort scratch (done sorting)
+    if (tid == 0) heap_free(&pool->scratch, (void*)s_key_scratch);
+
+    // Allocate WorkItem scratch
+    if (tid == 0) {
+        void* p = NULL;
+        if (heap_alloc(&pool->scratch, (unsigned int)(max_keep * (int)sizeof(WorkItem)), &p) != HEAP_OK) {
+            heap_free(&pool->scratch, (void*)s_keys);
+            s_scratch_items = NULL;
+            atomicOr(err, BEAM_ERR_FINALIZE_OOM);
+        } else {
+            s_scratch_items = (WorkItem*)p;
+        }
+    }
+    __syncthreads();
+    if (*err) return;
+
+    // Phase 2b: move top-k items from current to scratch (each warp = one item)
+    for (int wi_local = warp_id; wi_local < k; wi_local += num_warps) {
+        int src_idx     = s_keys[wi_local].idx;
+        WorkItem* src   = &current->items[src_idx];
+        WorkItem* dst   = &s_scratch_items[wi_local];
+        int np          = src->nparts;
+        if (wlane == 0) dst->nparts = np;
+        __syncwarp();
+        int copy_ints   = np * (int)(sizeof(Part) / sizeof(int));
+        int* isrc       = (int*)src->parts;
+        int* idst       = (int*)dst->parts;
+        for (int i = wlane; i < copy_ints; i += WARP_SIZE)
+            idst[i] = isrc[i];
+        if (wlane == 0) src->nparts = 0;
+        __syncwarp();
+    }
+    __syncthreads();
+
+    // Phase 2c: threshold check + free key buffer
+    if (tid == 0) {
+        if (k > 0 && s_keys[0].cost < threshold)
+            *finish = 1;
+        heap_free(&pool->scratch, (void*)s_keys);
+    }
+
+    // Phase 2d: clear all items in current (decrement refcounts; moved items
+    // already have nparts=0 so their inner loop is a no-op)
+    for (int wi_local = warp_id; wi_local < nitems; wi_local += num_warps) {
+        WorkItem* wi = &current->items[wi_local];
+        int np = wi->nparts;
+        for (int i = wlane; i < np; i += WARP_SIZE) {
+            Part* p = &wi->parts[i];
+            if (p->mesh.refcount) {
+                int old = atomicAdd(p->mesh.refcount, -1);
+                if (old == 1) heap_free(&pool->heap, (void*)p->mesh.verts);
+            }
+            if (p->hull.refcount) {
+                int old = atomicAdd(p->hull.refcount, -1);
+                if (old == 1) heap_free(&pool->heap, (void*)p->hull.verts);
+            }
+        }
+        if (wlane == 0) wi->nparts = 0;
+        __syncwarp();
+    }
+    __syncthreads();
+
+    // Phase 2e: move top-k items from scratch back to current->items[0..k-1]
+    for (int wi_local = warp_id; wi_local < k; wi_local += num_warps) {
+        WorkItem* src = &s_scratch_items[wi_local];
+        WorkItem* dst = &current->items[wi_local];
+        int np        = src->nparts;
+        if (wlane == 0) dst->nparts = np;
+        __syncwarp();
+        int copy_ints = np * (int)(sizeof(Part) / sizeof(int));
+        int* isrc     = (int*)src->parts;
+        int* idst     = (int*)dst->parts;
+        for (int i = wlane; i < copy_ints; i += WARP_SIZE)
+            idst[i] = isrc[i];
+        __syncwarp();
+    }
+    __syncthreads();
+
+    // Phase 2f: free scratch, update counts
+    if (tid == 0) {
+        heap_free(&pool->scratch, (void*)s_scratch_items);
+        prev->nitems    = 0;
+        current->nitems = k;
+    }
 }
