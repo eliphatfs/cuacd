@@ -1491,7 +1491,7 @@ __device__ Mesh hull_dandc_warp_mesh(
 
     *err = 0;
     if (lane == 0) { s_result.verts = NULL; s_result.tris = NULL;
-                     s_result.nv = 0; s_result.nt = 0; }
+                     s_result.nv = 0; s_result.nt = 0; s_result.refcount = NULL; }
 
     if (n < 4) { __syncwarp(); return s_result; }
 
@@ -1563,16 +1563,20 @@ __device__ Mesh hull_dandc_warp_mesh(
                 { *err = 6; goto done; }
             bt_rewind(&s_pool, pre_count);
 
-            // Allocate output Mesh chunk from heap: [verts (16-byte aligned) | tris]
+            // Allocate output Mesh chunk from heap: [verts (16-byte aligned) | tris (16-byte aligned) | refcount]
             if (nv > 0) {
                 size_t vb = (size_t)nv * 3 * sizeof(float);
                 size_t va = (vb + 15) & ~(size_t)15;
                 size_t tb = (size_t)nt * 3 * sizeof(int);
+                size_t ta = (tb + 15) & ~(size_t)15;
+                size_t rb = 16;
                 void* chunk = NULL;
-                if (heap_alloc(heap, (unsigned int)(va + tb), &chunk) != HEAP_OK)
+                if (heap_alloc(heap, (unsigned int)(va + ta + rb), &chunk) != HEAP_OK)
                     { *err = 1; goto done; }
                 float* ov = (float*)chunk;
                 int*   ot = (int*)((char*)chunk + va);
+                int*   rc = (int*)((char*)chunk + va + ta);
+                *rc = 1;
 
                 // Extract pass
                 int pre_ext = s_pool.offset;
@@ -1583,6 +1587,7 @@ __device__ Mesh hull_dandc_warp_mesh(
 
                 s_result.verts = ov; s_result.tris = ot;
                 s_result.nv    = nv; s_result.nt   = nt;
+                s_result.refcount = rc;
             }
         }
     }

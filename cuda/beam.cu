@@ -134,6 +134,12 @@ extern "C" __global__ void beam_expansion(
         dst[i] = src[i];
     __syncthreads();
 
+    // Increment refcounts for the copied parts (parallel over parts)
+    for (int i = tid; i < np - 1; i += blockDim.x) {
+        if (wo->parts[i].mesh.refcount) atomicAdd(wo->parts[i].mesh.refcount, 1);
+        if (wo->parts[i].hull.refcount) atomicAdd(wo->parts[i].hull.refcount, 1);
+    }
+
     // Thread 0 writes the two new parts and nparts
     if (tid == 0) {
         wo->parts[np - 1] = pp.pos;

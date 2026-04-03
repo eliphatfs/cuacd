@@ -116,8 +116,8 @@ __device__ inline void pc_intersect(
 #define PC_KERR_SORT_ERR    4
 
 __device__ inline void pc_zero_part(Part* p) {
-    p->mesh.verts = NULL; p->mesh.tris = NULL; p->mesh.nv = 0; p->mesh.nt = 0;
-    p->hull.verts = NULL; p->hull.tris = NULL; p->hull.nv = 0; p->hull.nt = 0;
+    p->mesh.verts = NULL; p->mesh.tris = NULL; p->mesh.nv = 0; p->mesh.nt = 0; p->mesh.refcount = NULL;
+    p->hull.verts = NULL; p->hull.tris = NULL; p->hull.nv = 0; p->hull.nt = 0; p->hull.refcount = NULL;
     p->mesh_vol = 0.0f; p->hull_vol = 0.0f; p->hausdorff = 0.0f;
 }
 
@@ -306,13 +306,16 @@ __device__ inline PartPair plane_cut_block(
             int is_neg = (any_neg && !any_pos);
             unsigned int vb = (unsigned int)PC_ALIGN16(n_verts * 3 * (int)sizeof(float));
             unsigned int tb = (unsigned int)PC_ALIGN16(n_tris  * 3 * (int)sizeof(int));
-            unsigned int sz = vb + tb; if (!sz) sz = 1;
+            unsigned int rb = (unsigned int)PC_ALIGN16((int)sizeof(int));
+            unsigned int sz = vb + tb + rb; if (!sz) sz = 1;
             void* chunk = NULL;
             if (heap_alloc(heap, sz, &chunk) != HEAP_OK) {
                 atomicOr(kernel_error, PC_KERR_POOL_OOM);
             } else {
                 float* pv = (float*)chunk;
                 int*   pt = (int*)((char*)chunk + vb);
+                int*   rc = (int*)((char*)chunk + vb + tb);
+                *rc = 1;
                 for (int i = 0; i < n_verts * 3; i++) pv[i] = vertices[i];
                 for (int i = 0; i < n_tris  * 3; i++) pt[i] = triangles[i];
                 Part* side  = is_neg ? &s_result.neg : &s_result.pos;
@@ -320,6 +323,7 @@ __device__ inline PartPair plane_cut_block(
                 pc_zero_part(side);
                 side->mesh.verts = pv; side->mesh.tris = pt;
                 side->mesh.nv = n_verts; side->mesh.nt = n_tris;
+                side->mesh.refcount = rc;
                 pc_zero_part(empty);
             }
             PC_FREE_ALL_SHARED_SCRATCH();
@@ -894,7 +898,8 @@ __device__ inline PartPair plane_cut_block(
             unsigned int pt_b=(unsigned int)PC_ALIGN16(total_pos*3*(int)sizeof(int));
             unsigned int nv_b=(unsigned int)PC_ALIGN16(nnv      *3*(int)sizeof(float));
             unsigned int nt_b=(unsigned int)PC_ALIGN16(total_neg*3*(int)sizeof(int));
-            unsigned int sz = pv_b+pt_b+nv_b+nt_b; if (!sz) sz=1;
+            unsigned int rc_b=(unsigned int)PC_ALIGN16((int)sizeof(int));
+            unsigned int sz = pv_b+pt_b+nv_b+nt_b+rc_b; if (!sz) sz=1;
             void* chunk = NULL;
             s_chunk_ok = 0;
             if (heap_alloc(heap, sz, &chunk) == HEAP_OK) {
@@ -904,12 +909,16 @@ __device__ inline PartPair plane_cut_block(
                 s_ptp = (int*)  (cb+pv_b);
                 s_nvp = (float*)(cb+pv_b+pt_b);
                 s_ntp = (int*)  (cb+pv_b+pt_b+nv_b);
+                int*   rcp = (int*)(cb+pv_b+pt_b+nv_b+nt_b);
+                *rcp = 1;
                 pc_zero_part(&s_result.pos);
                 s_result.pos.mesh.verts=s_pvp; s_result.pos.mesh.tris=s_ptp;
                 s_result.pos.mesh.nv=pnv;      s_result.pos.mesh.nt=total_pos;
+                s_result.pos.mesh.refcount=rcp;
                 pc_zero_part(&s_result.neg);
                 s_result.neg.mesh.verts=s_nvp; s_result.neg.mesh.tris=s_ntp;
                 s_result.neg.mesh.nv=nnv;      s_result.neg.mesh.nt=total_neg;
+                s_result.neg.mesh.refcount=rcp;
             } else {
                 atomicOr(kernel_error, PC_KERR_POOL_OOM);
                 s_pvp=NULL; s_ptp=NULL; s_nvp=NULL; s_ntp=NULL;

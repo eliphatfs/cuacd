@@ -107,7 +107,7 @@ After completing any code change, always build (`pip install -e .`) and run the 
 
 **Struct locations:**
 - `cuda/allocator.cuh` — device-side: `DevicePool` (with embedded `DeviceHeap heap/scratch`), `HeapArena`, `heap_alloc/free`; included by `common.cuh`
-- `cuda/structs.cuh` — device-side: `Mesh`, `Part`, `PartPair`, `WorkItem`, `AlgoState`; included by `plane_cut.cuh` and future algo code
+- `cuda/structs.cuh` — device-side: `Mesh` (verts, tris, nv, nt, refcount), `Part`, `PartPair`, `WorkItem`, `AlgoState`; included by `plane_cut.cuh` and future algo code
 - `csrc/structs.h` — host-side: `DevicePool`, `beam_ctx`; included by `beam.c` and `test_beam.c`
 
 Each `.cu` kernel module is self-contained: carries its own `#include` directives, all `__global__` kernels declared `extern "C"` directly on the function definition (no file-level block).
@@ -196,7 +196,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 
 - **Input**: `const Mesh*` (replaces separate verts/tris/nv/nt params).
 - **Output**: returns a `PartPair` directly (stored in `__shared__ PartPair s_result`); `pos.mesh` and `neg.mesh` point into a **single heap chunk** allocated from `DeviceHeap* heap`.
-- **Heap chunk layout** (one `heap_alloc` call on `heap`): `[pos_verts | pos_tris | neg_verts | neg_tris]`, each section 16-byte aligned.
+- **Heap chunk layout** (one `heap_alloc` call on `heap`): `[pos_verts | pos_tris | neg_verts | neg_tris | refcount(16B)]`, each section 16-byte aligned. `pos.mesh.refcount` and `neg.mesh.refcount` both point to the same `int` at the end of the chunk; initialized to 1. Early-exit (no-cross) case uses a separate `[verts | tris | refcount(16B)]` layout with the single mesh's `refcount` set similarly. Input meshes not allocated via `plane_cut_block` have `refcount = NULL`.
 - **Scratch**: all temporary buffers (signs, all_verts, cross_edges, sort_scratch, isect_idx, pos_tris, neg_tris, dir_edges, dir_sort, boundary_flags, and per-loop working buffers) are allocated from `DeviceHeap* scratch_heap` and freed individually as soon as each buffer's last use completes. Nothing from scratch_heap survives the call.
 - **Vertex compaction** (phase 13, parallel): phases 1-12 run on thread 0 or warp 0; phase 13 runs across all 64 threads. Steps: init remap[]=-1 (strided), mark used verts via `atomicMax` (strided), count per contiguous chunk, exclusive prefix scan (thread 0, 64 iters), assign new indices per chunk, remap tris in-place (strided), heap alloc (thread 0), scatter verts + copy tris (strided). Each side's `Mesh.verts` contains only the vertices actually referenced — no loose vertices.
 - **Counters** (`n_cross`, `n_all_verts`, `n_pos`, `n_neg`): stored in `__shared__ int s_counters[4]`; `atomicAdd` on shared memory. Not on heap.
@@ -213,7 +213,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **Calls `plane_cut_block`** on `wi->parts[nparts-1].mesh` using `pool->heap` and `pool->scratch`.
 - **Empty side**: if either `pos.mesh.nv == 0` or `neg.mesh.nv == 0`, frees the combined heap chunk and returns — no entry written to `next`.
 - **Overflow**: `BEAM_ERR_OVERFLOW = 0x10000` — `atomicOr`'d into `err` if `nparts+1 > WORK_ITEM_MAX_PARTS`. Distinct from any plane_cut error code (those are small integers).
-- **Part copy**: bulk int-copy of `parts[0..nparts-2]` in parallel; thread 0 appends `pp.pos` and `pp.neg`, sets `nparts = old_nparts + 1`.
+- **Part copy**: bulk int-copy of `parts[0..nparts-2]` in parallel; thread 0 appends `pp.pos` and `pp.neg`, sets `nparts = old_nparts + 1`. After the copy, threads iterate over the `nparts-1` copied parts in parallel and `atomicAdd(+1)` on `part.mesh.refcount` and `part.hull.refcount` if non-null.
 - **`next->nitems`**: incremented atomically (thread 0) only for successful cuts; caller must pre-zero it and ensure sufficient `items` capacity.
 - **Mesh volumes**: after writing the new parts, warp 0 calls `mesh_volume_warp` on the pos part, warp 1 on the neg part; lane 0 of each warp writes to `Part.mesh_vol`.
 
@@ -224,7 +224,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **Block mapping**: `item_idx = blockIdx.x / 2`, `part_off = blockIdx.x % 2` → `part_idx = nparts - 2 + part_off` (0 = second-to-last, 1 = last part).
 - **Early exit** (no error): if `item_idx >= nitems`, or `part_idx` out of range, or `part->hull.verts != NULL` (hull already computed).
 - **Calls `hull_dandc_warp_mesh`** on `p->mesh.verts` / `p->mesh.nv` using `pool->heap` (output) and `pool->scratch` (scratch). All 32 lanes call.
-- **Stores result**: lane 0 writes the returned `Mesh` into `p->hull`. Returns `{NULL,NULL,0,0}` on error or < 4 points (error code set in `*err`).
+- **Stores result**: lane 0 writes the returned `Mesh` into `p->hull`. Returns `{NULL,NULL,0,0,NULL}` on error or < 4 points (error code set in `*err`).
 - **Hull volume**: if `hull.nt > 0`, all 32 lanes call `mesh_volume_warp(&hull, lane)`; lane 0 writes result to `p->hull_vol`.
 
 ## beam_sort API
@@ -240,8 +240,8 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 
 `hull_dandc_warp_mesh(pts, n, lane, heap, scratch_heap, err) -> Mesh` — warp device function (all 32 lanes call with identical args).
 
-- **Output**: returns a `Mesh` struct directly. Allocates a single combined `[verts | tris]` chunk from `DeviceHeap* heap`. Returns `{NULL,NULL,0,0}` on error or n<4.
-- **Heap chunk layout**: `[verts (nv*3 floats, 16-byte aligned) | tris (nt*3 ints)]`; exact sizes from a count pass.
+- **Output**: returns a `Mesh` struct directly. Allocates a single combined chunk from `DeviceHeap* heap`. Returns `{NULL,NULL,0,0,NULL}` on error or n<4.
+- **Heap chunk layout**: `[verts (nv*3 floats, 16-byte aligned) | tris (nt*3 ints, 16-byte aligned) | refcount(16B)]`; exact sizes from a count pass. `Mesh.refcount` points to the trailing `int`, initialized to 1.
 - **No volume**: `bt_computeVolume` is not called; the function only produces the mesh.
 - **Scratch**: `DeviceHeap* scratch_heap` backs (a) the `WarpPool` (allocated as a single heap chunk via `dandc_scratch_bytes(n)`) and (b) `BtEdge` pool slabs (`BTPOOL_BLOCK_SIZE=8192` edges each, 2 initial + dynamic expansion). All scratch is heap-freed before return — scratch_heap is clean after call.
 - **WarpPool**: declared `__shared__`; backing allocated from scratch_heap by lane 0. Used for BtPoint32 array, vertex block, sort scratch, D&C stack, BFS queues (all rewound when done).

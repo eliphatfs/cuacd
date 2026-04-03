@@ -9,6 +9,7 @@ struct Mesh {
     int*   tris;       // triangle indices, nt * 3 ints
     int    nv;
     int    nt;
+    int*   refcount;   // pointer into heap chunk; NULL if not heap-allocated
 };
 
 // ============================================================================
