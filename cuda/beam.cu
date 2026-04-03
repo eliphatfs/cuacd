@@ -10,6 +10,7 @@
 #include "plane_cut.cuh"
 #include "warp_common.cuh"
 #include "hull_dandc.cuh"
+#include "mesh_volume.cuh"
 
 // Error code for exceeding WORK_ITEM_MAX_PARTS (distinct from plane_cut errors).
 #define BEAM_ERR_OVERFLOW 0x10000
@@ -114,6 +115,18 @@ extern "C" __global__ void beam_expansion(
         wo->parts[np]     = pp.neg;
         wo->nparts        = np + 1;
     }
+    __syncthreads();
+
+    // Warp 0 computes pos mesh volume, warp 1 computes neg mesh volume.
+    int warp_id = tid / WARP_SIZE;
+    int wlane   = tid & (WARP_SIZE - 1);
+    if (warp_id == 0) {
+        float vol = mesh_volume_warp(&wo->parts[np - 1].mesh, wlane);
+        if (wlane == 0) wo->parts[np - 1].mesh_vol = vol;
+    } else if (warp_id == 1) {
+        float vol = mesh_volume_warp(&wo->parts[np].mesh, wlane);
+        if (wlane == 0) wo->parts[np].mesh_vol = vol;
+    }
 }
 
 // beam_hull: <<<2*current->nitems, 32>>>
@@ -147,4 +160,10 @@ extern "C" __global__ void beam_hull(
 
     if (lane == 0)
         p->hull = hull;
+
+    if (hull.nt > 0) {
+        float hvol = mesh_volume_warp(&hull, lane);
+        if (lane == 0)
+            p->hull_vol = hvol;
+    }
 }

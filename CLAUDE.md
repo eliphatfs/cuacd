@@ -215,6 +215,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **Overflow**: `BEAM_ERR_OVERFLOW = 0x10000` — `atomicOr`'d into `err` if `nparts+1 > WORK_ITEM_MAX_PARTS`. Distinct from any plane_cut error code (those are small integers).
 - **Part copy**: bulk int-copy of `parts[0..nparts-2]` in parallel; thread 0 appends `pp.pos` and `pp.neg`, sets `nparts = old_nparts + 1`.
 - **`next->nitems`**: incremented atomically (thread 0) only for successful cuts; caller must pre-zero it and ensure sufficient `items` capacity.
+- **Mesh volumes**: after writing the new parts, warp 0 calls `mesh_volume_warp` on the pos part, warp 1 on the neg part; lane 0 of each warp writes to `Part.mesh_vol`.
 
 ## beam_hull API
 
@@ -224,6 +225,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **Early exit** (no error): if `item_idx >= nitems`, or `part_idx` out of range, or `part->hull.verts != NULL` (hull already computed).
 - **Calls `hull_dandc_warp_mesh`** on `p->mesh.verts` / `p->mesh.nv` using `pool->heap` (output) and `pool->scratch` (scratch). All 32 lanes call.
 - **Stores result**: lane 0 writes the returned `Mesh` into `p->hull`. Returns `{NULL,NULL,0,0}` on error or < 4 points (error code set in `*err`).
+- **Hull volume**: if `hull.nt > 0`, all 32 lanes call `mesh_volume_warp(&hull, lane)`; lane 0 writes result to `p->hull_vol`.
 
 ## hull_dandc_warp_mesh API
 
