@@ -25,7 +25,7 @@ OUTPUT_GLB   = os.path.join(os.path.dirname(__file__),
 
 @pytest.fixture(autouse=True, scope="module")
 def gpu_ctx():
-    _gpu.init(0)
+    _gpu.init(0, 8192000000)
     yield
     _gpu.destroy()
 
@@ -164,6 +164,7 @@ def _decompose_shape(verts, tris, label, **kwargs):
             tm_hull_vol = float('nan')
         print(f"  part {i:2d}: {mv:10.6f} {tm_mesh_vol:10.6f} {hv:10.6f} {tm_hull_vol:10.6f} {scipy_hull_vol:10.6f}")
         meshes.append(trimesh.Trimesh(pv_world.copy(), pt.copy()))
+    print("Memory Usage:", '%.1f MB' % (_gpu.pool_usage() / 1e6))
     return meshes
 
 
