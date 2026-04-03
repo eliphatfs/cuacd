@@ -218,7 +218,7 @@ __device__ inline void subbin_push_head(HeapArena* arena, int s,
 // Arena = blockIdx.x % HEAP_NUM_ARENAS.
 // On success: sets *out and returns HEAP_OK.  On failure: HEAP_ERR_OOM.
 
-__device__ int heap_alloc(DeviceHeap* h, unsigned int req_size, void** out) {
+__device__ inline int heap_alloc(DeviceHeap* h, unsigned int req_size, void** out) {
     unsigned int aligned = (req_size + HEAP_ALIGN - 1) & ~(unsigned int)(HEAP_ALIGN - 1);
     if (!aligned) aligned = HEAP_ALIGN;
 
@@ -312,7 +312,7 @@ __device__ int heap_alloc(DeviceHeap* h, unsigned int req_size, void** out) {
 // Uses the block's stored arena_idx as its home arena. All blocks within a
 // pool slab share the same arena_idx, so coalescing is always intra-arena.
 
-__device__ int heap_free(DeviceHeap* h, void* ptr) {
+__device__ inline int heap_free(DeviceHeap* h, void* ptr) {
     if (!ptr) return HEAP_OK;
     unsigned long long blk = (unsigned long long)ptr - HEAP_HDR_SIZE;
     unsigned int ds = ((HeapBlockHdr*)blk)->data_size;

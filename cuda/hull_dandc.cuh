@@ -1154,7 +1154,7 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
 // ============================================================================
 
 struct BtPointCmp {
-    __device__ bool operator()(const BtPoint32& p, const BtPoint32& q) const {
+    __device__ inline bool operator()(const BtPoint32& p, const BtPoint32& q) const {
         return (p.y < q.y) || ((p.y == q.y) && ((p.x < q.x) || ((p.x == q.x) && (p.z < q.z))));
     }
 };
@@ -1480,7 +1480,7 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 //
 // Returns a Mesh with verts/tris in heap. Returns {NULL,NULL,0,0} on error or n<4.
 // *err is set to a nonzero error code on failure (all lanes see the same value).
-__device__ Mesh hull_dandc_warp_mesh(
+__device__ inline Mesh hull_dandc_warp_mesh(
     const float* pts, int n, int lane,
     DeviceHeap* heap, DeviceHeap* scratch_heap,
     int* err)

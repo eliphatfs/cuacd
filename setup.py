@@ -16,6 +16,7 @@ import os
 import sys
 import shutil
 import subprocess
+import concurrent.futures
 
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
@@ -81,9 +82,21 @@ def _fatbin_gencode_flags():
     return flags
 
 
-def _compile_fatbin(cuda_home, cu_file, fatbin_file, build_dir):
+# Modules compiled separately; kernels.cu is the old monolithic entry point (unused).
+_CUDA_MODULES = [
+    "mm.cu",
+    "test_warp_sort.cu",
+    "test_hull_dandc.cu",
+    "test_mesh_volume.cu",
+    "test_plane_cut.cu",
+    "beam.cu",
+]
+
+
+def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
     nvcc = os.path.join(cuda_home, "bin", "nvcc")
     os.makedirs(build_dir, exist_ok=True)
+
     extra_defines = []
     if os.environ.get("COACD_TRACK_EDGES"):
         extra_defines.append("-DTRACK_MAX_EDGE_PAIRS")
@@ -91,11 +104,32 @@ def _compile_fatbin(cuda_home, cu_file, fatbin_file, build_dir):
         extra_defines.append(f"-DHEAP_NUM_ARENAS={os.environ['COACD_GPU_ARENAS']}")
     if os.environ.get("COACD_BEAM_DEBUG"):
         extra_defines.append("-DCOACD_BEAM_DEBUG")
+
+    gencode = _fatbin_gencode_flags()
+    cuda_dir = os.path.join(_ROOT, "cuda")
+
+    # Compile each module to a relocatable device object in parallel.
+    obj_files = []
+    def _compile_module(name):
+        src = os.path.join(cuda_dir, name)
+        obj = os.path.join(build_dir, name.replace(".cu", ".o"))
+        subprocess.check_call([
+            nvcc, src, "-rdc=true", "-dc", "-O3", "--use_fast_math",
+            "--generate-line-info",
+            *extra_defines,
+            *gencode, "-o", obj,
+        ])
+        return obj
+
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        futures = {pool.submit(_compile_module, name): name for name in _CUDA_MODULES}
+        for fut in concurrent.futures.as_completed(futures):
+            obj_files.append(fut.result())  # raises on error
+
+    # Device-link all objects into a single fatbin.
     subprocess.check_call([
-        nvcc, cu_file, "--fatbin", "-O3", "--use_fast_math",
-        "--generate-line-info",
-        *extra_defines,
-        *_fatbin_gencode_flags(), "-o", fatbin_file,
+        nvcc, "--device-link", "--fatbin",
+        *gencode, *obj_files, "-o", fatbin_file,
     ])
 
 

@@ -14,7 +14,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 setup.py              # Build config: setuptools builds _gpu extension
 pyproject.toml        # PEP 621 metadata
 cuda/                 # CUDA device code (compiled to single fatbin)
-  kernels.cu          #   Root compilation unit — includes all .cu modules (each is self-contained)
   allocator.cuh       #   DevicePool (bump alloc + embedded DeviceHeap×2) + pool_alloc + heap_alloc/free
   common.cuh          #   Constants, atomics (includes allocator.cuh)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
@@ -69,8 +68,11 @@ git add CLAUDE.md coacd_gpu/__init__.py csrc/beam.c csrc/beam.h csrc/beam_module
 # Install everything (requires: CUDA toolkit with nvcc, C compiler)
 pip install -e .
 
-# Override GPU architectures
+# Override GPU architectures (default: 80;86;89;90 — ~57s)
 COACD_GPU_ARCHS="80;86" pip install -e .
+
+# Fast development build — single arch for current GPU (RTX 4090 = sm_89, ~15s)
+COACD_GPU_ARCHS="89" pip install -e .
 
 # Run all tests
 python -m pytest tests/ -v
@@ -98,8 +100,9 @@ After completing any code change, always build (`pip install -e .`) and run the 
 
 ### Build System
 
-**`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles `cuda/kernels.cu` (which `#include`s all self-contained `.cu` modules) → fatbin → C header, then builds `csrc/beam_module.c` + `csrc/beam.c` + `csrc/test_beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). Fatbin compiled with `--generate-line-info` for NCU source-level profiling.
+**`coacd_gpu._gpu`** — Setuptools-built CPython extension. `setup.py` compiles each `.cu` module in parallel (`-rdc=true -dc`) using `concurrent.futures.ThreadPoolExecutor`, then runs `nvcc --device-link --fatbin` to produce `kernels.fatbin` → C header, then builds `csrc/beam_module.c` + `csrc/beam.c` + `csrc/test_beam.c` as a native Python extension with `Py_LIMITED_API` (cp310+, abi3 wheel). Fatbin compiled with `--generate-line-info` for NCU source-level profiling.
 
+**Parallel separate compilation requirement**: because modules are compiled independently with `-rdc=true`, all `__device__` functions defined in `.cuh` headers **must** be marked `inline` (or `__forceinline__`/`static`). Without `inline`, the device linker sees duplicate external symbol definitions from each `.o` that includes the same header. 
 **File split:**
 - `cuda/mm.cu` — `heap_init_kernel` (2×HEAP_NUM_ARENAS blocks × 32 threads; initialises both embedded heaps in DevicePool)
 - `cuda/test_hull_dandc.cu` — `hull_dandc_kernel` (hull mesh extraction)
