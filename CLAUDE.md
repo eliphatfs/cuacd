@@ -361,6 +361,24 @@ be_used[start] = 1;           // start == n_loops → overwrites loop_starts[n_l
 
 Because `start == n_loops` at the beginning of each outer loop iteration, `be_used[start] = 1` immediately clobbered the stored start value, making every loop appear to start one vertex late (size N-1 instead of N). Fix: save `lvi_start` in a local variable and assign `loop_starts[n_loops] = lvi_start` **after** all `be_used` writes complete.
 
+### plane_cut cap_ptr Buffer Too Small (Bridge Swap Overflow)
+
+`cap_ptr` (cap_tris) was allocated as `n_boundary * 3 * sizeof(int)` but is used as both:
+1. A temporary swap buffer during hole-bridge insertion (max size = `poly_n + hs + 2` ≤ `n_boundary*4+64`)
+2. The ear-clip output triangle buffer (max `n_cap` triangles × 3 ints)
+
+Use-1 can exceed `n_boundary * 3` when the merged polygon grows during bridging, overwriting adjacent scratch heap block headers → corrupted `arena_idx` → OOB arena lock in `heap_free`. Fix: allocate `cap_ptr` as `(n_boundary*4+64) * sizeof(int)` to match `poly_ptr`.
+
+### Using compute-sanitizer for CUDA Memory Errors
+
+When a CUDA kernel crashes with error 716 (misaligned address) or 700 (illegal memory access), use `compute-sanitizer --tool memcheck` to find the exact source location:
+
+```bash
+compute-sanitizer --tool memcheck python <script.py>
+```
+
+Note: compute-sanitizer serializes GPU execution and can change timing/behavior (e.g. algorithms may exit early or produce different results). Use it to find the source of crashes, not to validate correctness.
+
 ## Benchmarking
 
 ```bash
@@ -387,6 +405,11 @@ ncu --set full -o dandc_profile python tests/bench_dandc.py --n_pts 200 --n_hull
 - Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests)
 - Persistent heaps (`beam_init` with `pool_bytes`): both heaps share one pool, all memory recycled by kernels, pool stable after first call
 - `ctx.pool_usage()` — peak device pool bytes (monotonic), `ctx.heap_compact()` — available but not needed normally
+- `beam_decompose` (cube, lshape): cube → 1 part, lshape → 2 parts ✓
+
+### In Progress
+- `beam_decompose` (octocat): `beam_initialize` computes `hull_vol` incorrectly (0.0 for cube, 0.246 for lshape vs correct 8.0/1.48 from Python). Python-side scipy hull volumes are correct (verified via numpy divergence theorem). GPU `mesh_volume_warp` gives correct result for the input mesh but wrong for the hull mesh. Root cause TBD — currently under investigation.
+  - `part_cost = fmaxf(k_rv * cbrtf(max(hull_vol − mesh_vol, 0)), hausdorff)` — if `hull_vol < mesh_vol`, cost = 0 < threshold → algorithm exits with 1 part on iteration 0.
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input

@@ -561,7 +561,7 @@ __device__ inline PartPair plane_cut_block(
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &lsz_ptr) != HEAP_OK) { kern_ok = 0; }
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &lv2_ptr) != HEAP_OK) { kern_ok = 0; }
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * (int)sizeof(int)), &poly_ptr) != HEAP_OK) { kern_ok = 0; }
-                if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * 3 * (int)sizeof(int)), &cap_ptr)  != HEAP_OK) { kern_ok = 0; }
+                if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * (int)sizeof(int)), &cap_ptr)  != HEAP_OK) { kern_ok = 0; }
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * 2 * (int)sizeof(int)), &ep_ptr)   != HEAP_OK) { kern_ok = 0; }
                 if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(256 * (int)sizeof(int) + 256 * (int)sizeof(float)), &sb_ptr) != HEAP_OK) { kern_ok = 0; }
                 if (!kern_ok) atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);

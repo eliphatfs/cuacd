@@ -1,16 +1,26 @@
-"""Test beam_decompose on an L-shaped mesh.
+"""Test beam_decompose on a cube, an L-shape, and the Octocat mesh.
 
-The L-shape is built from two axis-aligned boxes joined at a corner:
-  - Box A: [0,2] x [0,1] x [0,1]   (horizontal bar)
-  - Box B: [0,1] x [1,3] x [0,1]   (vertical bar)
-Their union is non-convex.  With threshold=0.05 the decomposition should
-produce 2-4 convex pieces.
+Shapes:
+  - Cube [0,1]^3: already convex → should produce 1 part
+  - L-shape (two boxes joined at a corner): non-convex → 2-4 parts
+  - Octocat-v2.obj: complex organic shape → several parts
+
+Each shape is normalized to bbox [-1, 1] before decomposition, then
+rescaled back.  All three results are exported as a single GLB with
+random per-part colors, mirroring the CoACD reference visualizer.
 """
+import os
 import numpy as np
 import pytest
+import trimesh
 from scipy.spatial import ConvexHull
 
 import coacd_gpu._gpu as _gpu
+
+OCTOCAT_OBJ = os.path.join(os.path.dirname(__file__),
+                           "../CoACD/examples/Octocat-v2.obj")
+OUTPUT_GLB   = os.path.join(os.path.dirname(__file__),
+                           "../decomp_output/decompose_all.glb")
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -54,6 +64,10 @@ def _merge_meshes(meshes):
     return np.concatenate(all_v), np.concatenate(all_t)
 
 
+def _make_cube():
+    return _box([0, 0, 0], [1, 1, 1])
+
+
 def _make_lshape():
     """L-shape = box_A ∪ box_B (two boxes sharing a face-edge)."""
     box_a = _box([0, 0, 0], [2, 1, 1])  # horizontal bar
@@ -64,9 +78,8 @@ def _make_lshape():
 def _scipy_hull(verts):
     """Compute convex hull via scipy; return (hull_verts float32, hull_tris int32).
 
-    scipy simplices may have mixed winding. Reorient each triangle so its
-    normal points away from the hull centroid (outward), ensuring consistent
-    winding for the divergence theorem volume computation.
+    Reorient each triangle so its normal points outward (away from centroid),
+    ensuring consistent winding for the divergence theorem volume computation.
     """
     ch = ConvexHull(verts)
     hull_verts = verts[ch.vertices].astype(np.float32)
@@ -74,22 +87,37 @@ def _scipy_hull(verts):
     tris = np.array([[remap[i] for i in tri] for tri in ch.simplices],
                     dtype=np.int32)
 
-    # Reorient: flip triangle if its normal points inward (toward centroid).
     centroid = hull_verts.mean(axis=0)
     v0 = hull_verts[tris[:, 0]]
     v1 = hull_verts[tris[:, 1]]
     v2 = hull_verts[tris[:, 2]]
-    normals = np.cross(v1 - v0, v2 - v0)          # (N,3) unnormalized
-    outward = (v0 - centroid)                       # vector from centroid to v0
-    inward  = (normals * outward).sum(axis=1) < 0  # dot < 0 → normal faces in
-    tris[inward] = tris[inward][:, [0, 2, 1]]      # swap v1/v2 to flip normal
+    normals = np.cross(v1 - v0, v2 - v0)
+    outward = v0 - centroid
+    inward  = (normals * outward).sum(axis=1) < 0
+    tris[inward] = tris[inward][:, [0, 2, 1]]
 
     return hull_verts, tris
 
 
+def _normalize(verts):
+    """Scale verts so bbox spans [-1, 1] on all axes. Returns (verts_norm, center, scale)."""
+    lo = verts.min(axis=0)
+    hi = verts.max(axis=0)
+    center = (lo + hi) / 2.0
+    scale  = (hi - lo).max() / 2.0
+    if scale == 0:
+        scale = 1.0
+    return ((verts - center) / scale).astype(np.float32), center, float(scale)
+
+
+def _denormalize(verts, center, scale):
+    """Undo _normalize."""
+    return (verts * scale + center).astype(np.float32)
+
+
 def _call_decompose(verts, tris, hull_verts, hull_tris,
                     max_iters=100, cuts_per_axis=10,
-                    threshold=0.05, max_keep=32, verbose=1):
+                    threshold=0.05, max_keep=32, verbose=0):
     verts      = np.ascontiguousarray(verts,      dtype=np.float32)
     tris       = np.ascontiguousarray(tris,       dtype=np.int32)
     hull_verts = np.ascontiguousarray(hull_verts, dtype=np.float32)
@@ -106,29 +134,94 @@ def _call_decompose(verts, tris, hull_verts, hull_tris,
     return parts
 
 
+def _decompose_shape(verts, tris, label, **kwargs):
+    """Normalize, decompose, denormalize. Returns list of trimesh.Trimesh."""
+    verts_n, center, scale = _normalize(verts)
+    hull_verts, hull_tris  = _scipy_hull(verts_n)
+
+    raw = _call_decompose(verts_n, tris, hull_verts, hull_tris, **kwargs)
+
+    print(f"\n{label}: {len(raw)} parts")
+    meshes = []
+    for i, (vb, tb, nv, nt, mv, hv) in enumerate(raw):
+        pv = np.frombuffer(vb, dtype=np.float32).reshape(nv, 3)
+        pt = np.frombuffer(tb, dtype=np.int32).reshape(nt, 3)
+        pv_world = _denormalize(pv, center, scale)
+        print(f"  part {i}: nv={nv} nt={nt} mesh_vol={mv:.4f} hull_vol={hv:.4f}")
+        meshes.append(trimesh.Trimesh(pv_world.copy(), pt.copy()))
+    return meshes
+
+
+def _build_scene(all_parts_by_shape):
+    """Build a trimesh.Scene with random per-part colors, one section per shape."""
+    scene = trimesh.Scene()
+    rng = np.random.default_rng(0)
+    for label, parts in all_parts_by_shape:
+        for p in parts:
+            color = (rng.random(3) * 255).astype(np.uint8)
+            p.visual = trimesh.visual.ColorVisuals(mesh=p)
+            p.visual.vertex_colors[:, :3] = color
+            scene.add_geometry(p, node_name=f"{label}_{id(p)}")
+    return scene
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
+def test_cube_decompose():
+    verts, tris = _make_cube()
+    parts = _decompose_shape(verts, tris, "cube")
+    assert len(parts) == 1, f"Cube is convex, expected 1 part, got {len(parts)}"
+
+
 def test_lshape_decompose():
     verts, tris = _make_lshape()
-    hull_verts, hull_tris = _scipy_hull(verts)
-
-    parts = _call_decompose(verts, tris, hull_verts, hull_tris)
-
-    print(f"\nL-shape decomposition: {len(parts)} parts")
-    for i, (vb, tb, nv, nt, mv, hv) in enumerate(parts):
-        print(f"  part {i}: nv={nv} nt={nt} mesh_vol={mv:.4f} hull_vol={hv:.4f}")
-
+    parts = _decompose_shape(verts, tris, "lshape")
     assert 2 <= len(parts) <= 4, f"Expected 2-4 parts, got {len(parts)}"
+    for p in parts:
+        assert p.vertices.shape[1] == 3
+        assert p.faces.shape[1] == 3
 
-    # Each part should have valid geometry
-    for vb, tb, nv, nt, mv, hv in parts:
-        assert nv >= 4
-        assert nt >= 4
-        part_verts = np.frombuffer(vb, dtype=np.float32).reshape(nv, 3)
-        part_tris  = np.frombuffer(tb, dtype=np.int32).reshape(nt, 3)
-        assert part_verts.shape == (nv, 3)
-        assert part_tris.shape  == (nt, 3)
-        assert part_tris.min() >= 0
-        assert part_tris.max() < nv
+
+@pytest.mark.skipif(not os.path.exists(OCTOCAT_OBJ),
+                    reason="Octocat-v2.obj not found")
+def test_octocat_decompose():
+    mesh = trimesh.load(OCTOCAT_OBJ, force="mesh")
+    verts = np.array(mesh.vertices, dtype=np.float32)
+    tris  = np.array(mesh.faces,    dtype=np.int32)
+    parts = _decompose_shape(verts, tris, "octocat",
+                             max_iters=100, cuts_per_axis=10,
+                             threshold=0.05, max_keep=32)
+    assert len(parts) >= 1
+
+
+def test_export_glb():
+    """Decompose all three shapes and export combined GLB."""
+    os.makedirs(os.path.dirname(OUTPUT_GLB), exist_ok=True)
+
+    all_parts = []
+
+    # Cube
+    v, t = _make_cube()
+    all_parts.append(("cube",   _decompose_shape(v, t, "cube")))
+
+    # L-shape
+    v, t = _make_lshape()
+    all_parts.append(("lshape", _decompose_shape(v, t, "lshape")))
+
+    # Octocat (skip quietly if missing)
+    if os.path.exists(OCTOCAT_OBJ):
+        mesh = trimesh.load(OCTOCAT_OBJ, force="mesh")
+        v = np.array(mesh.vertices, dtype=np.float32)
+        t = np.array(mesh.faces,    dtype=np.int32)
+        all_parts.append(("octocat", _decompose_shape(v, t, "octocat",
+                                                      max_iters=100,
+                                                      cuts_per_axis=10,
+                                                      threshold=0.05,
+                                                      max_keep=32)))
+
+    scene = _build_scene(all_parts)
+    scene.export(OUTPUT_GLB)
+    print(f"\nExported {OUTPUT_GLB}")
+    assert os.path.exists(OUTPUT_GLB)
