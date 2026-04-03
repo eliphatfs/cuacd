@@ -124,6 +124,7 @@ struct beam_result {
     int nparts;
 };
 
+// verbose: if non-zero, print per-iteration sync wait time and final readback time to stderr.
 int beam_decompose(
     beam_ctx_t   ctx,
     const float* verts,      int nv,
@@ -131,6 +132,7 @@ int beam_decompose(
     const float* hull_verts, int hull_nv,
     const int*   hull_tris,  int hull_nt,
     int max_iters, int cuts_per_axis, float threshold, int max_keep,
+    int verbose,
     struct beam_result* out);
 
 void beam_result_free(struct beam_result* result);

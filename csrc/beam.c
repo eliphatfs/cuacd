@@ -280,6 +280,7 @@ int beam_decompose(
     const float* hull_verts, int hull_nv,
     const int*   hull_tris,  int hull_nt,
     int max_iters, int cuts_per_axis, float threshold, int max_keep,
+    int verbose,
     struct beam_result* out)
 {
     // Local CHECK that sets result_code and jumps to cleanup.
@@ -295,8 +296,20 @@ int beam_decompose(
     } \
 } while(0)
 
-    CUstream s = NULL;  // default (legacy) stream
+    CUstream s = NULL;
     int result_code = 0;
+    LCHECK(cuStreamCreate(&s, CU_STREAM_DEFAULT));
+
+    // Timing helpers (active only when verbose != 0).
+#if defined(_POSIX_C_SOURCE) || defined(__linux__)
+#include <time.h>
+    struct timespec _t0, _t1;
+#define TSTAMP(t) clock_gettime(CLOCK_MONOTONIC, &(t))
+#define TELAPSED_MS(a,b) (((b).tv_sec-(a).tv_sec)*1e3 + ((b).tv_nsec-(a).tv_nsec)*1e-6)
+#else
+#define TSTAMP(t)        ((void)0)
+#define TELAPSED_MS(a,b) 0.0
+#endif
 
     CUdeviceptr d_verts      = 0, d_tris       = 0;
     CUdeviceptr d_hverts     = 0, d_htris       = 0;
@@ -388,10 +401,15 @@ int beam_decompose(
         int h_finish = 0, h_err = 0;
         struct AlgoState_h h_st;
         memset(&h_st, 0, sizeof(h_st));
-        LCHECK(cuMemcpyDtoHAsync(&h_finish, d_finish,  sizeof(int),            s));
-        LCHECK(cuMemcpyDtoHAsync(&h_err,    d_err,     sizeof(int),            s));
+        LCHECK(cuMemcpyDtoHAsync(&h_finish, d_finish,  sizeof(int),                s));
+        LCHECK(cuMemcpyDtoHAsync(&h_err,    d_err,     sizeof(int),                s));
         LCHECK(cuMemcpyDtoHAsync(&h_st,     d_current, sizeof(struct AlgoState_h), s));
+        TSTAMP(_t0);
         LCHECK(cuStreamSynchronize(s));
+        TSTAMP(_t1);
+        if (verbose)
+            fprintf(stderr, "[beam] iter %d: sync wait %.3f ms  nitems=%d\n",
+                    iter, TELAPSED_MS(_t0, _t1), h_st.nitems);
 
         if (h_err) {
             snprintf(ctx->last_error, sizeof(ctx->last_error),
@@ -401,7 +419,11 @@ int beam_decompose(
         }
 
         if (h_finish) {
+            TSTAMP(_t0);
             result_code = decomp_read_result(ctx, d_current, out, s);
+            TSTAMP(_t1);
+            if (verbose)
+                fprintf(stderr, "[beam] readback: %.3f ms\n", TELAPSED_MS(_t0, _t1));
             goto cleanup;
         }
 
@@ -446,8 +468,16 @@ int beam_decompose(
     }
 
     // Iterations exhausted — read back current state.
+    TSTAMP(_t0);
     LCHECK(cuStreamSynchronize(s));
+    TSTAMP(_t1);
+    if (verbose)
+        fprintf(stderr, "[beam] exhausted: sync wait %.3f ms\n", TELAPSED_MS(_t0, _t1));
+    TSTAMP(_t0);
     result_code = decomp_read_result(ctx, d_current, out, s);
+    TSTAMP(_t1);
+    if (verbose)
+        fprintf(stderr, "[beam] readback: %.3f ms\n", TELAPSED_MS(_t0, _t1));
 
 cleanup:
     // Ensure stream is idle before releasing buffers.
@@ -463,6 +493,7 @@ cleanup:
     if (d_err)     cuMemFreeAsync(d_err,     s);
     if (d_finish)  cuMemFreeAsync(d_finish,  s);
     cuStreamSynchronize(s);
+    cuStreamDestroy(s);
 
 #undef LCHECK
     return result_code;

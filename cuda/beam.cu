@@ -53,6 +53,8 @@ struct PartKeyCmp {
 // Block 0: compute mesh volume via mesh_volume_warp, store in part 0 mesh_vol.
 // Block 1: compute hull volume via mesh_volume_warp, store in part 0 hull_vol.
 // Block 2: thread 0 sets up WorkItem 0 part 0 metadata and nitems/nparts.
+// Caller must launch block 2 before blocks 0/1 when ordering matters — or use
+// a dependency-free layout where blocks 0/1 receive args directly (current impl).
 extern "C" __global__ void beam_initialize(
     float*      verts,
     int*        tris,
@@ -67,7 +69,6 @@ extern "C" __global__ void beam_initialize(
     int lane = threadIdx.x;  // 0..31
 
     if (blockIdx.x == 0) {
-        // Compute mesh volume
         Mesh m;
         m.verts    = verts;
         m.tris     = tris;
@@ -75,10 +76,12 @@ extern "C" __global__ void beam_initialize(
         m.nt       = nt;
         m.refcount = NULL;
         float vol = mesh_volume_warp(&m, lane);
-        if (lane == 0)
+        if (lane == 0) {
+            printf("[init] mesh nv=%d nt=%d verts=%p tris=%p vol=%.6f\n",
+                   m.nv, m.nt, m.verts, m.tris, vol);
             current->items[0].parts[0].mesh_vol = vol;
+        }
     } else if (blockIdx.x == 1) {
-        // Compute hull volume
         Mesh h;
         h.verts    = hull_verts;
         h.tris     = hull_tris;
@@ -86,12 +89,14 @@ extern "C" __global__ void beam_initialize(
         h.nt       = hull_nt;
         h.refcount = NULL;
         float vol = mesh_volume_warp(&h, lane);
-        if (lane == 0)
-            current->items[0].parts[0].hull_vol = vol;
-    } else {
-        // Block 2: thread 0 sets metadata
         if (lane == 0) {
-            Part* p      = &current->items[0].parts[0];
+            printf("[init] hull nv=%d nt=%d verts=%p tris=%p vol=%.6f\n",
+                   h.nv, h.nt, h.verts, h.tris, vol);
+            current->items[0].parts[0].hull_vol = vol;
+        }
+    } else {
+        if (lane == 0) {
+            Part* p          = &current->items[0].parts[0];
             p->mesh.verts    = verts;
             p->mesh.tris     = tris;
             p->mesh.nv       = nv;
@@ -490,8 +495,19 @@ extern "C" __global__ void beam_finalize(
 
     // Phase 2c: threshold check + free key buffer
     if (tid == 0) {
-        if (k > 0 && s_keys[0].cost < threshold)
-            *finish = 1;
+        if (k > 0) {
+            WorkItem* best = &current->items[s_keys[0].idx];
+            int best_np = best->nparts;
+            Part* best_last = &best->parts[best_np - 1];
+            const float pi = 3.14159265358979f;
+            float best_rv = cbrtf((3.0f / (4.0f * pi)) * fmaxf(best_last->hull_vol - best_last->mesh_vol, 0.0f));
+            printf("[finalize] nitems=%d k=%d best_cost=%.6f threshold=%.6f "
+                   "mesh_vol=%.6f hull_vol=%.6f hausdorff=%.6f rv=%.6f\n",
+                   nitems, k, s_keys[0].cost, threshold,
+                   best_last->mesh_vol, best_last->hull_vol, best_last->hausdorff, best_rv);
+            if (s_keys[0].cost < threshold)
+                *finish = 1;
+        }
         heap_free(&pool->scratch, (void*)s_keys);
     }
 

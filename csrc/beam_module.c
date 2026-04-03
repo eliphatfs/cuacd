@@ -5,6 +5,7 @@
 #define PY_SSIZE_T_CLEAN
 #define Py_LIMITED_API 0x030A0000  // Python 3.10
 #include <Python.h>
+#include <string.h>
 #include "beam.h"
 
 // ---------------------------------------------------------------------------
@@ -228,6 +229,91 @@ static PyObject* py_test_plane_cut(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// decompose(verts_ptr, nv, tris_ptr, nt,
+//           hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,
+//           max_iters, cuts_per_axis, threshold, max_keep, verbose=0)
+//   -> list of (verts_np, tris_np, mesh_vol, hull_vol, hausdorff)
+//      one tuple per output part.
+// verts/tris/hull_* are raw C pointers to contiguous float32/int32 arrays.
+// ---------------------------------------------------------------------------
+
+static PyObject* py_decompose(PyObject* self, PyObject* args, PyObject* kwargs) {
+    static char* kwlist[] = {
+        "verts_ptr", "nv", "tris_ptr", "nt",
+        "hull_verts_ptr", "hull_nv", "hull_tris_ptr", "hull_nt",
+        "max_iters", "cuts_per_axis", "threshold", "max_keep",
+        "verbose", NULL
+    };
+    unsigned long long vp, tp, hvp, htp;
+    int nv, nt, hull_nv, hull_nt;
+    int max_iters, cuts_per_axis, max_keep;
+    float threshold;
+    int verbose = 0;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiifi|i", kwlist,
+            &vp, &nv, &tp, &nt,
+            &hvp, &hull_nv, &htp, &hull_nt,
+            &max_iters, &cuts_per_axis, &threshold, &max_keep,
+            &verbose))
+        return NULL;
+
+    REQUIRE_CTX();
+
+    struct beam_result result;
+    memset(&result, 0, sizeof(result));
+
+    int rc = beam_decompose(g_state.ctx,
+        (const float*)(uintptr_t)vp,  nv,
+        (const int*)  (uintptr_t)tp,  nt,
+        (const float*)(uintptr_t)hvp, hull_nv,
+        (const int*)  (uintptr_t)htp, hull_nt,
+        max_iters, cuts_per_axis, threshold, max_keep,
+        verbose,
+        &result);
+    if (rc != 0) {
+        beam_result_free(&result);
+        return raise_error(g_state.ctx, rc);
+    }
+
+    // Build Python list of tuples, one per part.
+    // Each tuple: (verts_memoryview, tris_memoryview, mesh_vol, hull_vol, hausdorff)
+    // We copy into numpy-compatible bytes objects so the caller owns the data.
+    PyObject* list = PyList_New(result.nparts);
+    if (!list) { beam_result_free(&result); return NULL; }
+
+    for (int i = 0; i < result.nparts; i++) {
+        struct beam_part_result* p = &result.parts[i];
+        Py_ssize_t vbytes = (Py_ssize_t)p->nv * 3 * sizeof(float);
+        Py_ssize_t tbytes = (Py_ssize_t)p->nt * 3 * sizeof(int);
+
+        PyObject* vbuf = PyBytes_FromStringAndSize((const char*)p->verts, vbytes);
+        PyObject* tbuf = PyBytes_FromStringAndSize((const char*)p->tris,  tbytes);
+        if (!vbuf || !tbuf) {
+            Py_XDECREF(vbuf); Py_XDECREF(tbuf);
+            Py_DECREF(list);
+            beam_result_free(&result);
+            return NULL;
+        }
+
+        PyObject* tup = Py_BuildValue("(OOiffi)",
+            vbuf, tbuf,
+            p->nv, p->nt,
+            p->mesh_vol, p->hull_vol);
+        Py_DECREF(vbuf);
+        Py_DECREF(tbuf);
+        if (!tup) {
+            Py_DECREF(list);
+            beam_result_free(&result);
+            return NULL;
+        }
+        PyList_SetItem(list, i, tup);  /* steals ref; always succeeds for valid index */
+    }
+
+    beam_result_free(&result);
+    return list;
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -246,6 +332,10 @@ static PyMethodDef gpu_methods[] = {
     { "test_mesh_volume",   py_test_mesh_volume,   METH_VARARGS, "Mesh volume (single mesh)." },
     { "batch_mesh_volume",  py_batch_mesh_volume,  METH_VARARGS, "Batch mesh volume (divergence theorem)." },
     { "test_plane_cut",     py_test_plane_cut,     METH_VARARGS, "GPU plane cut with cap triangulation." },
+    { "decompose",          (PyCFunction)py_decompose, METH_VARARGS | METH_KEYWORDS,
+      "decompose(verts_ptr, nv, tris_ptr, nt, hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,\n"
+      "          max_iters, cuts_per_axis, threshold, max_keep, verbose=0)\n"
+      "-> list of (verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol) per part." },
     { NULL, NULL, 0, NULL }
 };
 

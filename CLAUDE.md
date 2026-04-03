@@ -212,6 +212,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **Block 1**: all 32 lanes call `mesh_volume_warp` on the hull mesh; lane 0 writes result to `current->items[0].parts[0].hull_vol`.
 - **Block 2**: thread 0 sets `parts[0].mesh` and `parts[0].hull` to point directly at the caller-supplied device pointers (both `refcount = NULL` — input arrays are not heap-allocated and will not interact with `heap_free`); sets `hausdorff = 0`; sets `nparts = 1`; sets `nitems = 1`.
 - **No error argument**: initialization cannot fail; volumes are computed independently of allocation.
+- **Block ordering**: blocks 0/1 build a local `Mesh` from kernel parameters directly (not reading from `current->items`) so there is no data dependency on block 2's writes. All three blocks write disjoint fields of `parts[0]`.
 
 ## beam_expansion API
 
@@ -261,6 +262,20 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **`WIKey` / `WIKeyCmp`**: sort struct `{float cost; int idx}`, ascending by cost, ties broken by index. `sentinel = {1e30f, 0x7fffffff}`.
 - **Error codes**: `BEAM_ERR_FINALIZE_OOM = 0x80000` on scratch OOM; `BEAM_ERR_SORT_STACK` reused for WIKey sort stack overflow. All `atomicOr`'d into `*err`; scratch freed before early return.
 - **`__syncwarp()` discipline**: every `if (wlane == 0)` write to global memory is immediately followed by `__syncwarp()` to make the write visible to all lanes before proceeding.
+- **Debug printf**: a `printf` in phase 2c logs `nitems, k, best_cost, threshold, mesh_vol, hull_vol, hausdorff, rv` when tracing the threshold check. Remove after root-cause is resolved.
+
+## beam_decompose (csrc/beam.c)
+
+`beam_decompose(ctx, verts, nv, tris, nt, hull_verts, hull_nv, hull_tris, hull_nt, max_iters, cuts_per_axis, threshold, max_keep, verbose, out)` — host-side full beam-search convex decomposition loop.
+
+- **Inputs**: mesh (verts/tris) and its precomputed convex hull (hull_verts/hull_tris) as host pointers; hyperparams; `verbose` flag.
+- **Allocations**: all device buffers allocated with `cuMemAllocAsync` / freed with `cuMemFreeAsync` on a dedicated `CUstream` (created with `cuStreamCreate`, NOT NULL stream — async pool allocations on NULL stream have ordering issues with subsequent kernels). Double-buffered WorkItem arrays: `d_wi_a`/`d_wi_b` each holding `3*cuts_per_axis*max_keep` WorkItems.
+- **Loop**: `beam_finalize → (sync + read finish/err/nitems) → beam_expansion → [swap buffers] → beam_hull → beam_sort`. No sync between expansion, hull, and sort — they pipeline in stream order. Sync only after finalize (to read finish/err/nitems in one batch of async D2H copies).
+- **Timing** (`verbose != 0`): prints per-iteration sync wait time and final readback time to stderr via `clock_gettime(CLOCK_MONOTONIC)`.
+- **Output**: `beam_result` with `nparts` parts; each `beam_part_result` has malloc'd `verts`/`tris` + scalar volumes. Free with `beam_result_free`.
+- **Readback** (`decomp_read_result`): reads AlgoState + WorkItem synchronously (large struct), then issues all per-part D2H copies async, syncs once at end.
+- **Python binding** (`beam_module.c → py_decompose`): returns a list of `(verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol)` tuples. Uses `PyBytes_FromStringAndSize` to copy part data; format string `"(OOiiff)"`.
+- **Known issue (WIP)**: `beam_finalize` sees `mesh_vol=hull_vol=0` for the initial WorkItem even though `beam_initialize` correctly computes and writes both volumes (verified by device printf). Root cause under investigation — not a cross-block sync issue (blocks 0/1 use kernel params, not `current->items` fields written by block 2).
 
 ## hull_dandc_warp_mesh API
 
