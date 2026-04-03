@@ -8,3 +8,4 @@
 #include "test_mesh_volume.cu"
 #include "test_plane_cut.cu"
 #include "mm.cu"
+#include "beam.cu"

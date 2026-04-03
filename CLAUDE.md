@@ -25,6 +25,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   mm.cu               #   heap_init_kernel: <<<2×HEAP_NUM_ARENAS,32>>> initialises both embedded heaps in DevicePool
+  beam.cu             #   beam_expansion kernel: <<<3×cuts_per_axis×nitems, 64>>> cuts last part of each WorkItem
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel (hull mesh extraction)
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel (thin wrapper around plane_cut_block)
@@ -202,6 +203,18 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **Early exit** (`n_cross == 0`): entire input mesh goes to one side; allocates one heap chunk for verts+tris, other side gets empty `Mesh {NULL,NULL,0,0}`.
 - **No-boundary / one-empty-side cases**: handled by natural fallthrough — compaction produces a 0-entry side correctly.
 - **Call sites**: `test_plane_cut.cu` (thin `__global__` wrapper) and `test_beam.c` (host launcher) pass `DeviceHeap*` pointers into the embedded heaps of `DevicePool`.
+
+## beam_expansion API
+
+`beam_expansion<<<3*cuts_per_axis*current->nitems, 64>>>(current, next, pool, cuts_per_axis, err)` — one block per (item, cut); produces candidate WorkItems in `next`.
+
+- **Block mapping**: `item_idx = blockIdx.x / (3*cuts_per_axis)`, `axis = (blockIdx.x % (3*cuts_per_axis)) / cuts_per_axis`, `slice = … % cuts_per_axis`.
+- **Plane**: axis-aligned at `(slice+1)/(cuts_per_axis+1)` fraction of the last part's bounding box. Bbox computed with parallel `atomicMinF/atomicMaxF` across all 64 threads.
+- **Calls `plane_cut_block`** on `wi->parts[nparts-1].mesh` using `pool->heap` and `pool->scratch`.
+- **Empty side**: if either `pos.mesh.nv == 0` or `neg.mesh.nv == 0`, frees the combined heap chunk and returns — no entry written to `next`.
+- **Overflow**: `BEAM_ERR_OVERFLOW = 0x10000` — `atomicOr`'d into `err` if `nparts+1 > WORK_ITEM_MAX_PARTS`. Distinct from any plane_cut error code (those are small integers).
+- **Part copy**: bulk int-copy of `parts[0..nparts-2]` in parallel; thread 0 appends `pp.pos` and `pp.neg`, sets `nparts = old_nparts + 1`.
+- **`next->nitems`**: incremented atomically (thread 0) only for successful cuts; caller must pre-zero it and ensure sufficient `items` capacity.
 
 ## hull_dandc_warp_mesh API
 
