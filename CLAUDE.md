@@ -19,7 +19,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   common.cuh          #   Constants, atomics (includes allocator.cuh)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
   geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
-  hull_warp_common.cuh#   WarpPool allocator + warp reductions (used by D&C)
+  warp_common.cuh     #   WarpPool allocator + warp reductions (warp_min_f, warp_max_f, etc.)
   hull_dandc.cuh      #   Preparata-Hong D&C hull (Bullet port); hull_dandc_warp_mesh returns Mesh via heap
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
@@ -209,7 +209,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 `beam_expansion<<<3*cuts_per_axis*current->nitems, 64>>>(current, next, pool, cuts_per_axis, err)` — one block per (item, cut); produces candidate WorkItems in `next`.
 
 - **Block mapping**: `item_idx = blockIdx.x / (3*cuts_per_axis)`, `axis = (blockIdx.x % (3*cuts_per_axis)) / cuts_per_axis`, `slice = … % cuts_per_axis`.
-- **Plane**: axis-aligned at `(slice+1)/(cuts_per_axis+1)` fraction of the last part's bounding box. Bbox computed with parallel `atomicMinF/atomicMaxF` across all 64 threads.
+- **Plane**: axis-aligned at `(slice+1)/(cuts_per_axis+1)` fraction of the last part's bounding box. Bbox via three-stage reduction: per-thread local min/max → `warp_min_f`/`warp_max_f` → lane-0-per-warp `atomicMinF`/`atomicMaxF` into shared memory.
 - **Calls `plane_cut_block`** on `wi->parts[nparts-1].mesh` using `pool->heap` and `pool->scratch`.
 - **Empty side**: if either `pos.mesh.nv == 0` or `neg.mesh.nv == 0`, frees the combined heap chunk and returns — no entry written to `next`.
 - **Overflow**: `BEAM_ERR_OVERFLOW = 0x10000` — `atomicOr`'d into `err` if `nparts+1 > WORK_ITEM_MAX_PARTS`. Distinct from any plane_cut error code (those are small integers).

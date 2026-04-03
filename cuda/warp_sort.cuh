@@ -19,9 +19,9 @@
 //   ws_cmp / ws_min / ws_max / ws_bitonic32            — BtPoint32 helpers
 //
 // Defines BtPoint32 (canonical definition used by hull_dandc.cuh too).
-// Requires: hull_warp_common.cuh (WARP_SIZE, WARP_MASK)
+// Requires: warp_common.cuh (WARP_SIZE, WARP_MASK)
 #pragma once
-#include "hull_warp_common.cuh"
+#include "warp_common.cuh"
 
 // ============================================================================
 // Generic warp shuffle for any POD type (sizeof(T) % 4 == 0)

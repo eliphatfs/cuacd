@@ -5,6 +5,7 @@
 // adds the two halves to a new WorkItem in next.
 
 #include "plane_cut.cuh"
+#include "warp_common.cuh"
 
 // Error code for exceeding WORK_ITEM_MAX_PARTS (distinct from plane_cut errors).
 #define BEAM_ERR_OVERFLOW 0x10000
@@ -27,18 +28,35 @@ extern "C" __global__ void beam_expansion(
     int       np   = wi->nparts;
     Mesh*     mesh = &wi->parts[np - 1].mesh;
 
-    // Compute bounding box of last mesh (parallel, atomic min/max into shared)
+    // Compute bounding box — three-stage reduction:
+    //   1. Each thread accumulates its own lo/hi over its strided vertices.
+    //   2. warp_min_f / warp_max_f reduces to a per-warp result (lane 0 holds it).
+    //   3. Lane 0 of each warp atomicMin/Max into shared memory.
     __shared__ float s_lo[3], s_hi[3];
     if (tid < 3) { s_lo[tid] = 1e30f; s_hi[tid] = -1e30f; }
     __syncthreads();
 
+    int  lane    = tid & 31;
+    float tlo[3] = { 1e30f,  1e30f,  1e30f};
+    float thi[3] = {-1e30f, -1e30f, -1e30f};
     for (int i = tid; i < mesh->nv; i += blockDim.x) {
-        atomicMinF(&s_lo[0], mesh->verts[3*i + 0]);
-        atomicMaxF(&s_hi[0], mesh->verts[3*i + 0]);
-        atomicMinF(&s_lo[1], mesh->verts[3*i + 1]);
-        atomicMaxF(&s_hi[1], mesh->verts[3*i + 1]);
-        atomicMinF(&s_lo[2], mesh->verts[3*i + 2]);
-        atomicMaxF(&s_hi[2], mesh->verts[3*i + 2]);
+        float x = mesh->verts[3*i + 0];
+        float y = mesh->verts[3*i + 1];
+        float z = mesh->verts[3*i + 2];
+        tlo[0] = fminf(tlo[0], x); thi[0] = fmaxf(thi[0], x);
+        tlo[1] = fminf(tlo[1], y); thi[1] = fmaxf(thi[1], y);
+        tlo[2] = fminf(tlo[2], z); thi[2] = fmaxf(thi[2], z);
+    }
+    // Warp reduction
+    for (int a = 0; a < 3; a++) {
+        tlo[a] = warp_min_f(tlo[a]);
+        thi[a] = warp_max_f(thi[a]);
+    }
+    // First lane of each warp writes to shared
+    if (lane == 0) {
+        atomicMinF(&s_lo[0], tlo[0]); atomicMaxF(&s_hi[0], thi[0]);
+        atomicMinF(&s_lo[1], tlo[1]); atomicMaxF(&s_hi[1], thi[1]);
+        atomicMinF(&s_lo[2], tlo[2]); atomicMaxF(&s_hi[2], thi[2]);
     }
     __syncthreads();
 

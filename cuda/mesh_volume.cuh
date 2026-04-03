@@ -1,6 +1,6 @@
 // mesh_volume.cuh — Per-warp mesh volume via divergence theorem.
 #pragma once
-#include "hull_warp_common.cuh"
+#include "warp_common.cuh"
 #include "geometry.cuh"
 #include "structs.cuh"
 
