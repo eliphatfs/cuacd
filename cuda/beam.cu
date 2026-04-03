@@ -523,12 +523,19 @@ extern "C" __global__ void beam_finalize(
             WorkItem* best = &s_scratch_items[0];
             int best_np = best->nparts;
             Part* best_last = &best->parts[best_np - 1];
-            const float pi = 3.14159265358979f;
-            float best_rv = cbrtf((3.0f / (4.0f * pi)) * fmaxf(best_last->hull_vol - best_last->mesh_vol, 0.0f));
+            const float kpi = 3.14159265358979f;
+            float best_rv = cbrtf((3.0f / (4.0f * kpi)) * fmaxf(best_last->hull_vol - best_last->mesh_vol, 0.0f));
             DPRINTF("[finalize] nitems=%d k=%d best_idx=%d best_nparts=%d best_cost=%.6f threshold=%.6f "
-                   "mesh_vol=%.6f hull_vol=%.6f hausdorff=%.6f rv=%.6f\n",
+                   "last_mesh_vol=%.6f last_hull_vol=%.6f last_hausdorff=%.6f last_rv=%.6f\n",
                    nitems, k, s_keys[0].idx, best_np, s_keys[0].cost, threshold,
                    best_last->mesh_vol, best_last->hull_vol, best_last->hausdorff, best_rv);
+            for (int pi = 0; pi < best_np; pi++) {
+                Part* pp = &best->parts[pi];
+                float pp_rv = cbrtf((3.0f / (4.0f * kpi)) * fmaxf(pp->hull_vol - pp->mesh_vol, 0.0f));
+                float pp_cost = fmaxf(PART_COST_K_RV * pp_rv, pp->hausdorff);
+                DPRINTF("  part[%d]: mesh_vol=%.6f hull_vol=%.6f hausdorff=%.6f rv=%.6f cost=%.6f\n",
+                       pi, pp->mesh_vol, pp->hull_vol, pp->hausdorff, pp_rv, pp_cost);
+            }
             if (s_keys[0].cost < threshold)
                 *finish = 1;
         }

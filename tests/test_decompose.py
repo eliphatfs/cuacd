@@ -142,12 +142,27 @@ def _decompose_shape(verts, tris, label, **kwargs):
     raw = _call_decompose(verts_n, tris, hull_verts, hull_tris, **kwargs)
 
     print(f"\n{label}: {len(raw)} parts")
+    print(f"  {'':>6s}  {'gpu_mesh':>10s} {'tm_mesh':>10s} {'gpu_hull':>10s} {'tm_hull':>10s} {'scipy_hull':>10s}")
     meshes = []
     for i, (vb, tb, nv, nt, mv, hv) in enumerate(raw):
         pv = np.frombuffer(vb, dtype=np.float32).reshape(nv, 3)
         pt = np.frombuffer(tb, dtype=np.int32).reshape(nt, 3)
         pv_world = _denormalize(pv, center, scale)
-        print(f"  part {i}: nv={nv} nt={nt} mesh_vol={mv:.4f} hull_vol={hv:.4f}")
+        # Compare volumes in normalized space
+        tm = trimesh.Trimesh(pv.copy(), pt.copy(), process=False)
+        tm_mesh_vol = abs(tm.volume) if tm.is_volume else float('nan')
+        # Convex hull of the part mesh via scipy
+        try:
+            sc_hull = ConvexHull(pv)
+            scipy_hull_vol = sc_hull.volume
+        except Exception:
+            scipy_hull_vol = float('nan')
+        # trimesh convex hull volume (uses its own hull)
+        try:
+            tm_hull_vol = abs(tm.convex_hull.volume)
+        except Exception:
+            tm_hull_vol = float('nan')
+        print(f"  part {i:2d}: {mv:10.6f} {tm_mesh_vol:10.6f} {hv:10.6f} {tm_hull_vol:10.6f} {scipy_hull_vol:10.6f}")
         meshes.append(trimesh.Trimesh(pv_world.copy(), pt.copy()))
     return meshes
 

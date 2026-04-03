@@ -44,6 +44,7 @@ tests/                # All tests
   bench_arena_sweep.py#   Arena count sweep: rebuild + run benchmark for each HEAP_NUM_ARENAS value
   test_warp_sort.py   #   Tests for warp_sort_bp32 (bitonic + quicksort paths)
   test_plane_cut.py   #   Plane cut tests: simple loop, ring, multi-hole, edge cases (14 tests)
+  test_decompose.py   #   beam_decompose tests (cube, lshape, octocat); volume comparison table (GPU vs trimesh vs scipy)
 docs/                 # Analysis and benchmark results
   arena_sweep.md      #   Arena count sweep results (HEAP_NUM_ARENAS ∈ {32,64,128,256})
 CoACD/                # Reference C++ CoACD (embedded repo, not a submodule)
@@ -269,7 +270,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **`WIKey` / `WIKeyCmp`**: sort struct `{float cost; int idx}`, ascending by cost, ties broken by index. `sentinel = {1e30f, 0x7fffffff}`.
 - **Error codes**: `BEAM_ERR_FINALIZE_OOM = 0x80000` on scratch OOM; `BEAM_ERR_SORT_STACK` reused for WIKey sort stack overflow. All `atomicOr`'d into `*err`; scratch freed before early return.
 - **`__syncwarp()` discipline**: every `if (wlane == 0)` write to global memory is immediately followed by `__syncwarp()` to make the write visible to all lanes before proceeding.
-- **Debug printf**: a `printf` in phase 2c logs `nitems, k, best_cost, threshold, mesh_vol, hull_vol, hausdorff, rv` when tracing the threshold check. Remove after root-cause is resolved.
+- **Debug printf**: DPRINTF in phase 2c logs (1) summary line with `nitems, k, best_cost, threshold` and last part's volumes, (2) per-part detail lines with `mesh_vol, hull_vol, hausdorff, rv, cost` for all parts in the best WorkItem. Gated on `COACD_BEAM_DEBUG` compile flag.
 
 ## beam_decompose (csrc/beam.c)
 
@@ -425,7 +426,7 @@ ncu --set full -o dandc_profile python tests/bench_dandc.py --n_pts 200 --n_hull
 - Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests)
 - Persistent heaps (`beam_init` with `pool_bytes`): both heaps share one pool, all memory recycled by kernels, pool stable after first call
 - `ctx.pool_usage()` — peak device pool bytes (monotonic), `ctx.heap_compact()` — available but not needed normally
-- `beam_decompose` (cube, lshape, octocat): cube → 1 part, lshape → 2 parts, octocat → 16 parts ✓
+- `beam_decompose` (cube, lshape, octocat): cube → 1 part, lshape → 2 parts, octocat → ~14 parts ✓; test prints volume comparison table (GPU vs trimesh vs scipy)
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input
