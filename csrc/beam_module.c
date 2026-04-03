@@ -295,7 +295,7 @@ static PyObject* py_decompose(PyObject* self, PyObject* args, PyObject* kwargs) 
             return NULL;
         }
 
-        PyObject* tup = Py_BuildValue("(OOiffi)",
+        PyObject* tup = Py_BuildValue("(OOiiff)",
             vbuf, tbuf,
             p->nv, p->nt,
             p->mesh_vol, p->hull_vol);

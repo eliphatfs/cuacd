@@ -62,14 +62,29 @@ def _make_lshape():
 
 
 def _scipy_hull(verts):
-    """Compute convex hull via scipy; return (hull_verts float32, hull_tris int32)."""
+    """Compute convex hull via scipy; return (hull_verts float32, hull_tris int32).
+
+    scipy simplices may have mixed winding. Reorient each triangle so its
+    normal points away from the hull centroid (outward), ensuring consistent
+    winding for the divergence theorem volume computation.
+    """
     ch = ConvexHull(verts)
     hull_verts = verts[ch.vertices].astype(np.float32)
-    # Remap simplices to hull_verts indices
     remap = {old: new for new, old in enumerate(ch.vertices)}
-    hull_tris = np.array([[remap[i] for i in tri] for tri in ch.simplices],
-                         dtype=np.int32)
-    return hull_verts, hull_tris
+    tris = np.array([[remap[i] for i in tri] for tri in ch.simplices],
+                    dtype=np.int32)
+
+    # Reorient: flip triangle if its normal points inward (toward centroid).
+    centroid = hull_verts.mean(axis=0)
+    v0 = hull_verts[tris[:, 0]]
+    v1 = hull_verts[tris[:, 1]]
+    v2 = hull_verts[tris[:, 2]]
+    normals = np.cross(v1 - v0, v2 - v0)          # (N,3) unnormalized
+    outward = (v0 - centroid)                       # vector from centroid to v0
+    inward  = (normals * outward).sum(axis=1) < 0  # dot < 0 → normal faces in
+    tris[inward] = tris[inward][:, [0, 2, 1]]      # swap v1/v2 to flip normal
+
+    return hull_verts, tris
 
 
 def _call_decompose(verts, tris, hull_verts, hull_tris,

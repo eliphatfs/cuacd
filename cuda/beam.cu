@@ -179,10 +179,8 @@ extern "C" __global__ void beam_expansion(
     // If either side is empty, discard the cut result and exit
     if (pp.pos.mesh.nv == 0 || pp.neg.mesh.nv == 0) {
         if (tid == 0) {
-            void* chunk = pp.pos.mesh.verts
-                          ? (void*)pp.pos.mesh.verts
-                          : (void*)pp.neg.mesh.verts;
-            heap_free(&pool->heap, chunk);
+            if (pp.pos.mesh.verts) heap_free(&pool->heap, (void*)pp.pos.mesh.verts);
+            if (pp.neg.mesh.verts) heap_free(&pool->heap, (void*)pp.neg.mesh.verts);
         }
         return;
     }
@@ -192,6 +190,7 @@ extern "C" __global__ void beam_expansion(
         if (tid == 0) {
             atomicOr(err, BEAM_ERR_OVERFLOW);
             heap_free(&pool->heap, (void*)pp.pos.mesh.verts);
+            heap_free(&pool->heap, (void*)pp.neg.mesh.verts);
         }
         return;
     }
@@ -405,6 +404,12 @@ extern "C" __global__ void beam_finalize(
     if (tid == 0) {
         s_nitems = current->nitems;
         s_k      = (max_keep < s_nitems) ? max_keep : s_nitems;
+        printf("[finalize-enter] nitems=%d items_ptr=%p\n", s_nitems, current->items);
+        if (s_nitems > 0) {
+            WorkItem* wi0 = &current->items[0];
+            printf("[finalize-enter] wi0.nparts=%d wi0.parts[0].mesh_vol=%.6f wi0.parts[0].hull_vol=%.6f\n",
+                   wi0->nparts, wi0->parts[0].mesh_vol, wi0->parts[0].hull_vol);
+        }
         if (s_nitems == 0) { s_keys = NULL; s_key_scratch = NULL; }
         else {
             int key_bytes  = s_nitems * (int)sizeof(WIKey);
@@ -496,14 +501,15 @@ extern "C" __global__ void beam_finalize(
     // Phase 2c: threshold check + free key buffer
     if (tid == 0) {
         if (k > 0) {
-            WorkItem* best = &current->items[s_keys[0].idx];
+            // Read from scratch (phase 2b already zeroed current->items[s_keys[0].idx])
+            WorkItem* best = &s_scratch_items[0];
             int best_np = best->nparts;
             Part* best_last = &best->parts[best_np - 1];
             const float pi = 3.14159265358979f;
             float best_rv = cbrtf((3.0f / (4.0f * pi)) * fmaxf(best_last->hull_vol - best_last->mesh_vol, 0.0f));
-            printf("[finalize] nitems=%d k=%d best_cost=%.6f threshold=%.6f "
+            printf("[finalize] nitems=%d k=%d best_idx=%d best_nparts=%d best_cost=%.6f threshold=%.6f "
                    "mesh_vol=%.6f hull_vol=%.6f hausdorff=%.6f rv=%.6f\n",
-                   nitems, k, s_keys[0].cost, threshold,
+                   nitems, k, s_keys[0].idx, best_np, s_keys[0].cost, threshold,
                    best_last->mesh_vol, best_last->hull_vol, best_last->hausdorff, best_rv);
             if (s_keys[0].cost < threshold)
                 *finish = 1;

@@ -890,8 +890,8 @@ __device__ inline PartPair plane_cut_block(
         for (int i = tid; i < total_neg * 3; i += PC_BLOCK) neg_tris[i] = neg_remap[neg_tris[i]];
         __syncthreads();
 
-        // Step G: single combined heap alloc + output metadata (thread 0)
-        // [pos_verts | pos_tris | neg_verts | neg_tris], each 16-byte aligned
+        // Step G: two separate heap allocs (pos and neg), each with own refcount.
+        // Layout: [verts | tris | refcount(16B)], 16-byte aligned sections.
         if (tid == 0) {
             int pnv = s_pnv, nnv = s_nnv;
             unsigned int pv_b=(unsigned int)PC_ALIGN16(pnv      *3*(int)sizeof(float));
@@ -899,18 +899,21 @@ __device__ inline PartPair plane_cut_block(
             unsigned int nv_b=(unsigned int)PC_ALIGN16(nnv      *3*(int)sizeof(float));
             unsigned int nt_b=(unsigned int)PC_ALIGN16(total_neg*3*(int)sizeof(int));
             unsigned int rc_b=(unsigned int)PC_ALIGN16((int)sizeof(int));
-            unsigned int sz = pv_b+pt_b+nv_b+nt_b+rc_b; if (!sz) sz=1;
-            void* chunk = NULL;
+            unsigned int psz = pv_b+pt_b+rc_b; if (!psz) psz=1;
+            unsigned int nsz = nv_b+nt_b+rc_b; if (!nsz) nsz=1;
+            void* pchunk = NULL; void* nchunk = NULL;
             s_chunk_ok = 0;
-            if (heap_alloc(heap, sz, &chunk) == HEAP_OK) {
+            if (heap_alloc(heap, psz, &pchunk) == HEAP_OK &&
+                heap_alloc(heap, nsz, &nchunk) == HEAP_OK) {
                 s_chunk_ok = 1;
-                char* cb = (char*)chunk;
-                s_pvp = (float*)(cb);
-                s_ptp = (int*)  (cb+pv_b);
-                s_nvp = (float*)(cb+pv_b+pt_b);
-                s_ntp = (int*)  (cb+pv_b+pt_b+nv_b);
-                int*   rcp = (int*)(cb+pv_b+pt_b+nv_b+nt_b);
-                *rcp = 1;
+                char* pcb = (char*)pchunk;
+                char* ncb = (char*)nchunk;
+                s_pvp = (float*)(pcb);
+                s_ptp = (int*)  (pcb+pv_b);
+                int* rcp = (int*)(pcb+pv_b+pt_b); *rcp = 1;
+                s_nvp = (float*)(ncb);
+                s_ntp = (int*)  (ncb+nv_b);
+                int* rcn = (int*)(ncb+nv_b+nt_b); *rcn = 1;
                 pc_zero_part(&s_result.pos);
                 s_result.pos.mesh.verts=s_pvp; s_result.pos.mesh.tris=s_ptp;
                 s_result.pos.mesh.nv=pnv;      s_result.pos.mesh.nt=total_pos;
@@ -918,9 +921,10 @@ __device__ inline PartPair plane_cut_block(
                 pc_zero_part(&s_result.neg);
                 s_result.neg.mesh.verts=s_nvp; s_result.neg.mesh.tris=s_ntp;
                 s_result.neg.mesh.nv=nnv;      s_result.neg.mesh.nt=total_neg;
-                s_result.neg.mesh.refcount=rcp;
+                s_result.neg.mesh.refcount=rcn;
             } else {
                 atomicOr(kernel_error, PC_KERR_POOL_OOM);
+                if (pchunk) heap_free(heap, pchunk);
                 s_pvp=NULL; s_ptp=NULL; s_nvp=NULL; s_ntp=NULL;
             }
         }

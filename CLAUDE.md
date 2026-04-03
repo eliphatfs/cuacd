@@ -195,8 +195,8 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 `plane_cut_block(mesh, pa, pb, pc_n, pd, heap, scratch_heap, kernel_error) -> PartPair` — device function, one block (64 threads).
 
 - **Input**: `const Mesh*` (replaces separate verts/tris/nv/nt params).
-- **Output**: returns a `PartPair` directly (stored in `__shared__ PartPair s_result`); `pos.mesh` and `neg.mesh` point into a **single heap chunk** allocated from `DeviceHeap* heap`.
-- **Heap chunk layout** (one `heap_alloc` call on `heap`): `[pos_verts | pos_tris | neg_verts | neg_tris | refcount(16B)]`, each section 16-byte aligned. `pos.mesh.refcount` and `neg.mesh.refcount` both point to the same `int` at the end of the chunk; initialized to 1. Early-exit (no-cross) case uses a separate `[verts | tris | refcount(16B)]` layout with the single mesh's `refcount` set similarly. Input meshes not allocated via `plane_cut_block` have `refcount = NULL`.
+- **Output**: returns a `PartPair` directly (stored in `__shared__ PartPair s_result`); `pos.mesh` and `neg.mesh` each have their own independent heap allocation from `DeviceHeap* heap`.
+- **Heap chunk layout** (two `heap_alloc` calls on `heap`): pos chunk `[verts | tris | refcount(16B)]`, neg chunk `[verts | tris | refcount(16B)]`, each section 16-byte aligned. `pos.mesh.refcount` and `neg.mesh.refcount` point to independent `int`s in their respective chunks; each initialized to 1. `pos.mesh.verts` and `neg.mesh.verts` are both the starts of their respective allocations — `heap_free(mesh.verts)` is always valid. Early-exit (no-cross) case allocates one chunk `[verts | tris | refcount(16B)]` for the non-empty side. Input meshes not allocated via `plane_cut_block` have `refcount = NULL`.
 - **Scratch**: all temporary buffers (signs, all_verts, cross_edges, sort_scratch, isect_idx, pos_tris, neg_tris, dir_edges, dir_sort, boundary_flags, and per-loop working buffers) are allocated from `DeviceHeap* scratch_heap` and freed individually as soon as each buffer's last use completes. Nothing from scratch_heap survives the call.
 - **Vertex compaction** (phase 13, parallel): phases 1-12 run on thread 0 or warp 0; phase 13 runs across all 64 threads. Steps: init remap[]=-1 (strided), mark used verts via `atomicMax` (strided), count per contiguous chunk, exclusive prefix scan (thread 0, 64 iters), assign new indices per chunk, remap tris in-place (strided), heap alloc (thread 0), scatter verts + copy tris (strided). Each side's `Mesh.verts` contains only the vertices actually referenced — no loose vertices.
 - **Counters** (`n_cross`, `n_all_verts`, `n_pos`, `n_neg`): stored in `__shared__ int s_counters[4]`; `atomicAdd` on shared memory. Not on heap.
@@ -221,7 +221,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **Block mapping**: `item_idx = blockIdx.x / (3*cuts_per_axis)`, `axis = (blockIdx.x % (3*cuts_per_axis)) / cuts_per_axis`, `slice = … % cuts_per_axis`.
 - **Plane**: axis-aligned at `(slice+1)/(cuts_per_axis+1)` fraction of the last part's bounding box. Bbox via three-stage reduction: per-thread local min/max → `warp_min_f`/`warp_max_f` → lane-0-per-warp `atomicMinF`/`atomicMaxF` into shared memory.
 - **Calls `plane_cut_block`** on `wi->parts[nparts-1].mesh` using `pool->heap` and `pool->scratch`.
-- **Empty side**: if either `pos.mesh.nv == 0` or `neg.mesh.nv == 0`, frees the combined heap chunk and returns — no entry written to `next`.
+- **Empty side**: if either `pos.mesh.nv == 0` or `neg.mesh.nv == 0`, frees both pos and neg heap chunks independently and returns — no entry written to `next`.
 - **Overflow**: `BEAM_ERR_OVERFLOW = 0x10000` — `atomicOr`'d into `err` if `nparts+1 > WORK_ITEM_MAX_PARTS`. Distinct from any plane_cut error code (those are small integers).
 - **Part copy**: bulk int-copy of `parts[0..nparts-2]` in parallel; thread 0 appends `pp.pos` and `pp.neg`, sets `nparts = old_nparts + 1`. After the copy, threads iterate over the `nparts-1` copied parts in parallel and `atomicAdd(+1)` on `part.mesh.refcount` and `part.hull.refcount` if non-null.
 - **`next->nitems`**: incremented atomically (thread 0) only for successful cuts; caller must pre-zero it and ensure sufficient `items` capacity.
@@ -275,7 +275,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **Output**: `beam_result` with `nparts` parts; each `beam_part_result` has malloc'd `verts`/`tris` + scalar volumes. Free with `beam_result_free`.
 - **Readback** (`decomp_read_result`): reads AlgoState + WorkItem synchronously (large struct), then issues all per-part D2H copies async, syncs once at end.
 - **Python binding** (`beam_module.c → py_decompose`): returns a list of `(verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol)` tuples. Uses `PyBytes_FromStringAndSize` to copy part data; format string `"(OOiiff)"`.
-- **Known issue (WIP)**: `beam_finalize` sees `mesh_vol=hull_vol=0` for the initial WorkItem even though `beam_initialize` correctly computes and writes both volumes (verified by device printf). Root cause under investigation — not a cross-block sync issue (blocks 0/1 use kernel params, not `current->items` fields written by block 2).
+- **Python binding** (`beam_module.c → py_decompose`): returns a list of `(verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol)` tuples. Uses `PyBytes_FromStringAndSize` to copy part data; format string `"(OOiiff)"`.
 
 ## hull_dandc_warp_mesh API
 
