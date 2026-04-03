@@ -315,6 +315,24 @@ class TestEdgeCases:
             _check_watertight(nv, nt, "neg")
             _check_volume_conservation(pv, pt, nv, nt, 1.0, tol=0.05)
 
+    def test_two_disjoint_cubes(self):
+        """Two disjoint cubes cut by z=0 — both split, watertight, volume conserved."""
+        c = trimesh.creation.box(extents=(0.5, 0.5, 0.5))
+        cv = np.array(c.vertices, dtype=np.float32)
+        ct = np.array(c.faces, dtype=np.int32)
+        # Cube A centered at (-1, 0, 0), Cube B at (+1, 0, 0)
+        va = cv.copy(); va[:, 0] -= 1.0
+        vb = cv.copy(); vb[:, 0] += 1.0
+        v = np.vstack([va, vb])
+        t = np.vstack([ct, ct + len(va)])
+        total_vol = abs(_signed_volume(v, t))
+        # Cut with z=0
+        pv, pt, nv, nt = _plane_cut(v, t, 0, 0, 1, 0)
+        assert len(pt) > 0 and len(nt) > 0, "Expected split on both sides"
+        _check_watertight(pv, pt, "pos")
+        _check_watertight(nv, nt, "neg")
+        _check_volume_conservation(pv, pt, nv, nt, total_vol, tol=0.02)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -625,81 +625,123 @@ __device__ inline PartPair plane_cut_block(
                         else                        { pu=0; pv_ax=1; }
                     }
 
-                    // Phase 11: build polygon (bridge holes if needed)
-                    int poly_n = 0;
-                    if (n_loops == 1) {
-                        for (int i = 0; i < loop_sizes[0]; i++)
-                            polygon[i] = lv[loop_starts[0]+i];
-                        poly_n = loop_sizes[0];
-                        if (pc_signed_area(all_verts.raw(), polygon.raw(), poly_n, pu, pv_ax) < 0)
-                            pc_reverse(polygon.raw(), poly_n);
-                    } else if (n_loops > 1) {
-                        int outer_i = 0; float max_abs = 0;
-                        for (int i = 0; i < n_loops; i++) {
-                            float a = pc_signed_area(all_verts.raw(), lv.raw()+loop_starts[i], loop_sizes[i], pu, pv_ax);
-                            if (fabsf(a) > max_abs) { max_abs=fabsf(a); outer_i=i; }
-                        }
-                        if (pc_signed_area(all_verts.raw(), lv.raw()+loop_starts[outer_i], loop_sizes[outer_i], pu, pv_ax) < 0)
-                            pc_reverse(lv.raw()+loop_starts[outer_i], loop_sizes[outer_i]);
-                        for (int i = 0; i < n_loops; i++) {
-                            if (i == outer_i) continue;
-                            if (pc_signed_area(all_verts.raw(), lv.raw()+loop_starts[i], loop_sizes[i], pu, pv_ax) > 0)
-                                pc_reverse(lv.raw()+loop_starts[i], loop_sizes[i]);
-                        }
+                    // Phase 11-12: For each group of loops, build polygon
+                    // (bridging true holes) and ear-clip.
+                    //
+                    // Loops that are not contained inside any other loop are
+                    // independent islands — ear-clipped separately.  Loops
+                    // contained inside another are holes that get bridged
+                    // into their enclosing loop before ear-clipping.
 
-                        // Sort inner holes by rightmost vertex (descending u)
+                    // Orient all loops: positive area = CCW (outer), negative = CW (hole).
+                    for (int i = 0; i < n_loops; i++) {
+                        float a = pc_signed_area(all_verts.raw(), lv.raw()+loop_starts[i], loop_sizes[i], pu, pv_ax);
+                        if (a < 0) pc_reverse(lv.raw()+loop_starts[i], loop_sizes[i]);
+                    }
+
+                    // Classify: is_hole[i] = 1 if loop i's first vertex is inside some other loop.
+                    // parent[i] = enclosing loop index (smallest enclosing area), or -1.
+                    // Reuse inner_idx as parent[], inner_max_u's int-alias as is_hole[].
+                    // Both are 256-element buffers from sb_ptr.
+                    // First 128 entries: parent/is_hole classification (read-only after fill).
+                    // Second 128 entries: per-outer hole sort scratch.
+                    int*   parent    = inner_idx.raw();
+                    int*   is_hole   = inner_idx.raw() + 128;
+                    int*   h_idx     = (int*)inner_max_u;          // hole sort: indices
+                    float* h_max_u   = inner_max_u + 128;          // hole sort: max-u values
+                    int max_loops = 128;  // limit loops to fit classification arrays
+                    for (int i = 0; i < n_loops && i < max_loops; i++) { parent[i] = -1; is_hole[i] = 0; }
+
+                    for (int i = 0; i < n_loops && i < max_loops; i++) {
+                        if (loop_sizes[i] < 3) continue;
+                        // Test first vertex of loop i against all other loops
+                        int vi = lv[loop_starts[i]];
+                        float pu_ = all_verts[vi*3+pu], pv_ = all_verts[vi*3+pv_ax];
+                        float best_area = 1e30f;
+                        for (int j = 0; j < n_loops && j < max_loops; j++) {
+                            if (j == i || loop_sizes[j] < 3) continue;
+                            // Ray-casting point-in-polygon (2D, along +u axis)
+                            int* lp = lv.raw() + loop_starts[j];
+                            int ls_ = loop_sizes[j];
+                            int crossings = 0;
+                            for (int k = 0; k < ls_; k++) {
+                                int kn = (k+1) % ls_;
+                                float ay = all_verts[lp[k]*3+pv_ax], by = all_verts[lp[kn]*3+pv_ax];
+                                if ((ay <= pv_) == (by <= pv_)) continue;
+                                float ax = all_verts[lp[k]*3+pu], bx = all_verts[lp[kn]*3+pu];
+                                float t = (pv_ - ay) / (by - ay);
+                                if (ax + t * (bx - ax) > pu_) crossings++;
+                            }
+                            if (crossings & 1) {
+                                // i is inside j — pick smallest enclosing
+                                float a = fabsf(pc_signed_area(all_verts.raw(), lp, ls_, pu, pv_ax));
+                                if (a < best_area) { best_area = a; parent[i] = j; }
+                            }
+                        }
+                        if (parent[i] >= 0) is_hole[i] = 1;
+                    }
+
+                    // Reverse hole loops to CW winding (they were oriented CCW above).
+                    for (int i = 0; i < n_loops && i < max_loops; i++) {
+                        if (is_hole[i]) pc_reverse(lv.raw()+loop_starts[i], loop_sizes[i]);
+                    }
+
+                    // Process each outer loop (non-hole) and its direct children.
+                    for (int oi = 0; oi < n_loops && oi < max_loops; oi++) {
+                        if (is_hole[oi] || loop_sizes[oi] < 3) continue;
+
+                        // Copy outer loop into polygon
+                        int poly_n = loop_sizes[oi];
+                        for (int i = 0; i < poly_n; i++)
+                            polygon[i] = lv[loop_starts[oi]+i];
+
+                        // Collect direct holes (parent == oi), sorted by rightmost u descending
                         int n_inner = 0;
-                        for (int i = 0; i < n_loops && n_inner < 256; i++) {
-                            if (i == outer_i || loop_sizes[i] < 3) continue;
+                        for (int i = 0; i < n_loops && n_inner < 128; i++) {
+                            if (parent[i] != oi || loop_sizes[i] < 3) continue;
                             float mu = -1e30f;
                             for (int j = 0; j < loop_sizes[i]; j++) {
                                 float u = all_verts[lv[loop_starts[i]+j]*3+pu];
                                 if (u > mu) mu = u;
                             }
-                            inner_idx[n_inner] = i; inner_max_u[n_inner] = mu; n_inner++;
+                            h_idx[n_inner] = i; h_max_u[n_inner] = mu; n_inner++;
                         }
                         for (int i = 0; i < n_inner-1; i++) {
                             int best = i;
                             for (int j = i+1; j < n_inner; j++)
-                                if (inner_max_u[j] > inner_max_u[best]) best = j;
+                                if (h_max_u[j] > h_max_u[best]) best = j;
                             if (best != i) {
-                                int ti=inner_idx[i]; inner_idx[i]=inner_idx[best]; inner_idx[best]=ti;
-                                float tf=inner_max_u[i]; inner_max_u[i]=inner_max_u[best]; inner_max_u[best]=tf;
+                                int ti=h_idx[i]; h_idx[i]=h_idx[best]; h_idx[best]=ti;
+                                float tf=h_max_u[i]; h_max_u[i]=h_max_u[best]; h_max_u[best]=tf;
                             }
                         }
 
-                        // Start with outer loop
-                        for (int i = 0; i < loop_sizes[outer_i]; i++)
-                            polygon[i] = lv[loop_starts[outer_i]+i];
-                        poly_n = loop_sizes[outer_i];
-
-                        // Bridge each inner hole
+                        // Bridge each hole into polygon
                         for (int ii = 0; ii < n_inner; ii++) {
-                            int hi = inner_idx[ii], hs = loop_sizes[hi];
+                            int hi = h_idx[ii], hs = loop_sizes[hi];
                             int* hole = lv.raw() + loop_starts[hi];
                             int m_idx = 0; float max_u = -1e30f;
                             for (int j = 0; j < hs; j++) {
                                 float u = all_verts[hole[j]*3+pu];
                                 if (u > max_u) { max_u=u; m_idx=j; }
                             }
-                            float mu = all_verts[hole[m_idx]*3+pu];
-                            float mv = all_verts[hole[m_idx]*3+pv_ax];
+                            float mu_ = all_verts[hole[m_idx]*3+pu];
+                            float mv_ = all_verts[hole[m_idx]*3+pv_ax];
                             float best_t = 1e30f; int best_edge = -1;
                             for (int j = 0; j < poly_n; j++) {
                                 int jn = (j+1)%poly_n;
                                 float au=all_verts[polygon[j]*3+pu],  av2=all_verts[polygon[j]*3+pv_ax];
                                 float bu=all_verts[polygon[jn]*3+pu], bv2=all_verts[polygon[jn]*3+pv_ax];
                                 float dv = bv2-av2; if (fabsf(dv)<1e-10f) continue;
-                                float s = (mv-av2)/dv;
+                                float s = (mv_-av2)/dv;
                                 if (s<-1e-10f||s>1.0f+1e-10f) continue;
-                                float tv = au+s*(bu-au)-mu;
+                                float tv = au+s*(bu-au)-mu_;
                                 if (tv>1e-10f && tv<best_t) { best_t=tv; best_edge=j; }
                             }
                             if (best_edge < 0) continue;
                             int jn=(best_edge+1)%poly_n;
                             int p_pos = (all_verts[polygon[best_edge]*3+pu] >= all_verts[polygon[jn]*3+pu])
                                         ? best_edge : jn;
-                            // Bridge: use cap_tris as swap buffer (overwritten then moved to polygon)
                             int k = 0;
                             for (int j=0; j<=p_pos; j++) cap_tris[k++]=polygon[j];
                             for (int j=0; j<hs; j++) cap_tris[k++]=hole[(m_idx+j)%hs];
@@ -708,53 +750,53 @@ __device__ inline PartPair plane_cut_block(
                             for (int j=0; j<k; j++) polygon[j]=cap_tris[j];
                             poly_n=k;
                         }
-                    }
+
+                        // Ear-clip this polygon
+                        if (poly_n >= 3) {
+                            int* prev_a = ear_prevnext.raw();
+                            int* next_a = ear_prevnext.raw() + poly_n;
+                            for (int i = 0; i < poly_n; i++) {
+                                prev_a[i]=(i+poly_n-1)%poly_n; next_a[i]=(i+1)%poly_n;
+                            }
+                            int remaining=poly_n, cur=0, max_iter=poly_n*poly_n, iter=0;
+                            while (remaining > 3 && iter < max_iter) {
+                                iter++;
+                                int p=prev_a[cur], n=next_a[cur];
+                                int vp=polygon[p], vc=polygon[cur], vn=polygon[n];
+                                float up=all_verts[vp*3+pu],  vp_=all_verts[vp*3+pv_ax];
+                                float uc=all_verts[vc*3+pu],  vc_=all_verts[vc*3+pv_ax];
+                                float un=all_verts[vn*3+pu],  vn_=all_verts[vn*3+pv_ax];
+                                float cross=(uc-up)*(vn_-vp_)-(vc_-vp_)*(un-up);
+                                if (cross<=1e-10f) { cur=next_a[cur]; continue; }
+                                int ear=1, chk=next_a[n];
+                                while (chk != p) {
+                                    int vi_=polygon[chk];
+                                    float cu=all_verts[vi_*3+pu], cv=all_verts[vi_*3+pv_ax];
+                                    if (fabsf(cu-up)+fabsf(cv-vp_)>1e-6f &&
+                                        fabsf(cu-uc)+fabsf(cv-vc_)>1e-6f &&
+                                        fabsf(cu-un)+fabsf(cv-vn_)>1e-6f &&
+                                        pc_pt_in_tri(cu,cv,up,vp_,uc,vc_,un,vn_))
+                                        { ear=0; break; }
+                                    chk=next_a[chk];
+                                }
+                                if (ear) {
+                                    cap_tris[n_cap*3]=vp; cap_tris[n_cap*3+1]=vc; cap_tris[n_cap*3+2]=vn;
+                                    n_cap++; next_a[p]=n; prev_a[n]=p; remaining--; cur=n; iter=0;
+                                } else { cur=next_a[cur]; }
+                            }
+                            if (remaining == 3) {
+                                int p=prev_a[cur], n=next_a[cur];
+                                cap_tris[n_cap*3]=polygon[p]; cap_tris[n_cap*3+1]=polygon[cur]; cap_tris[n_cap*3+2]=polygon[n];
+                                n_cap++;
+                            }
+                        }
+                    } // end for each outer loop
 
                     // lv, loop_starts, loop_sizes, sort buf no longer needed
                     heap_free(scratch_heap, lv2_ptr);   lv2_ptr = NULL;
                     heap_free(scratch_heap, ls_ptr);     ls_ptr  = NULL;
                     heap_free(scratch_heap, lsz_ptr);    lsz_ptr = NULL;
                     heap_free(scratch_heap, sb_ptr);      sb_ptr  = NULL;
-
-                    // Phase 12: Ear clipping
-                    if (poly_n >= 3) {
-                        CheckedBuf<int> prev_a = ear_prevnext.slice(0, poly_n);
-                        CheckedBuf<int> next_a = ear_prevnext.slice(poly_n, poly_n);
-                        for (int i = 0; i < poly_n; i++) {
-                            prev_a[i]=(i+poly_n-1)%poly_n; next_a[i]=(i+1)%poly_n;
-                        }
-                        int remaining=poly_n, cur=0, max_iter=poly_n*poly_n, iter=0;
-                        while (remaining > 3 && iter < max_iter) {
-                            iter++;
-                            int p=prev_a[cur], n=next_a[cur];
-                            int vp=polygon[p], vc=polygon[cur], vn=polygon[n];
-                            float up=all_verts[vp*3+pu],  vp_=all_verts[vp*3+pv_ax];
-                            float uc=all_verts[vc*3+pu],  vc_=all_verts[vc*3+pv_ax];
-                            float un=all_verts[vn*3+pu],  vn_=all_verts[vn*3+pv_ax];
-                            float cross=(uc-up)*(vn_-vp_)-(vc_-vp_)*(un-up);
-                            if (cross<=1e-10f) { cur=next_a[cur]; continue; }
-                            int ear=1, chk=next_a[n];
-                            while (chk != p) {
-                                int vi_=polygon[chk];
-                                float cu=all_verts[vi_*3+pu], cv=all_verts[vi_*3+pv_ax];
-                                if (fabsf(cu-up)+fabsf(cv-vp_)>1e-6f &&
-                                    fabsf(cu-uc)+fabsf(cv-vc_)>1e-6f &&
-                                    fabsf(cu-un)+fabsf(cv-vn_)>1e-6f &&
-                                    pc_pt_in_tri(cu,cv,up,vp_,uc,vc_,un,vn_))
-                                    { ear=0; break; }
-                                chk=next_a[chk];
-                            }
-                            if (ear) {
-                                cap_tris[n_cap*3]=vp; cap_tris[n_cap*3+1]=vc; cap_tris[n_cap*3+2]=vn;
-                                n_cap++; next_a[p]=n; prev_a[n]=p; remaining--; cur=n; iter=0;
-                            } else { cur=next_a[cur]; }
-                        }
-                        if (remaining == 3) {
-                            int p=prev_a[cur], n=next_a[cur];
-                            cap_tris[n_cap*3]=polygon[p]; cap_tris[n_cap*3+1]=polygon[cur]; cap_tris[n_cap*3+2]=polygon[n];
-                            n_cap++;
-                        }
-                    }
 
                     // polygon and ear_prevnext no longer needed
                     heap_free(scratch_heap, poly_ptr); poly_ptr = NULL;
