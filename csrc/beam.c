@@ -280,7 +280,7 @@ int beam_decompose(
     const float* hull_verts, int hull_nv,
     const int*   hull_tris,  int hull_nt,
     int max_iters, int cuts_per_axis, float threshold, int max_keep,
-    int verbose,
+    int verbose, int debug,
     struct beam_result* out)
 {
     // Local CHECK that sets result_code and jumps to cleanup.
@@ -316,6 +316,16 @@ int beam_decompose(
     CUdeviceptr d_wi_a       = 0, d_wi_b        = 0;
     CUdeviceptr d_state_a    = 0, d_state_b     = 0;
     CUdeviceptr d_err        = 0, d_finish      = 0;
+
+    // Pinned host memory for truly async D2H copies (pageable memory
+    // forces cuMemcpyDtoHAsync to block until all prior stream work
+    // completes, hiding GPU time from the sync measurement).
+    void* h_pinned = NULL;
+    LCHECK(cuMemAllocHost(&h_pinned,
+                          sizeof(int) + sizeof(int) + sizeof(struct AlgoState_h)));
+    int*                h_finish_p = (int*)h_pinned;
+    int*                h_err_p    = (int*)((char*)h_pinned + sizeof(int));
+    struct AlgoState_h* h_st_p     = (struct AlgoState_h*)((char*)h_pinned + 2*sizeof(int));
 
     // Resolve beam kernels
     CUfunction fn_init = NULL, fn_expand = NULL, fn_hull = NULL,
@@ -386,6 +396,8 @@ int beam_decompose(
     // ------------------------------------------------------------------
     // Main loop
     // ------------------------------------------------------------------
+    struct timespec _t_iter;
+    TSTAMP(_t_iter);
     for (int iter = 0; iter < max_iters; iter++) {
 
         // ---- beam_finalize: clear prev, compact current to max_keep ----
@@ -397,28 +409,29 @@ int beam_decompose(
                                   max_keep, 1, 1, 1024, 1, 1,
                                   0, s, args, NULL));
         }
-        // Batch three D2H transfers async, then sync once before reading any.
-        int h_finish = 0, h_err = 0;
-        struct AlgoState_h h_st;
-        memset(&h_st, 0, sizeof(h_st));
-        LCHECK(cuMemcpyDtoHAsync(&h_finish, d_finish,  sizeof(int),                s));
-        LCHECK(cuMemcpyDtoHAsync(&h_err,    d_err,     sizeof(int),                s));
-        LCHECK(cuMemcpyDtoHAsync(&h_st,     d_current, sizeof(struct AlgoState_h), s));
+        // Batch three D2H transfers async (pinned host memory), then sync.
+        *h_finish_p = 0; *h_err_p = 0;
+        memset(h_st_p, 0, sizeof(*h_st_p));
+        LCHECK(cuMemcpyDtoHAsync(h_finish_p, d_finish,  sizeof(int),                s));
+        LCHECK(cuMemcpyDtoHAsync(h_err_p,    d_err,     sizeof(int),                s));
+        LCHECK(cuMemcpyDtoHAsync(h_st_p,     d_current, sizeof(struct AlgoState_h), s));
         TSTAMP(_t0);
         LCHECK(cuStreamSynchronize(s));
         TSTAMP(_t1);
-        if (verbose)
-            fprintf(stderr, "[beam] iter %d: sync wait %.3f ms  nitems=%d\n",
-                    iter, TELAPSED_MS(_t0, _t1), h_st.nitems);
+        if (verbose) {
+            fprintf(stderr, "[beam] iter %d: iter %.1f ms  sync %.1f ms  nitems=%d\n",
+                    iter, TELAPSED_MS(_t_iter, _t1), TELAPSED_MS(_t0, _t1), h_st_p->nitems);
+        }
+        TSTAMP(_t_iter);
 
-        if (h_err) {
+        if (*h_err_p) {
             snprintf(ctx->last_error, sizeof(ctx->last_error),
-                     "beam_decompose: GPU error 0x%x at iter %d", h_err, iter);
-            result_code = h_err;
+                     "beam_decompose: GPU error 0x%x at iter %d", *h_err_p, iter);
+            result_code = *h_err_p;
             goto cleanup;
         }
 
-        if (h_finish) {
+        if (*h_finish_p) {
             TSTAMP(_t0);
             result_code = decomp_read_result(ctx, d_current, out, s);
             TSTAMP(_t1);
@@ -427,7 +440,7 @@ int beam_decompose(
             goto cleanup;
         }
 
-        cur_nitems = h_st.nitems;
+        cur_nitems = h_st_p->nitems;
 
         // ---- beam_expansion: current → prev (now repurposed as next) ----
         // d_prev was cleared by beam_finalize; repurpose as "next".
@@ -440,8 +453,7 @@ int beam_decompose(
                                   0, s, args, NULL));
         }
 
-        // DEBUG: sync + check after expansion
-        {
+        if (debug) {
             CUresult _sr = cuStreamSynchronize(s);
             if (_sr != CUDA_SUCCESS) {
                 const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
@@ -472,8 +484,7 @@ int beam_decompose(
                                   0, s, args, NULL));
         }
 
-        // DEBUG: sync + check after hull
-        {
+        if (debug) {
             CUresult _sr = cuStreamSynchronize(s);
             if (_sr != CUDA_SUCCESS) {
                 const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
@@ -498,8 +509,7 @@ int beam_decompose(
                                   0, s, args, NULL));
         }
 
-        // DEBUG: sync + check after sort
-        {
+        if (debug) {
             CUresult _sr = cuStreamSynchronize(s);
             if (_sr != CUDA_SUCCESS) {
                 const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
@@ -542,6 +552,7 @@ cleanup:
     if (d_err)     cuMemFreeAsync(d_err,     s);
     if (d_finish)  cuMemFreeAsync(d_finish,  s);
     cuStreamSynchronize(s);
+    if (h_pinned) cuMemFreeHost(h_pinned);
     cuStreamDestroy(s);
 
 #undef LCHECK

@@ -132,7 +132,7 @@ int beam_decompose(
     const float* hull_verts, int hull_nv,
     const int*   hull_tris,  int hull_nt,
     int max_iters, int cuts_per_axis, float threshold, int max_keep,
-    int verbose,
+    int verbose, int debug,
     struct beam_result* out);
 
 void beam_result_free(struct beam_result* result);

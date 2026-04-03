@@ -242,19 +242,19 @@ static PyObject* py_decompose(PyObject* self, PyObject* args, PyObject* kwargs) 
         "verts_ptr", "nv", "tris_ptr", "nt",
         "hull_verts_ptr", "hull_nv", "hull_tris_ptr", "hull_nt",
         "max_iters", "cuts_per_axis", "threshold", "max_keep",
-        "verbose", NULL
+        "verbose", "debug", NULL
     };
     unsigned long long vp, tp, hvp, htp;
     int nv, nt, hull_nv, hull_nt;
     int max_iters, cuts_per_axis, max_keep;
     float threshold;
-    int verbose = 0;
+    int verbose = 0, debug = 0;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiifi|i", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiifi|ii", kwlist,
             &vp, &nv, &tp, &nt,
             &hvp, &hull_nv, &htp, &hull_nt,
             &max_iters, &cuts_per_axis, &threshold, &max_keep,
-            &verbose))
+            &verbose, &debug))
         return NULL;
 
     REQUIRE_CTX();
@@ -268,7 +268,7 @@ static PyObject* py_decompose(PyObject* self, PyObject* args, PyObject* kwargs) 
         (const float*)(uintptr_t)hvp, hull_nv,
         (const int*)  (uintptr_t)htp, hull_nt,
         max_iters, cuts_per_axis, threshold, max_keep,
-        verbose,
+        verbose, debug,
         &result);
     if (rc != 0) {
         beam_result_free(&result);
@@ -334,7 +334,7 @@ static PyMethodDef gpu_methods[] = {
     { "test_plane_cut",     py_test_plane_cut,     METH_VARARGS, "GPU plane cut with cap triangulation." },
     { "decompose",          (PyCFunction)py_decompose, METH_VARARGS | METH_KEYWORDS,
       "decompose(verts_ptr, nv, tris_ptr, nt, hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,\n"
-      "          max_iters, cuts_per_axis, threshold, max_keep, verbose=0)\n"
+      "          max_iters, cuts_per_axis, threshold, max_keep, verbose=0, debug=0)\n"
       "-> list of (verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol) per part." },
     { NULL, NULL, 0, NULL }
 };

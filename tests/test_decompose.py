@@ -192,7 +192,8 @@ def test_octocat_decompose():
     tris  = np.array(mesh.faces,    dtype=np.int32)
     parts = _decompose_shape(verts, tris, "octocat",
                              max_iters=100, cuts_per_axis=10,
-                             threshold=0.05, max_keep=32)
+                             threshold=0.05, max_keep=32,
+                             verbose=1)
     assert len(parts) >= 1
 
 

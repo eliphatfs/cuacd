@@ -273,16 +273,17 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 
 ## beam_decompose (csrc/beam.c)
 
-`beam_decompose(ctx, verts, nv, tris, nt, hull_verts, hull_nv, hull_tris, hull_nt, max_iters, cuts_per_axis, threshold, max_keep, verbose, out)` — host-side full beam-search convex decomposition loop.
+`beam_decompose(ctx, verts, nv, tris, nt, hull_verts, hull_nv, hull_tris, hull_nt, max_iters, cuts_per_axis, threshold, max_keep, verbose, debug, out)` — host-side full beam-search convex decomposition loop.
 
-- **Inputs**: mesh (verts/tris) and its precomputed convex hull (hull_verts/hull_tris) as host pointers; hyperparams; `verbose` flag.
+- **Inputs**: mesh (verts/tris) and its precomputed convex hull (hull_verts/hull_tris) as host pointers; hyperparams; `verbose` flag; `debug` flag.
 - **Allocations**: all device buffers allocated with `cuMemAllocAsync` / freed with `cuMemFreeAsync` on a dedicated `CUstream` (created with `cuStreamCreate`, NOT NULL stream — async pool allocations on NULL stream have ordering issues with subsequent kernels). Double-buffered WorkItem arrays: `d_wi_a`/`d_wi_b` each holding `3*cuts_per_axis*max_keep` WorkItems.
-- **Loop**: `beam_finalize → (sync + read finish/err/nitems) → beam_expansion → [swap buffers] → beam_hull → beam_sort`. No sync between expansion, hull, and sort — they pipeline in stream order. Sync only after finalize (to read finish/err/nitems in one batch of async D2H copies).
-- **Timing** (`verbose != 0`): prints per-iteration sync wait time and final readback time to stderr via `clock_gettime(CLOCK_MONOTONIC)`.
+- **Loop**: `beam_finalize → (sync + read finish/err/nitems) → beam_expansion → [swap buffers] → beam_hull → beam_sort`. No sync between expansion, hull, and sort — they pipeline in stream order. Sync only after finalize (to read finish/err/nitems via pinned-memory async D2H copies).
+- **Debug mode** (`debug != 0`): inserts `cuStreamSynchronize` + error readback after each kernel (expansion, hull, sort), printing per-stage status to stderr. Useful for isolating which kernel crashes.
+- **Pinned host memory**: `h_finish`, `h_err`, `h_st` are allocated via `cuMemAllocHost` so `cuMemcpyDtoHAsync` is truly async. Without pinned memory, the driver API falls back to synchronous copies to pageable memory, hiding GPU time from the sync measurement.
+- **Timing** (`verbose != 0`): prints per-iteration total time, sync wait time, and final readback time to stderr via `clock_gettime(CLOCK_MONOTONIC)`.
 - **Output**: `beam_result` with `nparts` parts; each `beam_part_result` has malloc'd `verts`/`tris` + scalar volumes. Free with `beam_result_free`.
 - **Readback** (`decomp_read_result`): reads AlgoState + WorkItem synchronously (large struct), then issues all per-part D2H copies async, syncs once at end.
-- **Python binding** (`beam_module.c → py_decompose`): returns a list of `(verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol)` tuples. Uses `PyBytes_FromStringAndSize` to copy part data; format string `"(OOiiff)"`.
-- **Python binding** (`beam_module.c → py_decompose`): returns a list of `(verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol)` tuples. Uses `PyBytes_FromStringAndSize` to copy part data; format string `"(OOiiff)"`.
+- **Python binding** (`beam_module.c → py_decompose`): returns a list of `(verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol)` tuples. `verbose` and `debug` are optional keyword args (default 0).
 
 ## hull_dandc_warp_mesh API
 
