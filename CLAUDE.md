@@ -204,6 +204,15 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 - **No-boundary / one-empty-side cases**: handled by natural fallthrough — compaction produces a 0-entry side correctly.
 - **Call sites**: `test_plane_cut.cu` (thin `__global__` wrapper) and `test_beam.c` (host launcher) pass `DeviceHeap*` pointers into the embedded heaps of `DevicePool`.
 
+## beam_initialize API
+
+`beam_initialize<<<3, 32>>>(verts, tris, nv, nt, hull_verts, hull_tris, hull_nv, hull_nt, current)` — seeds `current` with a single WorkItem containing one Part from the input mesh and its precomputed convex hull.
+
+- **Block 0**: all 32 lanes call `mesh_volume_warp` on the input mesh; lane 0 writes result to `current->items[0].parts[0].mesh_vol`.
+- **Block 1**: all 32 lanes call `mesh_volume_warp` on the hull mesh; lane 0 writes result to `current->items[0].parts[0].hull_vol`.
+- **Block 2**: thread 0 sets `parts[0].mesh` and `parts[0].hull` to point directly at the caller-supplied device pointers (both `refcount = NULL` — input arrays are not heap-allocated and will not interact with `heap_free`); sets `hausdorff = 0`; sets `nparts = 1`; sets `nitems = 1`.
+- **No error argument**: initialization cannot fail; volumes are computed independently of allocation.
+
 ## beam_expansion API
 
 `beam_expansion<<<3*cuts_per_axis*current->nitems, 64>>>(current, next, pool, cuts_per_axis, err)` — one block per (item, cut); produces candidate WorkItems in `next`. Returns immediately if `*err` is non-zero on entry.

@@ -49,6 +49,66 @@ struct PartKeyCmp {
     }
 };
 
+// beam_initialize: <<<3, 32>>>
+// Block 0: compute mesh volume via mesh_volume_warp, store in part 0 mesh_vol.
+// Block 1: compute hull volume via mesh_volume_warp, store in part 0 hull_vol.
+// Block 2: thread 0 sets up WorkItem 0 part 0 metadata and nitems/nparts.
+extern "C" __global__ void beam_initialize(
+    float*      verts,
+    int*        tris,
+    int         nv,
+    int         nt,
+    float*      hull_verts,
+    int*        hull_tris,
+    int         hull_nv,
+    int         hull_nt,
+    AlgoState*  current)
+{
+    int lane = threadIdx.x;  // 0..31
+
+    if (blockIdx.x == 0) {
+        // Compute mesh volume
+        Mesh m;
+        m.verts    = verts;
+        m.tris     = tris;
+        m.nv       = nv;
+        m.nt       = nt;
+        m.refcount = NULL;
+        float vol = mesh_volume_warp(&m, lane);
+        if (lane == 0)
+            current->items[0].parts[0].mesh_vol = vol;
+    } else if (blockIdx.x == 1) {
+        // Compute hull volume
+        Mesh h;
+        h.verts    = hull_verts;
+        h.tris     = hull_tris;
+        h.nv       = hull_nv;
+        h.nt       = hull_nt;
+        h.refcount = NULL;
+        float vol = mesh_volume_warp(&h, lane);
+        if (lane == 0)
+            current->items[0].parts[0].hull_vol = vol;
+    } else {
+        // Block 2: thread 0 sets metadata
+        if (lane == 0) {
+            Part* p      = &current->items[0].parts[0];
+            p->mesh.verts    = verts;
+            p->mesh.tris     = tris;
+            p->mesh.nv       = nv;
+            p->mesh.nt       = nt;
+            p->mesh.refcount = NULL;
+            p->hull.verts    = hull_verts;
+            p->hull.tris     = hull_tris;
+            p->hull.nv       = hull_nv;
+            p->hull.nt       = hull_nt;
+            p->hull.refcount = NULL;
+            p->hausdorff     = 0.0f;
+            current->items[0].nparts = 1;
+            current->nitems          = 1;
+        }
+    }
+}
+
 extern "C" __global__ void beam_expansion(
     AlgoState*  current,
     AlgoState*  next,
