@@ -1,8 +1,8 @@
 // hull_dandc.cuh — Warp-based D&C convex hull volume and mesh extraction.
 //
 // Faithful port of btConvexHullComputer by Ole Kniemeyer (MAXON, zlib license).
-// Runs entirely on lane 0 of the warp; other lanes idle (except AABB, vertex
-// init, and sort, which are warp-parallel).
+// Parallel tree merge: points split into 32 groups, each lane builds a small
+// hull independently, then 5 rounds of pairwise merging (16×2 → 8 → 4 → 2 → 1).
 // Uses int32 coordinates with exact int64/int128 predicates.
 //
 // All 32 threads must call hull_dandc_warp_mesh with identical arguments.
@@ -357,24 +357,40 @@ struct BtPool {
     int         error;
     int         nblocks;
     void*       blocks[BTPOOL_MAX_BLOCKS];
+    // Arena mode: when arena_base != NULL, growth uses atomic bump alloc
+    // from a shared pre-allocated arena (warp-safe, no heap lock needed).
+    char*       arena_base;
+    int*        arena_offset;   // pointer to shared-memory atomic counter
+    int         arena_cap;
+    int         growSlabSize;   // edges per growth slab (arena mode only)
 };
 
 // Allocate one slab of BTPOOL_BLOCK_SIZE objects from scratch_heap and prepend
 // to the free list. Serial (no warp parallelism). Lane 0 only.
 __device__ inline int btpool_add_block(BtPool* p) {
     if (p->nblocks >= BTPOOL_MAX_BLOCKS) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
+    int slab_n = (p->arena_base && p->growSlabSize > 0) ? p->growSlabSize : BTPOOL_BLOCK_SIZE;
     void* block = NULL;
-    if (heap_alloc(p->scratch_heap, (unsigned int)(BTPOOL_BLOCK_SIZE * p->objSize), &block) != HEAP_OK) {
-        p->error = BT_ERR_POOL_EXHAUST; return -1;
+    if (p->arena_base) {
+        // Arena-backed: atomic bump alloc (warp-safe, no heap lock)
+        int slab_bytes = slab_n * p->objSize;
+        int offset = atomicAdd(p->arena_offset, slab_bytes);
+        if (offset + slab_bytes > p->arena_cap) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
+        block = p->arena_base + offset;
+    } else {
+        // Heap-backed (original path, lane 0 only)
+        if (heap_alloc(p->scratch_heap, (unsigned int)(BTPOOL_BLOCK_SIZE * p->objSize), &block) != HEAP_OK) {
+            p->error = BT_ERR_POOL_EXHAUST; return -1;
+        }
     }
     p->blocks[p->nblocks++] = block;
     // slot[0] -> existing freeList; slot[i] -> slot[i-1] for i > 0
     char* b = (char*)block;
     int   padded = p->objSize;
     *(void**)b = p->freeList;
-    for (int i = 1; i < BTPOOL_BLOCK_SIZE; i++)
+    for (int i = 1; i < slab_n; i++)
         *(void**)(b + i * padded) = b + (i - 1) * padded;
-    p->freeList = b + (BTPOOL_BLOCK_SIZE - 1) * padded;  // head = last slot
+    p->freeList = b + (slab_n - 1) * padded;  // head = last slot
     return 0;
 }
 
@@ -385,8 +401,42 @@ __device__ inline int btpool_init(BtPool* p, DeviceHeap* scratch_heap, int objSi
     p->freeList     = NULL;
     p->error        = 0;
     p->nblocks      = 0;
+    p->arena_base   = NULL;
+    p->arena_offset = NULL;
+    p->arena_cap    = 0;
+    p->growSlabSize = 0;
     if (btpool_add_block(p) < 0) return -1;
     if (btpool_add_block(p) < 0) return -1;
+    return 0;
+}
+
+// Init an arena-backed pool with one initial slab of custom size.
+// arena_base/arena_offset/arena_cap describe a shared pre-allocated arena.
+// initial_slab_edges = number of edges in the first slab.
+__device__ inline int btpool_init_arena(BtPool* p, int objSize,
+    char* arena_base, int* arena_offset, int arena_cap, int initial_slab_edges) {
+    p->scratch_heap = NULL;
+    p->objSize      = (objSize + 3) & ~3;
+    p->freeList     = NULL;
+    p->error        = 0;
+    p->nblocks      = 0;
+    p->arena_base   = arena_base;
+    p->arena_offset = arena_offset;
+    p->arena_cap    = arena_cap;
+    // Growth slabs use same size as initial slab (not BTPOOL_BLOCK_SIZE)
+    p->growSlabSize = initial_slab_edges;
+    // Allocate initial slab from arena via atomic bump
+    int slab_bytes = initial_slab_edges * p->objSize;
+    int offset = atomicAdd(arena_offset, slab_bytes);
+    if (offset + slab_bytes > arena_cap) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
+    void* block = arena_base + offset;
+    p->blocks[p->nblocks++] = block;
+    char* b = (char*)block;
+    int padded = p->objSize;
+    *(void**)b = NULL;
+    for (int i = 1; i < initial_slab_edges; i++)
+        *(void**)(b + i * padded) = b + (i - 1) * padded;
+    p->freeList = b + (initial_slab_edges - 1) * padded;
     return 0;
 }
 
@@ -442,9 +492,10 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 
 // Compute total WarpPool scratch bytes needed for D&C hull with n points.
 // Sort scratch is rewound after sort. D&C stack is rewound after computeInternal.
-// BFS queues are allocated after D&C rewind, sharing that space.
-// Edge pool is now backed by DeviceHeap (scratch_heap), not included here.
-// Peak = presort + max(sort_scratch, persistent + max(dc_stack, bfs_queues)).
+// BFS queues are allocated after D&C, sharing that space.
+// Edge pool is backed by DeviceHeap (scratch_heap) via arena, not included here.
+// D&C stack is per-lane local memory (BT_DC_MAX_STACK_LOCAL), not in WarpPool.
+// Peak = presort + max(sort_scratch, persistent + bfs_queues).
 __host__ __device__ inline int dandc_scratch_bytes(int n) {
     int total = 0;
     // presort: BtPoint32 array (persists through sort, NOT rewound)
@@ -456,15 +507,10 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
     // postsort: vertex block (persists)
     postsort_persistent += BT_ALIGN16(n * (int)sizeof(BtVertex));
 
-    // These phases share space via rewind:
-    // Phase A: D&C stack (rewound after bt_computeInternal)
-    int phase_dc = BT_ALIGN16(BT_DC_MAX_STACK * (int)sizeof(BtDCStackItem));
-    // Phase B: BFS queues for mesh extraction + volume (each n * sizeof(BtVertex*))
-    // mesh extraction queue is rewound before volume queue is allocated
+    // BFS queues for mesh extraction + volume (each n * sizeof(BtVertex*))
     int phase_bfs = BT_ALIGN16(n * (int)sizeof(BtVertex*));
 
-    int rewindable_peak = phase_dc > phase_bfs ? phase_dc : phase_bfs;
-    int postsort = postsort_persistent + rewindable_peak;
+    int postsort = postsort_persistent + phase_bfs;
 
     total += (sort_scratch > postsort) ? sort_scratch : postsort;
     // alignment padding headroom
@@ -482,6 +528,7 @@ struct BtHullState {
     BtPool edgePool;
     BtVertex* vertexBase;
     int mergeStamp;
+    int* mergeStampPtr;    // if non-null, use atomicAdd on shared stamp
     int minAxis, medAxis, maxAxis;
     int usedEdgePairs;
 #ifdef TRACK_MAX_EDGE_PAIRS
@@ -597,99 +644,6 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVertex* st
     } while (e != start->edges);
     if (edge_count) *edge_count = count;
     return minEdge;
-}
-
-// Parallel findMaxAngle: 16 lanes cooperate to traverse and evaluate edges.
-// hlane = lane within the half-warp (0..15). half_mask = active lane mask for this half.
-__device__ inline BtEdge* bt_findMaxAngle_par(int mergeStamp, bool ccw, BtVertex* start,
-    BtPoint32 s_dir, BtPoint64 rxs, BtPoint64 sxrxs, BtRational64* minCot,
-    int* edge_count, int hlane, unsigned half_mask)
-{
-    BtEdge* myMin = NULL;
-    BtRational64 myMinCot;
-    myMinCot.num = 0; myMinCot.den = 0; myMinCot.sign = 0;
-    BtEdge* first = start->edges;
-    if (!first) { *edge_count = 0; return NULL; }
-    int total = 0;
-    BtEdge* e = first;
-
-    while (true) {
-        // Cascading pointer chase: lane k advances k steps from e
-        BtEdge* cur = e;
-        bool valid = true;
-        #pragma unroll
-        for (int step = 0; step < 15; step++) {
-            if (step < hlane) {
-                cur = cur->next;
-                if (cur == first) { valid = false; break; }
-            }
-        }
-
-        // Parallel evaluation
-        if (valid && cur->copy > mergeStamp) {
-            BtPoint32 t = bp32_sub(cur->target->point, start->point);
-            BtRational64 cot = br64_make(bp32_dot64(t, sxrxs), bp32_dot64(t, rxs));
-            if (!br64_isNaN(cot)) {
-                if (myMin == NULL) {
-                    myMinCot = cot;
-                    myMin = cur;
-                } else {
-                    int c = br64_cmp(cot, myMinCot);
-                    if (c < 0) {
-                        myMinCot = cot;
-                        myMin = cur;
-                    } else if (c == 0 && (ccw == (bt_getOrientation(myMin, cur, s_dir, t) == BT_COUNTER_CLOCKWISE))) {
-                        myMin = cur;
-                    }
-                }
-            }
-        }
-
-        // Count consumed edges
-        unsigned vmask = __ballot_sync(half_mask, valid);
-        int consumed = __popc(vmask);
-        total += consumed;
-
-        if (consumed < 16) break;  // ring exhausted
-
-        // Lane 15 broadcasts its cur->next as start for next round
-        BtEdge* next_e = cur->next;
-        long long ne_ll = (long long)next_e;
-        // Shuffle within half-warp: source lane is 15 relative to half
-        // For lower half (mask 0xFFFF), source is absolute lane 15
-        // For upper half (mask 0xFFFF0000), source is absolute lane 31
-        int src_lane = (half_mask == 0x0000FFFF) ? 15 : 31;
-        ne_ll = __shfl_sync(half_mask, ne_ll, src_lane);
-        next_e = (BtEdge*)ne_ll;
-        if (next_e == first) break;
-        e = next_e;
-    }
-
-    // Half-warp reduction to find global minimum
-    #pragma unroll
-    for (int delta = 8; delta >= 1; delta >>= 1) {
-        long long other_ptr = __shfl_down_sync(half_mask, (long long)myMin, delta);
-        unsigned long long other_num = __shfl_down_sync(half_mask, (unsigned long long)myMinCot.num, delta);
-        unsigned long long other_den = __shfl_down_sync(half_mask, (unsigned long long)myMinCot.den, delta);
-        int other_sign = __shfl_down_sync(half_mask, myMinCot.sign, delta);
-        BtEdge* other = (BtEdge*)other_ptr;
-        BtRational64 other_cot;
-        other_cot.num = other_num; other_cot.den = other_den; other_cot.sign = other_sign;
-
-        if (other && myMin) {
-            int cmp = br64_cmp(other_cot, myMinCot);
-            if (cmp < 0) { myMin = other; myMinCot = other_cot; }
-            else if (cmp == 0) {
-                BtPoint32 t_other = bp32_sub(other->target->point, start->point);
-                if (ccw == (bt_getOrientation(myMin, other, s_dir, t_other) == BT_COUNTER_CLOCKWISE))
-                    myMin = other;
-            }
-        } else if (other) { myMin = other; myMinCot = other_cot; }
-    }
-
-    *edge_count = total;
-    *minCot = myMinCot;
-    return myMin;
 }
 
 __device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0, BtVertex* c1,
@@ -923,18 +877,11 @@ __device__ inline bool bt_mergeProjection(BtHullState* s, BtIntermediateHull* h0
     return true;
 }
 
-__device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtIntermediateHull* h1, int lane) {
-    // All 32 lanes participate; lane 0 does setup/bookkeeping,
-    // lanes 0-15 search c0 edges, lanes 16-31 search c1 edges in findMaxAngle.
-    int should_return = 0;
-    if (lane == 0) {
-        if (!h1->maxXy) should_return = 1;
-        else if (!h0->maxXy) { *h0 = *h1; should_return = 1; }
-    }
-    should_return = __shfl_sync(0xFFFFFFFF, should_return, 0);
-    if (should_return) return;
+__device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtIntermediateHull* h1) {
+    // Single-thread merge (caller is the one active thread).
+    if (!h1->maxXy) return;
+    if (!h0->maxXy) { *h0 = *h1; return; }
 
-    int mergeStamp = 0;
     BtVertex* c0 = NULL;
     BtEdge* toPrev0 = NULL;
     BtEdge* firstNew0 = NULL;
@@ -947,157 +894,105 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
     BtEdge* pendingTail1 = NULL;
     BtPoint32 prevPoint;
 
-    if (lane == 0) {
+    if (s->mergeStampPtr) {
+        s->mergeStamp = atomicAdd(s->mergeStampPtr, -1) - 1;
+    } else {
         s->mergeStamp--;
-        mergeStamp = s->mergeStamp;
-
-        if (bt_mergeProjection(s, h0, h1, &c0, &c1)) {
-            BtPoint32 sd = bp32_sub(c1->point, c0->point);
-            BtPoint64 normal = bp32_cross(bp32(0,0,-1), sd);
-            BtPoint64 t = bp32_cross64(sd, normal);
-
-            BtEdge* e = c0->edges;
-            BtEdge* start0 = NULL;
-            if (e) {
-                do {
-                    long long dot = bp32_dot64(bp32_sub(e->target->point, c0->point), normal);
-                    if ((dot == 0) && (bp32_dot64(bp32_sub(e->target->point, c0->point), t) > 0)) {
-                        if (!start0 || (bt_getOrientation(start0, e, sd, bp32(0,0,-1)) == BT_CLOCKWISE))
-                            start0 = e;
-                    }
-                    e = e->next;
-                } while (e != c0->edges);
-            }
-
-            e = c1->edges;
-            BtEdge* start1 = NULL;
-            if (e) {
-                do {
-                    long long dot = bp32_dot64(bp32_sub(e->target->point, c1->point), normal);
-                    if ((dot == 0) && (bp32_dot64(bp32_sub(e->target->point, c1->point), t) > 0)) {
-                        if (!start1 || (bt_getOrientation(start1, e, sd, bp32(0,0,-1)) == BT_COUNTER_CLOCKWISE))
-                            start1 = e;
-                    }
-                    e = e->next;
-                } while (e != c1->edges);
-            }
-
-            if (start0 || start1) {
-                bt_findEdgeForCoplanarFaces(s, c0, c1, &start0, &start1, NULL, NULL);
-                if (start0) c0 = start0->target;
-                if (start1) c1 = start1->target;
-            }
-            prevPoint = c1->point;
-            prevPoint.z++;
-        } else {
-            prevPoint = c1->point;
-            prevPoint.x++;
-        }
     }
-    mergeStamp = __shfl_sync(0xFFFFFFFF, mergeStamp, 0);
+    int mergeStamp = s->mergeStamp;
+
+    if (bt_mergeProjection(s, h0, h1, &c0, &c1)) {
+        BtPoint32 sd = bp32_sub(c1->point, c0->point);
+        BtPoint64 normal = bp32_cross(bp32(0,0,-1), sd);
+        BtPoint64 t = bp32_cross64(sd, normal);
+
+        BtEdge* e = c0->edges;
+        BtEdge* start0 = NULL;
+        if (e) {
+            do {
+                long long dot = bp32_dot64(bp32_sub(e->target->point, c0->point), normal);
+                if ((dot == 0) && (bp32_dot64(bp32_sub(e->target->point, c0->point), t) > 0)) {
+                    if (!start0 || (bt_getOrientation(start0, e, sd, bp32(0,0,-1)) == BT_CLOCKWISE))
+                        start0 = e;
+                }
+                e = e->next;
+            } while (e != c0->edges);
+        }
+
+        e = c1->edges;
+        BtEdge* start1 = NULL;
+        if (e) {
+            do {
+                long long dot = bp32_dot64(bp32_sub(e->target->point, c1->point), normal);
+                if ((dot == 0) && (bp32_dot64(bp32_sub(e->target->point, c1->point), t) > 0)) {
+                    if (!start1 || (bt_getOrientation(start1, e, sd, bp32(0,0,-1)) == BT_COUNTER_CLOCKWISE))
+                        start1 = e;
+                }
+                e = e->next;
+            } while (e != c1->edges);
+        }
+
+        if (start0 || start1) {
+            bt_findEdgeForCoplanarFaces(s, c0, c1, &start0, &start1, NULL, NULL);
+            if (start0) c0 = start0->target;
+            if (start1) c1 = start1->target;
+        }
+        prevPoint = c1->point;
+        prevPoint.z++;
+    } else {
+        prevPoint = c1->point;
+        prevPoint.x++;
+    }
 
     BtVertex* first0 = c0;
     BtVertex* first1 = c1;
     bool firstRun = true;
 
-    // Half-warp masks for parallel findMaxAngle
-    const unsigned HMASK_LO = 0x0000FFFF;  // lanes 0-15: search c0
-    const unsigned HMASK_HI = 0xFFFF0000;  // lanes 16-31: search c1
-    int hlane = lane & 15;  // lane within half-warp
-    unsigned my_hmask = (lane < 16) ? HMASK_LO : HMASK_HI;
-
     while (true) {
-        // --- Broadcast c0, c1, prevPoint from lane 0; all lanes recompute sd/rxs/sxrxs ---
-        long long c0_ll = 0, c1_ll = 0;
-        BtPoint32 pp;
-        if (lane == 0) {
-            c0_ll = (long long)c0;
-            c1_ll = (long long)c1;
-            pp = prevPoint;
-        }
-        c0_ll = __shfl_sync(0xFFFFFFFF, c0_ll, 0);
-        c1_ll = __shfl_sync(0xFFFFFFFF, c1_ll, 0);
-        pp.x = __shfl_sync(0xFFFFFFFF, pp.x, 0);
-        pp.y = __shfl_sync(0xFFFFFFFF, pp.y, 0);
-        pp.z = __shfl_sync(0xFFFFFFFF, pp.z, 0);
-
-        BtVertex* v_c0 = (BtVertex*)c0_ll;
-        BtVertex* v_c1 = (BtVertex*)c1_ll;
-        BtPoint32 sd = bp32_sub(v_c1->point, v_c0->point);
-        BtPoint32 r = bp32_sub(pp, v_c0->point);
+        BtPoint32 sd = bp32_sub(c1->point, c0->point);
+        BtPoint32 r = bp32_sub(prevPoint, c0->point);
         BtPoint64 rxs = bp32_cross(r, sd);
         BtPoint64 sxrxs = bp32_cross64(sd, rxs);
 
-        // --- Parallel findMaxAngle: lanes 0-15 search c0, lanes 16-31 search c1 ---
-        BtVertex* my_start = (lane < 16) ? v_c0 : v_c1;
-        bool my_ccw = (lane >= 16);
-        BtRational64 my_minCot;
-        my_minCot.num = 0; my_minCot.den = 0; my_minCot.sign = 0;
-        int my_edge_count = 0;
-        BtEdge* my_min = bt_findMaxAngle_par(mergeStamp, my_ccw, my_start, sd, rxs, sxrxs, &my_minCot, &my_edge_count, hlane, my_hmask);
+        BtRational64 minCot0, minCot1;
+        int ec0 = 0, ec1 = 0;
+        BtEdge* min0 = bt_findMaxAngle(mergeStamp, false, c0, sd, rxs, sxrxs, &minCot0, &ec0);
+        BtEdge* min1 = bt_findMaxAngle(mergeStamp, true,  c1, sd, rxs, sxrxs, &minCot1, &ec1);
 
-        // --- Gather edge counts and update stats (lane 0) ---
-        {
-            int ec0 = my_edge_count;  // lane 0 has c0's count
-            int ec1 = __shfl_sync(0xFFFFFFFF, my_edge_count, 16);  // lane 16 has c1's count
-            if (lane == 0) {
-                s->fma_total_edges += ec0 + ec1;
-                if (ec0 < s->fma_min_edges) s->fma_min_edges = ec0;
-                if (ec1 < s->fma_min_edges) s->fma_min_edges = ec1;
-                if (ec0 > s->fma_max_edges) s->fma_max_edges = ec0;
-                if (ec1 > s->fma_max_edges) s->fma_max_edges = ec1;
-                s->fma_calls += 2;
-            }
-        }
-
-        // --- Gather results: lane 0 has min0/minCot0, lane 16 has min1/minCot1 ---
-        BtEdge* min0 = my_min;  // valid on lane 0
-        BtRational64 minCot0 = my_minCot;
-        BtEdge* min1 = (BtEdge*)__shfl_sync(0xFFFFFFFF, (long long)my_min, 16);
-        BtRational64 minCot1;
-        minCot1.num = __shfl_sync(0xFFFFFFFF, (unsigned long long)my_minCot.num, 16);
-        minCot1.den = __shfl_sync(0xFFFFFFFF, (unsigned long long)my_minCot.den, 16);
-        minCot1.sign = __shfl_sync(0xFFFFFFFF, my_minCot.sign, 16);
-
-        // --- Rest of loop body (lane 0 only) ---
-        int loop_action = 0; // 0=continue, 1=return
-        if (lane == 0) {
+        s->fma_total_edges += ec0 + ec1;
+        if (ec0 < s->fma_min_edges) s->fma_min_edges = ec0;
+        if (ec1 < s->fma_min_edges) s->fma_min_edges = ec1;
+        if (ec0 > s->fma_max_edges) s->fma_max_edges = ec0;
+        if (ec1 > s->fma_max_edges) s->fma_max_edges = ec1;
+        s->fma_calls += 2;
 
         if (!min0 && !min1) {
             BtEdge* e = bt_newEdgePair(s, c0, c1);
-            if (!e) { loop_action = 1; }
-            else {
-                bt_edge_link(e, e);
-                c0->edges = e;
-                e = e->reverse;
-                bt_edge_link(e, e);
-                c1->edges = e;
-                loop_action = 1;
-            }
+            if (!e) return;
+            bt_edge_link(e, e);
+            c0->edges = e;
+            e = e->reverse;
+            bt_edge_link(e, e);
+            c1->edges = e;
+            return;
         }
-
-        if (!loop_action) {
 
         int cmp = !min0 ? 1 : !min1 ? -1 : br64_cmp(minCot0, minCot1);
 
         if (firstRun || ((cmp >= 0) ? !br64_isNegInf(minCot1) : !br64_isNegInf(minCot0))) {
             BtEdge* e = bt_newEdgePair(s, c0, c1);
-            if (!e) { loop_action = 1; }
-            else {
-                if (pendingTail0) pendingTail0->prev = e;
-                else pendingHead0 = e;
-                e->next = pendingTail0;
-                pendingTail0 = e;
+            if (!e) return;
+            if (pendingTail0) pendingTail0->prev = e;
+            else pendingHead0 = e;
+            e->next = pendingTail0;
+            pendingTail0 = e;
 
-                e = e->reverse;
-                if (pendingTail1) pendingTail1->next = e;
-                else pendingHead1 = e;
-                e->prev = pendingTail1;
-                pendingTail1 = e;
-            }
+            e = e->reverse;
+            if (pendingTail1) pendingTail1->next = e;
+            else pendingHead1 = e;
+            e->prev = pendingTail1;
+            pendingTail1 = e;
         }
-
-        if (!loop_action) {
 
         BtEdge* e0 = min0;
         BtEdge* e1 = min1;
@@ -1173,16 +1068,9 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
                     bt_edge_link(pendingTail1, firstNew1);
                 }
             }
-            loop_action = 1;
+            return;
         }
         firstRun = false;
-
-        } // !loop_action (inner)
-        } // !loop_action (outer)
-        } // lane == 0
-
-        loop_action = __shfl_sync(0xFFFFFFFF, loop_action, 0);
-        if (loop_action) return;
     }
 }
 
@@ -1242,120 +1130,80 @@ __device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtInte
 }
 
 // ============================================================================
-// computeInternal — iterative D&C with explicit stack
+// computeInternal — iterative D&C with explicit local stack (single-thread)
 // ============================================================================
 
 #define BT_ERR_DC_STACK     4
+#define BT_DC_MAX_STACK_LOCAL 64
 
-__device__ inline void bt_computeInternal(BtHullState* s, int start, int end, BtIntermediateHull* result, int lane) {
-    // Both lanes 0 and 1 enter; lane 1 only participates in bt_merge's parallel findMaxAngle.
-    // The stack is in shared pool memory (accessible by both lanes).
-    BtDCStackItem* stack = NULL;
+__device__ inline void bt_computeInternal(BtHullState* s, int start, int end, BtIntermediateHull* result) {
+    BtDCStackItem stack[BT_DC_MAX_STACK_LOCAL];
     int sp = 0;
-    int err = 0;
 
-    if (lane == 0) {
-        stack = (BtDCStackItem*)bt_alloc(s->wp, BT_DC_MAX_STACK * (int)sizeof(BtDCStackItem));
-        if (!stack) { err = 1; }
-        else {
-            // Push root item (stage 0)
-            BtDCStackItem root;
-            root.start = start;
-            root.end = end;
-            root.stage = 0;
-            root.left_hull.minXy = NULL; root.left_hull.maxXy = NULL;
-            root.left_hull.minYx = NULL; root.left_hull.maxYx = NULL;
-            root.right_hull.minXy = NULL; root.right_hull.maxXy = NULL;
-            root.right_hull.minYx = NULL; root.right_hull.maxYx = NULL;
-            root.result = result;
-            stack[sp++] = root;
-        }
-    }
-    err = __shfl_sync(0xFFFFFFFF, err, 0);
-    if (err) return;
-    sp = __shfl_sync(0xFFFFFFFF, sp, 0);
-    stack = (BtDCStackItem*)(long long)__shfl_sync(0xFFFFFFFF, (long long)stack, 0);
+    // Push root
+    stack[sp].start = start;
+    stack[sp].end = end;
+    stack[sp].stage = 0;
+    stack[sp].left_hull.minXy = NULL; stack[sp].left_hull.maxXy = NULL;
+    stack[sp].left_hull.minYx = NULL; stack[sp].left_hull.maxYx = NULL;
+    stack[sp].right_hull.minXy = NULL; stack[sp].right_hull.maxXy = NULL;
+    stack[sp].right_hull.minYx = NULL; stack[sp].right_hull.maxYx = NULL;
+    stack[sp].result = result;
+    sp++;
 
     while (sp > 0) {
-        int stage = 0;
-        // Lane 0 pops; broadcast stage and sp
-        if (lane == 0) {
-            BtDCStackItem item = stack[--sp];
-            // Store popped item back so both lanes can reference it for merge
-            stack[sp] = item;  // write it at sp (the slot we just popped from)
-            stage = item.stage;
-        }
-        sp = __shfl_sync(0xFFFFFFFF, sp, 0);
-        stage = __shfl_sync(0xFFFFFFFF, stage, 0);
+        sp--;
+        BtDCStackItem* item = &stack[sp];
 
-        if (stage == 0) {
-            // Stage 0: subdivide — lane 0 only
-            if (lane == 0) {
-                BtDCStackItem item = stack[sp]; // re-read the popped item
-                int n = item.end - item.start;
-                if (n <= 2) {
-                    bt_computeBase(s, item.start, item.end, item.result);
-                } else {
-                    int split0 = item.start + n / 2;
-                    BtPoint32 p = s->vertexBase[split0 - 1].point;
-                    int split1 = split0;
-                    while ((split1 < item.end) && bp32_eq(s->vertexBase[split1].point, p)) split1++;
+        if (item->stage == 0) {
+            int n = item->end - item->start;
+            if (n <= 2) {
+                bt_computeBase(s, item->start, item->end, item->result);
+            } else {
+                int split0 = item->start + n / 2;
+                BtPoint32 p = s->vertexBase[split0 - 1].point;
+                int split1 = split0;
+                while ((split1 < item->end) && bp32_eq(s->vertexBase[split1].point, p)) split1++;
 
-                    // Push stage-1 merge item
-                    BtDCStackItem merge_item;
-                    merge_item.start = item.start;
-                    merge_item.end = item.end;
-                    merge_item.stage = 1;
-                    merge_item.left_hull.minXy = NULL; merge_item.left_hull.maxXy = NULL;
-                    merge_item.left_hull.minYx = NULL; merge_item.left_hull.maxYx = NULL;
-                    merge_item.right_hull.minXy = NULL; merge_item.right_hull.maxXy = NULL;
-                    merge_item.right_hull.minYx = NULL; merge_item.right_hull.maxYx = NULL;
-                    merge_item.result = item.result;
-                    if (sp >= BT_DC_MAX_STACK) { s->wp->error = BT_ERR_DC_STACK; err = 1; }
-                    else {
-                        stack[sp++] = merge_item;
-                        BtDCStackItem* merge_ptr = &stack[sp - 1];
+                BtIntermediateHull* res = item->result;
 
-                        // Push right child
-                        BtDCStackItem right_item;
-                        right_item.start = split1;
-                        right_item.end = item.end;
-                        right_item.stage = 0;
-                        right_item.left_hull.minXy = NULL; right_item.left_hull.maxXy = NULL;
-                        right_item.left_hull.minYx = NULL; right_item.left_hull.maxYx = NULL;
-                        right_item.right_hull.minXy = NULL; right_item.right_hull.maxXy = NULL;
-                        right_item.right_hull.minYx = NULL; right_item.right_hull.maxYx = NULL;
-                        right_item.result = &merge_ptr->right_hull;
-                        if (sp >= BT_DC_MAX_STACK) { s->wp->error = BT_ERR_DC_STACK; err = 1; }
-                        else {
-                            stack[sp++] = right_item;
+                // Convert current item to merge (stage 1)
+                item->stage = 1;
+                item->left_hull.minXy = NULL; item->left_hull.maxXy = NULL;
+                item->left_hull.minYx = NULL; item->left_hull.maxYx = NULL;
+                item->right_hull.minXy = NULL; item->right_hull.maxXy = NULL;
+                item->right_hull.minYx = NULL; item->right_hull.maxYx = NULL;
+                item->result = res;
+                sp++;  // re-push (it's already in place)
+                BtDCStackItem* merge_ptr = &stack[sp - 1];
 
-                            // Push left child
-                            BtDCStackItem left_item;
-                            left_item.start = item.start;
-                            left_item.end = split0;
-                            left_item.stage = 0;
-                            left_item.left_hull.minXy = NULL; left_item.left_hull.maxXy = NULL;
-                            left_item.left_hull.minYx = NULL; left_item.left_hull.maxYx = NULL;
-                            left_item.right_hull.minXy = NULL; left_item.right_hull.maxXy = NULL;
-                            left_item.right_hull.minYx = NULL; left_item.right_hull.maxYx = NULL;
-                            left_item.result = &merge_ptr->left_hull;
-                            if (sp >= BT_DC_MAX_STACK) { s->wp->error = BT_ERR_DC_STACK; err = 1; }
-                            else { stack[sp++] = left_item; }
-                        }
-                    }
-                }
+                // Push right child
+                if (sp >= BT_DC_MAX_STACK_LOCAL) { s->edgePool.error = BT_ERR_DC_STACK; return; }
+                stack[sp].start = split1;
+                stack[sp].end = item->end;
+                stack[sp].stage = 0;
+                stack[sp].left_hull.minXy = NULL; stack[sp].left_hull.maxXy = NULL;
+                stack[sp].left_hull.minYx = NULL; stack[sp].left_hull.maxYx = NULL;
+                stack[sp].right_hull.minXy = NULL; stack[sp].right_hull.maxXy = NULL;
+                stack[sp].right_hull.minYx = NULL; stack[sp].right_hull.maxYx = NULL;
+                stack[sp].result = &merge_ptr->right_hull;
+                sp++;
+
+                // Push left child
+                if (sp >= BT_DC_MAX_STACK_LOCAL) { s->edgePool.error = BT_ERR_DC_STACK; return; }
+                stack[sp].start = item->start;
+                stack[sp].end = split0;
+                stack[sp].stage = 0;
+                stack[sp].left_hull.minXy = NULL; stack[sp].left_hull.maxXy = NULL;
+                stack[sp].left_hull.minYx = NULL; stack[sp].left_hull.maxYx = NULL;
+                stack[sp].right_hull.minXy = NULL; stack[sp].right_hull.maxXy = NULL;
+                stack[sp].right_hull.minYx = NULL; stack[sp].right_hull.maxYx = NULL;
+                stack[sp].result = &merge_ptr->left_hull;
+                sp++;
             }
-            err = __shfl_sync(0xFFFFFFFF, err, 0);
-            if (err) return;
-            sp = __shfl_sync(0xFFFFFFFF, sp, 0);
         } else {
-            // Stage 1: merge — both lanes participate
-            BtDCStackItem* item_ptr = &stack[sp]; // popped item at slot sp
-            bt_merge(s, &item_ptr->left_hull, &item_ptr->right_hull, lane);
-            if (lane == 0) {
-                *item_ptr->result = item_ptr->left_hull;
-            }
+            bt_merge(s, &item->left_hull, &item->right_hull);
+            *item->result = item->left_hull;
         }
     }
 }
@@ -1620,15 +1468,36 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
     return points;
 }
 
-// Post-sort: allocate pools (all lanes), init vertices (all lanes), D&C (lane 0).
+// Post-sort: init vertices (all lanes), parallel D&C + tree merge.
+// 1. Split sorted points into 32 groups (one per warp lane).
+// 2. Each lane independently builds a small hull of its group.
+// 3. Tree merge: 5 rounds (16×2 → 8×4 → … → 1×32), each round's
+//    independent merges run in parallel across warp lanes.
 __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count, int lane) {
+    // --- Broadcast shared state from lane 0 (only lane 0's s is valid) ---
+    float sc0 = 0, sc1 = 0, sc2 = 0, cn0 = 0, cn1 = 0, cn2 = 0;
+    int minAx = 0, medAx = 0, maxAx = 0;
+    long long wp_ll = 0, sh_ll = 0;
+    if (lane == 0) {
+        sc0 = s->scaling[0]; sc1 = s->scaling[1]; sc2 = s->scaling[2];
+        cn0 = s->center[0];  cn1 = s->center[1];  cn2 = s->center[2];
+        minAx = s->minAxis; medAx = s->medAxis; maxAx = s->maxAxis;
+        wp_ll = (long long)s->wp;
+        sh_ll = (long long)s->scratch_heap;
+    }
+    sc0 = __shfl_sync(WARP_MASK, sc0, 0); sc1 = __shfl_sync(WARP_MASK, sc1, 0); sc2 = __shfl_sync(WARP_MASK, sc2, 0);
+    cn0 = __shfl_sync(WARP_MASK, cn0, 0); cn1 = __shfl_sync(WARP_MASK, cn1, 0); cn2 = __shfl_sync(WARP_MASK, cn2, 0);
+    minAx = __shfl_sync(WARP_MASK, minAx, 0); medAx = __shfl_sync(WARP_MASK, medAx, 0); maxAx = __shfl_sync(WARP_MASK, maxAx, 0);
+    wp_ll = __shfl_sync(WARP_MASK, wp_ll, 0); sh_ll = __shfl_sync(WARP_MASK, sh_ll, 0);
+    WarpPool* shared_wp = (WarpPool*)wp_ll;
+    DeviceHeap* shared_sh = (DeviceHeap*)sh_ll;
+
     // Lane 0: allocate vblock
     BtVertex* vblock = NULL;
     if (lane == 0) {
-        vblock = (BtVertex*)bt_alloc(s->wp, count * (int)sizeof(BtVertex));
+        vblock = (BtVertex*)bt_alloc(shared_wp, count * (int)sizeof(BtVertex));
         s->vertexBase = vblock;
     }
-    // Broadcast pointer
     long long vb = __shfl_sync(WARP_MASK, (long long)vblock, 0);
     vblock = (BtVertex*)vb;
     if (!vblock) return;
@@ -1649,38 +1518,128 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     }
     __syncwarp();
 
-    // Lane 0: init edge pool (2 slabs of BTPOOL_BLOCK_SIZE from scratch_heap)
-    // and run D&C.
+    if (lane == 0) s->npoints = count;
+
+    // --- Allocate shared edge arena from scratch_heap (lane 0 only) ---
+    __shared__ char* s_arena_base;
+    __shared__ int   s_arena_offset;
+    __shared__ int   s_arena_cap;
+    __shared__ BtIntermediateHull s_hulls[WARP_SIZE];
+    __shared__ int   s_postsort_error;
+    __shared__ int   s_mergeStamp;
+
+    int padded_edge = ((int)sizeof(BtEdge) + 3) & ~3;
+    // Arena budget: initial slabs (32 lanes × initial_slab_edges) + growth headroom (16 × count edges).
+    // Growth slabs use BTPOOL_BLOCK_SIZE but that's bounded by the 16×count term.
+    int initial_slab_edges = 8 * count / WARP_SIZE;
+    if (initial_slab_edges < 32) initial_slab_edges = 32;
+    int arena_bytes = (WARP_SIZE * initial_slab_edges + 16 * count) * padded_edge;
+    if (arena_bytes < 64 * 1024) arena_bytes = 64 * 1024;  // 64 KB minimum
+
     if (lane == 0) {
-        s->npoints = count;
-        if (btpool_init(&s->edgePool, s->scratch_heap, (int)sizeof(BtEdge)) < 0)
-            s->wp->error = BT_ERR_POOL_EXHAUST;
+        s_postsort_error = 0;
+        s_mergeStamp = -3;
+        void* arena_ptr = NULL;
+        if (heap_alloc(shared_sh, (unsigned int)arena_bytes, &arena_ptr) != HEAP_OK)
+            s_postsort_error = BT_ERR_POOL_EXHAUST;
+        s_arena_base = (char*)arena_ptr;
+        s_arena_offset = 0;
+        s_arena_cap = arena_bytes;
     }
     __syncwarp();
+    if (s_postsort_error) { if (lane == 0) shared_wp->error = s_postsort_error; return; }
 
-    // All 32 lanes: D&C (lanes 0-15 and 16-31 parallelize findMaxAngle inside bt_merge)
-    {
-        if (lane == 0) {
-            s->usedEdgePairs = 0;
+    // --- Per-lane group boundaries ---
+    int my_start = lane * count / WARP_SIZE;
+    int my_end   = (lane + 1) * count / WARP_SIZE;
+
+    // --- Per-lane BtHullState with arena-backed edge pool ---
+    BtHullState my_state;
+    my_state.scaling[0] = sc0; my_state.scaling[1] = sc1; my_state.scaling[2] = sc2;
+    my_state.center[0]  = cn0; my_state.center[1]  = cn1; my_state.center[2]  = cn2;
+    my_state.vertexBase  = vblock;
+    my_state.minAxis = minAx; my_state.medAxis = medAx; my_state.maxAxis = maxAx;
+    my_state.wp           = shared_wp;
+    my_state.scratch_heap = shared_sh;
+    my_state.npoints      = count;
+    my_state.usedEdgePairs = 0;
 #ifdef TRACK_MAX_EDGE_PAIRS
-            s->maxEdgePairs = 0;
+    my_state.maxEdgePairs = 0;
 #endif
-            s->mergeStamp = -3;
+    my_state.vertexList = NULL;
+    my_state.fma_total_edges = 0;
+    my_state.fma_min_edges   = 0x7fffffff;
+    my_state.fma_max_edges   = 0;
+    my_state.fma_calls       = 0;
+    // All lanes share a single atomic mergeStamp counter so that edge stamps
+    // are on a common timeline (required for cross-lane merges in tree merge).
+    my_state.mergeStamp = -3;
+    my_state.mergeStampPtr = &s_mergeStamp;
+
+    // Init arena-backed edge pool (each lane gets an initial slab via atomicAdd)
+    // initial_slab_edges must match the value used in arena_bytes calculation above.
+    if (btpool_init_arena(&my_state.edgePool, (int)sizeof(BtEdge),
+                          s_arena_base, &s_arena_offset, s_arena_cap,
+                          initial_slab_edges) < 0) {
+        // Arena exhausted during init — signal error
+        s->wp->error = BT_ERR_POOL_EXHAUST;
+    }
+    __syncwarp();
+    if (s->wp->error) return;
+
+    // --- Phase 1: Each lane builds hull of its group (parallel D&C) ---
+    BtIntermediateHull my_hull;
+    my_hull.minXy = NULL; my_hull.maxXy = NULL;
+    my_hull.minYx = NULL; my_hull.maxYx = NULL;
+
+    if (my_end - my_start > 0) {
+        bt_computeInternal(&my_state, my_start, my_end, &my_hull);
+    }
+    s_hulls[lane] = my_hull;
+    __syncwarp();
+
+    // Check for errors from any lane
+    {
+        int any_err = (my_state.edgePool.error != 0) ? 1 : 0;
+        any_err = __any_sync(WARP_MASK, any_err);
+        if (any_err) { s->wp->error = BT_ERR_POOL_EXHAUST; return; }
+    }
+
+    // --- Phase 2: Tree merge (5 rounds) ---
+    // Round r: 32>>>(r+1) independent merges, each handled by one lane.
+    // Lane i merges s_hulls[i*stride] with s_hulls[i*stride + stride/2].
+    for (int round = 0; round < 5; round++) {
+        int stride = 1 << (round + 1);
+        int merge_count = WARP_SIZE >> (round + 1);
+        if (lane < merge_count) {
+            int left  = lane * stride;
+            int right = left + (stride >> 1);
+            bt_merge(&my_state, &s_hulls[left], &s_hulls[right]);
+            // bt_merge writes result into s_hulls[left] via bt_mergeProjection
         }
         __syncwarp();
 
-        // Save offset before D&C stack allocation so we can rewind after
-        int pre_dc_offset = 0;
-        if (lane == 0) pre_dc_offset = s->wp->offset;
-
-        BtIntermediateHull hull;
-        bt_computeInternal(s, 0, count, &hull, lane);
-        if (lane == 0) {
-            s->vertexList = hull.minXy;
-
-            // Rewind D&C stack — it's no longer needed after computeInternal
-            bt_rewind(s->wp, pre_dc_offset);
+        // Check for errors (pool exhaustion during merge)
+        {
+            int any_err = (my_state.edgePool.error != 0) ? 1 : 0;
+            any_err = __any_sync(WARP_MASK, any_err);
+            if (any_err) { s->wp->error = BT_ERR_POOL_EXHAUST; return; }
         }
+    }
+
+    // --- Result is in s_hulls[0] ---
+    if (lane == 0) {
+        s->vertexList = s_hulls[0].minXy;
+        // Copy edge pool info for cleanup (arena slabs freed by hull_dandc_warp_mesh)
+        s->edgePool = my_state.edgePool;
+        // Set mergeStamp from shared counter for use by extractMesh/computeVolume
+        s->mergeStamp = s_mergeStamp;
+        s->mergeStampPtr = NULL;  // extractMesh uses local stamp, not shared
+        // Aggregate instrumentation from lane 0 (other lanes' stats are lost)
+        s->fma_total_edges = my_state.fma_total_edges;
+        s->fma_min_edges   = my_state.fma_min_edges;
+        s->fma_max_edges   = my_state.fma_max_edges;
+        s->fma_calls       = my_state.fma_calls;
     }
     __syncwarp();
 }
@@ -1739,6 +1698,9 @@ __device__ inline Mesh hull_dandc_warp_mesh(
         state.wp           = &s_pool;
         state.scratch_heap = scratch_heap;
         state.vertexList   = NULL;
+        state.mergeStampPtr = NULL;
+        state.edgePool.arena_base = NULL;
+        state.edgePool.nblocks = 0;
         state.fma_total_edges = 0;
         state.fma_min_edges   = 0x7fffffff;
         state.fma_max_edges   = 0;
@@ -1820,11 +1782,12 @@ __device__ inline Mesh hull_dandc_warp_mesh(
     }
 
 done:
-    // Cleanup scratch: free WarpPool backing and all edge pool slabs (lane 0).
+    // Cleanup scratch: free WarpPool backing and edge arena (lane 0).
+    // Edge pool slabs are sub-ranges of the arena — free the arena as one chunk.
     if (lane == 0) {
         heap_free(scratch_heap, s_pool_backing);
-        for (int i = 0; i < state.edgePool.nblocks; i++)
-            heap_free(scratch_heap, state.edgePool.blocks[i]);
+        if (state.edgePool.arena_base)
+            heap_free(scratch_heap, state.edgePool.arena_base);
     }
     __syncwarp();
 

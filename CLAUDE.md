@@ -198,22 +198,24 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 | J3 | `heap_compact(heap) -> int` | Removed from allocator.cuh; `beam_heap_compact()` is now a no-op |
 | J4 | `query_dandc_scratch` kernel | Removed from test_hull_dandc.cu, beam.c, structs.h, test_beam.c; scratch is heap-managed, no pre-query needed |
 | J5 | `bt_computeVolume` in hull_dandc.cuh | Volume now computed via `mesh_volume_warp` on extracted triangle mesh; half-edge BFS volume never called |
+| J6 | `bt_findMaxAngle_par` in hull_dandc.cuh | Removed; replaced by parallel tree merge (each lane calls serial `bt_findMaxAngle` on its own hull) |
+| J7 | `BT_DC_MAX_STACK` (4096) | Replaced by `BT_DC_MAX_STACK_LOCAL` (64); D&C stack is now per-lane local memory, not WarpPool |
 
-## bt_findMaxAngle Parallelization
+## Parallel Tree Merge (hull_dandc.cuh)
 
-`bt_findMaxAngle_par` parallelizes edge traversal and evaluation across 16 lanes (half-warp). All 32 warp lanes participate in D&C: lanes 0-15 search hull 0's edges, lanes 16-31 search hull 1's edges.
+The D&C convex hull uses a parallel tree merge instead of a single serial D&C. Sorted points are split into 32 groups (one per warp lane), each lane independently builds a small hull, then 5 rounds of pairwise merging (16×2 → 8×4 → 4×8 → 2×16 → 1×32) produce the final hull.
 
-**Cascading pointer chase**: each of 16 lanes advances `hlane` steps from the current edge pointer (`#pragma unroll` with early-exit on wrap-around). For average degree ~3.5, most lanes break after 2-3 chases. Each valid lane evaluates its edge's cotangent (`br64_make` + `bp32_dot64`) in parallel.
+**Per-lane D&C**: `bt_computeInternal` uses a local stack array (`BT_DC_MAX_STACK_LOCAL=64` entries in thread-local memory) instead of WarpPool. Each lane runs serial D&C on its n/32 points using `bt_merge` (single-thread gift-wrap, no warp sync needed).
 
-**Half-warp reduction**: 4-step log-depth reduction via `__shfl_down_sync` finds the global minimum cotangent. Ties broken by `bt_getOrientation` (exact match with serial behavior). Lane 0 of each half-warp holds the result; lane 16 shuffles to lane 0 for the final comparison.
+**Edge pool arena**: all 32 per-lane edge pools share a single arena allocated from `scratch_heap` via `heap_alloc` (lane 0 only). Each lane gets an initial slab via `atomicAdd` on a shared offset counter. Growth slabs also use `atomicAdd` — no heap locks, warp-safe. Arena sizing: `(32 × initial_slab_edges + 16 × count) × sizeof(BtEdge)`, minimum 64 KB. Growth slabs use `growSlabSize` (same as initial slab size, NOT `BTPOOL_BLOCK_SIZE`) to avoid overshooting small arenas.
 
-**Bridge direction recompute**: instead of broadcasting 9 components (sd/rxs/sxrxs), lane 0 broadcasts c0, c1, prevPoint (5 shuffles), and all lanes recompute sd/rxs/sxrxs from cached vertex data.
+**Shared mergeStamp**: all lanes share a single `__shared__ int s_mergeStamp` decremented via `atomicAdd`. This is required because `bt_findMaxAngle` checks `e->copy > mergeStamp` — if per-lane stamps were on different timelines, cross-lane merges would skip edges. `BtHullState.mergeStampPtr` points to the shared counter; `bt_merge` uses `atomicAdd` when non-null, falls back to local `s->mergeStamp--` when null.
 
-Instrumentation (gated on `COACD_BEAM_DEBUG`): `BtHullState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`); lane 0 accumulates after shuffling lane 16's count.
+**State broadcasting**: `BtHullState` is a per-thread local variable. Only lane 0's state has valid scaling/center/axes (set by `bt_compute_presort`). `bt_compute_postsort` broadcasts these 9 values from lane 0 via `__shfl_sync` before per-lane state init.
 
-Edge degree stats on octocat mesh (20k vertices):
-- **Average degree: 3.0–3.9** across all hull sizes (86 to 20k points)
-- **Max degree: 20–42** (rare outliers)
+**Cleanup**: the arena is ONE `heap_alloc` — freed as one chunk via `heap_free(scratch_heap, arena_base)`. Individual slabs (sub-ranges of the arena) are NOT freed individually. `state.edgePool.arena_base` is initialized to NULL before postsort runs, so the cleanup path is safe even if postsort fails early.
+
+Instrumentation (gated on `COACD_BEAM_DEBUG`): `BtHullState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`); only lane 0's stats are reported.
 
 ## plane_cut_block API
 
@@ -407,15 +409,21 @@ Use-1 can exceed `n_boundary * 3` when the merged polygon grows during bridging,
 
 All scratch buffers in `plane_cut_block` are wrapped with `CheckedBuf` for OOB detection.
 
-### Using compute-sanitizer for CUDA Memory Errors
+### CUDA Error Cascading
 
-When a CUDA kernel crashes with error 716 (misaligned address) or 700 (illegal memory access), use `compute-sanitizer --tool memcheck` to find the exact source location:
+CUDA error 700 (illegal memory access) is **sticky**: once any kernel triggers it, ALL subsequent CUDA API calls (cuMemAlloc, cuStreamCreate, cuLaunchKernel, etc.) fail with the same error code. This makes the error appear to originate from unrelated code.
 
-```bash
-compute-sanitizer --tool memcheck python <script.py>
-```
-
-Note: compute-sanitizer serializes GPU execution and can change timing/behavior (e.g. algorithms may exit early or produce different results). Use it to find the source of crashes, not to validate correctness.
+**Debugging workflow for error 700/716:**
+1. **Identify the first failing operation.** Run with `--tb=short` or standalone scripts. The *first* error is the real one; everything after is cascade.
+2. **Isolate the failing test/kernel.** Run the single failing test alone (not the full suite) to avoid cascade from earlier tests corrupting the CUDA context.
+3. **Use compute-sanitizer** to find the exact source:
+   ```bash
+   compute-sanitizer --tool memcheck python <script.py>
+   ```
+   Note: compute-sanitizer serializes GPU execution and can change timing/behavior. Use it to find the source of crashes, not to validate correctness.
+4. **Use `python tests/test_hull.py`** (standalone benchmark mode) for hull debugging — it isolates batch sizes and reports errors per-config instead of failing the whole suite.
+5. **Enable CheckedBuf** (`COACD_BEAM_DEBUG=1 pip install -e .`) to detect OOB accesses in device code. Wrap raw buffers with `PC_BUF(type, name, ptr, count)` in the suspected code path.
+6. **Do not guess** the root cause from cascaded errors. Always trace back to the first CUDA error and use compute-sanitizer or CheckedBuf instrumentation to identify the exact failing line and address.
 
 ## Benchmarking
 
@@ -437,13 +445,16 @@ ncu --set full -o dandc_profile python tests/bench_dandc.py --n_pts 200 --n_hull
 ## Current Status
 
 ### Working
-- D&C hull volume (`batch_hull_volume`) and mesh extraction (`batch_hull_dandc_mesh`) — all 103 tests pass
+- D&C hull with parallel tree merge — 104 tests pass (hull, hull_mesh, warp_sort, plane_cut)
 - Batch mesh volume (`batch_mesh_volume`) — divergence theorem, watertight meshes
 - Warp sort (`test_warp_sort`) — bitonic + quicksort paths, duplicates
 - Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests)
 - Persistent heaps (`beam_init` with `pool_bytes`): both heaps share one pool, all memory recycled by kernels, pool stable after first call
 - `ctx.pool_usage()` — peak device pool bytes (monotonic), `ctx.heap_compact()` — available but not needed normally
-- `beam_decompose` (cube, lshape, octocat): cube → 1 part, lshape → 2 parts, octocat → ~14 parts ✓; test prints volume comparison table (GPU vs trimesh vs scipy)
+- `beam_decompose` (cube, lshape): cube → 1 part, lshape → 2 parts ✓
+
+### Known Issues
+- `beam_decompose` (octocat): crashes with error 700 (illegal memory access) during `beam_hull` kernel. The crash occurs after several beam search iterations, suggesting the tree merge arena runs out of space or produces corrupted edge structures when processing larger meshes from plane cuts (~20k vertices). Cube/lshape (small meshes) work. Needs investigation with compute-sanitizer or CheckedBuf instrumentation.
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input
