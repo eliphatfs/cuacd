@@ -199,16 +199,21 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 | J4 | `query_dandc_scratch` kernel | Removed from test_hull_dandc.cu, beam.c, structs.h, test_beam.c; scratch is heap-managed, no pre-query needed |
 | J5 | `bt_computeVolume` in hull_dandc.cuh | Volume now computed via `mesh_volume_warp` on extracted triangle mesh; half-edge BFS volume never called |
 
-## bt_findMaxAngle Profiling (Edge Degree)
+## bt_findMaxAngle Parallelization
 
-`bt_findMaxAngle` iterates a vertex's circular edge list to find the best merge angle. Instrumentation (gated on `COACD_BEAM_DEBUG`) measures edges chased per call. `BtHullState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`); lane 0 accumulates after shuffling lane 1's count.
+`bt_findMaxAngle_par` parallelizes edge traversal and evaluation across 16 lanes (half-warp). All 32 warp lanes participate in D&C: lanes 0-15 search hull 0's edges, lanes 16-31 search hull 1's edges.
 
-Results on octocat mesh (20k vertices, realistic distribution):
+**Cascading pointer chase**: each of 16 lanes advances `hlane` steps from the current edge pointer (`#pragma unroll` with early-exit on wrap-around). For average degree ~3.5, most lanes break after 2-3 chases. Each valid lane evaluates its edge's cotangent (`br64_make` + `bp32_dot64`) in parallel.
+
+**Half-warp reduction**: 4-step log-depth reduction via `__shfl_down_sync` finds the global minimum cotangent. Ties broken by `bt_getOrientation` (exact match with serial behavior). Lane 0 of each half-warp holds the result; lane 16 shuffles to lane 0 for the final comparison.
+
+**Bridge direction recompute**: instead of broadcasting 9 components (sd/rxs/sxrxs), lane 0 broadcasts c0, c1, prevPoint (5 shuffles), and all lanes recompute sd/rxs/sxrxs from cached vertex data.
+
+Instrumentation (gated on `COACD_BEAM_DEBUG`): `BtHullState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`); lane 0 accumulates after shuffling lane 16's count.
+
+Edge degree stats on octocat mesh (20k vertices):
 - **Average degree: 3.0–3.9** across all hull sizes (86 to 20k points)
 - **Max degree: 20–42** (rare outliers)
-- **Calls per hull: ~180k** for 20k-point hulls
-
-**Conclusion**: parallelizing the inner edge loop (batch K edges across K lanes) is not viable — average degree ~3.5 means most lanes would be idle. The bottleneck is the sheer number of `bt_findMaxAngle` calls, not work per call. Alternative data structures (linear arrays replacing the linked list) are also not justified at this degree.
 
 ## plane_cut_block API
 

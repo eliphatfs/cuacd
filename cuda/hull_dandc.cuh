@@ -599,6 +599,99 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVertex* st
     return minEdge;
 }
 
+// Parallel findMaxAngle: 16 lanes cooperate to traverse and evaluate edges.
+// hlane = lane within the half-warp (0..15). half_mask = active lane mask for this half.
+__device__ inline BtEdge* bt_findMaxAngle_par(int mergeStamp, bool ccw, BtVertex* start,
+    BtPoint32 s_dir, BtPoint64 rxs, BtPoint64 sxrxs, BtRational64* minCot,
+    int* edge_count, int hlane, unsigned half_mask)
+{
+    BtEdge* myMin = NULL;
+    BtRational64 myMinCot;
+    myMinCot.num = 0; myMinCot.den = 0; myMinCot.sign = 0;
+    BtEdge* first = start->edges;
+    if (!first) { *edge_count = 0; return NULL; }
+    int total = 0;
+    BtEdge* e = first;
+
+    while (true) {
+        // Cascading pointer chase: lane k advances k steps from e
+        BtEdge* cur = e;
+        bool valid = true;
+        #pragma unroll
+        for (int step = 0; step < 15; step++) {
+            if (step < hlane) {
+                cur = cur->next;
+                if (cur == first) { valid = false; break; }
+            }
+        }
+
+        // Parallel evaluation
+        if (valid && cur->copy > mergeStamp) {
+            BtPoint32 t = bp32_sub(cur->target->point, start->point);
+            BtRational64 cot = br64_make(bp32_dot64(t, sxrxs), bp32_dot64(t, rxs));
+            if (!br64_isNaN(cot)) {
+                if (myMin == NULL) {
+                    myMinCot = cot;
+                    myMin = cur;
+                } else {
+                    int c = br64_cmp(cot, myMinCot);
+                    if (c < 0) {
+                        myMinCot = cot;
+                        myMin = cur;
+                    } else if (c == 0 && (ccw == (bt_getOrientation(myMin, cur, s_dir, t) == BT_COUNTER_CLOCKWISE))) {
+                        myMin = cur;
+                    }
+                }
+            }
+        }
+
+        // Count consumed edges
+        unsigned vmask = __ballot_sync(half_mask, valid);
+        int consumed = __popc(vmask);
+        total += consumed;
+
+        if (consumed < 16) break;  // ring exhausted
+
+        // Lane 15 broadcasts its cur->next as start for next round
+        BtEdge* next_e = cur->next;
+        long long ne_ll = (long long)next_e;
+        // Shuffle within half-warp: source lane is 15 relative to half
+        // For lower half (mask 0xFFFF), source is absolute lane 15
+        // For upper half (mask 0xFFFF0000), source is absolute lane 31
+        int src_lane = (half_mask == 0x0000FFFF) ? 15 : 31;
+        ne_ll = __shfl_sync(half_mask, ne_ll, src_lane);
+        next_e = (BtEdge*)ne_ll;
+        if (next_e == first) break;
+        e = next_e;
+    }
+
+    // Half-warp reduction to find global minimum
+    #pragma unroll
+    for (int delta = 8; delta >= 1; delta >>= 1) {
+        long long other_ptr = __shfl_down_sync(half_mask, (long long)myMin, delta);
+        unsigned long long other_num = __shfl_down_sync(half_mask, (unsigned long long)myMinCot.num, delta);
+        unsigned long long other_den = __shfl_down_sync(half_mask, (unsigned long long)myMinCot.den, delta);
+        int other_sign = __shfl_down_sync(half_mask, myMinCot.sign, delta);
+        BtEdge* other = (BtEdge*)other_ptr;
+        BtRational64 other_cot;
+        other_cot.num = other_num; other_cot.den = other_den; other_cot.sign = other_sign;
+
+        if (other && myMin) {
+            int cmp = br64_cmp(other_cot, myMinCot);
+            if (cmp < 0) { myMin = other; myMinCot = other_cot; }
+            else if (cmp == 0) {
+                BtPoint32 t_other = bp32_sub(other->target->point, start->point);
+                if (ccw == (bt_getOrientation(myMin, other, s_dir, t_other) == BT_COUNTER_CLOCKWISE))
+                    myMin = other;
+            }
+        } else if (other) { myMin = other; myMinCot = other_cot; }
+    }
+
+    *edge_count = total;
+    *minCot = myMinCot;
+    return myMin;
+}
+
 __device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0, BtVertex* c1,
     BtEdge** e0, BtEdge** e1, BtVertex* stop0, BtVertex* stop1)
 {
@@ -831,13 +924,14 @@ __device__ inline bool bt_mergeProjection(BtHullState* s, BtIntermediateHull* h0
 }
 
 __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtIntermediateHull* h1, int lane) {
-    // lane 0 does all setup/bookkeeping; lane 1 only participates in findMaxAngle
+    // All 32 lanes participate; lane 0 does setup/bookkeeping,
+    // lanes 0-15 search c0 edges, lanes 16-31 search c1 edges in findMaxAngle.
     int should_return = 0;
     if (lane == 0) {
         if (!h1->maxXy) should_return = 1;
         else if (!h0->maxXy) { *h0 = *h1; should_return = 1; }
     }
-    should_return = __shfl_sync(0x3, should_return, 0);
+    should_return = __shfl_sync(0xFFFFFFFF, should_return, 0);
     if (should_return) return;
 
     int mergeStamp = 0;
@@ -900,48 +994,52 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
             prevPoint.x++;
         }
     }
-    mergeStamp = __shfl_sync(0x3, mergeStamp, 0);
+    mergeStamp = __shfl_sync(0xFFFFFFFF, mergeStamp, 0);
 
     BtVertex* first0 = c0;
     BtVertex* first1 = c1;
     bool firstRun = true;
 
+    // Half-warp masks for parallel findMaxAngle
+    const unsigned HMASK_LO = 0x0000FFFF;  // lanes 0-15: search c0
+    const unsigned HMASK_HI = 0xFFFF0000;  // lanes 16-31: search c1
+    int hlane = lane & 15;  // lane within half-warp
+    unsigned my_hmask = (lane < 16) ? HMASK_LO : HMASK_HI;
+
     while (true) {
-        // --- Compute inputs (lane 0) and broadcast to lane 1 ---
-        BtPoint32 sd;
-        BtPoint64 rxs, sxrxs;
+        // --- Broadcast c0, c1, prevPoint from lane 0; all lanes recompute sd/rxs/sxrxs ---
         long long c0_ll = 0, c1_ll = 0;
+        BtPoint32 pp;
         if (lane == 0) {
-            sd = bp32_sub(c1->point, c0->point);
-            BtPoint32 r = bp32_sub(prevPoint, c0->point);
-            rxs = bp32_cross(r, sd);
-            sxrxs = bp32_cross64(sd, rxs);
             c0_ll = (long long)c0;
             c1_ll = (long long)c1;
+            pp = prevPoint;
         }
-        sd.x = __shfl_sync(0x3, sd.x, 0);
-        sd.y = __shfl_sync(0x3, sd.y, 0);
-        sd.z = __shfl_sync(0x3, sd.z, 0);
-        rxs.x = __shfl_sync(0x3, rxs.x, 0);
-        rxs.y = __shfl_sync(0x3, rxs.y, 0);
-        rxs.z = __shfl_sync(0x3, rxs.z, 0);
-        sxrxs.x = __shfl_sync(0x3, sxrxs.x, 0);
-        sxrxs.y = __shfl_sync(0x3, sxrxs.y, 0);
-        sxrxs.z = __shfl_sync(0x3, sxrxs.z, 0);
-        c0_ll = __shfl_sync(0x3, c0_ll, 0);
-        c1_ll = __shfl_sync(0x3, c1_ll, 0);
+        c0_ll = __shfl_sync(0xFFFFFFFF, c0_ll, 0);
+        c1_ll = __shfl_sync(0xFFFFFFFF, c1_ll, 0);
+        pp.x = __shfl_sync(0xFFFFFFFF, pp.x, 0);
+        pp.y = __shfl_sync(0xFFFFFFFF, pp.y, 0);
+        pp.z = __shfl_sync(0xFFFFFFFF, pp.z, 0);
 
-        // --- Parallel findMaxAngle: lane 0 searches c0 (ccw=false), lane 1 searches c1 (ccw=true) ---
-        BtVertex* my_start = (lane == 0) ? (BtVertex*)c0_ll : (BtVertex*)c1_ll;
-        bool my_ccw = (lane != 0);
-        BtRational64 my_minCot = br64_make(0, 0);
+        BtVertex* v_c0 = (BtVertex*)c0_ll;
+        BtVertex* v_c1 = (BtVertex*)c1_ll;
+        BtPoint32 sd = bp32_sub(v_c1->point, v_c0->point);
+        BtPoint32 r = bp32_sub(pp, v_c0->point);
+        BtPoint64 rxs = bp32_cross(r, sd);
+        BtPoint64 sxrxs = bp32_cross64(sd, rxs);
+
+        // --- Parallel findMaxAngle: lanes 0-15 search c0, lanes 16-31 search c1 ---
+        BtVertex* my_start = (lane < 16) ? v_c0 : v_c1;
+        bool my_ccw = (lane >= 16);
+        BtRational64 my_minCot;
+        my_minCot.num = 0; my_minCot.den = 0; my_minCot.sign = 0;
         int my_edge_count = 0;
-        BtEdge* my_min = bt_findMaxAngle(mergeStamp, my_ccw, my_start, sd, rxs, sxrxs, &my_minCot, &my_edge_count);
+        BtEdge* my_min = bt_findMaxAngle_par(mergeStamp, my_ccw, my_start, sd, rxs, sxrxs, &my_minCot, &my_edge_count, hlane, my_hmask);
 
         // --- Gather edge counts and update stats (lane 0) ---
         {
-            int ec0 = my_edge_count;
-            int ec1 = __shfl_sync(0x3, my_edge_count, 1);
+            int ec0 = my_edge_count;  // lane 0 has c0's count
+            int ec1 = __shfl_sync(0xFFFFFFFF, my_edge_count, 16);  // lane 16 has c1's count
             if (lane == 0) {
                 s->fma_total_edges += ec0 + ec1;
                 if (ec0 < s->fma_min_edges) s->fma_min_edges = ec0;
@@ -952,14 +1050,14 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
             }
         }
 
-        // --- Gather results: lane 0 keeps min0/minCot0, gets min1/minCot1 from lane 1 ---
-        BtEdge* min0 = my_min;
+        // --- Gather results: lane 0 has min0/minCot0, lane 16 has min1/minCot1 ---
+        BtEdge* min0 = my_min;  // valid on lane 0
         BtRational64 minCot0 = my_minCot;
-        BtEdge* min1 = (BtEdge*)__shfl_sync(0x3, (long long)my_min, 1);
+        BtEdge* min1 = (BtEdge*)__shfl_sync(0xFFFFFFFF, (long long)my_min, 16);
         BtRational64 minCot1;
-        minCot1.num = __shfl_sync(0x3, (unsigned long long)my_minCot.num, 1);
-        minCot1.den = __shfl_sync(0x3, (unsigned long long)my_minCot.den, 1);
-        minCot1.sign = __shfl_sync(0x3, my_minCot.sign, 1);
+        minCot1.num = __shfl_sync(0xFFFFFFFF, (unsigned long long)my_minCot.num, 16);
+        minCot1.den = __shfl_sync(0xFFFFFFFF, (unsigned long long)my_minCot.den, 16);
+        minCot1.sign = __shfl_sync(0xFFFFFFFF, my_minCot.sign, 16);
 
         // --- Rest of loop body (lane 0 only) ---
         int loop_action = 0; // 0=continue, 1=return
@@ -1083,7 +1181,7 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
         } // !loop_action (outer)
         } // lane == 0
 
-        loop_action = __shfl_sync(0x3, loop_action, 0);
+        loop_action = __shfl_sync(0xFFFFFFFF, loop_action, 0);
         if (loop_action) return;
     }
 }
@@ -1173,10 +1271,10 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
             stack[sp++] = root;
         }
     }
-    err = __shfl_sync(0x3, err, 0);
+    err = __shfl_sync(0xFFFFFFFF, err, 0);
     if (err) return;
-    sp = __shfl_sync(0x3, sp, 0);
-    stack = (BtDCStackItem*)(long long)__shfl_sync(0x3, (long long)stack, 0);
+    sp = __shfl_sync(0xFFFFFFFF, sp, 0);
+    stack = (BtDCStackItem*)(long long)__shfl_sync(0xFFFFFFFF, (long long)stack, 0);
 
     while (sp > 0) {
         int stage = 0;
@@ -1187,8 +1285,8 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
             stack[sp] = item;  // write it at sp (the slot we just popped from)
             stage = item.stage;
         }
-        sp = __shfl_sync(0x3, sp, 0);
-        stage = __shfl_sync(0x3, stage, 0);
+        sp = __shfl_sync(0xFFFFFFFF, sp, 0);
+        stage = __shfl_sync(0xFFFFFFFF, stage, 0);
 
         if (stage == 0) {
             // Stage 0: subdivide — lane 0 only
@@ -1248,9 +1346,9 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
                     }
                 }
             }
-            err = __shfl_sync(0x3, err, 0);
+            err = __shfl_sync(0xFFFFFFFF, err, 0);
             if (err) return;
-            sp = __shfl_sync(0x3, sp, 0);
+            sp = __shfl_sync(0xFFFFFFFF, sp, 0);
         } else {
             // Stage 1: merge — both lanes participate
             BtDCStackItem* item_ptr = &stack[sp]; // popped item at slot sp
@@ -1560,8 +1658,8 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     }
     __syncwarp();
 
-    // Lanes 0-1: D&C (lane 1 participates in parallel findMaxAngle inside bt_merge)
-    if (lane <= 1) {
+    // All 32 lanes: D&C (lanes 0-15 and 16-31 parallelize findMaxAngle inside bt_merge)
+    {
         if (lane == 0) {
             s->usedEdgePairs = 0;
 #ifdef TRACK_MAX_EDGE_PAIRS
@@ -1569,6 +1667,7 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 #endif
             s->mergeStamp = -3;
         }
+        __syncwarp();
 
         // Save offset before D&C stack allocation so we can rewind after
         int pre_dc_offset = 0;
