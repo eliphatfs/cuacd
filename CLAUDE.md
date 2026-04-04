@@ -197,6 +197,18 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 | J2 | `hull_dandc_warp` | Removed; use `hull_dandc_warp_mesh` for all callers |
 | J3 | `heap_compact(heap) -> int` | Removed from allocator.cuh; `beam_heap_compact()` is now a no-op |
 | J4 | `query_dandc_scratch` kernel | Removed from test_hull_dandc.cu, beam.c, structs.h, test_beam.c; scratch is heap-managed, no pre-query needed |
+| J5 | `bt_computeVolume` in hull_dandc.cuh | Volume now computed via `mesh_volume_warp` on extracted triangle mesh; half-edge BFS volume never called |
+
+## bt_findMaxAngle Profiling (Edge Degree)
+
+`bt_findMaxAngle` iterates a vertex's circular edge list to find the best merge angle. Instrumentation (gated on `COACD_BEAM_DEBUG`) measures edges chased per call. `BtHullState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`); lane 0 accumulates after shuffling lane 1's count.
+
+Results on octocat mesh (20k vertices, realistic distribution):
+- **Average degree: 3.0–3.9** across all hull sizes (86 to 20k points)
+- **Max degree: 20–42** (rare outliers)
+- **Calls per hull: ~180k** for 20k-point hulls
+
+**Conclusion**: parallelizing the inner edge loop (batch K edges across K lanes) is not viable — average degree ~3.5 means most lanes would be idle. The bottleneck is the sheer number of `bt_findMaxAngle` calls, not work per call. Alternative data structures (linear arrays replacing the linked list) are also not justified at this degree.
 
 ## plane_cut_block API
 
