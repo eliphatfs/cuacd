@@ -42,7 +42,7 @@ tests/                # All tests
   test_hull_mesh.py   #   D&C hull mesh extraction tests
   test_warp_sort.py   #   Tests for warp_sort_bp32
   test_plane_cut.py   #   Plane cut tests (14 tests)
-  test_decompose.py   #   beam_decompose tests (cube, lshape, octocat)
+  test_decompose.py   #   beam_decompose tests (cube, lshape, octocat, octocat_debug_steps)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling
   bench_mm.py         #   Memory management benchmark
   bench_arena_sweep.py#   Arena count sweep benchmark
@@ -162,6 +162,7 @@ One `DevicePool` with bump allocator backs two embedded `DeviceHeap` instances (
 - **compute-sanitizer**: `compute-sanitizer --tool memcheck python <script.py>` to find exact source.
 - **CheckedBuf**: `COACD_BEAM_DEBUG=1 pip install -e .` enables OOB detection in device code.
 - **Debug mode**: `ctx.decompose(..., debug=1)` syncs after each kernel, prints per-stage status.
+- **Per-substep memory profiling**: `python -m pytest tests/test_decompose.py::test_octocat_decompose_debug_steps -v -s` — runs octocat with `debug=1`, use captured stdout/stderr to see per-substep pool usage.
 - See `docs/implementation_notes.md` for resolved bugs and gotchas.
 
 ## Current Status

@@ -215,6 +215,19 @@ def test_octocat_decompose():
     assert len(parts) >= 1
 
 
+@pytest.mark.skipif(not os.path.exists(OCTOCAT_OBJ),
+                    reason="Octocat-v2.obj not found")
+def test_octocat_decompose_debug_steps():
+    mesh = trimesh.load(OCTOCAT_OBJ, force="mesh")
+    verts = np.array(mesh.vertices, dtype=np.float32)
+    tris  = np.array(mesh.faces,    dtype=np.int32)
+    parts = _decompose_shape(verts, tris, "octocat",
+                             max_iters=100, cuts_per_axis=10,
+                             threshold=0.05, max_keep=32,
+                             verbose=1, debug=1)
+    assert len(parts) >= 1
+
+
 @pytest.mark.skipif(not os.path.exists(STL_49160),
                     reason="49160.stl not found")
 def test_49160_decompose():
