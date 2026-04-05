@@ -569,14 +569,10 @@ __device__ inline BtEdge* bt_newEdgePair(BtHullState* s, BtVertex* from, BtVerte
     return e;
 }
 
-// Returns -1 if a NULL pointer is detected (pending chain edge in a ring
-// removal), indicating a data structure invariant violation. Caller should
-// set error flag and abort the merge.
-__device__ inline int bt_removeEdgePair(BtHullState* s, BtEdge* edge) {
+__device__ inline void bt_removeEdgePair(BtHullState* s, BtEdge* edge) {
     BtEdge* n = edge->next;
     BtEdge* r = edge->reverse;
     if (n != edge) {
-        if (!edge->prev || !n) return -1;
         n->prev = edge->prev;
         edge->prev->next = n;
         r->target->edges = n;
@@ -585,7 +581,6 @@ __device__ inline int bt_removeEdgePair(BtHullState* s, BtEdge* edge) {
     }
     n = r->next;
     if (n != r) {
-        if (!r->prev || !n) return -2;
         n->prev = r->prev;
         r->prev->next = n;
         edge->target->edges = n;
@@ -595,65 +590,6 @@ __device__ inline int bt_removeEdgePair(BtHullState* s, BtEdge* edge) {
     btpool_free(&s->edgePool, edge);
     btpool_free(&s->edgePool, r);
     s->usedEdgePairs--;
-    return 0;
-}
-
-// Remove an edge pair where the reverse may be in a pending chain
-// (not a circular ring). Scans pending_head→...→pending_tail to check;
-// if found, unlinks from the chain (NULL-safe) and updates head/tail.
-// Otherwise performs normal ring unlinking for the reverse side.
-__device__ inline int bt_removeEdgePairPending(
-    BtHullState* s, BtEdge* edge,
-    BtEdge** pending_head, BtEdge** pending_tail)
-{
-    BtEdge* r = edge->reverse;
-
-    // First half: unlink edge from its circular ring (always safe).
-    BtEdge* n = edge->next;
-    if (n != edge) {
-        if (!edge->prev || !n) return -1;
-        n->prev = edge->prev;
-        edge->prev->next = n;
-        r->target->edges = n;
-    } else {
-        r->target->edges = NULL;
-    }
-
-    // Second half: check if r is in the pending chain by scanning.
-    bool in_pending = false;
-    if (pending_head && pending_tail && *pending_head) {
-        for (BtEdge* p = *pending_head; p; p = p->next) {
-            if (p == r) { in_pending = true; break; }
-            if (p == *pending_tail) break;
-        }
-    }
-
-    if (in_pending) {
-        // Unlink r from the pending chain (NULL-safe at boundaries).
-        BtEdge* rn = r->next;
-        BtEdge* rp = r->prev;
-        if (rp) rp->next = rn;
-        if (rn) rn->prev = rp;
-        if (*pending_head == r) *pending_head = rn;
-        if (*pending_tail == r) *pending_tail = rp;
-        // Do NOT touch edge->target->edges — r was not in the vertex ring.
-    } else {
-        // Normal ring case.
-        n = r->next;
-        if (n != r) {
-            if (!r->prev || !n) return -2;
-            n->prev = r->prev;
-            r->prev->next = n;
-            edge->target->edges = n;
-        } else {
-            edge->target->edges = NULL;
-        }
-    }
-
-    btpool_free(&s->edgePool, edge);
-    btpool_free(&s->edgePool, r);
-    s->usedEdgePairs--;
-    return 0;
 }
 
 enum BtOrientation { BT_NONE, BT_CLOCKWISE, BT_COUNTER_CLOCKWISE };
@@ -1032,36 +968,7 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
     BtVertex* first1 = c1;
     bool firstRun = true;
 
-    int merge_iter = 0;
-#ifdef COACD_BEAM_DEBUG
-    bool ring_was_ok = true;  // track if we've already reported a break
-#endif
     while (true) {
-#ifdef COACD_BEAM_DEBUG
-        if (ring_was_ok) {
-            int rc0 = bt_checkEdgeRing(c0, "");
-            int rc1 = bt_checkEdgeRing(c1, "");
-            if (rc0 < 0 || rc1 < 0) {
-                DPRINTF("[BREAK] ring broken at iter=%d blk=%d lane=%d stamp=%d "
-                        "c0_ok=%d c1_ok=%d c0=%p c1=%p\n",
-                        merge_iter, blockIdx.x, threadIdx.x, mergeStamp,
-                        rc0 == 0, rc1 == 0, c0, c1);
-                // Dump c1's ring
-                BtEdge* re = c1->edges;
-                if (re) {
-                    for (int ri = 0; ri < 10; ri++) {
-                        DPRINTF("  c1[%d]: e=%p n=%p p=%p tgt=%p cp=%d\n",
-                                ri, re, re->next, re->prev, re->target, re->copy);
-                        re = re->next;
-                        if (!re || re == c1->edges) break;
-                    }
-                }
-                ring_was_ok = false;
-                s->edgePool.error = 99;
-                return;
-            }
-        }
-#endif
         BtPoint32 sd = bp32_sub(c1->point, c0->point);
         BtPoint32 r = bp32_sub(prevPoint, c0->point);
         BtPoint64 rxs = bp32_cross(r, sd);
@@ -1092,7 +999,6 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
 
         int cmp = !min0 ? 1 : !min1 ? -1 : br64_cmp(minCot0, minCot1);
 
-        bool bridge_created = false;
         if (firstRun || ((cmp >= 0) ? !br64_isNegInf(minCot1) : !br64_isNegInf(minCot0))) {
             BtEdge* e = bt_newEdgePair(s, c0, c1);
             if (!e) { DPRINTF("[BUG] bt_merge OOM at bridge edge, blk=%d lane=%d\n", blockIdx.x, threadIdx.x); return; }
@@ -1106,14 +1012,6 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
             else pendingHead1 = e;
             e->prev = pendingTail1;
             pendingTail1 = e;
-            bridge_created = true;
-#ifdef COACD_BEAM_DEBUG
-            // Log bridge reverse creation for failing lane only (stamp -163 is the known bad merge)
-            if (mergeStamp == -163)
-                DPRINTF("[BRIDGE] iter=%d blk=%d lane=%d rev=%p cmp=%d c0=%p c1=%p pendH1=%p pendT1=%p\n",
-                        merge_iter, blockIdx.x, threadIdx.x, e, cmp, c0, c1,
-                        pendingHead1, pendingTail1);
-#endif
         }
 
         BtEdge* e0 = min0;
@@ -1125,25 +1023,12 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
 
         if ((cmp >= 0) && e1) {
             if (toPrev1) {
-                int rem_count = 0;
                 for (BtEdge *e = toPrev1->next, *n = NULL; e != min1; e = n) {
                     n = e->next;
-                    { int _rc = bt_removeEdgePairPending(s, e, &pendingHead0, &pendingTail0); if (_rc < 0) {
-                        DPRINTF("[REP] rc=%d blk=%d ln=%d\n", _rc, blockIdx.x, threadIdx.x);
-                        s->edgePool.error = 99; return; } }
-                    if (++rem_count > 10000) {
-                        DPRINTF("[BUG] c1 removal loop stuck, blk=%d lane=%d iter=%d\n",
-                                blockIdx.x, threadIdx.x, merge_iter);
-                        break;
-                    }
+                    bt_removeEdgePair(s, e);
                 }
             }
             if (pendingTail1) {
-#ifdef COACD_BEAM_DEBUG
-                if (mergeStamp == -163)
-                    DPRINTF("[INTEG1] iter=%d blk=%d lane=%d toPrev1=%p pendH1=%p pendT1=%p min1=%p c1=%p\n",
-                            merge_iter, blockIdx.x, threadIdx.x, toPrev1, pendingHead1, pendingTail1, min1, c1);
-#endif
                 if (toPrev1) bt_edge_link(toPrev1, pendingHead1);
                 else { bt_edge_link(min1->prev, pendingHead1); firstNew1 = pendingHead1; }
                 bt_edge_link(pendingTail1, min1);
@@ -1155,74 +1040,12 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
             c1 = e1->target;
             toPrev1 = e1->reverse;
         }
-#ifdef COACD_BEAM_DEBUG
-        if (ring_was_ok) {
-            int rc1_mid = bt_checkEdgeRing(c1, "");
-            if (rc1_mid < 0) {
-                DPRINTF("[MID-BREAK] c1 ring broken after c1-branch iter=%d cmp=%d bridge=%d "
-                        "blk=%d lane=%d pendH1=%p pendT1=%p\n",
-                        merge_iter, cmp, (int)bridge_created,
-                        blockIdx.x, threadIdx.x, pendingHead1, pendingTail1);
-                BtEdge* re = c1->edges;
-                if (re) {
-                    for (int ri = 0; ri < 10; ri++) {
-                        DPRINTF("  c1[%d]: e=%p n=%p p=%p tgt=%p cp=%d\n",
-                                ri, re, re->next, re->prev, re->target, re->copy);
-                        re = re->next;
-                        if (!re || re == c1->edges) break;
-                    }
-                }
-                ring_was_ok = false;
-                s->edgePool.error = 99; return;
-            }
-        }
-#endif
 
         if ((cmp <= 0) && e0) {
             if (toPrev0) {
-                int rem_count = 0;
                 for (BtEdge *e = toPrev0->prev, *n = NULL; e != min0; e = n) {
                     n = e->prev;
-#ifdef COACD_BEAM_DEBUG
-                    int c1_ring_pre = bt_checkEdgeRing(c1, "c0-rem-pre");
-#endif
-                    { int _rc = bt_removeEdgePairPending(s, e, &pendingHead1, &pendingTail1); if (_rc < 0) {
-                        DPRINTF("[REP] rc=%d blk=%d ln=%d\n", _rc, blockIdx.x, threadIdx.x);
-                        s->edgePool.error = 99; return; } }
-#ifdef COACD_BEAM_DEBUG
-                    int c1_ring_post = bt_checkEdgeRing(c1, "c0-rem-post");
-                    if (c1_ring_pre == 0 && c1_ring_post < 0) {
-                        BtEdge* r = e->reverse;
-                        // Where is the reverse? Check: pending1, its target's ring, or orphan
-                        bool in_pending1 = false;
-                        for (BtEdge* p = pendingHead1; p; p = p->next) {
-                            if (p == r) { in_pending1 = true; break; }
-                            if (p == pendingTail1) break;
-                        }
-                        bool in_target_ring = false;
-                        BtVertex* rsrc = r->reverse->target; // source vertex of r
-                        if (rsrc->edges) {
-                            BtEdge* scan = rsrc->edges;
-                            for (int si = 0; si < 1000; si++) {
-                                if (scan == r) { in_target_ring = true; break; }
-                                scan = scan->next;
-                                if (!scan || scan == rsrc->edges) break;
-                            }
-                        }
-                        DPRINTF("[CULPRIT] c0 rem broke c1 ring! blk=%d lane=%d iter=%d rem=%d "
-                                "e->target=%p==c1=%p rev=%p r.prev=%p r.next=%p "
-                                "in_pending1=%d in_src_ring=%d pendH1=%p pendT1=%p\n",
-                                blockIdx.x, threadIdx.x, merge_iter, rem_count,
-                                e->target, c1, r, r->prev, r->next,
-                                (int)in_pending1, (int)in_target_ring,
-                                pendingHead1, pendingTail1);
-                    }
-#endif
-                    if (++rem_count > 10000) {
-                        DPRINTF("[BUG] c0 removal loop stuck, blk=%d lane=%d iter=%d\n",
-                                blockIdx.x, threadIdx.x, merge_iter);
-                        break;
-                    }
+                    bt_removeEdgePair(s, e);
                 }
             }
             if (pendingTail0) {
@@ -1237,9 +1060,6 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
             c0 = e0->target;
             toPrev0 = e0->reverse;
         }
-#ifdef COACD_BEAM_DEBUG
-        merge_iter++;
-#endif
 
         if ((c0 == first0) && (c1 == first1)) {
             if (toPrev0 == NULL) {
@@ -1248,9 +1068,7 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
             } else {
                 for (BtEdge *e = toPrev0->prev, *n = NULL; e != firstNew0; e = n) {
                     n = e->prev;
-                    { int _rc = bt_removeEdgePairPending(s, e, &pendingHead1, &pendingTail1); if (_rc < 0) {
-                        DPRINTF("[REP] rc=%d blk=%d ln=%d\n", _rc, blockIdx.x, threadIdx.x);
-                        s->edgePool.error = 99; return; } }
+                    bt_removeEdgePair(s, e);
                 }
                 if (pendingTail0) {
                     bt_edge_link(pendingHead0, toPrev0);
@@ -1263,9 +1081,7 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
             } else {
                 for (BtEdge *e = toPrev1->next, *n = NULL; e != firstNew1; e = n) {
                     n = e->next;
-                    { int _rc = bt_removeEdgePairPending(s, e, &pendingHead0, &pendingTail0); if (_rc < 0) {
-                        DPRINTF("[REP] rc=%d blk=%d ln=%d\n", _rc, blockIdx.x, threadIdx.x);
-                        s->edgePool.error = 99; return; } }
+                    bt_removeEdgePair(s, e);
                 }
                 if (pendingTail1) {
                     bt_edge_link(toPrev1, pendingHead1);
@@ -1753,9 +1569,26 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     __syncwarp();
     if (s_postsort_error) { if (lane == 0) shared_wp->error = s_postsort_error; return; }
 
-    // --- Per-lane group boundaries ---
-    int my_start = lane * count / WARP_SIZE;
-    int my_end   = (lane + 1) * count / WARP_SIZE;
+    // --- Per-lane group boundaries (with dedup at split points) ---
+    // Like serial D&C's split logic, advance each split past runs of
+    // equal points so that identical vertices are never split across
+    // two lanes. Without this, degenerate sub-hulls at lane boundaries
+    // trigger edge cases in bt_merge (pending chain use-after-free).
+    __shared__ int s_splits[WARP_SIZE + 1];
+    if (lane == 0) {
+        s_splits[0] = 0;
+        for (int g = 1; g < WARP_SIZE; g++) {
+            int split = g * count / WARP_SIZE;
+            // Advance past equal points (same logic as bt_computeInternal)
+            BtPoint32 p = vblock[split - 1].point;
+            while (split < count && bp32_eq(vblock[split].point, p)) split++;
+            s_splits[g] = split;
+        }
+        s_splits[WARP_SIZE] = count;
+    }
+    __syncwarp();
+    int my_start = s_splits[lane];
+    int my_end   = s_splits[lane + 1];
 
     // --- Per-lane BtHullState with arena-backed edge pool ---
     BtHullState my_state;
