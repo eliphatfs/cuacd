@@ -134,6 +134,7 @@ __device__ inline void pc_zero_part(Part* p) {
     heap_free(scratch_heap, (void*)s_dir_edges);                    \
     heap_free(scratch_heap, (void*)s_dir_sort);                     \
     heap_free(scratch_heap, (void*)s_boundary_flags);               \
+    heap_free(scratch_heap, (void*)s_be_a);                        \
 } while(0)
 
 __device__ inline PartPair plane_cut_block(
@@ -179,6 +180,8 @@ __device__ inline PartPair plane_cut_block(
     __shared__ Edge2i* s_dir_edges;
     __shared__ char*   s_dir_sort;
     __shared__ char*   s_boundary_flags;
+    __shared__ int*    s_be_a;
+    __shared__ int     s_n_boundary;
 
     // Return value — written by thread 0, returned by all threads.
     __shared__ PartPair s_result;
@@ -202,7 +205,7 @@ __device__ inline PartPair plane_cut_block(
         s_signs = NULL; s_all_verts = NULL;
         s_cross_edges = NULL; s_sort_scratch = NULL; s_isect_idx = NULL;
         s_pos_tris = NULL; s_neg_tris = NULL;
-        s_dir_edges = NULL; s_dir_sort = NULL; s_boundary_flags = NULL;
+        s_dir_edges = NULL; s_dir_sort = NULL; s_boundary_flags = NULL; s_be_a = NULL;
         s_counters[0] = 0; s_counters[1] = n_verts;
         s_counters[2] = 0; s_counters[3] = 0;
         pc_zero_part(&s_result.pos);
@@ -542,6 +545,37 @@ __device__ inline PartPair plane_cut_block(
     }
     __syncthreads();
 
+    // === Phase 9b: Parallel compact boundary edges ===
+    if (tid == 0) {
+        s_n_boundary = 0;
+        s_be_a = NULL;
+        if (n_de > 0) {
+            void* p;
+            if (heap_alloc(scratch_heap, (unsigned int)(n_de * 2 * (int)sizeof(int)), &p) != HEAP_OK)
+                { s_alloc_ok = 0; p = NULL; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+            s_be_a = (int*)p;
+        }
+    }
+    __syncthreads();
+    if (!s_alloc_ok) {
+        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); }
+        return s_result;
+    }
+    for (int i = tid; i < n_de; i += PC_BLOCK) {
+        if (boundary_flags[i]) {
+            int wi = atomicAdd(&s_n_boundary, 1);
+            s_be_a[wi*2]   = dir_edges[i].a;
+            s_be_a[wi*2+1] = dir_edges[i].b;
+        }
+    }
+    __syncthreads();
+    // dir_edges and boundary_flags no longer needed.
+    if (tid == 0) {
+        heap_free(scratch_heap, (void*)s_dir_edges);       s_dir_edges      = NULL;
+        heap_free(scratch_heap, (void*)s_boundary_flags);  s_boundary_flags = NULL;
+    }
+    __syncthreads();
+
     // =========================================================================
     // Phases 10-12: thread 0 only.
     //
@@ -553,10 +587,10 @@ __device__ inline PartPair plane_cut_block(
     if (tid == 0) {
         int kern_ok    = 1;
         int n_cap      = 0;
-        int n_boundary = 0;
+        int n_boundary = s_n_boundary;
+        void* lv_ptr   = (void*)s_be_a;  // boundary edge pairs (be_a), freed after loop recon
 
         // Thread-0-only scratch — all NULL so heap_free is always safe.
-        void* lv_ptr   = NULL;  // boundary edge pairs (be_a), freed after loop recon
         void* lv2_ptr  = NULL;  // loop vertex sequence (lv)
         void* ls_ptr   = NULL;  // loop_starts
         void* lsz_ptr  = NULL;  // loop_sizes
@@ -564,26 +598,6 @@ __device__ inline PartPair plane_cut_block(
         void* cap_ptr  = NULL;  // cap_tris (ear-clip output)
         void* ep_ptr   = NULL;  // ear_prevnext
         void* sb_ptr   = NULL;  // inner sort buf (inner_idx + inner_max_u, 256 each)
-
-        // --- Compact boundary edges into lv_ptr (packed a,b pairs) ---
-        if (n_de > 0) {
-            if (heap_alloc(scratch_heap, (unsigned int)(n_de * 2 * (int)sizeof(int)), &lv_ptr) != HEAP_OK) {
-                kern_ok = 0; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);
-            }
-        }
-
-        if (kern_ok) {
-            PC_BUF(int, be_a, lv_ptr, n_de * 2);
-            for (int i = 0; i < n_de; i++) {
-                if (boundary_flags[i]) {
-                    be_a[n_boundary*2]   = dir_edges[i].a;
-                    be_a[n_boundary*2+1] = dir_edges[i].b;
-                    n_boundary++;
-                }
-            }
-            // dir_edges and boundary_flags no longer needed.
-            heap_free(scratch_heap, (void*)s_dir_edges);       s_dir_edges      = NULL;
-            heap_free(scratch_heap, (void*)s_boundary_flags);  s_boundary_flags = NULL;
 
             // --- Phase 10-12: loop reconstruction + polygon + ear-clip ---
             if (n_boundary > 0) {
@@ -608,7 +622,7 @@ __device__ inline PartPair plane_cut_block(
                     float* inner_max_u  = (float*)((int*)sb_ptr + 256);
 
                     // Phase 10: reconstruct loops from boundary edge pairs
-                    PC_BUF(int, be_a2, lv_ptr, n_de * 2);
+                    PC_BUF(int, be_a2, lv_ptr, n_boundary * 2);
                     int* be_used = loop_starts.raw();  // borrow before it's filled
                     for (int i = 0; i < n_boundary; i++) be_used[i] = 0;
 
@@ -638,7 +652,7 @@ __device__ inline PartPair plane_cut_block(
                     }
 
                     // be_a (lv_ptr) no longer needed — free to reclaim memory.
-                    heap_free(scratch_heap, lv_ptr); lv_ptr = NULL;
+                    heap_free(scratch_heap, lv_ptr); lv_ptr = NULL; s_be_a = NULL;
 
                     // 2D projection axes (drop largest normal component)
                     int pu, pv_ax;
@@ -847,8 +861,6 @@ __device__ inline PartPair plane_cut_block(
                     heap_free(scratch_heap, cap_ptr); cap_ptr = NULL;
                 } // kern_ok after loop-phase alloc
             } // n_boundary > 0
-        } // kern_ok after lv alloc
-
         // Broadcast phase-13 state.  Local scratch lv_ptr..sb_ptr are all NULL
         // at this point (freed inline above); heap_free is NULL-safe.
         s_total_pos = n_pos + n_cap;
@@ -866,7 +878,7 @@ __device__ inline PartPair plane_cut_block(
                 else { s_alloc_ok = 0; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
             }
         }
-        heap_free(scratch_heap, lv_ptr);
+        heap_free(scratch_heap, lv_ptr); s_be_a = NULL;
         heap_free(scratch_heap, lv2_ptr);
         heap_free(scratch_heap, ls_ptr);
         heap_free(scratch_heap, lsz_ptr);
