@@ -501,7 +501,7 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 // ============================================================================
 
 #define BT_DC_MAX_STACK  4096
-#define BT_DC_MAX_STACK_LOCAL 2048
+#define BT_DC_MAX_STACK_LOCAL 128
 
 // Error codes (binary flags, combined via OR)
 #define BT_ERR_WARP_POOL_OOM  1   // bt_alloc failed (WarpPool capacity exceeded)
