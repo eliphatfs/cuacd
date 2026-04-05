@@ -306,9 +306,8 @@ struct BtDCStackItem {
     int start;
     int end;
     int stage;                   // 0 = descend, 1 = merge
-    BtIntermediateHull left_hull;
     BtIntermediateHull right_hull;
-    BtIntermediateHull* result;  // where to write the merged hull
+    BtIntermediateHull* result;  // where to write the merged hull (left child writes here directly)
 };
 
 // Vertex operations
@@ -357,12 +356,7 @@ struct BtPool {
     int         error;
     int         nblocks;
     CheckedBuf<void*> blocks;  // allocated from WarpPool, capacity BTPOOL_MAX_BLOCKS
-    // Arena mode: when arena_base != NULL, growth uses atomic bump alloc
-    // from a shared pre-allocated arena (warp-safe, no heap lock needed).
-    char*       arena_base;
-    int*        arena_offset;   // pointer to shared-memory atomic counter
-    int         arena_cap;
-    int         growSlabSize;   // edges per growth slab (arena mode only)
+    int         growSlabSize;   // edges per growth slab
 };
 
 // Allocate one slab from scratch_heap and prepend to the free list.
@@ -371,17 +365,8 @@ __device__ inline int btpool_add_block(BtPool* p) {
     if (p->nblocks >= BTPOOL_MAX_BLOCKS || !p->blocks.raw()) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
     int slab_n = (p->growSlabSize > 0) ? p->growSlabSize : BTPOOL_BLOCK_SIZE;
     void* block = NULL;
-    if (p->arena_base) {
-        // Arena-backed: atomic bump alloc (warp-safe, no heap lock)
-        int slab_bytes = slab_n * p->objSize;
-        int offset = atomicAdd(p->arena_offset, slab_bytes);
-        if (offset + slab_bytes > p->arena_cap) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
-        block = p->arena_base + offset;
-    } else {
-        // Heap-backed: lane calling this must hold the heap lock or be the only caller.
-        if (heap_alloc(p->scratch_heap, (unsigned int)(slab_n * p->objSize), &block) != HEAP_OK) {
-            p->error = BT_ERR_POOL_EXHAUST; return -1;
-        }
+    if (heap_alloc(p->scratch_heap, (unsigned int)(slab_n * p->objSize), &block) != HEAP_OK) {
+        p->error = BT_ERR_POOL_EXHAUST; return -1;
     }
     p->blocks[p->nblocks++] = block;
     // slot[0] -> existing freeList; slot[i] -> slot[i-1] for i > 0
@@ -404,9 +389,6 @@ __device__ inline int btpool_init_sized(BtPool* p, DeviceHeap* scratch_heap, int
     p->error        = 0;
     p->nblocks      = 0;
     p->blocks       = blocks_buf;
-    p->arena_base   = NULL;
-    p->arena_offset = NULL;
-    p->arena_cap    = 0;
     p->growSlabSize = slab_edges;
     if (btpool_add_block(p) < 0) return -1;
     return 0;
@@ -421,44 +403,9 @@ __device__ inline int btpool_init(BtPool* p, DeviceHeap* scratch_heap, int objSi
     p->error        = 0;
     p->nblocks      = 0;
     p->blocks       = blocks_buf;
-    p->arena_base   = NULL;
-    p->arena_offset = NULL;
-    p->arena_cap    = 0;
     p->growSlabSize = 0;
     if (btpool_add_block(p) < 0) return -1;
     if (btpool_add_block(p) < 0) return -1;
-    return 0;
-}
-
-// Init an arena-backed pool with one initial slab of custom size.
-// arena_base/arena_offset/arena_cap describe a shared pre-allocated arena.
-// initial_slab_edges = number of edges in the first slab.
-__device__ inline int btpool_init_arena(BtPool* p, int objSize,
-    char* arena_base, int* arena_offset, int arena_cap, int initial_slab_edges,
-    CheckedBuf<void*> blocks_buf) {
-    p->scratch_heap = NULL;
-    p->objSize      = (objSize + 3) & ~3;
-    p->freeList     = NULL;
-    p->error        = 0;
-    p->nblocks      = 0;
-    p->blocks       = blocks_buf;
-    p->arena_base   = arena_base;
-    p->arena_offset = arena_offset;
-    p->arena_cap    = arena_cap;
-    // Growth slabs use same size as initial slab (not BTPOOL_BLOCK_SIZE)
-    p->growSlabSize = initial_slab_edges;
-    // Allocate initial slab from arena via atomic bump
-    int slab_bytes = initial_slab_edges * p->objSize;
-    int offset = atomicAdd(arena_offset, slab_bytes);
-    if (offset + slab_bytes > arena_cap) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
-    void* block = arena_base + offset;
-    p->blocks[p->nblocks++] = block;
-    char* b = (char*)block;
-    int padded = p->objSize;
-    *(void**)b = NULL;
-    for (int i = 1; i < initial_slab_edges; i++)
-        *(void**)(b + i * padded) = b + (i - 1) * padded;
-    p->freeList = b + (initial_slab_edges - 1) * padded;
     return 0;
 }
 
@@ -572,10 +519,12 @@ struct BtHullState {
     WarpPool*   wp;
     DeviceHeap* scratch_heap;  // backing for edgePool slabs
     int         npoints;       // original point count (queue size bound)
+#ifdef COACD_BEAM_DEBUG
     int fma_total_edges;       // instrumentation: total edges chased in bt_findMaxAngle
     int fma_min_edges;         // instrumentation: min edges per call
     int fma_max_edges;         // instrumentation: max edges per call
     int fma_calls;             // instrumentation: number of bt_findMaxAngle calls
+#endif
 };
 
 // ============================================================================
@@ -1013,12 +962,14 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
         BtEdge* min0 = bt_findMaxAngle(mergeStamp, false, c0, sd, rxs, sxrxs, &minCot0, &ec0);
         BtEdge* min1 = bt_findMaxAngle(mergeStamp, true,  c1, sd, rxs, sxrxs, &minCot1, &ec1);
 
+#ifdef COACD_BEAM_DEBUG
         s->fma_total_edges += ec0 + ec1;
         if (ec0 < s->fma_min_edges) s->fma_min_edges = ec0;
         if (ec1 < s->fma_min_edges) s->fma_min_edges = ec1;
         if (ec0 > s->fma_max_edges) s->fma_max_edges = ec0;
         if (ec1 > s->fma_max_edges) s->fma_max_edges = ec1;
         s->fma_calls += 2;
+#endif
 
         if (!min0 && !min1) {
             BtEdge* e = bt_newEdgePair(s, c0, c1);
@@ -1197,8 +1148,6 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
     stack[sp].start = start;
     stack[sp].end = end;
     stack[sp].stage = 0;
-    stack[sp].left_hull.minXy = NULL; stack[sp].left_hull.maxXy = NULL;
-    stack[sp].left_hull.minYx = NULL; stack[sp].left_hull.maxYx = NULL;
     stack[sp].right_hull.minXy = NULL; stack[sp].right_hull.maxXy = NULL;
     stack[sp].right_hull.minYx = NULL; stack[sp].right_hull.maxYx = NULL;
     stack[sp].result = result;
@@ -1222,41 +1171,34 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
 
                 // Convert current item to merge (stage 1)
                 item->stage = 1;
-                item->left_hull.minXy = NULL; item->left_hull.maxXy = NULL;
-                item->left_hull.minYx = NULL; item->left_hull.maxYx = NULL;
                 item->right_hull.minXy = NULL; item->right_hull.maxXy = NULL;
                 item->right_hull.minYx = NULL; item->right_hull.maxYx = NULL;
                 item->result = res;
                 sp++;  // re-push (it's already in place)
                 BtDCStackItem* merge_ptr = &stack[sp - 1];
 
-                // Push right child
+                // Push right child (result → merge parent's right_hull)
                 if (sp >= BT_DC_MAX_STACK_LOCAL) { s->edgePool.error = BT_ERR_DC_STACK; return; }
                 stack[sp].start = split1;
                 stack[sp].end = item->end;
                 stack[sp].stage = 0;
-                stack[sp].left_hull.minXy = NULL; stack[sp].left_hull.maxXy = NULL;
-                stack[sp].left_hull.minYx = NULL; stack[sp].left_hull.maxYx = NULL;
                 stack[sp].right_hull.minXy = NULL; stack[sp].right_hull.maxXy = NULL;
                 stack[sp].right_hull.minYx = NULL; stack[sp].right_hull.maxYx = NULL;
                 stack[sp].result = &merge_ptr->right_hull;
                 sp++;
 
-                // Push left child
+                // Push left child (result → merge parent's result directly)
                 if (sp >= BT_DC_MAX_STACK_LOCAL) { s->edgePool.error = BT_ERR_DC_STACK; return; }
                 stack[sp].start = item->start;
                 stack[sp].end = split0;
                 stack[sp].stage = 0;
-                stack[sp].left_hull.minXy = NULL; stack[sp].left_hull.maxXy = NULL;
-                stack[sp].left_hull.minYx = NULL; stack[sp].left_hull.maxYx = NULL;
                 stack[sp].right_hull.minXy = NULL; stack[sp].right_hull.maxXy = NULL;
                 stack[sp].right_hull.minYx = NULL; stack[sp].right_hull.maxYx = NULL;
-                stack[sp].result = &merge_ptr->left_hull;
+                stack[sp].result = merge_ptr->result;
                 sp++;
             }
         } else {
-            bt_merge(s, &item->left_hull, &item->right_hull);
-            *item->result = item->left_hull;
+            bt_merge(s, item->result, &item->right_hull);
         }
     }
 }
@@ -1569,10 +1511,12 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     my_state.maxEdgePairs = 0;
 #endif
     my_state.vertexList = NULL;
+#ifdef COACD_BEAM_DEBUG
     my_state.fma_total_edges = 0;
     my_state.fma_min_edges   = 0x7fffffff;
     my_state.fma_max_edges   = 0;
     my_state.fma_calls       = 0;
+#endif
     // All lanes share a single atomic mergeStamp counter so that edge stamps
     // are on a common timeline (required for cross-lane merges in tree merge).
     my_state.mergeStamp = -3;
@@ -1609,9 +1553,6 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         my_state.edgePool.freeList     = NULL;
         my_state.edgePool.error        = 0;
         my_state.edgePool.nblocks      = 0;
-        my_state.edgePool.arena_base   = NULL;
-        my_state.edgePool.arena_offset = NULL;
-        my_state.edgePool.arena_cap    = 0;
         my_state.edgePool.growSlabSize = slab_edges;
         // Build free list from both slabs (slab1 -> slab0 -> NULL)
         for (int si = 0; si < 2; si++) {
@@ -1718,11 +1659,13 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         // Set mergeStamp from shared counter for use by extractMesh/computeVolume
         s->mergeStamp = s_mergeStamp;
         s->mergeStampPtr = NULL;  // extractMesh uses local stamp, not shared
+#ifdef COACD_BEAM_DEBUG
         // Aggregate instrumentation from lane 0 (other lanes' stats are lost)
         s->fma_total_edges = my_state.fma_total_edges;
         s->fma_min_edges   = my_state.fma_min_edges;
         s->fma_max_edges   = my_state.fma_max_edges;
         s->fma_calls       = my_state.fma_calls;
+#endif
     }
 
     // Each lane saves its own pool blocks for deferred cleanup in hull_dandc_warp_mesh.
@@ -1794,12 +1737,13 @@ __device__ inline Mesh hull_dandc_warp_mesh(
         state.scratch_heap = scratch_heap;
         state.vertexList   = NULL;
         state.mergeStampPtr = NULL;
-        state.edgePool.arena_base = NULL;
         state.edgePool.nblocks = 0;
+#ifdef COACD_BEAM_DEBUG
         state.fma_total_edges = 0;
         state.fma_min_edges   = 0x7fffffff;
         state.fma_max_edges   = 0;
         state.fma_calls       = 0;
+#endif
     }
     __syncwarp();
 

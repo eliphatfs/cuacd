@@ -191,7 +191,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 
 The D&C convex hull uses a parallel tree merge instead of a single serial D&C. Sorted points are split into 32 groups (one per warp lane), each lane independently builds a small hull, then 5 rounds of pairwise merging (16×2 → 8×4 → 4×8 → 2×16 → 1×32) produce the final hull.
 
-**Per-lane D&C**: `bt_computeInternal` uses a local stack array (`BT_DC_MAX_STACK_LOCAL=64` entries in thread-local memory) instead of WarpPool. Each lane runs serial D&C on its n/32 points using `bt_merge` (single-thread gift-wrap, no warp sync needed).
+**Per-lane D&C**: `bt_computeInternal` uses a local stack array (`BT_DC_MAX_STACK_LOCAL=64` entries in thread-local memory) instead of WarpPool. Each lane runs serial D&C on its n/32 points using `bt_merge` (single-thread gift-wrap, no warp sync needed). `BtDCStackItem` stores `{start, end, stage, right_hull, result}` — the left child writes directly to `*result`, so no `left_hull` field is needed; `bt_merge` operates on `result` in-place.
 
 **Per-lane edge pools**: each of the 32 lanes owns an independent `BtPool` for edge allocation. Lane 0 pre-allocates 64 slabs (2 per lane, each `min(3×count, BTPOOL_BLOCK_SIZE)` edges) from `scratch_heap` via `heap_alloc` and distributes them via shared memory. Growth slabs are allocated dynamically per-lane via `heap_alloc` during D&C (safe on sm_70+ with independent thread scheduling). `BTPOOL_BLOCK_SIZE=1024` edges per slab. Error codes are binary flags: `BT_ERR_POOL_EXHAUST=8`, `BT_ERR_DC_STACK=4`, `BT_ERR_SORT_STACK=2`. Error propagation after D&C/merge uses warp-wide OR reduction (`__shfl_xor_sync`) to collect all lanes' errors.
 
@@ -201,7 +201,7 @@ The D&C convex hull uses a parallel tree merge instead of a single serial D&C. S
 
 **Cleanup**: each lane saves its pool blocks to a `__shared__ BtLanePoolCleanup[WARP_SIZE]` array at the end of `bt_compute_postsort`. Lane 0 frees all blocks (initial + growth) in `hull_dandc_warp_mesh`'s `done:` section after `extractMesh` completes.
 
-Instrumentation (gated on `COACD_BEAM_DEBUG`): `BtHullState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`); only lane 0's stats are reported.
+Instrumentation (`#ifdef COACD_BEAM_DEBUG`): `BtHullState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`), all `#ifdef`'d out in release builds; only lane 0's stats are reported.
 
 ## plane_cut_block API
 
