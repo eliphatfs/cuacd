@@ -170,7 +170,7 @@ __device__ inline PartPair plane_cut_block(
     __shared__ int s_alloc_ok;
 
     // Shared scratch pointers — all initialised to NULL so heap_free is always safe.
-    __shared__ int*    s_signs;
+    __shared__ signed char* s_signs;
     __shared__ float*  s_all_verts;
     __shared__ Edge2i* s_cross_edges;
     __shared__ char*   s_sort_scratch;
@@ -219,9 +219,9 @@ __device__ inline PartPair plane_cut_block(
     if (tid == 0) {
         void* p;
         s_alloc_ok = 1;
-        if (heap_alloc(scratch_heap, (unsigned int)(n_verts * (int)sizeof(int)), &p) != HEAP_OK)
+        if (heap_alloc(scratch_heap, (unsigned int)(n_verts * (int)sizeof(signed char)), &p) != HEAP_OK)
             { s_alloc_ok = 0; p = NULL; }
-        s_signs = (int*)p;
+        s_signs = (signed char*)p;
 
         if (heap_alloc(scratch_heap, (unsigned int)(total_verts_cap * 3 * (int)sizeof(float)), &p) != HEAP_OK)
             { s_alloc_ok = 0; p = NULL; }
@@ -233,7 +233,7 @@ __device__ inline PartPair plane_cut_block(
         return s_result;
     }
 
-    PC_BUF(int,   signs,     s_signs,     n_verts);
+    PC_BUF(signed char, signs, s_signs,   n_verts);
     PC_BUF(float, all_verts, s_all_verts, total_verts_cap * 3);
 
     // === Phase 1: Classify vertices ===
