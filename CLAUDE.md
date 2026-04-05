@@ -17,7 +17,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   allocator.cuh       #   DevicePool (bump alloc + embedded DeviceHeap×2) + pool_alloc + heap_alloc/free
   common.cuh          #   Constants, atomics, CheckedBuf<T> (includes allocator.cuh)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)
-  geometry.cuh        #   Edge intersection, point-triangle distance, concavity metrics
+  geometry.cuh        #   signed_tet_volume (divergence theorem kernel helper)
   warp_common.cuh     #   WarpPool allocator + warp reductions (warp_min_f, warp_max_f, etc.)
   hull_dandc.cuh      #   Preparata-Hong D&C hull (Bullet port); hull_dandc_warp_mesh returns Mesh via heap
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
@@ -160,8 +160,6 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 | ID | Function | File |
 |----|----------|------|
 | A1 | `signed_tet_volume(p0, p1, p2) -> float` | geometry.cuh |
-| A2 | `intersect_edge(v0, v1, plane) -> (ix, iy, iz)` | geometry.cuh |
-| A3 | `point_triangle_dist(point, v0, v1, v2) -> float` | geometry.cuh |
 
 ### B. Block-Level Reductions (all threads call, __syncthreads)
 
@@ -183,23 +181,11 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:
 | ID | Function | File |
 |----|----------|------|
 | I1 | `pool_alloc(pool, size) -> void*` | allocator.cuh |
-| I2 | `global_alloc_warp(pool, bytes, lane) -> void*` | allocator.cuh |
 | I3 | `atomicMinF / atomicMaxF` | common.cuh |
 | I6 | `CheckedBuf<T>` — debug-mode bounds-checked buffer | common.cuh |
 | I4 | `heap_alloc(heap, size, out) -> int` | allocator.cuh |
 | I5 | `heap_free(heap, ptr) -> int` | allocator.cuh |
 
-### J. Dead Code
-
-| ID | What | Why dead |
-|----|------|----------|
-| J1 | `compute_concavity_tris` in geometry.cuh | Bbox cube-root proxy, superseded by Rv |
-| J2 | `hull_dandc_warp` | Removed; use `hull_dandc_warp_mesh` for all callers |
-| J3 | `heap_compact(heap) -> int` | Removed from allocator.cuh; `beam_heap_compact()` is now a no-op |
-| J4 | `query_dandc_scratch` kernel | Removed from test_hull_dandc.cu, beam.c, structs.h, test_beam.c; scratch is heap-managed, no pre-query needed |
-| J5 | `bt_computeVolume` in hull_dandc.cuh | Volume now computed via `mesh_volume_warp` on extracted triangle mesh; half-edge BFS volume never called |
-| J6 | `bt_findMaxAngle_par` in hull_dandc.cuh | Removed; replaced by parallel tree merge (each lane calls serial `bt_findMaxAngle` on its own hull) |
-| J7 | `BT_DC_MAX_STACK` (4096) | Replaced by `BT_DC_MAX_STACK_LOCAL` (64); D&C stack is now per-lane local memory, not WarpPool |
 
 ## Parallel Tree Merge (hull_dandc.cuh)
 
@@ -311,7 +297,7 @@ Instrumentation (gated on `COACD_BEAM_DEBUG`): `BtHullState` carries 4 counter f
 
 - **Output**: returns a `Mesh` struct directly. Allocates a single combined chunk from `DeviceHeap* heap`. Returns `{NULL,NULL,0,0,NULL}` on error or n<4.
 - **Heap chunk layout**: `[verts (nv*3 floats, 16-byte aligned) | tris (nt*3 ints, 16-byte aligned) | refcount(16B)]`; exact sizes from a count pass. `Mesh.refcount` points to the trailing `int`, initialized to 1.
-- **No volume**: `bt_computeVolume` is not called; the function only produces the mesh.
+- **No volume**: the function only produces the mesh; volume is computed separately via `mesh_volume_warp`.
 - **Scratch**: `DeviceHeap* scratch_heap` backs (a) the `WarpPool` (allocated as a single heap chunk via `dandc_scratch_bytes(n)`) and (b) `BtEdge` pool slabs (`BTPOOL_BLOCK_SIZE=8192` edges each, 2 initial + dynamic expansion). All scratch is heap-freed before return — scratch_heap is clean after call.
 - **WarpPool**: declared `__shared__`; backing allocated from scratch_heap by lane 0. Used for BtPoint32 array, vertex block, sort scratch, D&C stack, BFS queues (all rewound when done).
 - **BtPool (edge pool)**: starts with 2 slabs (16384 edges); expands one slab at a time via `heap_alloc(scratch_heap, ...)` when exhausted. Lane 0 only; free-list setup is serial. Up to `BTPOOL_MAX_BLOCKS=32` slabs tracked for cleanup.

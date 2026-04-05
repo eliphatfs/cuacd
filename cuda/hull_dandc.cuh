@@ -1241,68 +1241,7 @@ struct BtPointCmp {
 // Sort is handled by warp_sort.cuh (warp_sort_bp32) — no CUB dependency.
 
 // ============================================================================
-// Volume extraction from half-edge hull
-// ============================================================================
-
-__device__ inline float bt_computeVolume(BtHullState* s) {
-    if (!s->vertexList) return 0.0f;
-
-    // BFS over vertices (Bullet getVertexCopy pattern).
-    // Queue size bounded by number of hull vertices (≤ n), no stack overflow possible.
-    int vstamp = --s->mergeStamp;  // vertex visited stamp
-    int fstamp = --s->mergeStamp;  // face/edge visited stamp
-
-    // Allocate BFS queue from pool (n vertex pointers)
-    BtVertex** queue = (BtVertex**)bt_alloc(s->wp, s->npoints * (int)sizeof(BtVertex*));
-    if (!queue) return -1.0f;
-    int qhead = 0, qtail = 0;
-
-    s->vertexList->copy = vstamp;
-    queue[qtail++] = s->vertexList;
-
-    BtPoint32 ref = s->vertexList->point;
-    BtInt128 volume = bt128_from_u64(0);
-
-    while (qhead < qtail) {
-        BtVertex* v = queue[qhead++];
-        BtEdge* e = v->edges;
-        if (!e) continue;
-        do {
-            if (e->target->copy != vstamp) {
-                e->target->copy = vstamp;
-                queue[qtail++] = e->target;
-            }
-            if (e->copy != fstamp) {
-                // Walk face: fan-triangulate from first vertex
-                BtVertex* a = NULL;
-                BtVertex* b = NULL;
-                BtEdge* f = e;
-                do {
-                    if (a && b) {
-                        BtPoint32 va = bp32_sub(v->point, ref);
-                        BtPoint32 pa = bp32_sub(a->point, ref);
-                        BtPoint32 pb = bp32_sub(b->point, ref);
-                        long long vol = bp32_dot64(va, bp32_cross(pa, pb));
-                        volume = bt128_add(volume, bt128_from_i64(vol));
-                    }
-                    f->copy = fstamp;
-                    a = b;
-                    b = f->target;
-                    f = f->reverse->prev;
-                } while (f != e);
-            }
-            e = e->next;
-        } while (e != v->edges);
-    }
-
-    float sv = bt128_to_float(volume);
-    float scale = s->scaling[0] * s->scaling[1] * s->scaling[2];
-    float vol = fabsf(sv * scale) / 6.0f;
-    return vol;
-}
-
-// ============================================================================
-// Mesh extraction from half-edge hull (lane 0 only, after bt_computeVolume)
+// Mesh extraction from half-edge hull (lane 0 only)
 // ============================================================================
 
 // bt_extractMesh: BFS over the half-edge graph, assigns sequential indices to

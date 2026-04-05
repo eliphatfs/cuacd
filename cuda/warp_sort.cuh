@@ -225,12 +225,6 @@ struct BtPoint32Cmp {
 __device__ inline int ws_cmp(BtPoint32 a, BtPoint32 b) {
     return BtPoint32Cmp::cmp(a, b);
 }
-__device__ inline BtPoint32 ws_min(BtPoint32 a, BtPoint32 b) {
-    return (ws_cmp(a, b) < 0) ? a : b;
-}
-__device__ inline BtPoint32 ws_max(BtPoint32 a, BtPoint32 b) {
-    return (ws_cmp(a, b) < 0) ? b : a;
-}
 __device__ inline BtPoint32 ws_bitonic32(BtPoint32 val, int n, int lane) {
     return warp_bitonic32_t<BtPoint32, BtPoint32Cmp>(val, n, lane);
 }
