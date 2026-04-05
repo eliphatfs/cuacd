@@ -1585,13 +1585,11 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 
 #ifdef BT_SERIAL_MERGE
     // --- Serial D&C: only lane 0 builds full hull (for debugging) ---
-    BtIntermediateHull my_hull;
-    my_hull.minXy = NULL; my_hull.maxXy = NULL;
-    my_hull.minYx = NULL; my_hull.maxYx = NULL;
+    s_hulls[0].minXy = NULL; s_hulls[0].maxXy = NULL;
+    s_hulls[0].minYx = NULL; s_hulls[0].maxYx = NULL;
     if (lane == 0 && count > 0) {
-        bt_computeInternal(&my_state, 0, count, &my_hull, my_dc_stack);
+        bt_computeInternal(&my_state, 0, count, &s_hulls[0], my_dc_stack);
     }
-    s_hulls[0] = my_hull;
     __syncwarp();
     {
         int my_err = my_state.edgePool.error;
@@ -1601,14 +1599,12 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     }
 #else
     // --- Phase 1: Each lane builds hull of its group (parallel D&C) ---
-    BtIntermediateHull my_hull;
-    my_hull.minXy = NULL; my_hull.maxXy = NULL;
-    my_hull.minYx = NULL; my_hull.maxYx = NULL;
+    s_hulls[lane].minXy = NULL; s_hulls[lane].maxXy = NULL;
+    s_hulls[lane].minYx = NULL; s_hulls[lane].maxYx = NULL;
 
     if (my_end - my_start > 0) {
-        bt_computeInternal(&my_state, my_start, my_end, &my_hull, my_dc_stack);
+        bt_computeInternal(&my_state, my_start, my_end, &s_hulls[lane], my_dc_stack);
     }
-    s_hulls[lane] = my_hull;
     __syncwarp();
 
     // Check for errors from any lane — propagate actual error bits
