@@ -344,8 +344,8 @@ __device__ inline void bt_edge_link(BtEdge* a, BtEdge* n) {
 // Pool allocator backed by DeviceHeap (lane 0 only)
 // ============================================================================
 
-#define BT_ERR_POOL_EXHAUST 5
-#define BTPOOL_BLOCK_SIZE   8192   // edges per slab
+#define BT_ERR_POOL_EXHAUST 8
+#define BTPOOL_BLOCK_SIZE   1024   // edges per slab
 #define BTPOOL_MAX_BLOCKS   32     // max heap slabs tracked for cleanup
 
 // BtPool: free list of fixed-size objects, backed by heap slabs.
@@ -365,11 +365,11 @@ struct BtPool {
     int         growSlabSize;   // edges per growth slab (arena mode only)
 };
 
-// Allocate one slab of BTPOOL_BLOCK_SIZE objects from scratch_heap and prepend
-// to the free list. Serial (no warp parallelism). Lane 0 only.
+// Allocate one slab from scratch_heap and prepend to the free list.
+// Uses growSlabSize if set, else BTPOOL_BLOCK_SIZE. Heap-backed only.
 __device__ inline int btpool_add_block(BtPool* p) {
     if (p->nblocks >= BTPOOL_MAX_BLOCKS) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
-    int slab_n = (p->arena_base && p->growSlabSize > 0) ? p->growSlabSize : BTPOOL_BLOCK_SIZE;
+    int slab_n = (p->growSlabSize > 0) ? p->growSlabSize : BTPOOL_BLOCK_SIZE;
     void* block = NULL;
     if (p->arena_base) {
         // Arena-backed: atomic bump alloc (warp-safe, no heap lock)
@@ -378,8 +378,8 @@ __device__ inline int btpool_add_block(BtPool* p) {
         if (offset + slab_bytes > p->arena_cap) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
         block = p->arena_base + offset;
     } else {
-        // Heap-backed (original path, lane 0 only)
-        if (heap_alloc(p->scratch_heap, (unsigned int)(BTPOOL_BLOCK_SIZE * p->objSize), &block) != HEAP_OK) {
+        // Heap-backed: lane calling this must hold the heap lock or be the only caller.
+        if (heap_alloc(p->scratch_heap, (unsigned int)(slab_n * p->objSize), &block) != HEAP_OK) {
             p->error = BT_ERR_POOL_EXHAUST; return -1;
         }
     }
@@ -391,6 +391,22 @@ __device__ inline int btpool_add_block(BtPool* p) {
     for (int i = 1; i < slab_n; i++)
         *(void**)(b + i * padded) = b + (i - 1) * padded;
     p->freeList = b + (slab_n - 1) * padded;  // head = last slot
+    return 0;
+}
+
+// Initialise per-lane pool with one heap-allocated slab of slab_edges objects.
+// Safe to call from multiple lanes concurrently (heap_alloc uses per-arena locks).
+__device__ inline int btpool_init_sized(BtPool* p, DeviceHeap* scratch_heap, int objSize, int slab_edges) {
+    p->scratch_heap = scratch_heap;
+    p->objSize      = (objSize + 3) & ~3;
+    p->freeList     = NULL;
+    p->error        = 0;
+    p->nblocks      = 0;
+    p->arena_base   = NULL;
+    p->arena_offset = NULL;
+    p->arena_cap    = 0;
+    p->growSlabSize = slab_edges;
+    if (btpool_add_block(p) < 0) return -1;
     return 0;
 }
 
@@ -1430,9 +1446,17 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
 // Post-sort: init vertices (all lanes), parallel D&C + tree merge.
 // 1. Split sorted points into 32 groups (one per warp lane).
 // 2. Each lane independently builds a small hull of its group.
+// Per-lane edge pool cleanup info saved for deferred freeing after extractMesh.
+struct BtLanePoolCleanup {
+    int    nblocks;
+    void*  blocks[BTPOOL_MAX_BLOCKS];
+};
+
 // 3. Tree merge: 5 rounds (16×2 → 8×4 → … → 1×32), each round's
 //    independent merges run in parallel across warp lanes.
-__device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count, int lane) {
+// out_cleanup: __shared__ BtLanePoolCleanup[WARP_SIZE] — each lane saves its pool blocks here.
+__device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count, int lane,
+                                           BtLanePoolCleanup* out_cleanup) {
     // --- Broadcast shared state from lane 0 (only lane 0's s is valid) ---
     float sc0 = 0, sc1 = 0, sc2 = 0, cn0 = 0, cn1 = 0, cn2 = 0;
     int minAx = 0, medAx = 0, maxAx = 0;
@@ -1479,34 +1503,10 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 
     if (lane == 0) s->npoints = count;
 
-    // --- Allocate shared edge arena from scratch_heap (lane 0 only) ---
-    __shared__ char* s_arena_base;
-    __shared__ int   s_arena_offset;
-    __shared__ int   s_arena_cap;
     __shared__ BtIntermediateHull s_hulls[WARP_SIZE];
-    __shared__ int   s_postsort_error;
     __shared__ int   s_mergeStamp;
 
-    int padded_edge = ((int)sizeof(BtEdge) + 3) & ~3;
-    // Arena budget: initial slabs (32 lanes × initial_slab_edges) + growth headroom (16 × count edges).
-    // Growth slabs use BTPOOL_BLOCK_SIZE but that's bounded by the 16×count term.
-    int initial_slab_edges = 8 * count / WARP_SIZE;
-    if (initial_slab_edges < 32) initial_slab_edges = 32;
-    int arena_bytes = (WARP_SIZE * initial_slab_edges + 16 * count) * padded_edge;
-    if (arena_bytes < 64 * 1024) arena_bytes = 64 * 1024;  // 64 KB minimum
-
-    if (lane == 0) {
-        s_postsort_error = 0;
-        s_mergeStamp = -3;
-        void* arena_ptr = NULL;
-        if (heap_alloc(shared_sh, (unsigned int)arena_bytes, &arena_ptr) != HEAP_OK)
-            s_postsort_error = BT_ERR_POOL_EXHAUST;
-        s_arena_base = (char*)arena_ptr;
-        s_arena_offset = 0;
-        s_arena_cap = arena_bytes;
-    }
-    __syncwarp();
-    if (s_postsort_error) { if (lane == 0) shared_wp->error = s_postsort_error; return; }
+    if (lane == 0) s_mergeStamp = -3;
 
     // --- Per-lane group boundaries (with dedup at split points) ---
     // Like serial D&C's split logic, advance each split past runs of
@@ -1529,7 +1529,7 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     int my_start = s_splits[lane];
     int my_end   = s_splits[lane + 1];
 
-    // --- Per-lane BtHullState with arena-backed edge pool ---
+    // --- Per-lane BtHullState with per-lane heap-backed edge pool ---
     BtHullState my_state;
     my_state.scaling[0] = sc0; my_state.scaling[1] = sc1; my_state.scaling[2] = sc2;
     my_state.center[0]  = cn0; my_state.center[1]  = cn1; my_state.center[2]  = cn2;
@@ -1552,16 +1552,50 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     my_state.mergeStamp = -3;
     my_state.mergeStampPtr = &s_mergeStamp;
 
-    // Init arena-backed edge pool (each lane gets an initial slab via atomicAdd)
-    // initial_slab_edges must match the value used in arena_bytes calculation above.
-    if (btpool_init_arena(&my_state.edgePool, (int)sizeof(BtEdge),
-                          s_arena_base, &s_arena_offset, s_arena_cap,
-                          initial_slab_edges) < 0) {
-        // Arena exhausted during init — signal error
-        s->wp->error = BT_ERR_POOL_EXHAUST;
+    // Lane 0 allocates 2 slabs per lane (64 total) from scratch_heap.
+    // Each lane then builds its own BtPool from the two pre-allocated slabs.
+    // Growth slabs are allocated dynamically per-lane via heap_alloc during D&C.
+    __shared__ void* s_edge_slabs[WARP_SIZE * 2];
+    {
+        int slab_edges = 3 * count;
+        if (slab_edges > BTPOOL_BLOCK_SIZE) slab_edges = BTPOOL_BLOCK_SIZE;
+        int padded = ((int)sizeof(BtEdge) + 3) & ~3;
+        int slab_bytes = slab_edges * padded;
+        if (lane == 0) {
+            for (int g = 0; g < WARP_SIZE * 2; g++) {
+                void* blk = NULL;
+                if (heap_alloc(shared_sh, (unsigned int)slab_bytes, &blk) != HEAP_OK) {
+                    shared_wp->error = BT_ERR_POOL_EXHAUST;
+                    break;
+                }
+                s_edge_slabs[g] = blk;
+            }
+        }
+        __syncwarp();
+        if (shared_wp->error) return;
+
+        // Each lane initialises its BtPool from two pre-allocated slabs.
+        my_state.edgePool.scratch_heap = shared_sh;
+        my_state.edgePool.objSize      = padded;
+        my_state.edgePool.freeList     = NULL;
+        my_state.edgePool.error        = 0;
+        my_state.edgePool.nblocks      = 0;
+        my_state.edgePool.arena_base   = NULL;
+        my_state.edgePool.arena_offset = NULL;
+        my_state.edgePool.arena_cap    = 0;
+        my_state.edgePool.growSlabSize = slab_edges;
+        // Build free list from both slabs (slab1 -> slab0 -> NULL)
+        for (int si = 0; si < 2; si++) {
+            void* blk = s_edge_slabs[lane * 2 + si];
+            my_state.edgePool.blocks[my_state.edgePool.nblocks++] = blk;
+            char* b = (char*)blk;
+            *(void**)b = my_state.edgePool.freeList;
+            for (int i = 1; i < slab_edges; i++)
+                *(void**)(b + i * padded) = b + (i - 1) * padded;
+            my_state.edgePool.freeList = b + (slab_edges - 1) * padded;
+        }
     }
     __syncwarp();
-    if (s->wp->error) return;
 
     //if (lane == 0) DPRINTF("[postsort] blk=%d n=%d arena=%d\n", blockIdx.x, count, arena_bytes);
 
@@ -1576,9 +1610,10 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     s_hulls[0] = my_hull;
     __syncwarp();
     {
-        int any_err = (lane == 0 && my_state.edgePool.error != 0) ? 1 : 0;
-        any_err = __any_sync(WARP_MASK, any_err);
-        if (any_err) { s->wp->error = BT_ERR_POOL_EXHAUST; return; }
+        int my_err = my_state.edgePool.error;
+        for (int off = 16; off > 0; off >>= 1)
+            my_err |= __shfl_xor_sync(WARP_MASK, my_err, off);
+        if (my_err) { shared_wp->error = my_err; return; }
     }
 #else
     // --- Phase 1: Each lane builds hull of its group (parallel D&C) ---
@@ -1592,11 +1627,13 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     s_hulls[lane] = my_hull;
     __syncwarp();
 
-    // Check for errors from any lane
+    // Check for errors from any lane — propagate actual error bits
     {
-        int any_err = (my_state.edgePool.error != 0) ? 1 : 0;
-        any_err = __any_sync(WARP_MASK, any_err);
-        if (any_err) { s->wp->error = BT_ERR_POOL_EXHAUST; return; }
+        int my_err = my_state.edgePool.error;
+        // OR all lanes' errors together via warp reduction
+        for (int off = 16; off > 0; off >>= 1)
+            my_err |= __shfl_xor_sync(WARP_MASK, my_err, off);
+        if (my_err) { shared_wp->error = my_err; return; }
     }
 
     // --- Phase 2: Tree merge (5 rounds) ---
@@ -1617,9 +1654,10 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 
         // Check for errors (pool exhaustion during merge)
         {
-            int any_err = (my_state.edgePool.error != 0) ? 1 : 0;
-            any_err = __any_sync(WARP_MASK, any_err);
-            if (any_err) { s->wp->error = BT_ERR_POOL_EXHAUST; return; }
+            int my_err = my_state.edgePool.error;
+            for (int off = 16; off > 0; off >>= 1)
+                my_err |= __shfl_xor_sync(WARP_MASK, my_err, off);
+            if (my_err) { shared_wp->error = my_err; return; }
         }
     }
 #endif
@@ -1638,6 +1676,11 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         s->fma_max_edges   = my_state.fma_max_edges;
         s->fma_calls       = my_state.fma_calls;
     }
+
+    // Each lane saves its own pool blocks for deferred cleanup in hull_dandc_warp_mesh.
+    out_cleanup[lane].nblocks = my_state.edgePool.nblocks;
+    for (int i = 0; i < my_state.edgePool.nblocks; i++)
+        out_cleanup[lane].blocks[i] = my_state.edgePool.blocks[i];
     __syncwarp();
 }
 
@@ -1658,13 +1701,15 @@ __device__ inline Mesh hull_dandc_warp_mesh(
     DeviceHeap* heap, DeviceHeap* scratch_heap,
     int* err)
 {
-    __shared__ WarpPool s_pool;
-    __shared__ void*    s_pool_backing;
-    __shared__ Mesh     s_result;
+    __shared__ WarpPool           s_pool;
+    __shared__ void*              s_pool_backing;
+    __shared__ Mesh               s_result;
+    __shared__ BtLanePoolCleanup  s_lane_cleanup[WARP_SIZE];
 
     // Use a local error variable to avoid racing on *err with other blocks.
     // Only lane 0 writes; atomicOr to *err at the end.
     int local_err = 0;
+    s_lane_cleanup[lane].nblocks = 0;
     if (lane == 0) { s_result.verts = NULL; s_result.tris = NULL;
                      s_result.nv = 0; s_result.nt = 0; s_result.refcount = NULL; }
 
@@ -1731,7 +1776,7 @@ __device__ inline Mesh hull_dandc_warp_mesh(
         __syncwarp();
 
         // --- Phase 3: post-sort D&C (vertex init: all lanes, D&C + edgePool init: lane 0) ---
-        bt_compute_postsort(&state, points, n, lane);
+        bt_compute_postsort(&state, points, n, lane, s_lane_cleanup);
 
         if (lane == 0) {
             if (s_pool.error || state.edgePool.error) {
@@ -1782,12 +1827,15 @@ __device__ inline Mesh hull_dandc_warp_mesh(
     }
 
 done:
-    // Cleanup scratch: free WarpPool backing and edge arena (lane 0).
-    // Edge pool slabs are sub-ranges of the arena — free the arena as one chunk.
+    // Cleanup scratch: free WarpPool backing and all lane edge pool blocks (lane 0 only,
+    // heap_free is thread-0-only due to spin-lock).
     if (lane == 0) {
         heap_free(scratch_heap, s_pool_backing);
-        if (state.edgePool.arena_base)
-            heap_free(scratch_heap, state.edgePool.arena_base);
+        for (int g = 0; g < WARP_SIZE; g++) {
+            BtLanePoolCleanup* c = &s_lane_cleanup[g];
+            for (int i = 0; i < c->nblocks; i++)
+                heap_free(scratch_heap, c->blocks[i]);
+        }
     }
     __syncwarp();
 

@@ -193,13 +193,13 @@ The D&C convex hull uses a parallel tree merge instead of a single serial D&C. S
 
 **Per-lane D&C**: `bt_computeInternal` uses a local stack array (`BT_DC_MAX_STACK_LOCAL=64` entries in thread-local memory) instead of WarpPool. Each lane runs serial D&C on its n/32 points using `bt_merge` (single-thread gift-wrap, no warp sync needed).
 
-**Edge pool arena**: all 32 per-lane edge pools share a single arena allocated from `scratch_heap` via `heap_alloc` (lane 0 only). Each lane gets an initial slab via `atomicAdd` on a shared offset counter. Growth slabs also use `atomicAdd` — no heap locks, warp-safe. Arena sizing: `(32 × initial_slab_edges + 16 × count) × sizeof(BtEdge)`, minimum 64 KB. Growth slabs use `growSlabSize` (same as initial slab size, NOT `BTPOOL_BLOCK_SIZE`) to avoid overshooting small arenas.
+**Per-lane edge pools**: each of the 32 lanes owns an independent `BtPool` for edge allocation. Lane 0 pre-allocates 64 slabs (2 per lane, each `min(3×count, BTPOOL_BLOCK_SIZE)` edges) from `scratch_heap` via `heap_alloc` and distributes them via shared memory. Growth slabs are allocated dynamically per-lane via `heap_alloc` during D&C (safe on sm_70+ with independent thread scheduling). `BTPOOL_BLOCK_SIZE=1024` edges per slab. Error codes are binary flags: `BT_ERR_POOL_EXHAUST=8`, `BT_ERR_DC_STACK=4`, `BT_ERR_SORT_STACK=2`. Error propagation after D&C/merge uses warp-wide OR reduction (`__shfl_xor_sync`) to collect all lanes' errors.
 
 **Shared mergeStamp**: all lanes share a single `__shared__ int s_mergeStamp` decremented via `atomicAdd`. This is required because `bt_findMaxAngle` checks `e->copy > mergeStamp` — if per-lane stamps were on different timelines, cross-lane merges would skip edges. `BtHullState.mergeStampPtr` points to the shared counter; `bt_merge` uses `atomicAdd` when non-null, falls back to local `s->mergeStamp--` when null.
 
-**State broadcasting**: `BtHullState` is a per-thread local variable. Only lane 0's state has valid scaling/center/axes (set by `bt_compute_presort`). `bt_compute_postsort` broadcasts these 9 values from lane 0 via `__shfl_sync` before per-lane state init.
+**State broadcasting**: `BtHullState` is a per-thread local variable. Only lane 0's state has valid scaling/center/axes (set by `bt_compute_presort`). `bt_compute_postsort` broadcasts these 9 values from lane 0 via `__shfl_sync` before per-lane state init. Note: only lane 0's `s->wp` is valid — error checks in postsort must use the broadcast `shared_wp` pointer, not `s->wp`.
 
-**Cleanup**: the arena is ONE `heap_alloc` — freed as one chunk via `heap_free(scratch_heap, arena_base)`. Individual slabs (sub-ranges of the arena) are NOT freed individually. `state.edgePool.arena_base` is initialized to NULL before postsort runs, so the cleanup path is safe even if postsort fails early.
+**Cleanup**: each lane saves its pool blocks to a `__shared__ BtLanePoolCleanup[WARP_SIZE]` array at the end of `bt_compute_postsort`. Lane 0 frees all blocks (initial + growth) in `hull_dandc_warp_mesh`'s `done:` section after `extractMesh` completes.
 
 Instrumentation (gated on `COACD_BEAM_DEBUG`): `BtHullState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`); only lane 0's stats are reported.
 
@@ -298,7 +298,7 @@ Instrumentation (gated on `COACD_BEAM_DEBUG`): `BtHullState` carries 4 counter f
 - **Output**: returns a `Mesh` struct directly. Allocates a single combined chunk from `DeviceHeap* heap`. Returns `{NULL,NULL,0,0,NULL}` on error or n<4.
 - **Heap chunk layout**: `[verts (nv*3 floats, 16-byte aligned) | tris (nt*3 ints, 16-byte aligned) | refcount(16B)]`; exact sizes from a count pass. `Mesh.refcount` points to the trailing `int`, initialized to 1.
 - **No volume**: the function only produces the mesh; volume is computed separately via `mesh_volume_warp`.
-- **Scratch**: `DeviceHeap* scratch_heap` backs (a) the `WarpPool` (allocated as a single heap chunk via `dandc_scratch_bytes(n)`) and (b) `BtEdge` pool slabs (`BTPOOL_BLOCK_SIZE=8192` edges each, 2 initial + dynamic expansion). All scratch is heap-freed before return — scratch_heap is clean after call.
+- **Scratch**: `DeviceHeap* scratch_heap` backs (a) the `WarpPool` (allocated as a single heap chunk via `dandc_scratch_bytes(n)`) and (b) per-lane `BtEdge` pool slabs (`BTPOOL_BLOCK_SIZE=1024` edges each, 2 initial per lane + dynamic expansion). All scratch is heap-freed before return — scratch_heap is clean after call.
 - **WarpPool**: declared `__shared__`; backing allocated from scratch_heap by lane 0. Used for BtPoint32 array, vertex block, sort scratch, D&C stack, BFS queues (all rewound when done).
 - **BtPool (edge pool)**: starts with 2 slabs (16384 edges); expands one slab at a time via `heap_alloc(scratch_heap, ...)` when exhausted. Lane 0 only; free-list setup is serial. Up to `BTPOOL_MAX_BLOCKS=32` slabs tracked for cleanup.
 - **Two-pass mesh extraction**: count pass (`bt_extractMesh` with NULL buffers, counts nv/nt via fan formula) → `heap_alloc(heap, ...)` for exact output → extract pass (writes verts+tris). BFS queue rewound between passes.
@@ -437,10 +437,10 @@ ncu --set full -o dandc_profile python tests/bench_dandc.py --n_pts 200 --n_hull
 - Plane cut (`test_plane_cut`) — simple loop, ring, multi-hole, edge cases (14 tests)
 - Persistent heaps (`beam_init` with `pool_bytes`): both heaps share one pool, all memory recycled by kernels, pool stable after first call
 - `ctx.pool_usage()` — peak device pool bytes (monotonic), `ctx.heap_compact()` — available but not needed normally
-- `beam_decompose` (cube, lshape): cube → 1 part, lshape → 2 parts ✓
+- `beam_decompose` (cube, lshape, octocat): cube → 1 part, lshape → 2 parts, octocat → 13 parts ✓
 
 ### Known Issues
-- `beam_decompose` (octocat): crashes with error 700 (illegal memory access) during `beam_hull` kernel. The crash occurs after several beam search iterations, suggesting the tree merge arena runs out of space or produces corrupted edge structures when processing larger meshes from plane cuts (~20k vertices). Cube/lshape (small meshes) work. Needs investigation with compute-sanitizer or CheckedBuf instrumentation.
+- None currently — all tests pass (cube, lshape, octocat decompose).
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input
