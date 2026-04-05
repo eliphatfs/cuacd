@@ -248,7 +248,7 @@ __device__ inline PartPair plane_cut_block(
     __syncthreads();
 
     // =========================================================================
-    // Alloc cross_edges + sort_scratch + isect_idx  (needed: phases 3-6)
+    // Alloc cross_edges (needed: phase 3; sort_scratch + isect_idx deferred)
     // =========================================================================
     if (tid == 0) {
         void* p;
@@ -257,11 +257,7 @@ __device__ inline PartPair plane_cut_block(
             { s_alloc_ok = 0; p = NULL; }
         s_cross_edges = (Edge2i*)p;
 
-        // sort_scratch deferred to after phase 3 when n_cross is known.
-
-        if (heap_alloc(scratch_heap, (unsigned int)(max_cross_edges * (int)sizeof(int)), &p) != HEAP_OK)
-            { s_alloc_ok = 0; p = NULL; }
-        s_isect_idx = (int*)p;
+        // sort_scratch and isect_idx deferred to after phase 3 when n_cross is known.
     }
     __syncthreads();
     if (!s_alloc_ok) {
@@ -270,7 +266,6 @@ __device__ inline PartPair plane_cut_block(
     }
 
     PC_BUF(Edge2i, cross_edges, s_cross_edges, max_cross_edges);
-    PC_BUF(int,    isect_idx,   s_isect_idx,   max_cross_edges);
 
     // === Phase 3: Collect crossing edges ===
     for (int t = tid; t < n_tris; t += PC_BLOCK) {
@@ -335,19 +330,25 @@ __device__ inline PartPair plane_cut_block(
         return s_result;
     }
 
-    // Alloc sort_scratch now that n_cross is known.
+    // Alloc sort_scratch + isect_idx now that n_cross is known.
     if (tid == 0) {
-        int sort_scratch_bytes = n_cross * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
         void* p;
+        int sort_scratch_bytes = n_cross * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
         if (heap_alloc(scratch_heap, (unsigned int)sort_scratch_bytes, &p) != HEAP_OK)
             { s_alloc_ok = 0; p = NULL; }
         s_sort_scratch = (char*)p;
+
+        if (heap_alloc(scratch_heap, (unsigned int)(n_cross * (int)sizeof(int)), &p) != HEAP_OK)
+            { s_alloc_ok = 0; p = NULL; }
+        s_isect_idx = (int*)p;
     }
     __syncthreads();
     if (!s_alloc_ok) {
         if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
         return s_result;
     }
+
+    PC_BUF(int, isect_idx, s_isect_idx, n_cross);
 
     // === Phase 4: Sort crossing edges (warp 0) ===
     if (warp_id == 0) {
