@@ -178,7 +178,7 @@ __device__ inline PartPair plane_cut_block(
     __shared__ int*    s_neg_tris;
     __shared__ Edge2i* s_dir_edges;
     __shared__ char*   s_dir_sort;
-    __shared__ int*    s_boundary_flags;
+    __shared__ char*   s_boundary_flags;
 
     // Return value — written by thread 0, returned by all threads.
     __shared__ PartPair s_result;
@@ -495,9 +495,9 @@ __device__ inline PartPair plane_cut_block(
                 { s_alloc_ok = 0; p = NULL; }
             s_dir_sort = (char*)p;
 
-            if (heap_alloc(scratch_heap, (unsigned int)(n_de_alloc * (int)sizeof(int)), &p) != HEAP_OK)
+            if (heap_alloc(scratch_heap, (unsigned int)(n_de_alloc * (int)sizeof(char)), &p) != HEAP_OK)
                 { s_alloc_ok = 0; p = NULL; }
-            s_boundary_flags = (int*)p;
+            s_boundary_flags = (char*)p;
         }
     }
     __syncthreads();
@@ -511,7 +511,7 @@ __device__ inline PartPair plane_cut_block(
     int* trace_tris = s_trace_tris;
     int n_de = n_trace * 3;
     PC_BUF(Edge2i, dir_edges,      s_dir_edges,      n_de);
-    PC_BUF(int,    boundary_flags, s_boundary_flags,  n_de);
+    PC_BUF(char,   boundary_flags, s_boundary_flags,  n_de);
 
     // === Phase 7: Collect directed edges from the smaller side ===
     for (int t = tid; t < n_trace; t += PC_BLOCK) {
