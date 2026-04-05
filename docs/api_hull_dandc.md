@@ -1,0 +1,31 @@
+# Parallel Tree Merge (hull_dandc.cuh)
+
+The D&C convex hull uses a parallel tree merge instead of a single serial D&C. Sorted points are split into 32 groups (one per warp lane), each lane independently builds a small hull, then 5 rounds of pairwise merging (16x2 -> 8x4 -> 4x8 -> 2x16 -> 1x32) produce the final hull.
+
+**Per-lane D&C**: `bt_computeInternal(BtDCState*, BtVertex* vertexBase, ...)` uses a local stack array (`BT_DC_MAX_STACK_LOCAL=64` entries in thread-local memory) instead of WarpPool. Each lane runs serial D&C on its n/32 points using `bt_merge` (single-thread gift-wrap, no warp sync needed). `BtDCStackItem` stores `{start, end, stage, right_hull, result}` -- the left child writes directly to `*result`, so no `left_hull` field is needed; `bt_merge` operates on `result` in-place.
+
+**BtDCState vs BtHullState**: D&C functions (`bt_merge`, `bt_computeBase`, `bt_computeInternal`, `bt_newEdgePair`, `bt_removeEdgePair`) take a lightweight `BtDCState*` containing only per-lane mutable fields (`edgePool`, `mergeStamp`, `mergeStampPtr`, plus `#ifdef` debug counters). Shared read-only state (`scaling`, `center`, axes, `wp`, `scratch_heap`, `npoints`, `vertexList`) stays in `BtHullState` (declared `__shared__`). This avoids replicating ~14 identical registers across 32 lanes. `bt_mergeProjection` takes no state parameter; `bt_findEdgeForCoplanarFaces` takes `int mergeStamp` directly.
+
+**Per-lane edge pools**: each of the 32 lanes owns an independent `BtPool` for edge allocation. Lane 0 pre-allocates 64 slabs (2 per lane, each `min(3*count, BTPOOL_BLOCK_SIZE)` edges) from `scratch_heap` via `heap_alloc` and distributes them via shared memory. Growth slabs are allocated dynamically per-lane via `heap_alloc` during D&C (safe on sm_70+ with independent thread scheduling). `BTPOOL_BLOCK_SIZE=1024` edges per slab. Error codes are binary flags: `BT_ERR_POOL_EXHAUST=8`, `BT_ERR_DC_STACK=4`, `BT_ERR_SORT_STACK=2`. Error propagation after D&C/merge uses warp-wide OR reduction (`__shfl_xor_sync`) to collect all lanes' errors.
+
+**Shared mergeStamp**: all lanes share a single `__shared__ int s_mergeStamp` decremented via `atomicAdd`. This is required because `bt_findMaxAngle` checks `e->copy > mergeStamp` -- if per-lane stamps were on different timelines, cross-lane merges would skip edges. `BtDCState.mergeStampPtr` points to the shared counter; `bt_merge` uses `atomicAdd` when non-null, falls back to local `dc->mergeStamp--` when null.
+
+**State broadcasting**: In `hull_dandc_warp_mesh`, `BtHullState` is `__shared__` (only lane 0 uses it for pre/post-sort and extractMesh). In `bt_compute_postsort`, each lane has a per-thread `BtDCState my_dc` for per-lane D&C (edgePool + mergeStamp only). Only lane 0's `BtHullState` has valid scaling/center/axes (set by `bt_compute_presort`). `bt_compute_postsort` broadcasts these 9 values from lane 0 via `__shfl_sync` before per-lane D&C. Note: only lane 0's `s->wp` is valid -- error checks in postsort must use the broadcast `shared_wp` pointer, not `s->wp`.
+
+**Cleanup**: each lane's `BtLanePoolCleanup` entry points directly into `all_pool_blocks` (the same WarpPool-backed array used as `edgePool.blocks` during D&C) -- no separate copy. Lane 0 frees all blocks (initial + growth) in `hull_dandc_warp_mesh`'s `done:` section after `extractMesh` completes.
+
+Instrumentation (`#ifdef COACD_BEAM_DEBUG`): `BtDCState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`), all `#ifdef`'d out in release builds; lane 0's stats are copied to shared `BtHullState` after postsort for reporting.
+
+## hull_dandc_warp_mesh API
+
+`hull_dandc_warp_mesh(pts, n, lane, heap, scratch_heap, err) -> Mesh` -- warp device function (all 32 lanes call with identical args).
+
+- **Output**: returns a `Mesh` struct directly. Allocates a single combined chunk from `DeviceHeap* heap`. Returns `{NULL,NULL,0,0,NULL}` on error or n<4.
+- **Heap chunk layout**: `[verts (nv*3 floats, 16-byte aligned) | tris (nt*3 ints, 16-byte aligned) | refcount(16B)]`; exact sizes from a count pass. `Mesh.refcount` points to the trailing `int`, initialized to 1.
+- **No volume**: the function only produces the mesh; volume is computed separately via `mesh_volume_warp`.
+- **Scratch**: `DeviceHeap* scratch_heap` backs (a) the `WarpPool` (allocated as a single heap chunk via `dandc_scratch_bytes(n)`) and (b) per-lane `BtEdge` pool slabs (`BTPOOL_BLOCK_SIZE=1024` edges each, 2 initial per lane + dynamic expansion). All scratch is heap-freed before return -- scratch_heap is clean after call.
+- **WarpPool**: declared `__shared__`; backing allocated from scratch_heap by lane 0. Used for BtPoint32 array, vertex block, sort scratch, D&C stack, BFS queues (all rewound when done).
+- **BtPool (edge pool)**: starts with 2 slabs (16384 edges); expands one slab at a time via `heap_alloc(scratch_heap, ...)` when exhausted. Lane 0 only; free-list setup is serial. Up to `BTPOOL_MAX_BLOCKS=32` slabs tracked for cleanup.
+- **Two-pass mesh extraction**: count pass (`bt_extractMesh` with NULL buffers, counts nv/nt via fan formula) -> `heap_alloc(heap, ...)` for exact output -> extract pass (writes verts+tris). BFS queue rewound between passes.
+- **dandc_scratch_bytes**: no longer includes the `6*n*sizeof(BtEdge)` edge pool term (pool now comes from scratch_heap separately).
+- **Call sites**: `test_hull_dandc.cu` (kernel) and `test_beam.c` (host launcher) pass `DeviceHeap*` pointers into the embedded heaps of `DevicePool`.
