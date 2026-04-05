@@ -117,7 +117,7 @@ def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
         obj = os.path.join(build_dir, name.replace(".cu", ".o"))
         subprocess.check_call([
             nvcc, src, "-rdc=true", "-dc", "-O3", "--use_fast_math",
-            "--generate-line-info",
+            "--generate-line-info", "-Xptxas=-v",
             *extra_defines,
             *gencode, "-o", obj,
         ])

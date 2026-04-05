@@ -17,10 +17,12 @@ from scipy.spatial import ConvexHull
 
 import coacd_gpu._gpu as _gpu
 
-OCTOCAT_OBJ = os.path.join(os.path.dirname(__file__),
-                           "../CoACD/examples/Octocat-v2.obj")
+OCTOCAT_OBJ  = os.path.join(os.path.dirname(__file__),
+                            "../CoACD/examples/Octocat-v2.obj")
+STL_49160    = os.path.join(os.path.dirname(__file__),
+                            "data/49160.stl")
 OUTPUT_GLB   = os.path.join(os.path.dirname(__file__),
-                           "../decomp_output/decompose_all.glb")
+                            "../decomp_output/decompose_all.glb")
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -213,6 +215,18 @@ def test_octocat_decompose():
     assert len(parts) >= 1
 
 
+@pytest.mark.skipif(not os.path.exists(STL_49160),
+                    reason="49160.stl not found")
+def test_49160_decompose():
+    mesh = trimesh.load(STL_49160, force="mesh")
+    verts = np.array(mesh.vertices, dtype=np.float32)
+    tris  = np.array(mesh.faces,    dtype=np.int32)
+    parts = _decompose_shape(verts, tris, "49160",
+                             max_iters=100, cuts_per_axis=10,
+                             threshold=0.05, max_keep=32)
+    assert len(parts) >= 1
+
+
 def test_export_glb():
     """Decompose all three shapes and export one GLB each."""
     outdir = os.path.dirname(OUTPUT_GLB)
@@ -233,6 +247,21 @@ def test_export_glb():
     _build_scene([("lshape", parts)]).export(path)
     print(f"\nExported {path}")
     assert os.path.exists(path)
+
+    # 49160.stl (skip quietly if missing)
+    if os.path.exists(STL_49160):
+        mesh = trimesh.load(STL_49160, force="mesh")
+        v = np.array(mesh.vertices, dtype=np.float32)
+        t = np.array(mesh.faces,    dtype=np.int32)
+        parts = _decompose_shape(v, t, "49160",
+                                 max_iters=100,
+                                 cuts_per_axis=10,
+                                 threshold=0.05,
+                                 max_keep=32)
+        path = os.path.join(outdir, "49160.glb")
+        _build_scene([("49160", parts)]).export(path)
+        print(f"\nExported {path}")
+        assert os.path.exists(path)
 
     # Octocat (skip quietly if missing)
     if os.path.exists(OCTOCAT_OBJ):
