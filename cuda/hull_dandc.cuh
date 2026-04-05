@@ -346,7 +346,7 @@ __device__ inline void bt_edge_link(BtEdge* a, BtEdge* n) {
 
 #define BT_ERR_POOL_EXHAUST 8
 #define BTPOOL_BLOCK_SIZE   1024   // edges per slab
-#define BTPOOL_MAX_BLOCKS   32     // max heap slabs tracked for cleanup
+#define BTPOOL_MAX_BLOCKS   64     // max heap slabs tracked for cleanup
 
 // BtPool: free list of fixed-size objects, backed by heap slabs.
 // All operations (init, new, free) are lane-0-only.
@@ -356,7 +356,7 @@ struct BtPool {
     int         objSize;    // padded to multiple of 4
     int         error;
     int         nblocks;
-    void*       blocks[BTPOOL_MAX_BLOCKS];
+    CheckedBuf<void*> blocks;  // allocated from WarpPool, capacity BTPOOL_MAX_BLOCKS
     // Arena mode: when arena_base != NULL, growth uses atomic bump alloc
     // from a shared pre-allocated arena (warp-safe, no heap lock needed).
     char*       arena_base;
@@ -368,7 +368,7 @@ struct BtPool {
 // Allocate one slab from scratch_heap and prepend to the free list.
 // Uses growSlabSize if set, else BTPOOL_BLOCK_SIZE. Heap-backed only.
 __device__ inline int btpool_add_block(BtPool* p) {
-    if (p->nblocks >= BTPOOL_MAX_BLOCKS) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
+    if (p->nblocks >= BTPOOL_MAX_BLOCKS || !p->blocks.raw()) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
     int slab_n = (p->growSlabSize > 0) ? p->growSlabSize : BTPOOL_BLOCK_SIZE;
     void* block = NULL;
     if (p->arena_base) {
@@ -396,12 +396,14 @@ __device__ inline int btpool_add_block(BtPool* p) {
 
 // Initialise per-lane pool with one heap-allocated slab of slab_edges objects.
 // Safe to call from multiple lanes concurrently (heap_alloc uses per-arena locks).
-__device__ inline int btpool_init_sized(BtPool* p, DeviceHeap* scratch_heap, int objSize, int slab_edges) {
+__device__ inline int btpool_init_sized(BtPool* p, DeviceHeap* scratch_heap, int objSize, int slab_edges,
+                                        CheckedBuf<void*> blocks_buf) {
     p->scratch_heap = scratch_heap;
     p->objSize      = (objSize + 3) & ~3;
     p->freeList     = NULL;
     p->error        = 0;
     p->nblocks      = 0;
+    p->blocks       = blocks_buf;
     p->arena_base   = NULL;
     p->arena_offset = NULL;
     p->arena_cap    = 0;
@@ -411,12 +413,14 @@ __device__ inline int btpool_init_sized(BtPool* p, DeviceHeap* scratch_heap, int
 }
 
 // Initialise pool with 2 pre-allocated slabs. Lane 0 only.
-__device__ inline int btpool_init(BtPool* p, DeviceHeap* scratch_heap, int objSize) {
+__device__ inline int btpool_init(BtPool* p, DeviceHeap* scratch_heap, int objSize,
+                                  CheckedBuf<void*> blocks_buf) {
     p->scratch_heap = scratch_heap;
     p->objSize      = (objSize + 3) & ~3;
     p->freeList     = NULL;
     p->error        = 0;
     p->nblocks      = 0;
+    p->blocks       = blocks_buf;
     p->arena_base   = NULL;
     p->arena_offset = NULL;
     p->arena_cap    = 0;
@@ -430,12 +434,14 @@ __device__ inline int btpool_init(BtPool* p, DeviceHeap* scratch_heap, int objSi
 // arena_base/arena_offset/arena_cap describe a shared pre-allocated arena.
 // initial_slab_edges = number of edges in the first slab.
 __device__ inline int btpool_init_arena(BtPool* p, int objSize,
-    char* arena_base, int* arena_offset, int arena_cap, int initial_slab_edges) {
+    char* arena_base, int* arena_offset, int arena_cap, int initial_slab_edges,
+    CheckedBuf<void*> blocks_buf) {
     p->scratch_heap = NULL;
     p->objSize      = (objSize + 3) & ~3;
     p->freeList     = NULL;
     p->error        = 0;
     p->nblocks      = 0;
+    p->blocks       = blocks_buf;
     p->arena_base   = arena_base;
     p->arena_offset = arena_offset;
     p->arena_cap    = arena_cap;
@@ -495,6 +501,7 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 // ============================================================================
 
 #define BT_DC_MAX_STACK  4096
+#define BT_DC_MAX_STACK_LOCAL 2048
 
 // Error codes (distinct from pool OOM = 1)
 #define BT_ERR_SORT_STACK  2
@@ -507,11 +514,11 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 #define BT_ALIGN16(x) (((x) + 15) & ~15)
 
 // Compute total WarpPool scratch bytes needed for D&C hull with n points.
-// Sort scratch is rewound after sort. D&C stack is rewound after computeInternal.
+// Sort scratch is rewound after sort. D&C stacks are rewound after computeInternal.
 // BFS queues are allocated after D&C, sharing that space.
-// Edge pool is backed by DeviceHeap (scratch_heap) via arena, not included here.
-// D&C stack is per-lane local memory (BT_DC_MAX_STACK_LOCAL), not in WarpPool.
-// Peak = presort + max(sort_scratch, persistent + bfs_queues).
+// Edge pool is backed by DeviceHeap (scratch_heap), not included here.
+// Per-lane D&C stacks and BtPool blocks arrays are allocated from WarpPool.
+// Peak = presort + max(sort_scratch, persistent + dc_stacks + pool_blocks + cleanup_blocks + bfs_queues).
 __host__ __device__ inline int dandc_scratch_bytes(int n) {
     int total = 0;
     // presort: BtPoint32 array (persists through sort, NOT rewound)
@@ -522,11 +529,19 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
     int postsort_persistent = 0;
     // postsort: vertex block (persists)
     postsort_persistent += BT_ALIGN16(n * (int)sizeof(BtVertex));
+    // per-lane BtPool blocks arrays: 32 lanes × BTPOOL_MAX_BLOCKS pointers (persists until cleanup)
+    postsort_persistent += BT_ALIGN16(WARP_SIZE * BTPOOL_MAX_BLOCKS * (int)sizeof(void*));
+    // per-lane cleanup blocks arrays: 32 lanes × BTPOOL_MAX_BLOCKS pointers (persists until cleanup)
+    postsort_persistent += BT_ALIGN16(WARP_SIZE * BTPOOL_MAX_BLOCKS * (int)sizeof(void*));
+
+    // Per-lane D&C stacks: 32 lanes × BT_DC_MAX_STACK_LOCAL items (rewound after D&C)
+    int dc_stacks = BT_ALIGN16(WARP_SIZE * BT_DC_MAX_STACK_LOCAL * (int)sizeof(BtDCStackItem));
 
     // BFS queues for mesh extraction + volume (each n * sizeof(BtVertex*))
     int phase_bfs = BT_ALIGN16(n * (int)sizeof(BtVertex*));
 
-    int postsort = postsort_persistent + phase_bfs;
+    // dc_stacks and bfs_queues don't overlap (dc rewound before bfs)
+    int postsort = postsort_persistent + (dc_stacks > phase_bfs ? dc_stacks : phase_bfs);
 
     total += (sort_scratch > postsort) ? sort_scratch : postsort;
     // alignment padding headroom
@@ -1170,10 +1185,9 @@ __device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtInte
 // ============================================================================
 
 #define BT_ERR_DC_STACK     4
-#define BT_DC_MAX_STACK_LOCAL 64
 
-__device__ inline void bt_computeInternal(BtHullState* s, int start, int end, BtIntermediateHull* result) {
-    BtDCStackItem stack[BT_DC_MAX_STACK_LOCAL];
+__device__ inline void bt_computeInternal(BtHullState* s, int start, int end, BtIntermediateHull* result,
+                                          CheckedBuf<BtDCStackItem> stack) {
     int sp = 0;
 
     // Push root
@@ -1449,7 +1463,7 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
 // Per-lane edge pool cleanup info saved for deferred freeing after extractMesh.
 struct BtLanePoolCleanup {
     int    nblocks;
-    void*  blocks[BTPOOL_MAX_BLOCKS];
+    void** blocks;  // points into WarpPool-allocated array, capacity BTPOOL_MAX_BLOCKS
 };
 
 // 3. Tree merge: 5 rounds (16×2 → 8×4 → … → 1×32), each round's
@@ -1475,15 +1489,24 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     WarpPool* shared_wp = (WarpPool*)wp_ll;
     DeviceHeap* shared_sh = (DeviceHeap*)sh_ll;
 
-    // Lane 0: allocate vblock
+    // Lane 0: allocate vblock + per-lane pool blocks + per-lane cleanup blocks
     BtVertex* vblock = NULL;
+    void** all_pool_blocks = NULL;
+    void** all_cleanup_blocks = NULL;
     if (lane == 0) {
         vblock = (BtVertex*)bt_alloc(shared_wp, count * (int)sizeof(BtVertex));
         s->vertexBase = vblock;
+        all_pool_blocks = (void**)bt_alloc(shared_wp, WARP_SIZE * BTPOOL_MAX_BLOCKS * (int)sizeof(void*));
+        all_cleanup_blocks = (void**)bt_alloc(shared_wp, WARP_SIZE * BTPOOL_MAX_BLOCKS * (int)sizeof(void*));
     }
     long long vb = __shfl_sync(WARP_MASK, (long long)vblock, 0);
     vblock = (BtVertex*)vb;
     if (!vblock) return;
+    { long long pb = __shfl_sync(WARP_MASK, (long long)all_pool_blocks, 0);
+      all_pool_blocks = (void**)pb; }
+    { long long cb = __shfl_sync(WARP_MASK, (long long)all_cleanup_blocks, 0);
+      all_cleanup_blocks = (void**)cb; }
+    if (!all_pool_blocks || !all_cleanup_blocks) return;
 
     // All lanes: init vertices in parallel
     BtInt128 zero128 = bt128_from_u64(0);
@@ -1575,6 +1598,9 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         if (shared_wp->error) return;
 
         // Each lane initialises its BtPool from two pre-allocated slabs.
+        // Per-lane blocks array from the WarpPool-allocated flat buffer.
+        my_state.edgePool.blocks = CheckedBuf<void*>(
+            all_pool_blocks + lane * BTPOOL_MAX_BLOCKS, BTPOOL_MAX_BLOCKS, "edgePool.blocks");
         my_state.edgePool.scratch_heap = shared_sh;
         my_state.edgePool.objSize      = padded;
         my_state.edgePool.freeList     = NULL;
@@ -1599,13 +1625,28 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 
     //if (lane == 0) DPRINTF("[postsort] blk=%d n=%d arena=%d\n", blockIdx.x, count, arena_bytes);
 
+    // --- Allocate per-lane D&C stacks from WarpPool (lane 0), rewind after D&C ---
+    BtDCStackItem* all_dc_stacks = NULL;
+    int pre_dc_offset = 0;
+    if (lane == 0) {
+        pre_dc_offset = shared_wp->offset;
+        all_dc_stacks = (BtDCStackItem*)bt_alloc(shared_wp,
+            WARP_SIZE * BT_DC_MAX_STACK_LOCAL * (int)sizeof(BtDCStackItem));
+    }
+    { long long ds = __shfl_sync(WARP_MASK, (long long)all_dc_stacks, 0);
+      all_dc_stacks = (BtDCStackItem*)ds; }
+    pre_dc_offset = __shfl_sync(WARP_MASK, pre_dc_offset, 0);
+    if (!all_dc_stacks) return;
+    CheckedBuf<BtDCStackItem> my_dc_stack(
+        all_dc_stacks + lane * BT_DC_MAX_STACK_LOCAL, BT_DC_MAX_STACK_LOCAL, "dc_stack");
+
 #ifdef BT_SERIAL_MERGE
     // --- Serial D&C: only lane 0 builds full hull (for debugging) ---
     BtIntermediateHull my_hull;
     my_hull.minXy = NULL; my_hull.maxXy = NULL;
     my_hull.minYx = NULL; my_hull.maxYx = NULL;
     if (lane == 0 && count > 0) {
-        bt_computeInternal(&my_state, 0, count, &my_hull);
+        bt_computeInternal(&my_state, 0, count, &my_hull, my_dc_stack);
     }
     s_hulls[0] = my_hull;
     __syncwarp();
@@ -1622,7 +1663,7 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     my_hull.minYx = NULL; my_hull.maxYx = NULL;
 
     if (my_end - my_start > 0) {
-        bt_computeInternal(&my_state, my_start, my_end, &my_hull);
+        bt_computeInternal(&my_state, my_start, my_end, &my_hull, my_dc_stack);
     }
     s_hulls[lane] = my_hull;
     __syncwarp();
@@ -1662,6 +1703,10 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     }
 #endif
 
+    // Rewind D&C stacks (no longer needed after tree merge)
+    if (lane == 0) bt_rewind(shared_wp, pre_dc_offset);
+    __syncwarp();
+
     // --- Result is in s_hulls[0] ---
     if (lane == 0) {
         s->vertexList = s_hulls[0].minXy;
@@ -1678,6 +1723,8 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     }
 
     // Each lane saves its own pool blocks for deferred cleanup in hull_dandc_warp_mesh.
+    // Cleanup blocks array backed by WarpPool (all_cleanup_blocks).
+    out_cleanup[lane].blocks = all_cleanup_blocks + lane * BTPOOL_MAX_BLOCKS;
     out_cleanup[lane].nblocks = my_state.edgePool.nblocks;
     for (int i = 0; i < my_state.edgePool.nblocks; i++)
         out_cleanup[lane].blocks[i] = my_state.edgePool.blocks[i];
@@ -1827,15 +1874,15 @@ __device__ inline Mesh hull_dandc_warp_mesh(
     }
 
 done:
-    // Cleanup scratch: free WarpPool backing and all lane edge pool blocks (lane 0 only,
-    // heap_free is thread-0-only due to spin-lock).
+    // Cleanup scratch: free all lane edge pool blocks first (their pointers are stored
+    // in WarpPool-backed arrays), then free WarpPool backing itself.
     if (lane == 0) {
-        heap_free(scratch_heap, s_pool_backing);
         for (int g = 0; g < WARP_SIZE; g++) {
             BtLanePoolCleanup* c = &s_lane_cleanup[g];
             for (int i = 0; i < c->nblocks; i++)
                 heap_free(scratch_heap, c->blocks[i]);
         }
+        heap_free(scratch_heap, s_pool_backing);
     }
     __syncwarp();
 
