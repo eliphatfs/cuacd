@@ -422,6 +422,11 @@ int beam_decompose(
             fprintf(stderr, "[beam] iter %d: iter %.1f ms  sync %.1f ms  nitems=%d\n",
                     iter, TELAPSED_MS(_t_iter, _t1), TELAPSED_MS(_t0, _t1), h_st_p->nitems);
         }
+        if (debug) {
+            unsigned long long _pu0 = 0;
+            cuMemcpyDtoH(&_pu0, ctx->d_pool_off, sizeof(unsigned long long));
+            fprintf(stderr, "[beam] iter %d: finalize  pool=%.1f MB\n", iter, (double)_pu0 / (1024*1024));
+        }
         TSTAMP(_t_iter);
 
         if (*h_err_p) {
@@ -466,7 +471,9 @@ int beam_decompose(
                 fprintf(stderr, "[beam] iter %d EXPAND err=0x%x\n", iter, _he);
                 result_code = _he; goto cleanup;
             }
-            fprintf(stderr, "[beam] iter %d: expand OK\n", iter);
+            unsigned long long _pu = 0;
+            cuMemcpyDtoH(&_pu, ctx->d_pool_off, sizeof(unsigned long long));
+            fprintf(stderr, "[beam] iter %d: expand OK  pool=%.1f MB\n", iter, (double)_pu / (1024*1024));
         }
 
         // Swap: next (d_prev) becomes current; old current becomes prev.
@@ -497,7 +504,9 @@ int beam_decompose(
                 fprintf(stderr, "[beam] iter %d HULL err=0x%x\n", iter, _he);
                 result_code = _he; goto cleanup;
             }
-            fprintf(stderr, "[beam] iter %d: hull OK\n", iter);
+            unsigned long long _pu2 = 0;
+            cuMemcpyDtoH(&_pu2, ctx->d_pool_off, sizeof(unsigned long long));
+            fprintf(stderr, "[beam] iter %d: hull OK  pool=%.1f MB\n", iter, (double)_pu2 / (1024*1024));
         }
 
         // ---- beam_sort: over-provisioned grid, self-checks nitems ----
@@ -522,7 +531,9 @@ int beam_decompose(
                 fprintf(stderr, "[beam] iter %d SORT err=0x%x\n", iter, _he);
                 result_code = _he; goto cleanup;
             }
-            fprintf(stderr, "[beam] iter %d: sort OK\n", iter);
+            unsigned long long _pu3 = 0;
+            cuMemcpyDtoH(&_pu3, ctx->d_pool_off, sizeof(unsigned long long));
+            fprintf(stderr, "[beam] iter %d: sort OK  pool=%.1f MB\n", iter, (double)_pu3 / (1024*1024));
         }
     }
 

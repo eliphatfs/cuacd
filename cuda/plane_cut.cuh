@@ -162,8 +162,7 @@ __device__ inline PartPair plane_cut_block(
     // poly_n <= 2*n_boundary <= 4*n_tris, so n_cap <= 4*n_tris + 1024.
     int max_cap_tris       = n_tris * 4 + 1024;
     int sort_scratch_bytes = max_cross_edges * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
-    int max_dir_edges      = max_out_tris * 3;  // dir_edges only needs phase-6 counts
-    int dir_sort_bytes     = max_dir_edges * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
+    // dir_edges/dir_sort/boundary_flags are now sized from actual n_trace after phase 6.
 
     // s_counters: [0]=n_cross, [1]=n_all_verts, [2]=n_pos, [3]=n_neg
     __shared__ int s_counters[4];
@@ -453,30 +452,41 @@ __device__ inline PartPair plane_cut_block(
     // Free signs, cross_edges, isect_idx — done after phase 6.
     // Alloc dir_edges + dir_sort + boundary_flags  (needed: phases 7-9)
     // =========================================================================
+    __shared__ int s_n_pos, s_n_neg, s_n_trace;
+    __shared__ int* s_trace_tris;  // points to the smaller side's triangle buffer
     if (tid == 0) {
         heap_free(scratch_heap, (void*)s_signs);       s_signs       = NULL;
         heap_free(scratch_heap, (void*)s_cross_edges); s_cross_edges = NULL;
         heap_free(scratch_heap, (void*)s_isect_idx);   s_isect_idx   = NULL;
 
-        void* p;
-        s_alloc_ok = 1;
-        if (heap_alloc(scratch_heap, (unsigned int)(max_dir_edges * (int)sizeof(Edge2i)), &p) != HEAP_OK)
-            { s_alloc_ok = 0; p = NULL; }
-        s_dir_edges = (Edge2i*)p;
-
-        if (heap_alloc(scratch_heap, (unsigned int)dir_sort_bytes, &p) != HEAP_OK)
-            { s_alloc_ok = 0; p = NULL; }
-        s_dir_sort = (char*)p;
-
-        if (heap_alloc(scratch_heap, (unsigned int)(max_dir_edges * (int)sizeof(int)), &p) != HEAP_OK)
-            { s_alloc_ok = 0; p = NULL; }
-        s_boundary_flags = (int*)p;
-    }
-
-    __shared__ int s_n_pos, s_n_neg;
-    if (tid == 0) {
         s_n_pos = s_counters[2];
         s_n_neg = s_counters[3];
+        // Trace the smaller side to find boundary edges — saves ~half space+time.
+        // Boundary edges are identical regardless of which side is traced.
+        if (s_n_pos <= s_n_neg) {
+            s_n_trace = s_n_pos; s_trace_tris = s_pos_tris;
+        } else {
+            s_n_trace = s_n_neg; s_trace_tris = s_neg_tris;
+        }
+
+        int n_de_alloc = s_n_trace * 3;
+        int de_sort_bytes = n_de_alloc * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
+
+        void* p;
+        s_alloc_ok = 1;
+        if (n_de_alloc > 0) {
+            if (heap_alloc(scratch_heap, (unsigned int)(n_de_alloc * (int)sizeof(Edge2i)), &p) != HEAP_OK)
+                { s_alloc_ok = 0; p = NULL; }
+            s_dir_edges = (Edge2i*)p;
+
+            if (heap_alloc(scratch_heap, (unsigned int)de_sort_bytes, &p) != HEAP_OK)
+                { s_alloc_ok = 0; p = NULL; }
+            s_dir_sort = (char*)p;
+
+            if (heap_alloc(scratch_heap, (unsigned int)(n_de_alloc * (int)sizeof(int)), &p) != HEAP_OK)
+                { s_alloc_ok = 0; p = NULL; }
+            s_boundary_flags = (int*)p;
+        }
     }
     __syncthreads();
     if (!s_alloc_ok) {
@@ -485,13 +495,15 @@ __device__ inline PartPair plane_cut_block(
     }
 
     int n_pos = s_n_pos, n_neg = s_n_neg;
-    PC_BUF(Edge2i, dir_edges,      s_dir_edges,      max_dir_edges);
-    PC_BUF(int,    boundary_flags, s_boundary_flags,  max_dir_edges);
+    int n_trace = s_n_trace;
+    int* trace_tris = s_trace_tris;
+    int n_de = n_trace * 3;
+    PC_BUF(Edge2i, dir_edges,      s_dir_edges,      n_de);
+    PC_BUF(int,    boundary_flags, s_boundary_flags,  n_de);
 
-    // === Phase 7: Collect directed edges from pos_tris ===
-    int n_de = n_pos * 3;
-    for (int t = tid; t < n_pos; t += PC_BLOCK) {
-        int a = pos_tris[t*3], b = pos_tris[t*3+1], c = pos_tris[t*3+2];
+    // === Phase 7: Collect directed edges from the smaller side ===
+    for (int t = tid; t < n_trace; t += PC_BLOCK) {
+        int a = trace_tris[t*3], b = trace_tris[t*3+1], c = trace_tris[t*3+2];
         int bi = t * 3;
         dir_edges[bi  ] = (Edge2i){a, b};
         dir_edges[bi+1] = (Edge2i){b, c};
