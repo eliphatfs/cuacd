@@ -481,8 +481,6 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
     postsort_persistent += BT_ALIGN16(n * (int)sizeof(BtVertex));
     // per-lane BtPool blocks arrays: 32 lanes × BTPOOL_MAX_BLOCKS pointers (persists until cleanup)
     postsort_persistent += BT_ALIGN16(WARP_SIZE * BTPOOL_MAX_BLOCKS * (int)sizeof(void*));
-    // per-lane cleanup blocks arrays: 32 lanes × BTPOOL_MAX_BLOCKS pointers (persists until cleanup)
-    postsort_persistent += BT_ALIGN16(WARP_SIZE * BTPOOL_MAX_BLOCKS * (int)sizeof(void*));
 
     // Per-lane D&C stacks: 32 lanes × BT_DC_MAX_STACK_LOCAL items (rewound after D&C)
     int dc_stacks = BT_ALIGN16(WARP_SIZE * BT_DC_MAX_STACK_LOCAL * (int)sizeof(BtDCStackItem));
@@ -1451,23 +1449,19 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     WarpPool* shared_wp = (WarpPool*)wp_ll;
     DeviceHeap* shared_sh = (DeviceHeap*)sh_ll;
 
-    // Lane 0: allocate vblock + per-lane pool blocks + per-lane cleanup blocks
+    // Lane 0: allocate vblock + per-lane pool blocks
     BtVertex* vblock = NULL;
     void** all_pool_blocks = NULL;
-    void** all_cleanup_blocks = NULL;
     if (lane == 0) {
         vblock = (BtVertex*)bt_alloc(shared_wp, count * (int)sizeof(BtVertex));
         all_pool_blocks = (void**)bt_alloc(shared_wp, WARP_SIZE * BTPOOL_MAX_BLOCKS * (int)sizeof(void*));
-        all_cleanup_blocks = (void**)bt_alloc(shared_wp, WARP_SIZE * BTPOOL_MAX_BLOCKS * (int)sizeof(void*));
     }
     long long vb = __shfl_sync(WARP_MASK, (long long)vblock, 0);
     vblock = (BtVertex*)vb;
     if (!vblock) return;
     { long long pb = __shfl_sync(WARP_MASK, (long long)all_pool_blocks, 0);
       all_pool_blocks = (void**)pb; }
-    { long long cb = __shfl_sync(WARP_MASK, (long long)all_cleanup_blocks, 0);
-      all_cleanup_blocks = (void**)cb; }
-    if (!all_pool_blocks || !all_cleanup_blocks) return;
+    if (!all_pool_blocks) return;
 
     // All lanes: init vertices in parallel
     BtInt128 zero128 = bt128_from_u64(0);
@@ -1669,12 +1663,10 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 #endif
     }
 
-    // Each lane saves its own pool blocks for deferred cleanup in hull_dandc_warp_mesh.
-    // Cleanup blocks array backed by WarpPool (all_cleanup_blocks).
-    out_cleanup[lane].blocks = all_cleanup_blocks + lane * BTPOOL_MAX_BLOCKS;
+    // Each lane's edgePool.blocks already points into all_pool_blocks; just record
+    // the pointer and count for deferred cleanup in hull_dandc_warp_mesh.
+    out_cleanup[lane].blocks = all_pool_blocks + lane * BTPOOL_MAX_BLOCKS;
     out_cleanup[lane].nblocks = my_dc.edgePool.nblocks;
-    for (int i = 0; i < my_dc.edgePool.nblocks; i++)
-        out_cleanup[lane].blocks[i] = my_dc.edgePool.blocks[i];
     __syncwarp();
 }
 

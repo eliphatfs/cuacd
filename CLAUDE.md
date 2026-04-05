@@ -201,7 +201,7 @@ The D&C convex hull uses a parallel tree merge instead of a single serial D&C. S
 
 **State broadcasting**: In `hull_dandc_warp_mesh`, `BtHullState` is `__shared__` (only lane 0 uses it for pre/post-sort and extractMesh). In `bt_compute_postsort`, each lane has a per-thread `BtDCState my_dc` for per-lane D&C (edgePool + mergeStamp only). Only lane 0's `BtHullState` has valid scaling/center/axes (set by `bt_compute_presort`). `bt_compute_postsort` broadcasts these 9 values from lane 0 via `__shfl_sync` before per-lane D&C. Note: only lane 0's `s->wp` is valid — error checks in postsort must use the broadcast `shared_wp` pointer, not `s->wp`.
 
-**Cleanup**: each lane saves its pool blocks to a `__shared__ BtLanePoolCleanup[WARP_SIZE]` array at the end of `bt_compute_postsort`. Lane 0 frees all blocks (initial + growth) in `hull_dandc_warp_mesh`'s `done:` section after `extractMesh` completes.
+**Cleanup**: each lane's `BtLanePoolCleanup` entry points directly into `all_pool_blocks` (the same WarpPool-backed array used as `edgePool.blocks` during D&C) — no separate copy. Lane 0 frees all blocks (initial + growth) in `hull_dandc_warp_mesh`'s `done:` section after `extractMesh` completes.
 
 Instrumentation (`#ifdef COACD_BEAM_DEBUG`): `BtDCState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`), all `#ifdef`'d out in release builds; lane 0's stats are copied to shared `BtHullState` after postsort for reporting.
 
