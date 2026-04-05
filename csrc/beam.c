@@ -70,11 +70,11 @@ int beam_init(beam_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     cuModuleGetFunction(&ctx->fn_plane_cut,           ctx->module, "plane_cut_kernel");
     cuModuleGetFunction(&ctx->fn_heap_init,           ctx->module, "heap_init_kernel");
 
-    // Determine pool size: default to 70% of free device memory
+    // Determine pool size: default to 80% of free device memory
     if (pool_bytes == 0) {
         size_t free_bytes = 0, total_bytes = 0;
         cuMemGetInfo(&free_bytes, &total_bytes);
-        pool_bytes = (size_t)(free_bytes * 0.70);
+        pool_bytes = (size_t)(free_bytes * 0.80);
         if (pool_bytes < 64 * 1024 * 1024)
             pool_bytes = 64 * 1024 * 1024;  // minimum 64 MB
     }
