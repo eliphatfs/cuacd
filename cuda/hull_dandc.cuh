@@ -187,14 +187,6 @@ __device__ inline int br64_cmp(BtRational64 a, BtRational64 b) {
 // PointR128 for intersection vertices
 // ============================================================================
 
-struct BtPointR128 {
-    BtInt128 x, y, z, den;
-};
-
-__device__ inline float bpr128_xval(BtPointR128 p) { return bt128_to_float(p.x) / bt128_to_float(p.den); }
-__device__ inline float bpr128_yval(BtPointR128 p) { return bt128_to_float(p.y) / bt128_to_float(p.den); }
-__device__ inline float bpr128_zval(BtPointR128 p) { return bt128_to_float(p.z) / bt128_to_float(p.den); }
-
 // ============================================================================
 // Rational128 for exact vertex dot products
 // ============================================================================
@@ -213,17 +205,6 @@ __device__ inline BtRational128 br128_from_i64(long long val) {
     else { r.sign = 0; r.num = bt128_from_u64(0); }
     r.den = bt128_from_u64(1);
     r.isInt64 = true;
-    return r;
-}
-
-__device__ inline BtRational128 br128_from_128(BtInt128 num, BtInt128 den) {
-    BtRational128 r;
-    r.sign = bt128_sign(num);
-    r.num = (r.sign >= 0) ? num : bt128_neg(num);
-    int dsign = bt128_sign(den);
-    if (dsign >= 0) { r.den = den; }
-    else { r.sign = -r.sign; r.den = bt128_neg(den); }
-    r.isInt64 = false;
     return r;
 }
 
@@ -289,7 +270,6 @@ struct BtVertex {
     BtVertex* next;
     BtVertex* prev;
     BtEdge* edges;
-    BtPointR128 point128;
     BtPoint32 point;
     int copy;
 };
@@ -315,24 +295,12 @@ __device__ inline BtPoint32 bv_sub(BtVertex* a, BtVertex* b) { return bp32_sub(a
 
 // Vertex dot with Point64 -> Rational128
 __device__ inline BtRational128 bv_dot(BtVertex* v, BtPoint64 b) {
-    if (v->point.index >= 0) {
-        return br128_from_i64(bp32_dot64(v->point, b));
-    }
-    BtInt128 sum = bt128_add(
-        bt128_add(bt128_mul_i64(v->point128.x, b.x), bt128_mul_i64(v->point128.y, b.y)),
-        bt128_mul_i64(v->point128.z, b.z));
-    return br128_from_128(sum, v->point128.den);
+    return br128_from_i64(bp32_dot64(v->point, b));
 }
 
-__device__ inline float bv_xval(BtVertex* v) {
-    return (v->point.index >= 0) ? (float)v->point.x : bpr128_xval(v->point128);
-}
-__device__ inline float bv_yval(BtVertex* v) {
-    return (v->point.index >= 0) ? (float)v->point.y : bpr128_yval(v->point128);
-}
-__device__ inline float bv_zval(BtVertex* v) {
-    return (v->point.index >= 0) ? (float)v->point.z : bpr128_zval(v->point128);
-}
+__device__ inline float bv_xval(BtVertex* v) { return (float)v->point.x; }
+__device__ inline float bv_yval(BtVertex* v) { return (float)v->point.y; }
+__device__ inline float bv_zval(BtVertex* v) { return (float)v->point.z; }
 
 __device__ inline void bt_edge_link(BtEdge* a, BtEdge* n) {
     a->next = n;
@@ -504,7 +472,6 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
 struct BtHullState {
     float scaling[3];
     float center[3];
-    BtVertex* vertexBase;
     int mergeStamp;
     int* mergeStampPtr;    // if non-null, use atomicAdd on shared stamp
     int minAxis, medAxis, maxAxis;
@@ -1464,18 +1431,12 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     if (!all_pool_blocks) return;
 
     // All lanes: init vertices in parallel
-    BtInt128 zero128 = bt128_from_u64(0);
-    BtInt128 one128 = bt128_from_u64(1);
     for (int i = lane; i < count; i += WARP_SIZE) {
         BtVertex* v = &vblock[i];
         v->edges = NULL;
         v->next = NULL; v->prev = NULL;
         v->point = points[i];
         v->copy = -1;
-        v->point128.x = zero128;
-        v->point128.y = zero128;
-        v->point128.z = zero128;
-        v->point128.den = one128;
     }
     __syncwarp();
 
