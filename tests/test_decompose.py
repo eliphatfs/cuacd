@@ -189,13 +189,13 @@ def _build_scene(all_parts_by_shape):
 
 def test_cube_decompose():
     verts, tris = _make_cube()
-    parts = _decompose_shape(verts, tris, "cube")
+    parts = _decompose_shape(verts, tris, "cube", verbose=1)
     assert len(parts) == 1, f"Cube is convex, expected 1 part, got {len(parts)}"
 
 
 def test_lshape_decompose():
     verts, tris = _make_lshape()
-    parts = _decompose_shape(verts, tris, "lshape")
+    parts = _decompose_shape(verts, tris, "lshape", verbose=1)
     assert 2 <= len(parts) <= 4, f"Expected 2-4 parts, got {len(parts)}"
     for p in parts:
         assert p.vertices.shape[1] == 3
@@ -223,7 +223,8 @@ def test_49160_decompose():
     tris  = np.array(mesh.faces,    dtype=np.int32)
     parts = _decompose_shape(verts, tris, "49160",
                              max_iters=100, cuts_per_axis=10,
-                             threshold=0.05, max_keep=32)
+                             threshold=0.05, max_keep=32,
+                             verbose=1)
     assert len(parts) >= 1
 
 
