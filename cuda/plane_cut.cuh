@@ -12,7 +12,7 @@
 //   3    Collect crossing edges                        (parallel, 64 threads)
 //   4    Sort crossing edges                           (warp 0)
 //   5    Dedup + create intersection vertices          (thread 0)
-//        Free sort_scratch; alloc pos_tris, neg_tris.
+//        Free sort_scratch; alloc pos_tris, neg_tris (phase-6 only).
 //   6    Split triangles                               (parallel, 64 threads)
 //        Free signs, cross_edges, isect_idx.
 //   7    Collect directed edges from pos_tris          (parallel, 64 threads)
@@ -20,7 +20,9 @@
 //        Free dir_sort.
 //   9    Binary search for boundary edges              (parallel, 64 threads)
 //  10-12 Compact boundary → loops → polygon → ear-clip (thread 0)
-//  13    Compact verts per side, heap-alloc output     (parallel, 64 threads)
+//        Cap tris kept in separate cap_tris buffer (sized from n_boundary).
+//  13    Compact verts per side, heap-alloc output,    (parallel, 64 threads)
+//        merge cap tris with winding + remap.
 //        Free all remaining scratch.
 //
 #pragma once
@@ -135,6 +137,7 @@ __device__ inline void pc_zero_part(Part* p) {
     heap_free(scratch_heap, (void*)s_dir_sort);                     \
     heap_free(scratch_heap, (void*)s_boundary_flags);               \
     heap_free(scratch_heap, (void*)s_be_a);                        \
+    heap_free(scratch_heap, (void*)s_cap_tris);                    \
 } while(0)
 
 __device__ inline PartPair plane_cut_block(
@@ -159,9 +162,8 @@ __device__ inline PartPair plane_cut_block(
     int total_verts_cap    = n_verts + max_new_verts;
     int max_cross_edges    = n_tris * 2;
     int max_out_tris       = n_tris * 3;   // phase-6 upper bound; also sizes dir_edges
-    // Cap triangles (ear-clip) are appended to pos_tris/neg_tris at index n_pos/n_neg.
-    // poly_n <= 2*n_boundary <= 4*n_tris, so n_cap <= 4*n_tris + 1024.
-    int max_cap_tris       = n_tris * 4 + 1024;
+    // Cap triangles are kept in a separate cap_tris buffer (sized from n_boundary after phase 9b)
+    // and merged into the output during phase 13.
     // sort_scratch_bytes computed after phase 3 when n_cross is known.
     // dir_edges/dir_sort/boundary_flags are now sized from actual n_trace after phase 6.
 
@@ -181,7 +183,10 @@ __device__ inline PartPair plane_cut_block(
     __shared__ char*   s_dir_sort;
     __shared__ char*   s_boundary_flags;
     __shared__ int*    s_be_a;
+    __shared__ int*    s_cap_tris;
     __shared__ int     s_n_boundary;
+    __shared__ int     s_n_cap;
+    __shared__ int     s_flip_pos;
 
     // Return value — written by thread 0, returned by all threads.
     __shared__ PartPair s_result;
@@ -205,7 +210,7 @@ __device__ inline PartPair plane_cut_block(
         s_signs = NULL; s_all_verts = NULL;
         s_cross_edges = NULL; s_sort_scratch = NULL; s_isect_idx = NULL;
         s_pos_tris = NULL; s_neg_tris = NULL;
-        s_dir_edges = NULL; s_dir_sort = NULL; s_boundary_flags = NULL; s_be_a = NULL;
+        s_dir_edges = NULL; s_dir_sort = NULL; s_boundary_flags = NULL; s_be_a = NULL; s_cap_tris = NULL;
         s_counters[0] = 0; s_counters[1] = n_verts;
         s_counters[2] = 0; s_counters[3] = 0;
         pc_zero_part(&s_result.pos);
@@ -366,11 +371,11 @@ __device__ inline PartPair plane_cut_block(
 
         void* p;
         s_alloc_ok = 1;
-        if (heap_alloc(scratch_heap, (unsigned int)((max_out_tris + max_cap_tris) * 3 * (int)sizeof(int)), &p) != HEAP_OK)
+        if (heap_alloc(scratch_heap, (unsigned int)(max_out_tris * 3 * (int)sizeof(int)), &p) != HEAP_OK)
             { s_alloc_ok = 0; p = NULL; }
         s_pos_tris = (int*)p;
 
-        if (heap_alloc(scratch_heap, (unsigned int)((max_out_tris + max_cap_tris) * 3 * (int)sizeof(int)), &p) != HEAP_OK)
+        if (heap_alloc(scratch_heap, (unsigned int)(max_out_tris * 3 * (int)sizeof(int)), &p) != HEAP_OK)
             { s_alloc_ok = 0; p = NULL; }
         s_neg_tris = (int*)p;
 
@@ -393,7 +398,7 @@ __device__ inline PartPair plane_cut_block(
     }
 
     int  n_all    = s_counters[1];
-    int  tris_cap = (max_out_tris + max_cap_tris) * 3;
+    int  tris_cap = max_out_tris * 3;
     PC_BUF(int, pos_tris, s_pos_tris, tris_cap);
     PC_BUF(int, neg_tris, s_neg_tris, tris_cap);
 
@@ -841,31 +846,23 @@ __device__ inline PartPair plane_cut_block(
                     heap_free(scratch_heap, poly_ptr); poly_ptr = NULL;
                     heap_free(scratch_heap, ep_ptr);   ep_ptr   = NULL;
 
-                    // Cap winding + append to pos_tris / neg_tris
-                    float n2d[3]={0,0,0};
-                    if      (pu==0 && pv_ax==1) n2d[2]=1.0f;
-                    else if (pu==1 && pv_ax==2) n2d[0]=1.0f;
-                    else                        n2d[1]=-1.0f;
-                    int flip_pos = (n2d[0]*(-pa)+n2d[1]*(-pb)+n2d[2]*(-pc_n) < 0) ? 1 : 0;
-                    for (int i = 0; i < n_cap; i++) {
-                        int pi=n_pos+i;
-                        pos_tris[pi*3]=cap_tris[i*3];
-                        if (flip_pos) { pos_tris[pi*3+1]=cap_tris[i*3+2]; pos_tris[pi*3+2]=cap_tris[i*3+1]; }
-                        else          { pos_tris[pi*3+1]=cap_tris[i*3+1]; pos_tris[pi*3+2]=cap_tris[i*3+2]; }
-                        int ni=n_neg+i;
-                        neg_tris[ni*3]=cap_tris[i*3];
-                        if (!flip_pos) { neg_tris[ni*3+1]=cap_tris[i*3+2]; neg_tris[ni*3+2]=cap_tris[i*3+1]; }
-                        else           { neg_tris[ni*3+1]=cap_tris[i*3+1]; neg_tris[ni*3+2]=cap_tris[i*3+2]; }
+                    // Compute cap winding flip; broadcast cap state to shared memory.
+                    // Cap tris stay in cap_ptr and are merged into output during phase 13.
+                    {
+                        float n2d[3]={0,0,0};
+                        if      (pu==0 && pv_ax==1) n2d[2]=1.0f;
+                        else if (pu==1 && pv_ax==2) n2d[0]=1.0f;
+                        else                        n2d[1]=-1.0f;
+                        s_flip_pos = (n2d[0]*(-pa)+n2d[1]*(-pb)+n2d[2]*(-pc_n) < 0) ? 1 : 0;
                     }
-
-                    // cap_tris no longer needed
-                    heap_free(scratch_heap, cap_ptr); cap_ptr = NULL;
+                    s_cap_tris = (int*)cap_ptr; cap_ptr = NULL;  // ownership transferred to shared
                 } // kern_ok after loop-phase alloc
             } // n_boundary > 0
         // Broadcast phase-13 state.  Local scratch lv_ptr..sb_ptr are all NULL
         // at this point (freed inline above); heap_free is NULL-safe.
-        s_total_pos = n_pos + n_cap;
-        s_total_neg = n_neg + n_cap;
+        s_n_cap     = n_cap;
+        s_total_pos = n_pos;
+        s_total_neg = n_neg;
         s_alloc_ok  = kern_ok;   // repurpose flag for phase-13 gate
         s_pr_ptr = NULL; s_nr_ptr = NULL;
         if (kern_ok) {
@@ -884,7 +881,7 @@ __device__ inline PartPair plane_cut_block(
         heap_free(scratch_heap, ls_ptr);
         heap_free(scratch_heap, lsz_ptr);
         heap_free(scratch_heap, poly_ptr);
-        heap_free(scratch_heap, cap_ptr);
+        // cap_ptr ownership transferred to s_cap_tris; freed via PC_FREE_ALL_SHARED_SCRATCH
         heap_free(scratch_heap, ep_ptr);
         heap_free(scratch_heap, sb_ptr);
     } // end if (tid == 0) phases 10-12
@@ -925,6 +922,8 @@ __device__ inline PartPair plane_cut_block(
         __syncthreads();
 
         // Step B: mark vertices used by each side (atomicMax -1 → 0, parallel)
+        int n_cap_b = s_n_cap;
+        int* cap_b  = s_cap_tris;
         for (int t = tid; t < total_pos; t += PC_BLOCK) {
             int vi0=pos_tris[t*3+0], vi1=pos_tris[t*3+1], vi2=pos_tris[t*3+2];
             atomicMax(&pos_remap[vi0], 0);
@@ -936,6 +935,12 @@ __device__ inline PartPair plane_cut_block(
             atomicMax(&neg_remap[vi0], 0);
             atomicMax(&neg_remap[vi1], 0);
             atomicMax(&neg_remap[vi2], 0);
+        }
+        // Cap tris share the same vertices on both sides
+        for (int t = tid; t < n_cap_b; t += PC_BLOCK) {
+            int vi0=cap_b[t*3+0], vi1=cap_b[t*3+1], vi2=cap_b[t*3+2];
+            atomicMax(&pos_remap[vi0], 0); atomicMax(&pos_remap[vi1], 0); atomicMax(&pos_remap[vi2], 0);
+            atomicMax(&neg_remap[vi0], 0); atomicMax(&neg_remap[vi1], 0); atomicMax(&neg_remap[vi2], 0);
         }
         __syncthreads();
 
@@ -989,12 +994,15 @@ __device__ inline PartPair plane_cut_block(
 
         // Step G: two separate heap allocs (pos and neg), each with own refcount.
         // Layout: [verts | tris | refcount(16B)], 16-byte aligned sections.
+        // Output tri count includes cap tris.
         if (tid == 0) {
             int pnv = s_pnv, nnv = s_nnv;
-            unsigned int pv_b=(unsigned int)PC_ALIGN16(pnv      *3*(int)sizeof(float));
-            unsigned int pt_b=(unsigned int)PC_ALIGN16(total_pos*3*(int)sizeof(int));
-            unsigned int nv_b=(unsigned int)PC_ALIGN16(nnv      *3*(int)sizeof(float));
-            unsigned int nt_b=(unsigned int)PC_ALIGN16(total_neg*3*(int)sizeof(int));
+            int out_pos_nt = total_pos + n_cap_b;
+            int out_neg_nt = total_neg + n_cap_b;
+            unsigned int pv_b=(unsigned int)PC_ALIGN16(pnv       *3*(int)sizeof(float));
+            unsigned int pt_b=(unsigned int)PC_ALIGN16(out_pos_nt*3*(int)sizeof(int));
+            unsigned int nv_b=(unsigned int)PC_ALIGN16(nnv       *3*(int)sizeof(float));
+            unsigned int nt_b=(unsigned int)PC_ALIGN16(out_neg_nt*3*(int)sizeof(int));
             unsigned int rc_b=(unsigned int)PC_ALIGN16((int)sizeof(int));
             unsigned int psz = pv_b+pt_b+rc_b; if (!psz) psz=1;
             unsigned int nsz = nv_b+nt_b+rc_b; if (!nsz) nsz=1;
@@ -1013,11 +1021,11 @@ __device__ inline PartPair plane_cut_block(
                 int* rcn = (int*)(ncb+nv_b+nt_b); *rcn = 1;
                 pc_zero_part(&s_result.pos);
                 s_result.pos.mesh.verts=s_pvp; s_result.pos.mesh.tris=s_ptp;
-                s_result.pos.mesh.nv=pnv;      s_result.pos.mesh.nt=total_pos;
+                s_result.pos.mesh.nv=pnv;      s_result.pos.mesh.nt=out_pos_nt;
                 s_result.pos.mesh.refcount=rcp;
                 pc_zero_part(&s_result.neg);
                 s_result.neg.mesh.verts=s_nvp; s_result.neg.mesh.tris=s_ntp;
-                s_result.neg.mesh.nv=nnv;      s_result.neg.mesh.nt=total_neg;
+                s_result.neg.mesh.nv=nnv;      s_result.neg.mesh.nt=out_neg_nt;
                 s_result.neg.mesh.refcount=rcn;
             } else {
                 atomicOr(kernel_error, PC_KERR_POOL_OOM);
@@ -1027,11 +1035,13 @@ __device__ inline PartPair plane_cut_block(
         }
         __syncthreads();
 
-        // Steps H-I: scatter verts and copy tris (parallel)
+        // Steps H-I: scatter verts, copy phase-6 tris, copy cap tris with winding (parallel)
         if (s_chunk_ok) {
             float* pvp = s_pvp; int* ptp = s_ptp;
             float* nvp = s_nvp; int* ntp = s_ntp;
+            int flip = s_flip_pos;
 
+            // H: scatter verts
             for (int i = tid; i < n_all; i += PC_BLOCK) {
                 int ni = pos_remap[i];
                 if (ni >= 0) { pvp[ni*3+0]=all_verts[i*3+0]; pvp[ni*3+1]=all_verts[i*3+1]; pvp[ni*3+2]=all_verts[i*3+2]; }
@@ -1040,8 +1050,21 @@ __device__ inline PartPair plane_cut_block(
                 int ni = neg_remap[i];
                 if (ni >= 0) { nvp[ni*3+0]=all_verts[i*3+0]; nvp[ni*3+1]=all_verts[i*3+1]; nvp[ni*3+2]=all_verts[i*3+2]; }
             }
+            // I: copy phase-6 tris (already remapped in step F)
             for (int i = tid; i < total_pos * 3; i += PC_BLOCK) ptp[i] = pos_tris[i];
             for (int i = tid; i < total_neg * 3; i += PC_BLOCK) ntp[i] = neg_tris[i];
+            // I2: copy cap tris with winding adjustment + remap
+            for (int t = tid; t < n_cap_b; t += PC_BLOCK) {
+                int v0 = cap_b[t*3], v1 = cap_b[t*3+1], v2 = cap_b[t*3+2];
+                int po = (total_pos + t) * 3;
+                ptp[po]   = pos_remap[v0];
+                ptp[po+1] = flip ? pos_remap[v2] : pos_remap[v1];
+                ptp[po+2] = flip ? pos_remap[v1] : pos_remap[v2];
+                int no = (total_neg + t) * 3;
+                ntp[no]   = neg_remap[v0];
+                ntp[no+1] = flip ? neg_remap[v1] : neg_remap[v2];
+                ntp[no+2] = flip ? neg_remap[v2] : neg_remap[v1];
+            }
         }
         __syncthreads();
     }
