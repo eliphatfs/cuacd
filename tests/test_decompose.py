@@ -117,7 +117,7 @@ def _denormalize(verts, center, scale):
 
 def _call_decompose(verts, tris, hull_verts, hull_tris,
                     max_iters=100, cuts_per_axis=10,
-                    threshold=0.05, max_keep=32, verbose=0):
+                    threshold=0.05, max_keep=32, verbose=0, debug=0):
     verts      = np.ascontiguousarray(verts,      dtype=np.float32)
     tris       = np.ascontiguousarray(tris,       dtype=np.int32)
     hull_verts = np.ascontiguousarray(hull_verts, dtype=np.float32)
@@ -129,7 +129,7 @@ def _call_decompose(verts, tris, hull_verts, hull_tris,
         hull_verts.ctypes.data, len(hull_verts),
         hull_tris.ctypes.data,  len(hull_tris),
         max_iters, cuts_per_axis, threshold, max_keep,
-        verbose,
+        verbose, debug,
     )
     return parts
 

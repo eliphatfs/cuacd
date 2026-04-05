@@ -104,6 +104,8 @@ def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
         extra_defines.append(f"-DHEAP_NUM_ARENAS={os.environ['COACD_GPU_ARENAS']}")
     if os.environ.get("COACD_BEAM_DEBUG"):
         extra_defines.append("-DCOACD_BEAM_DEBUG")
+    if os.environ.get("COACD_SERIAL_MERGE"):
+        extra_defines.append("-DBT_SERIAL_MERGE")
 
     gencode = _fatbin_gencode_flags()
     cuda_dir = os.path.join(_ROOT, "cuda")

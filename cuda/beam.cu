@@ -274,6 +274,8 @@ extern "C" __global__ void beam_hull(
     Part* p = &wi->parts[part_idx];
     if (p->hull.verts != NULL) return;  // already computed
 
+    // HULL_DUMP disabled — re-enable to extract failing point clouds
+
     Mesh hull = hull_dandc_warp_mesh(
         p->mesh.verts, p->mesh.nv, lane,
         &pool->heap, &pool->scratch, err);
