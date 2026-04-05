@@ -1372,12 +1372,9 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
 
     // --- Point conversion: warp-parallel strided ---
     for (int i = lane; i < count; i += WARP_SIZE) {
-        float p[3];
-        for (int k = 0; k < 3; k++)
-            p[k] = (pts[i*3+k] - cen[k]) * inv[k];
-        points[i].x = (int)p[medAx];
-        points[i].y = (int)p[maxAx];
-        points[i].z = (int)p[minAx];
+        points[i].x = (int)((pts[i*3+medAx] - cen[medAx]) * inv[medAx]);
+        points[i].y = (int)((pts[i*3+maxAx] - cen[maxAx]) * inv[maxAx]);
+        points[i].z = (int)((pts[i*3+minAx] - cen[minAx]) * inv[minAx]);
         points[i].index = i;
     }
     __syncwarp();
