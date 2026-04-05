@@ -197,7 +197,7 @@ The D&C convex hull uses a parallel tree merge instead of a single serial D&C. S
 
 **Shared mergeStamp**: all lanes share a single `__shared__ int s_mergeStamp` decremented via `atomicAdd`. This is required because `bt_findMaxAngle` checks `e->copy > mergeStamp` — if per-lane stamps were on different timelines, cross-lane merges would skip edges. `BtHullState.mergeStampPtr` points to the shared counter; `bt_merge` uses `atomicAdd` when non-null, falls back to local `s->mergeStamp--` when null.
 
-**State broadcasting**: `BtHullState` is a per-thread local variable. Only lane 0's state has valid scaling/center/axes (set by `bt_compute_presort`). `bt_compute_postsort` broadcasts these 9 values from lane 0 via `__shfl_sync` before per-lane state init. Note: only lane 0's `s->wp` is valid — error checks in postsort must use the broadcast `shared_wp` pointer, not `s->wp`.
+**State broadcasting**: In `hull_dandc_warp_mesh`, `BtHullState` is `__shared__` (only lane 0 uses it; avoids 32 local-memory copies). In `bt_compute_postsort`, each lane has a per-thread `my_state` for per-lane D&C. Only lane 0's state has valid scaling/center/axes (set by `bt_compute_presort`). `bt_compute_postsort` broadcasts these 9 values from lane 0 via `__shfl_sync` before per-lane state init. Note: only lane 0's `s->wp` is valid — error checks in postsort must use the broadcast `shared_wp` pointer, not `s->wp`.
 
 **Cleanup**: each lane saves its pool blocks to a `__shared__ BtLanePoolCleanup[WARP_SIZE]` array at the end of `bt_compute_postsort`. Lane 0 frees all blocks (initial + growth) in `hull_dandc_warp_mesh`'s `done:` section after `extractMesh` completes.
 

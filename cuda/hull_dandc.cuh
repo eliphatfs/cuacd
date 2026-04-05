@@ -448,7 +448,7 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 // ============================================================================
 
 #define BT_DC_MAX_STACK  4096
-#define BT_DC_MAX_STACK_LOCAL 128
+#define BT_DC_MAX_STACK_LOCAL 64
 
 // Error codes (binary flags, combined via OR)
 #define BT_ERR_WARP_POOL_OOM  1   // bt_alloc failed (WarpPool capacity exceeded)
@@ -1440,7 +1440,6 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     void** all_cleanup_blocks = NULL;
     if (lane == 0) {
         vblock = (BtVertex*)bt_alloc(shared_wp, count * (int)sizeof(BtVertex));
-        s->vertexBase = vblock;
         all_pool_blocks = (void**)bt_alloc(shared_wp, WARP_SIZE * BTPOOL_MAX_BLOCKS * (int)sizeof(void*));
         all_cleanup_blocks = (void**)bt_alloc(shared_wp, WARP_SIZE * BTPOOL_MAX_BLOCKS * (int)sizeof(void*));
     }
@@ -1698,6 +1697,7 @@ __device__ inline Mesh hull_dandc_warp_mesh(
     __shared__ void*              s_pool_backing;
     __shared__ Mesh               s_result;
     __shared__ BtLanePoolCleanup  s_lane_cleanup[WARP_SIZE];
+    __shared__ BtHullState        s_state;
 
     // Use a local error variable to avoid racing on *err with other blocks.
     // Only lane 0 writes; atomicOr to *err at the end.
@@ -1731,23 +1731,24 @@ __device__ inline Mesh hull_dandc_warp_mesh(
     }
 
     // --- Phase 1: pre-sort (all lanes) ---
-    BtHullState state;
+    // s_state is __shared__ to avoid 32 copies in local memory (only lane 0 uses it).
+    BtHullState* state = &s_state;
     if (lane == 0) {
-        state.wp           = &s_pool;
-        state.scratch_heap = scratch_heap;
-        state.vertexList   = NULL;
-        state.mergeStampPtr = NULL;
-        state.edgePool.nblocks = 0;
+        state->wp           = &s_pool;
+        state->scratch_heap = scratch_heap;
+        state->vertexList   = NULL;
+        state->mergeStampPtr = NULL;
+        state->edgePool.nblocks = 0;
 #ifdef COACD_BEAM_DEBUG
-        state.fma_total_edges = 0;
-        state.fma_min_edges   = 0x7fffffff;
-        state.fma_max_edges   = 0;
-        state.fma_calls       = 0;
+        state->fma_total_edges = 0;
+        state->fma_min_edges   = 0x7fffffff;
+        state->fma_max_edges   = 0;
+        state->fma_calls       = 0;
 #endif
     }
     __syncwarp();
 
-    BtPoint32* points = bt_compute_presort(&state, pts, n, lane);
+    BtPoint32* points = bt_compute_presort(state, pts, n, lane);
     if (!points) { local_err = 1; goto done; }
 
     {
@@ -1770,24 +1771,24 @@ __device__ inline Mesh hull_dandc_warp_mesh(
         __syncwarp();
 
         // --- Phase 3: post-sort D&C (vertex init: all lanes, D&C + edgePool init: lane 0) ---
-        bt_compute_postsort(&state, points, n, lane, s_lane_cleanup);
+        bt_compute_postsort(state, points, n, lane, s_lane_cleanup);
 
         if (lane == 0) {
-            if (s_pool.error || state.edgePool.error) {
-                local_err = s_pool.error ? s_pool.error : state.edgePool.error;
+            if (s_pool.error || state->edgePool.error) {
+                local_err = s_pool.error ? s_pool.error : state->edgePool.error;
                 goto done;
             }
 
             DPRINTF("[hull] n=%d fma_calls=%d edges: total=%d avg=%.1f min=%d max=%d\n",
-                n, state.fma_calls, state.fma_total_edges,
-                state.fma_calls > 0 ? (float)state.fma_total_edges / state.fma_calls : 0.f,
-                state.fma_min_edges == 0x7fffffff ? 0 : state.fma_min_edges,
-                state.fma_max_edges);
+                n, state->fma_calls, state->fma_total_edges,
+                state->fma_calls > 0 ? (float)state->fma_total_edges / state->fma_calls : 0.f,
+                state->fma_min_edges == 0x7fffffff ? 0 : state->fma_min_edges,
+                state->fma_max_edges);
 
             // Count pass: exact nv and nt without writing output
             int pre_count = s_pool.offset;
             int nv = 0, nt = 0;
-            if (bt_extractMesh(&state, NULL, NULL, &nv, &nt) < 0)
+            if (bt_extractMesh(state, NULL, NULL, &nv, &nt) < 0)
                 { local_err = 6; goto done; }
             bt_rewind(&s_pool, pre_count);
 
@@ -1809,7 +1810,7 @@ __device__ inline Mesh hull_dandc_warp_mesh(
                 // Extract pass
                 int pre_ext = s_pool.offset;
                 int nv2 = 0, nt2 = 0;
-                if (bt_extractMesh(&state, ov, ot, &nv2, &nt2) < 0)
+                if (bt_extractMesh(state, ov, ot, &nv2, &nt2) < 0)
                     { local_err = 6; goto done; }
                 bt_rewind(&s_pool, pre_ext);
 
