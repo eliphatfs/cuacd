@@ -506,15 +506,10 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
 struct BtHullState {
     float scaling[3];
     float center[3];
-    BtPool edgePool;
     BtVertex* vertexBase;
     int mergeStamp;
     int* mergeStampPtr;    // if non-null, use atomicAdd on shared stamp
     int minAxis, medAxis, maxAxis;
-    int usedEdgePairs;
-#ifdef TRACK_MAX_EDGE_PAIRS
-    int maxEdgePairs;
-#endif
     BtVertex* vertexList;
     WarpPool*   wp;
     DeviceHeap* scratch_heap;  // backing for edgePool slabs
@@ -528,31 +523,51 @@ struct BtHullState {
 };
 
 // ============================================================================
+// Per-lane D&C state (lightweight: only mutable per-lane fields)
+// ============================================================================
+
+struct BtDCState {
+    BtPool edgePool;
+    int mergeStamp;
+    int* mergeStampPtr;    // if non-null, use atomicAdd on shared stamp
+#ifdef TRACK_MAX_EDGE_PAIRS
+    int usedEdgePairs;
+    int maxEdgePairs;
+#endif
+#ifdef COACD_BEAM_DEBUG
+    int fma_total_edges;
+    int fma_min_edges;
+    int fma_max_edges;
+    int fma_calls;
+#endif
+};
+
+// ============================================================================
 // Core algorithm functions
 // ============================================================================
 
-__device__ inline BtEdge* bt_newEdgePair(BtHullState* s, BtVertex* from, BtVertex* to) {
-    BtEdge* e = btpool_new_edge(&s->edgePool);
-    BtEdge* r = btpool_new_edge(&s->edgePool);
+__device__ inline BtEdge* bt_newEdgePair(BtDCState* dc, BtVertex* from, BtVertex* to) {
+    BtEdge* e = btpool_new_edge(&dc->edgePool);
+    BtEdge* r = btpool_new_edge(&dc->edgePool);
     if (!e || !r) return NULL;
     e->reverse = r;
     r->reverse = e;
-    e->copy = s->mergeStamp;
-    r->copy = s->mergeStamp;
+    e->copy = dc->mergeStamp;
+    r->copy = dc->mergeStamp;
     e->target = to;
     r->target = from;
     e->next = NULL; e->prev = NULL;
     r->next = NULL; r->prev = NULL;
-    s->usedEdgePairs++;
 #ifdef TRACK_MAX_EDGE_PAIRS
-    if (s->usedEdgePairs > s->maxEdgePairs) {
-        s->maxEdgePairs = s->usedEdgePairs;
+    dc->usedEdgePairs++;
+    if (dc->usedEdgePairs > dc->maxEdgePairs) {
+        dc->maxEdgePairs = dc->usedEdgePairs;
     }
 #endif
     return e;
 }
 
-__device__ inline void bt_removeEdgePair(BtHullState* s, BtEdge* edge) {
+__device__ inline void bt_removeEdgePair(BtDCState* dc, BtEdge* edge) {
     BtEdge* n = edge->next;
     BtEdge* r = edge->reverse;
     if (n != edge) {
@@ -570,9 +585,11 @@ __device__ inline void bt_removeEdgePair(BtHullState* s, BtEdge* edge) {
     } else {
         edge->target->edges = NULL;
     }
-    btpool_free(&s->edgePool, edge);
-    btpool_free(&s->edgePool, r);
-    s->usedEdgePairs--;
+    btpool_free(&dc->edgePool, edge);
+    btpool_free(&dc->edgePool, r);
+#ifdef TRACK_MAX_EDGE_PAIRS
+    dc->usedEdgePairs--;
+#endif
 }
 
 enum BtOrientation { BT_NONE, BT_CLOCKWISE, BT_COUNTER_CLOCKWISE };
@@ -636,7 +653,7 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVertex* st
     return minEdge;
 }
 
-__device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0, BtVertex* c1,
+__device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVertex* c0, BtVertex* c1,
     BtEdge** e0, BtEdge** e1, BtVertex* stop0, BtVertex* stop1)
 {
     BtEdge* start0 = *e0;
@@ -658,7 +675,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0,
         while ((*e0)->target != stop0) {
             BtEdge* e = (*e0)->reverse->prev;
             if (bp32_dot64(e->target->point, normal) < dist) break;
-            if (e->copy == s->mergeStamp) break;
+            if (e->copy == mergeStamp) break;
             long long dot = bp32_dot64(e->target->point, perp);
             if (dot <= maxDot0) break;
             maxDot0 = dot;
@@ -672,7 +689,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0,
         while ((*e1)->target != stop1) {
             BtEdge* e = (*e1)->reverse->next;
             if (bp32_dot64(e->target->point, normal) < dist) break;
-            if (e->copy == s->mergeStamp) break;
+            if (e->copy == mergeStamp) break;
             long long dot = bp32_dot64(e->target->point, perp);
             if (dot <= maxDot1) break;
             maxDot1 = dot;
@@ -687,7 +704,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0,
             long long dy = bp32_dot64_32(bp32_sub(et1, et0), s_dir);
             if (*e0 && ((*e0)->target != stop0)) {
                 BtEdge* f0 = (*e0)->next->reverse;
-                if (f0->copy > s->mergeStamp) {
+                if (f0->copy > mergeStamp) {
                     long long dx0 = bp32_dot64(bp32_sub(f0->target->point, et0), perp);
                     long long dy0 = bp32_dot64_32(bp32_sub(f0->target->point, et0), s_dir);
                     if ((dx0 == 0) ? (dy0 < 0) : ((dx0 < 0) && (br64_cmp(br64_make(dy0, dx0), br64_make(dy, dx)) >= 0))) {
@@ -700,7 +717,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0,
             }
             if (*e1 && ((*e1)->target != stop1)) {
                 BtEdge* f1 = (*e1)->reverse->next;
-                if (f1->copy > s->mergeStamp) {
+                if (f1->copy > mergeStamp) {
                     BtPoint32 d1 = bp32_sub(f1->target->point, et1);
                     if (bp32_dot64(d1, normal) == 0) {
                         long long dx1 = bp32_dot64(d1, perp);
@@ -722,7 +739,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0,
             long long dy = bp32_dot64_32(bp32_sub(et1, et0), s_dir);
             if (*e1 && ((*e1)->target != stop1)) {
                 BtEdge* f1 = (*e1)->prev->reverse;
-                if (f1->copy > s->mergeStamp) {
+                if (f1->copy > mergeStamp) {
                     long long dx1 = bp32_dot64(bp32_sub(f1->target->point, et1), perp);
                     long long dy1 = bp32_dot64_32(bp32_sub(f1->target->point, et1), s_dir);
                     if ((dx1 == 0) ? (dy1 > 0) : ((dx1 < 0) && (br64_cmp(br64_make(dy1, dx1), br64_make(dy, dx)) <= 0))) {
@@ -735,7 +752,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0,
             }
             if (*e0 && ((*e0)->target != stop0)) {
                 BtEdge* f0 = (*e0)->reverse->prev;
-                if (f0->copy > s->mergeStamp) {
+                if (f0->copy > mergeStamp) {
                     BtPoint32 d0 = bp32_sub(f0->target->point, et0);
                     if (bp32_dot64(d0, normal) == 0) {
                         long long dx0 = bp32_dot64(d0, perp);
@@ -755,7 +772,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(BtHullState* s, BtVertex* c0,
     }
 }
 
-__device__ inline bool bt_mergeProjection(BtHullState* s, BtIntermediateHull* h0, BtIntermediateHull* h1, BtVertex** c0, BtVertex** c1) {
+__device__ inline bool bt_mergeProjection(BtIntermediateHull* h0, BtIntermediateHull* h1, BtVertex** c0, BtVertex** c1) {
     BtVertex* v0 = h0->maxYx;
     BtVertex* v1 = h1->minYx;
     if ((v0->point.x == v1->point.x) && (v0->point.y == v1->point.y)) {
@@ -880,7 +897,7 @@ __device__ inline int bt_checkEdgeRing(BtVertex* v, const char* /*label*/) {
     return -1;
 }
 
-__device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtIntermediateHull* h1) {
+__device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtIntermediateHull* h1) {
     // Single-thread merge (caller is the one active thread).
     if (!h1->maxXy) return;
     if (!h0->maxXy) { *h0 = *h1; return; }
@@ -897,14 +914,14 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
     BtEdge* pendingTail1 = NULL;
     BtPoint32 prevPoint;
 
-    if (s->mergeStampPtr) {
-        s->mergeStamp = atomicAdd(s->mergeStampPtr, -1) - 1;
+    if (dc->mergeStampPtr) {
+        dc->mergeStamp = atomicAdd(dc->mergeStampPtr, -1) - 1;
     } else {
-        s->mergeStamp--;
+        dc->mergeStamp--;
     }
-    int mergeStamp = s->mergeStamp;
+    int mergeStamp = dc->mergeStamp;
 
-    if (bt_mergeProjection(s, h0, h1, &c0, &c1)) {
+    if (bt_mergeProjection(h0, h1, &c0, &c1)) {
         BtPoint32 sd = bp32_sub(c1->point, c0->point);
         BtPoint64 normal = bp32_cross(bp32(0,0,-1), sd);
         BtPoint64 t = bp32_cross64(sd, normal);
@@ -936,7 +953,7 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
         }
 
         if (start0 || start1) {
-            bt_findEdgeForCoplanarFaces(s, c0, c1, &start0, &start1, NULL, NULL);
+            bt_findEdgeForCoplanarFaces(mergeStamp, c0, c1, &start0, &start1, NULL, NULL);
             if (start0) c0 = start0->target;
             if (start1) c1 = start1->target;
         }
@@ -963,16 +980,16 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
         BtEdge* min1 = bt_findMaxAngle(mergeStamp, true,  c1, sd, rxs, sxrxs, &minCot1, &ec1);
 
 #ifdef COACD_BEAM_DEBUG
-        s->fma_total_edges += ec0 + ec1;
-        if (ec0 < s->fma_min_edges) s->fma_min_edges = ec0;
-        if (ec1 < s->fma_min_edges) s->fma_min_edges = ec1;
-        if (ec0 > s->fma_max_edges) s->fma_max_edges = ec0;
-        if (ec1 > s->fma_max_edges) s->fma_max_edges = ec1;
-        s->fma_calls += 2;
+        dc->fma_total_edges += ec0 + ec1;
+        if (ec0 < dc->fma_min_edges) dc->fma_min_edges = ec0;
+        if (ec1 < dc->fma_min_edges) dc->fma_min_edges = ec1;
+        if (ec0 > dc->fma_max_edges) dc->fma_max_edges = ec0;
+        if (ec1 > dc->fma_max_edges) dc->fma_max_edges = ec1;
+        dc->fma_calls += 2;
 #endif
 
         if (!min0 && !min1) {
-            BtEdge* e = bt_newEdgePair(s, c0, c1);
+            BtEdge* e = bt_newEdgePair(dc, c0, c1);
             if (!e) { DPRINTF("[BUG] bt_merge OOM at final edge, blk=%d lane=%d\n", blockIdx.x, threadIdx.x); return; }
             bt_edge_link(e, e);
             c0->edges = e;
@@ -985,7 +1002,7 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
         int cmp = !min0 ? 1 : !min1 ? -1 : br64_cmp(minCot0, minCot1);
 
         if (firstRun || ((cmp >= 0) ? !br64_isNegInf(minCot1) : !br64_isNegInf(minCot0))) {
-            BtEdge* e = bt_newEdgePair(s, c0, c1);
+            BtEdge* e = bt_newEdgePair(dc, c0, c1);
             if (!e) { DPRINTF("[BUG] bt_merge OOM at bridge edge, blk=%d lane=%d\n", blockIdx.x, threadIdx.x); return; }
             if (pendingTail0) pendingTail0->prev = e;
             else pendingHead0 = e;
@@ -1003,14 +1020,14 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
         BtEdge* e1 = min1;
 
         if (cmp == 0) {
-            bt_findEdgeForCoplanarFaces(s, c0, c1, &e0, &e1, NULL, NULL);
+            bt_findEdgeForCoplanarFaces(mergeStamp, c0, c1, &e0, &e1, NULL, NULL);
         }
 
         if ((cmp >= 0) && e1) {
             if (toPrev1) {
                 for (BtEdge *e = toPrev1->next, *n = NULL; e != min1; e = n) {
                     n = e->next;
-                    bt_removeEdgePair(s, e);
+                    bt_removeEdgePair(dc, e);
                 }
             }
             if (pendingTail1) {
@@ -1030,7 +1047,7 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
             if (toPrev0) {
                 for (BtEdge *e = toPrev0->prev, *n = NULL; e != min0; e = n) {
                     n = e->prev;
-                    bt_removeEdgePair(s, e);
+                    bt_removeEdgePair(dc, e);
                 }
             }
             if (pendingTail0) {
@@ -1053,7 +1070,7 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
             } else {
                 for (BtEdge *e = toPrev0->prev, *n = NULL; e != firstNew0; e = n) {
                     n = e->prev;
-                    bt_removeEdgePair(s, e);
+                    bt_removeEdgePair(dc, e);
                 }
                 if (pendingTail0) {
                     bt_edge_link(pendingHead0, toPrev0);
@@ -1066,7 +1083,7 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
             } else {
                 for (BtEdge *e = toPrev1->next, *n = NULL; e != firstNew1; e = n) {
                     n = e->next;
-                    bt_removeEdgePair(s, e);
+                    bt_removeEdgePair(dc, e);
                 }
                 if (pendingTail1) {
                     bt_edge_link(toPrev1, pendingHead1);
@@ -1083,7 +1100,7 @@ __device__ inline void bt_merge(BtHullState* s, BtIntermediateHull* h0, BtInterm
 // computeInternal base case — handles n <= 2
 // ============================================================================
 
-__device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtIntermediateHull* result) {
+__device__ inline void bt_computeBase(BtDCState* dc, BtVertex* vertexBase, int start, int end, BtIntermediateHull* result) {
     int n = end - start;
     switch (n) {
     case 0:
@@ -1091,7 +1108,7 @@ __device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtInte
         result->minYx = NULL; result->maxYx = NULL;
         return;
     case 2: {
-        BtVertex* v = &s->vertexBase[start];
+        BtVertex* v = &vertexBase[start];
         BtVertex* w = v + 1;
         if (bp32_ne(v->point, w->point)) {
             int dx = v->point.x - w->point.x;
@@ -1114,7 +1131,7 @@ __device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtInte
                     result->minYx = w; result->maxYx = v;
                 }
             }
-            BtEdge* e = bt_newEdgePair(s, v, w);
+            BtEdge* e = bt_newEdgePair(dc, v, w);
             if (!e) { DPRINTF("[BUG] bt_merge OOM at coplanar edge, blk=%d lane=%d\n", blockIdx.x, threadIdx.x); return; }
             bt_edge_link(e, e); v->edges = e;
             e = e->reverse;
@@ -1124,7 +1141,7 @@ __device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtInte
     }
     // fallthrough
     case 1: {
-        BtVertex* v = &s->vertexBase[start];
+        BtVertex* v = &vertexBase[start];
         v->edges = NULL;
         v->next = v; v->prev = v;
         result->minXy = v; result->maxXy = v;
@@ -1140,7 +1157,7 @@ __device__ inline void bt_computeBase(BtHullState* s, int start, int end, BtInte
 
 #define BT_ERR_DC_STACK     4
 
-__device__ inline void bt_computeInternal(BtHullState* s, int start, int end, BtIntermediateHull* result,
+__device__ inline void bt_computeInternal(BtDCState* dc, BtVertex* vertexBase, int start, int end, BtIntermediateHull* result,
                                           CheckedBuf<BtDCStackItem> stack) {
     int sp = 0;
 
@@ -1160,12 +1177,12 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
         if (item->stage == 0) {
             int n = item->end - item->start;
             if (n <= 2) {
-                bt_computeBase(s, item->start, item->end, item->result);
+                bt_computeBase(dc, vertexBase, item->start, item->end, item->result);
             } else {
                 int split0 = item->start + n / 2;
-                BtPoint32 p = s->vertexBase[split0 - 1].point;
+                BtPoint32 p = vertexBase[split0 - 1].point;
                 int split1 = split0;
-                while ((split1 < item->end) && bp32_eq(s->vertexBase[split1].point, p)) split1++;
+                while ((split1 < item->end) && bp32_eq(vertexBase[split1].point, p)) split1++;
 
                 BtIntermediateHull* res = item->result;
 
@@ -1178,7 +1195,7 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
                 BtDCStackItem* merge_ptr = &stack[sp - 1];
 
                 // Push right child (result → merge parent's right_hull)
-                if (sp >= BT_DC_MAX_STACK_LOCAL) { s->edgePool.error = BT_ERR_DC_STACK; return; }
+                if (sp >= BT_DC_MAX_STACK_LOCAL) { dc->edgePool.error = BT_ERR_DC_STACK; return; }
                 stack[sp].start = split1;
                 stack[sp].end = item->end;
                 stack[sp].stage = 0;
@@ -1188,7 +1205,7 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
                 sp++;
 
                 // Push left child (result → merge parent's result directly)
-                if (sp >= BT_DC_MAX_STACK_LOCAL) { s->edgePool.error = BT_ERR_DC_STACK; return; }
+                if (sp >= BT_DC_MAX_STACK_LOCAL) { dc->edgePool.error = BT_ERR_DC_STACK; return; }
                 stack[sp].start = item->start;
                 stack[sp].end = split0;
                 stack[sp].stage = 0;
@@ -1198,7 +1215,7 @@ __device__ inline void bt_computeInternal(BtHullState* s, int start, int end, Bt
                 sp++;
             }
         } else {
-            bt_merge(s, item->result, &item->right_hull);
+            bt_merge(dc, item->result, &item->right_hull);
         }
     }
 }
@@ -1267,15 +1284,15 @@ __device__ inline int bt_extractMesh(BtHullState* s,
         for (int i = 0; i < n_verts; i++)
             queue[i]->copy = idx_base - i;
 
-        float sc[3]  = { s->scaling[0], s->scaling[1], s->scaling[2] };
-        float cen[3] = { s->center[0],  s->center[1],  s->center[2]  };
         int medAx = s->medAxis, maxAx = s->maxAxis, minAx = s->minAxis;
+        float sc_med = s->scaling[medAx], sc_max = s->scaling[maxAx], sc_min = s->scaling[minAx];
+        float cn_med = s->center[medAx],  cn_max = s->center[maxAx],  cn_min = s->center[minAx];
         for (int i = 0; i < n_verts; i++) {
             BtVertex* v = queue[i];
             float xyz[3];
-            xyz[medAx] = bv_xval(v) * sc[medAx] + cen[medAx];
-            xyz[maxAx] = bv_yval(v) * sc[maxAx] + cen[maxAx];
-            xyz[minAx] = bv_zval(v) * sc[minAx] + cen[minAx];
+            xyz[medAx] = bv_xval(v) * sc_med + cn_med;
+            xyz[maxAx] = bv_yval(v) * sc_max + cn_max;
+            xyz[minAx] = bv_zval(v) * sc_min + cn_min;
             out_verts[i * 3 + 0] = xyz[0];
             out_verts[i * 3 + 1] = xyz[1];
             out_verts[i * 3 + 2] = xyz[2];
@@ -1496,30 +1513,21 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     int my_start = s_splits[lane];
     int my_end   = s_splits[lane + 1];
 
-    // --- Per-lane BtHullState with per-lane heap-backed edge pool ---
-    BtHullState my_state;
-    my_state.scaling[0] = sc0; my_state.scaling[1] = sc1; my_state.scaling[2] = sc2;
-    my_state.center[0]  = cn0; my_state.center[1]  = cn1; my_state.center[2]  = cn2;
-    my_state.vertexBase  = vblock;
-    my_state.minAxis = minAx; my_state.medAxis = medAx; my_state.maxAxis = maxAx;
-    my_state.wp           = shared_wp;
-    my_state.scratch_heap = shared_sh;
-    my_state.npoints      = count;
-    my_state.usedEdgePairs = 0;
+    // --- Per-lane D&C state (lightweight: only edgePool + mergeStamp) ---
+    // Common fields (scaling, center, axes, wp, etc.) stay in shared BtHullState *s.
+    BtDCState my_dc;
+    my_dc.mergeStamp = -3;
+    my_dc.mergeStampPtr = &s_mergeStamp;
 #ifdef TRACK_MAX_EDGE_PAIRS
-    my_state.maxEdgePairs = 0;
+    my_dc.usedEdgePairs = 0;
+    my_dc.maxEdgePairs = 0;
 #endif
-    my_state.vertexList = NULL;
 #ifdef COACD_BEAM_DEBUG
-    my_state.fma_total_edges = 0;
-    my_state.fma_min_edges   = 0x7fffffff;
-    my_state.fma_max_edges   = 0;
-    my_state.fma_calls       = 0;
+    my_dc.fma_total_edges = 0;
+    my_dc.fma_min_edges   = 0x7fffffff;
+    my_dc.fma_max_edges   = 0;
+    my_dc.fma_calls       = 0;
 #endif
-    // All lanes share a single atomic mergeStamp counter so that edge stamps
-    // are on a common timeline (required for cross-lane merges in tree merge).
-    my_state.mergeStamp = -3;
-    my_state.mergeStampPtr = &s_mergeStamp;
 
     // Lane 0 allocates 2 slabs per lane (64 total) from scratch_heap.
     // Each lane then builds its own BtPool from the two pre-allocated slabs.
@@ -1545,23 +1553,23 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 
         // Each lane initialises its BtPool from two pre-allocated slabs.
         // Per-lane blocks array from the WarpPool-allocated flat buffer.
-        my_state.edgePool.blocks = CheckedBuf<void*>(
+        my_dc.edgePool.blocks = CheckedBuf<void*>(
             all_pool_blocks + lane * BTPOOL_MAX_BLOCKS, BTPOOL_MAX_BLOCKS, "edgePool.blocks");
-        my_state.edgePool.scratch_heap = shared_sh;
-        my_state.edgePool.objSize      = padded;
-        my_state.edgePool.freeList     = NULL;
-        my_state.edgePool.error        = 0;
-        my_state.edgePool.nblocks      = 0;
-        my_state.edgePool.growSlabSize = slab_edges;
+        my_dc.edgePool.scratch_heap = shared_sh;
+        my_dc.edgePool.objSize      = padded;
+        my_dc.edgePool.freeList     = NULL;
+        my_dc.edgePool.error        = 0;
+        my_dc.edgePool.nblocks      = 0;
+        my_dc.edgePool.growSlabSize = slab_edges;
         // Build free list from both slabs (slab1 -> slab0 -> NULL)
         for (int si = 0; si < 2; si++) {
             void* blk = s_edge_slabs[lane * 2 + si];
-            my_state.edgePool.blocks[my_state.edgePool.nblocks++] = blk;
+            my_dc.edgePool.blocks[my_dc.edgePool.nblocks++] = blk;
             char* b = (char*)blk;
-            *(void**)b = my_state.edgePool.freeList;
+            *(void**)b = my_dc.edgePool.freeList;
             for (int i = 1; i < slab_edges; i++)
                 *(void**)(b + i * padded) = b + (i - 1) * padded;
-            my_state.edgePool.freeList = b + (slab_edges - 1) * padded;
+            my_dc.edgePool.freeList = b + (slab_edges - 1) * padded;
         }
     }
     __syncwarp();
@@ -1588,11 +1596,11 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     s_hulls[0].minXy = NULL; s_hulls[0].maxXy = NULL;
     s_hulls[0].minYx = NULL; s_hulls[0].maxYx = NULL;
     if (lane == 0 && count > 0) {
-        bt_computeInternal(&my_state, 0, count, &s_hulls[0], my_dc_stack);
+        bt_computeInternal(&my_dc, vblock, 0, count, &s_hulls[0], my_dc_stack);
     }
     __syncwarp();
     {
-        int my_err = my_state.edgePool.error;
+        int my_err = my_dc.edgePool.error;
         for (int off = 16; off > 0; off >>= 1)
             my_err |= __shfl_xor_sync(WARP_MASK, my_err, off);
         if (my_err) { shared_wp->error = my_err; return; }
@@ -1603,13 +1611,13 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     s_hulls[lane].minYx = NULL; s_hulls[lane].maxYx = NULL;
 
     if (my_end - my_start > 0) {
-        bt_computeInternal(&my_state, my_start, my_end, &s_hulls[lane], my_dc_stack);
+        bt_computeInternal(&my_dc, vblock, my_start, my_end, &s_hulls[lane], my_dc_stack);
     }
     __syncwarp();
 
     // Check for errors from any lane — propagate actual error bits
     {
-        int my_err = my_state.edgePool.error;
+        int my_err = my_dc.edgePool.error;
         // OR all lanes' errors together via warp reduction
         for (int off = 16; off > 0; off >>= 1)
             my_err |= __shfl_xor_sync(WARP_MASK, my_err, off);
@@ -1627,14 +1635,14 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
             int right = left + (stride >> 1);
             //DPRINTF("[tree] blk=%d lane=%d round=%d merge hulls[%d]+hulls[%d]\n",
             //        blockIdx.x, lane, round, left, right);
-            bt_merge(&my_state, &s_hulls[left], &s_hulls[right]);
+            bt_merge(&my_dc, &s_hulls[left], &s_hulls[right]);
             // bt_merge writes result into s_hulls[left] via bt_mergeProjection
         }
         __syncwarp();
 
         // Check for errors (pool exhaustion during merge)
         {
-            int my_err = my_state.edgePool.error;
+            int my_err = my_dc.edgePool.error;
             for (int off = 16; off > 0; off >>= 1)
                 my_err |= __shfl_xor_sync(WARP_MASK, my_err, off);
             if (my_err) { shared_wp->error = my_err; return; }
@@ -1649,26 +1657,24 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     // --- Result is in s_hulls[0] ---
     if (lane == 0) {
         s->vertexList = s_hulls[0].minXy;
-        // Copy edge pool info for cleanup (arena slabs freed by hull_dandc_warp_mesh)
-        s->edgePool = my_state.edgePool;
-        // Set mergeStamp from shared counter for use by extractMesh/computeVolume
+        // Set mergeStamp from shared counter for use by extractMesh
         s->mergeStamp = s_mergeStamp;
         s->mergeStampPtr = NULL;  // extractMesh uses local stamp, not shared
 #ifdef COACD_BEAM_DEBUG
         // Aggregate instrumentation from lane 0 (other lanes' stats are lost)
-        s->fma_total_edges = my_state.fma_total_edges;
-        s->fma_min_edges   = my_state.fma_min_edges;
-        s->fma_max_edges   = my_state.fma_max_edges;
-        s->fma_calls       = my_state.fma_calls;
+        s->fma_total_edges = my_dc.fma_total_edges;
+        s->fma_min_edges   = my_dc.fma_min_edges;
+        s->fma_max_edges   = my_dc.fma_max_edges;
+        s->fma_calls       = my_dc.fma_calls;
 #endif
     }
 
     // Each lane saves its own pool blocks for deferred cleanup in hull_dandc_warp_mesh.
     // Cleanup blocks array backed by WarpPool (all_cleanup_blocks).
     out_cleanup[lane].blocks = all_cleanup_blocks + lane * BTPOOL_MAX_BLOCKS;
-    out_cleanup[lane].nblocks = my_state.edgePool.nblocks;
-    for (int i = 0; i < my_state.edgePool.nblocks; i++)
-        out_cleanup[lane].blocks[i] = my_state.edgePool.blocks[i];
+    out_cleanup[lane].nblocks = my_dc.edgePool.nblocks;
+    for (int i = 0; i < my_dc.edgePool.nblocks; i++)
+        out_cleanup[lane].blocks[i] = my_dc.edgePool.blocks[i];
     __syncwarp();
 }
 
@@ -1734,7 +1740,6 @@ __device__ inline Mesh hull_dandc_warp_mesh(
         state->scratch_heap = scratch_heap;
         state->vertexList   = NULL;
         state->mergeStampPtr = NULL;
-        state->edgePool.nblocks = 0;
 #ifdef COACD_BEAM_DEBUG
         state->fma_total_edges = 0;
         state->fma_min_edges   = 0x7fffffff;
@@ -1770,8 +1775,8 @@ __device__ inline Mesh hull_dandc_warp_mesh(
         bt_compute_postsort(state, points, n, lane, s_lane_cleanup);
 
         if (lane == 0) {
-            if (s_pool.error || state->edgePool.error) {
-                local_err = s_pool.error ? s_pool.error : state->edgePool.error;
+            if (s_pool.error) {
+                local_err = s_pool.error;
                 goto done;
             }
 
