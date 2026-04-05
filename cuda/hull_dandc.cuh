@@ -1254,13 +1254,9 @@ __device__ inline int bt_extractMesh(BtHullState* s,
         float cn_med = s->center[medAx],  cn_max = s->center[maxAx],  cn_min = s->center[minAx];
         for (int i = 0; i < n_verts; i++) {
             BtVertex* v = queue[i];
-            float xyz[3];
-            xyz[medAx] = bv_xval(v) * sc_med + cn_med;
-            xyz[maxAx] = bv_yval(v) * sc_max + cn_max;
-            xyz[minAx] = bv_zval(v) * sc_min + cn_min;
-            out_verts[i * 3 + 0] = xyz[0];
-            out_verts[i * 3 + 1] = xyz[1];
-            out_verts[i * 3 + 2] = xyz[2];
+            out_verts[i * 3 + medAx] = bv_xval(v) * sc_med + cn_med;
+            out_verts[i * 3 + maxAx] = bv_yval(v) * sc_max + cn_max;
+            out_verts[i * 3 + minAx] = bv_zval(v) * sc_min + cn_min;
         }
 
         int fstamp = --s->mergeStamp;
@@ -1348,13 +1344,6 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
         sc[0] = -sc[0]; sc[1] = -sc[1]; sc[2] = -sc[2];
     }
 
-    float inv[3];
-    inv[0] = (sc[0] != 0.0f) ? 1.0f / sc[0] : 0.0f;
-    inv[1] = (sc[1] != 0.0f) ? 1.0f / sc[1] : 0.0f;
-    inv[2] = (sc[2] != 0.0f) ? 1.0f / sc[2] : 0.0f;
-
-    float cen[3] = {(mn0+mx0)*0.5f, (mn1+mx1)*0.5f, (mn2+mx2)*0.5f};
-
     // --- Lane 0: write state and allocate ---
     BtPoint32* points = NULL;
     if (lane == 0) {
@@ -1362,19 +1351,25 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
         s->minAxis = minAx;
         s->medAxis = medAx;
         s->scaling[0] = sc[0]; s->scaling[1] = sc[1]; s->scaling[2] = sc[2];
-        s->center[0] = cen[0]; s->center[1] = cen[1]; s->center[2] = cen[2];
+        s->center[0] = (mn0+mx0)*0.5f; s->center[1] = (mn1+mx1)*0.5f; s->center[2] = (mn2+mx2)*0.5f;
         points = (BtPoint32*)bt_alloc(s->wp, count * (int)sizeof(BtPoint32));
     }
-    // Broadcast pointer from lane 0
+    // Broadcast pointer from lane 0; syncwarp ensures s->center/scaling visible to all lanes
     long long pp = __shfl_sync(WARP_MASK, (long long)points, 0);
     points = (BtPoint32*)pp;
     if (!points) return NULL;
+    __syncwarp();
+
+    float cen_med = s->center[medAx], cen_max = s->center[maxAx], cen_min = s->center[minAx];
+    float inv_med = (s->scaling[medAx] != 0.0f) ? 1.0f / s->scaling[medAx] : 0.0f;
+    float inv_max = (s->scaling[maxAx] != 0.0f) ? 1.0f / s->scaling[maxAx] : 0.0f;
+    float inv_min = (s->scaling[minAx] != 0.0f) ? 1.0f / s->scaling[minAx] : 0.0f;
 
     // --- Point conversion: warp-parallel strided ---
     for (int i = lane; i < count; i += WARP_SIZE) {
-        points[i].x = (int)((pts[i*3+medAx] - cen[medAx]) * inv[medAx]);
-        points[i].y = (int)((pts[i*3+maxAx] - cen[maxAx]) * inv[maxAx]);
-        points[i].z = (int)((pts[i*3+minAx] - cen[minAx]) * inv[minAx]);
+        points[i].x = (int)((pts[i*3+medAx] - cen_med) * inv_med);
+        points[i].y = (int)((pts[i*3+maxAx] - cen_max) * inv_max);
+        points[i].z = (int)((pts[i*3+minAx] - cen_min) * inv_min);
         points[i].index = i;
     }
     __syncwarp();
