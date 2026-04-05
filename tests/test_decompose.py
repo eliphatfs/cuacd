@@ -27,7 +27,7 @@ OUTPUT_GLB   = os.path.join(os.path.dirname(__file__),
 
 @pytest.fixture(autouse=True, scope="module")
 def gpu_ctx():
-    _gpu.init(0)
+    _gpu.init(0, 10_000_000_000)
     yield
     _gpu.destroy()
 

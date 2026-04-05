@@ -258,27 +258,29 @@ __device__ inline int br128_cmp_i64(BtRational128 a, long long b) {
 
 struct BtVertex;
 struct BtEdge;
+typedef int BtVIndex;
+#define BT_VI_NULL (-1)
 struct BtEdge {
     BtEdge* next;
     BtEdge* prev;
     BtEdge* reverse;
-    BtVertex* target;
+    BtVIndex target;
     int copy;
 };
 
 struct BtVertex {
-    BtVertex* next;
-    BtVertex* prev;
+    BtVIndex next;
+    BtVIndex prev;
     BtEdge* edges;
     BtPoint32 point;
     int copy;
 };
 
 struct BtIntermediateHull {
-    BtVertex* minXy;
-    BtVertex* maxXy;
-    BtVertex* minYx;
-    BtVertex* maxYx;
+    BtVIndex minXy;
+    BtVIndex maxXy;
+    BtVIndex minYx;
+    BtVIndex maxYx;
 };
 
 // D&C stack item for iterative computeInternal
@@ -289,18 +291,6 @@ struct BtDCStackItem {
     BtIntermediateHull right_hull;
     BtIntermediateHull* result;  // where to write the merged hull (left child writes here directly)
 };
-
-// Vertex operations
-__device__ inline BtPoint32 bv_sub(BtVertex* a, BtVertex* b) { return bp32_sub(a->point, b->point); }
-
-// Vertex dot with Point64 -> Rational128
-__device__ inline BtRational128 bv_dot(BtVertex* v, BtPoint64 b) {
-    return br128_from_i64(bp32_dot64(v->point, b));
-}
-
-__device__ inline float bv_xval(BtVertex* v) { return (float)v->point.x; }
-__device__ inline float bv_yval(BtVertex* v) { return (float)v->point.y; }
-__device__ inline float bv_zval(BtVertex* v) { return (float)v->point.z; }
 
 __device__ inline void bt_edge_link(BtEdge* a, BtEdge* n) {
     a->next = n;
@@ -453,8 +443,8 @@ __host__ __device__ inline int dandc_scratch_bytes(int n) {
     // Per-lane D&C stacks: 32 lanes × BT_DC_MAX_STACK_LOCAL items (rewound after D&C)
     int dc_stacks = BT_ALIGN16(WARP_SIZE * BT_DC_MAX_STACK_LOCAL * (int)sizeof(BtDCStackItem));
 
-    // BFS queues for mesh extraction + volume (each n * sizeof(BtVertex*))
-    int phase_bfs = BT_ALIGN16(n * (int)sizeof(BtVertex*));
+    // BFS queues for mesh extraction + volume (each n * sizeof(BtVIndex))
+    int phase_bfs = BT_ALIGN16(n * (int)sizeof(BtVIndex));
 
     // dc_stacks and bfs_queues don't overlap (dc rewound before bfs)
     int postsort = postsort_persistent + (dc_stacks > phase_bfs ? dc_stacks : phase_bfs);
@@ -475,7 +465,8 @@ struct BtHullState {
     int mergeStamp;
     int* mergeStampPtr;    // if non-null, use atomicAdd on shared stamp
     int minAxis, medAxis, maxAxis;
-    BtVertex* vertexList;
+    BtVIndex vertexList;
+    BtVertex* __restrict__ vblock;
     WarpPool*   wp;
     DeviceHeap* scratch_heap;  // backing for edgePool slabs
     int         npoints;       // original point count (queue size bound)
@@ -495,6 +486,7 @@ struct BtDCState {
     BtPool edgePool;
     int mergeStamp;
     int* mergeStampPtr;    // if non-null, use atomicAdd on shared stamp
+    BtVertex* __restrict__ vblock;
 #ifdef TRACK_MAX_EDGE_PAIRS
     int usedEdgePairs;
     int maxEdgePairs;
@@ -511,7 +503,7 @@ struct BtDCState {
 // Core algorithm functions
 // ============================================================================
 
-__device__ inline BtEdge* bt_newEdgePair(BtDCState* dc, BtVertex* from, BtVertex* to) {
+__device__ inline BtEdge* bt_newEdgePair(BtDCState* __restrict__ dc, BtVIndex from, BtVIndex to) {
     BtEdge* e = btpool_new_edge(&dc->edgePool);
     BtEdge* r = btpool_new_edge(&dc->edgePool);
     if (!e || !r) return NULL;
@@ -538,17 +530,17 @@ __device__ inline void bt_removeEdgePair(BtDCState* dc, BtEdge* edge) {
     if (n != edge) {
         n->prev = edge->prev;
         edge->prev->next = n;
-        r->target->edges = n;
+        dc->vblock[r->target].edges = n;
     } else {
-        r->target->edges = NULL;
+        dc->vblock[r->target].edges = NULL;
     }
     n = r->next;
     if (n != r) {
         n->prev = r->prev;
         r->prev->next = n;
-        edge->target->edges = n;
+        dc->vblock[edge->target].edges = n;
     } else {
-        edge->target->edges = NULL;
+        dc->vblock[edge->target].edges = NULL;
     }
     btpool_free(&dc->edgePool, edge);
     btpool_free(&dc->edgePool, r);
@@ -559,13 +551,13 @@ __device__ inline void bt_removeEdgePair(BtDCState* dc, BtEdge* edge) {
 
 enum BtOrientation { BT_NONE, BT_CLOCKWISE, BT_COUNTER_CLOCKWISE };
 
-__device__ inline BtOrientation bt_getOrientation(BtEdge* prev_e, BtEdge* next_e, BtPoint32 s_dir, BtPoint32 t_dir) {
+__device__ inline BtOrientation bt_getOrientation(BtEdge* prev_e, BtEdge* next_e, BtPoint32 s_dir, BtPoint32 t_dir, BtVertex* __restrict__ vblock) {
     if (prev_e->next == next_e) {
         if (prev_e->prev == next_e) {
             BtPoint64 n = bp32_cross(t_dir, s_dir);
             BtPoint64 m = bp32_cross(
-                bp32_sub(prev_e->target->point, next_e->reverse->target->point),
-                bp32_sub(next_e->target->point, next_e->reverse->target->point));
+                bp32_sub(vblock[prev_e->target].point, vblock[next_e->reverse->target].point),
+                bp32_sub(vblock[next_e->target].point, vblock[next_e->reverse->target].point));
             long long dot = bp64_dot64(n, m);
             return (dot > 0) ? BT_COUNTER_CLOCKWISE : BT_CLOCKWISE;
         }
@@ -577,18 +569,18 @@ __device__ inline BtOrientation bt_getOrientation(BtEdge* prev_e, BtEdge* next_e
     return BT_NONE;
 }
 
-__device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVertex* start,
+__device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVIndex start,
     BtPoint32 s_dir, BtPoint64 rxs, BtPoint64 sxrxs, BtRational64* minCot,
-    int* edge_count)
+    int* edge_count, BtVertex* __restrict__ vblock)
 {
     BtEdge* minEdge = NULL;
-    BtEdge* e = start->edges;
+    BtEdge* e = vblock[start].edges;
     if (!e) { if (edge_count) *edge_count = 0; return NULL; }
     int count = 0;
     do {
         count++;
         if (e->copy > mergeStamp) {
-            BtPoint32 t = bp32_sub(e->target->point, start->point);
+            BtPoint32 t = bp32_sub(vblock[e->target].point, vblock[start].point);
             BtRational64 cot = br64_make(bp32_dot64(t, sxrxs), bp32_dot64(t, rxs));
             if (!br64_isNaN(cot)) {
                 if (minEdge == NULL) {
@@ -599,7 +591,7 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVertex* st
                     if (c < 0) {
                         *minCot = cot;
                         minEdge = e;
-                    } else if (c == 0 && (ccw == (bt_getOrientation(minEdge, e, s_dir, t) == BT_COUNTER_CLOCKWISE))) {
+                    } else if (c == 0 && (ccw == (bt_getOrientation(minEdge, e, s_dir, t, vblock) == BT_COUNTER_CLOCKWISE))) {
                         minEdge = e;
                     }
                 }
@@ -608,44 +600,44 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVertex* st
         e = e->next;
         if (!e) {
             DPRINTF("[BUG] bt_findMaxAngle: NULL edge->next after %d edges, "
-                    "blk=%d lane=%d start=%p mergeStamp=%d\n",
+                    "blk=%d lane=%d start=%d mergeStamp=%d\n",
                     count, blockIdx.x, threadIdx.x, start, mergeStamp);
             if (edge_count) *edge_count = count;
             return minEdge;  // bail out instead of crashing
         }
-    } while (e != start->edges);
+    } while (e != vblock[start].edges);
     if (edge_count) *edge_count = count;
     return minEdge;
 }
 
-__device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVertex* c0, BtVertex* c1,
-    BtEdge** e0, BtEdge** e1, BtVertex* stop0, BtVertex* stop1)
+__device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, BtVIndex c1,
+    BtEdge** e0, BtEdge** e1, BtVIndex stop0, BtVIndex stop1, BtVertex* __restrict__ vblock)
 {
     BtEdge* start0 = *e0;
     BtEdge* start1 = *e1;
-    BtPoint32 et0 = start0 ? start0->target->point : c0->point;
-    BtPoint32 et1 = start1 ? start1->target->point : c1->point;
-    BtPoint32 s_dir = bp32_sub(c1->point, c0->point);
+    BtPoint32 et0 = start0 ? vblock[start0->target].point : vblock[c0].point;
+    BtPoint32 et1 = start1 ? vblock[start1->target].point : vblock[c1].point;
+    BtPoint32 s_dir = bp32_sub(vblock[c1].point, vblock[c0].point);
     BtPoint64 normal = bp32_cross(bp32(0,0,-1), s_dir);
     // Use whichever start edge exists to define the coplanar normal
     if (start0 || start1) {
-        BtVertex* ref = (start0 ? start0 : start1)->target;
-        normal = bp32_cross(bp32_sub(ref->point, c0->point), s_dir);
+        BtVIndex ref = (start0 ? start0 : start1)->target;
+        normal = bp32_cross(bp32_sub(vblock[ref].point, vblock[c0].point), s_dir);
     }
-    long long dist = bp32_dot64(c0->point, normal);
+    long long dist = bp32_dot64(vblock[c0].point, normal);
     BtPoint64 perp = bp32_cross64(s_dir, normal);
 
     long long maxDot0 = bp32_dot64(et0, perp);
     if (*e0) {
         while ((*e0)->target != stop0) {
             BtEdge* e = (*e0)->reverse->prev;
-            if (bp32_dot64(e->target->point, normal) < dist) break;
+            if (bp32_dot64(vblock[e->target].point, normal) < dist) break;
             if (e->copy == mergeStamp) break;
-            long long dot = bp32_dot64(e->target->point, perp);
+            long long dot = bp32_dot64(vblock[e->target].point, perp);
             if (dot <= maxDot0) break;
             maxDot0 = dot;
             *e0 = e;
-            et0 = e->target->point;
+            et0 = vblock[e->target].point;
         }
     }
 
@@ -653,13 +645,13 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVertex* c0,
     if (*e1) {
         while ((*e1)->target != stop1) {
             BtEdge* e = (*e1)->reverse->next;
-            if (bp32_dot64(e->target->point, normal) < dist) break;
+            if (bp32_dot64(vblock[e->target].point, normal) < dist) break;
             if (e->copy == mergeStamp) break;
-            long long dot = bp32_dot64(e->target->point, perp);
+            long long dot = bp32_dot64(vblock[e->target].point, perp);
             if (dot <= maxDot1) break;
             maxDot1 = dot;
             *e1 = e;
-            et1 = e->target->point;
+            et1 = vblock[e->target].point;
         }
     }
 
@@ -670,10 +662,10 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVertex* c0,
             if (*e0 && ((*e0)->target != stop0)) {
                 BtEdge* f0 = (*e0)->next->reverse;
                 if (f0->copy > mergeStamp) {
-                    long long dx0 = bp32_dot64(bp32_sub(f0->target->point, et0), perp);
-                    long long dy0 = bp32_dot64_32(bp32_sub(f0->target->point, et0), s_dir);
+                    long long dx0 = bp32_dot64(bp32_sub(vblock[f0->target].point, et0), perp);
+                    long long dy0 = bp32_dot64_32(bp32_sub(vblock[f0->target].point, et0), s_dir);
                     if ((dx0 == 0) ? (dy0 < 0) : ((dx0 < 0) && (br64_cmp(br64_make(dy0, dx0), br64_make(dy, dx)) >= 0))) {
-                        et0 = f0->target->point;
+                        et0 = vblock[f0->target].point;
                         dx = bp32_dot64(bp32_sub(et1, et0), perp);
                         *e0 = (*e0 == start0) ? NULL : f0;
                         continue;
@@ -683,14 +675,14 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVertex* c0,
             if (*e1 && ((*e1)->target != stop1)) {
                 BtEdge* f1 = (*e1)->reverse->next;
                 if (f1->copy > mergeStamp) {
-                    BtPoint32 d1 = bp32_sub(f1->target->point, et1);
+                    BtPoint32 d1 = bp32_sub(vblock[f1->target].point, et1);
                     if (bp32_dot64(d1, normal) == 0) {
                         long long dx1 = bp32_dot64(d1, perp);
                         long long dy1 = bp32_dot64_32(d1, s_dir);
-                        long long dxn = bp32_dot64(bp32_sub(f1->target->point, et0), perp);
+                        long long dxn = bp32_dot64(bp32_sub(vblock[f1->target].point, et0), perp);
                         if ((dxn > 0) && ((dx1 == 0) ? (dy1 < 0) : ((dx1 < 0) && (br64_cmp(br64_make(dy1, dx1), br64_make(dy, dx)) > 0)))) {
                             *e1 = f1;
-                            et1 = (*e1)->target->point;
+                            et1 = vblock[(*e1)->target].point;
                             dx = dxn;
                             continue;
                         }
@@ -705,10 +697,10 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVertex* c0,
             if (*e1 && ((*e1)->target != stop1)) {
                 BtEdge* f1 = (*e1)->prev->reverse;
                 if (f1->copy > mergeStamp) {
-                    long long dx1 = bp32_dot64(bp32_sub(f1->target->point, et1), perp);
-                    long long dy1 = bp32_dot64_32(bp32_sub(f1->target->point, et1), s_dir);
+                    long long dx1 = bp32_dot64(bp32_sub(vblock[f1->target].point, et1), perp);
+                    long long dy1 = bp32_dot64_32(bp32_sub(vblock[f1->target].point, et1), s_dir);
                     if ((dx1 == 0) ? (dy1 > 0) : ((dx1 < 0) && (br64_cmp(br64_make(dy1, dx1), br64_make(dy, dx)) <= 0))) {
-                        et1 = f1->target->point;
+                        et1 = vblock[f1->target].point;
                         dx = bp32_dot64(bp32_sub(et1, et0), perp);
                         *e1 = (*e1 == start1) ? NULL : f1;
                         continue;
@@ -718,14 +710,14 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVertex* c0,
             if (*e0 && ((*e0)->target != stop0)) {
                 BtEdge* f0 = (*e0)->reverse->prev;
                 if (f0->copy > mergeStamp) {
-                    BtPoint32 d0 = bp32_sub(f0->target->point, et0);
+                    BtPoint32 d0 = bp32_sub(vblock[f0->target].point, et0);
                     if (bp32_dot64(d0, normal) == 0) {
                         long long dx0 = bp32_dot64(d0, perp);
                         long long dy0 = bp32_dot64_32(d0, s_dir);
-                        long long dxn = bp32_dot64(bp32_sub(et1, f0->target->point), perp);
+                        long long dxn = bp32_dot64(bp32_sub(et1, vblock[f0->target].point), perp);
                         if ((dxn < 0) && ((dx0 == 0) ? (dy0 > 0) : ((dx0 < 0) && (br64_cmp(br64_make(dy0, dx0), br64_make(dy, dx)) < 0)))) {
                             *e0 = f0;
-                            et0 = (*e0)->target->point;
+                            et0 = vblock[(*e0)->target].point;
                             dx = dxn;
                             continue;
                         }
@@ -737,54 +729,54 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVertex* c0,
     }
 }
 
-__device__ inline bool bt_mergeProjection(BtIntermediateHull* h0, BtIntermediateHull* h1, BtVertex** c0, BtVertex** c1) {
-    BtVertex* v0 = h0->maxYx;
-    BtVertex* v1 = h1->minYx;
-    if ((v0->point.x == v1->point.x) && (v0->point.y == v1->point.y)) {
-        BtVertex* v1p = v1->prev;
+__device__ inline bool bt_mergeProjection(BtIntermediateHull* h0, BtIntermediateHull* h1, BtVIndex* c0, BtVIndex* c1, BtVertex* __restrict__ vblock) {
+    BtVIndex v0 = h0->maxYx;
+    BtVIndex v1 = h1->minYx;
+    if ((vblock[v0].point.x == vblock[v1].point.x) && (vblock[v0].point.y == vblock[v1].point.y)) {
+        BtVIndex v1p = vblock[v1].prev;
         if (v1p == v1) {
             *c0 = v0;
-            if (v1->edges) {
-                v1 = v1->edges->target;
+            if (vblock[v1].edges) {
+                v1 = vblock[v1].edges->target;
             }
             *c1 = v1;
             return false;
         }
-        BtVertex* v1n = v1->next;
-        v1p->next = v1n;
-        v1n->prev = v1p;
+        BtVIndex v1n = vblock[v1].next;
+        vblock[v1p].next = v1n;
+        vblock[v1n].prev = v1p;
         if (v1 == h1->minXy) {
-            h1->minXy = ((v1n->point.x < v1p->point.x) || ((v1n->point.x == v1p->point.x) && (v1n->point.y < v1p->point.y))) ? v1n : v1p;
+            h1->minXy = ((vblock[v1n].point.x < vblock[v1p].point.x) || ((vblock[v1n].point.x == vblock[v1p].point.x) && (vblock[v1n].point.y < vblock[v1p].point.y))) ? v1n : v1p;
         }
         if (v1 == h1->maxXy) {
-            h1->maxXy = ((v1n->point.x > v1p->point.x) || ((v1n->point.x == v1p->point.x) && (v1n->point.y > v1p->point.y))) ? v1n : v1p;
+            h1->maxXy = ((vblock[v1n].point.x > vblock[v1p].point.x) || ((vblock[v1n].point.x == vblock[v1p].point.x) && (vblock[v1n].point.y > vblock[v1p].point.y))) ? v1n : v1p;
         }
     }
 
     v0 = h0->maxXy;
     v1 = h1->maxXy;
-    BtVertex* v00 = NULL;
-    BtVertex* v10 = NULL;
+    BtVIndex v00 = BT_VI_NULL;
+    BtVIndex v10 = BT_VI_NULL;
     int sign = 1;
 
     for (int side = 0; side <= 1; side++) {
-        int dx = (v1->point.x - v0->point.x) * sign;
+        int dx = (vblock[v1].point.x - vblock[v0].point.x) * sign;
         if (dx > 0) {
             while (true) {
-                int dy = v1->point.y - v0->point.y;
-                BtVertex* w0 = side ? v0->next : v0->prev;
+                int dy = vblock[v1].point.y - vblock[v0].point.y;
+                BtVIndex w0 = side ? vblock[v0].next : vblock[v0].prev;
                 if (w0 != v0) {
-                    int dx0 = (w0->point.x - v0->point.x) * sign;
-                    int dy0 = w0->point.y - v0->point.y;
+                    int dx0 = (vblock[w0].point.x - vblock[v0].point.x) * sign;
+                    int dy0 = vblock[w0].point.y - vblock[v0].point.y;
                     if ((dy0 <= 0) && ((dx0 == 0) || ((dx0 < 0) && ((long long)dy0 * dx <= (long long)dy * dx0)))) {
-                        v0 = w0; dx = (v1->point.x - v0->point.x) * sign; continue;
+                        v0 = w0; dx = (vblock[v1].point.x - vblock[v0].point.x) * sign; continue;
                     }
                 }
-                BtVertex* w1 = side ? v1->next : v1->prev;
+                BtVIndex w1 = side ? vblock[v1].next : vblock[v1].prev;
                 if (w1 != v1) {
-                    int dx1 = (w1->point.x - v1->point.x) * sign;
-                    int dy1 = w1->point.y - v1->point.y;
-                    int dxn = (w1->point.x - v0->point.x) * sign;
+                    int dx1 = (vblock[w1].point.x - vblock[v1].point.x) * sign;
+                    int dy1 = vblock[w1].point.y - vblock[v1].point.y;
+                    int dxn = (vblock[w1].point.x - vblock[v0].point.x) * sign;
                     if ((dxn > 0) && (dy1 < 0) && ((dx1 == 0) || ((dx1 < 0) && ((long long)dy1 * dx < (long long)dy * dx1)))) {
                         v1 = w1; dx = dxn; continue;
                     }
@@ -793,20 +785,20 @@ __device__ inline bool bt_mergeProjection(BtIntermediateHull* h0, BtIntermediate
             }
         } else if (dx < 0) {
             while (true) {
-                int dy = v1->point.y - v0->point.y;
-                BtVertex* w1 = side ? v1->prev : v1->next;
+                int dy = vblock[v1].point.y - vblock[v0].point.y;
+                BtVIndex w1 = side ? vblock[v1].prev : vblock[v1].next;
                 if (w1 != v1) {
-                    int dx1 = (w1->point.x - v1->point.x) * sign;
-                    int dy1 = w1->point.y - v1->point.y;
+                    int dx1 = (vblock[w1].point.x - vblock[v1].point.x) * sign;
+                    int dy1 = vblock[w1].point.y - vblock[v1].point.y;
                     if ((dy1 >= 0) && ((dx1 == 0) || ((dx1 < 0) && ((long long)dy1 * dx <= (long long)dy * dx1)))) {
-                        v1 = w1; dx = (v1->point.x - v0->point.x) * sign; continue;
+                        v1 = w1; dx = (vblock[v1].point.x - vblock[v0].point.x) * sign; continue;
                     }
                 }
-                BtVertex* w0 = side ? v0->prev : v0->next;
+                BtVIndex w0 = side ? vblock[v0].prev : vblock[v0].next;
                 if (w0 != v0) {
-                    int dx0 = (w0->point.x - v0->point.x) * sign;
-                    int dy0 = w0->point.y - v0->point.y;
-                    int dxn = (v1->point.x - w0->point.x) * sign;
+                    int dx0 = (vblock[w0].point.x - vblock[v0].point.x) * sign;
+                    int dy0 = vblock[w0].point.y - vblock[v0].point.y;
+                    int dxn = (vblock[v1].point.x - vblock[w0].point.x) * sign;
                     if ((dxn < 0) && (dy0 > 0) && ((dx0 == 0) || ((dx0 < 0) && ((long long)dy0 * dx < (long long)dy * dx0)))) {
                         v0 = w0; dx = dxn; continue;
                     }
@@ -814,18 +806,18 @@ __device__ inline bool bt_mergeProjection(BtIntermediateHull* h0, BtIntermediate
                 break;
             }
         } else {
-            int x = v0->point.x;
-            int y0 = v0->point.y;
-            BtVertex* w0 = v0;
-            BtVertex* t;
-            while (((t = side ? w0->next : w0->prev) != v0) && (t->point.x == x) && (t->point.y <= y0)) {
-                w0 = t; y0 = t->point.y;
+            int x = vblock[v0].point.x;
+            int y0 = vblock[v0].point.y;
+            BtVIndex w0 = v0;
+            BtVIndex t;
+            while (((t = side ? vblock[w0].next : vblock[w0].prev) != v0) && (vblock[t].point.x == x) && (vblock[t].point.y <= y0)) {
+                w0 = t; y0 = vblock[t].point.y;
             }
             v0 = w0;
-            int y1 = v1->point.y;
-            BtVertex* w1 = v1;
-            while (((t = side ? w1->prev : w1->next) != v1) && (t->point.x == x) && (t->point.y >= y1)) {
-                w1 = t; y1 = t->point.y;
+            int y1 = vblock[v1].point.y;
+            BtVIndex w1 = v1;
+            while (((t = side ? vblock[w1].prev : vblock[w1].next) != v1) && (vblock[t].point.x == x) && (vblock[t].point.y >= y1)) {
+                w1 = t; y1 = vblock[t].point.y;
             }
             v1 = w1;
         }
@@ -835,13 +827,13 @@ __device__ inline bool bt_mergeProjection(BtIntermediateHull* h0, BtIntermediate
         }
     }
 
-    v0->prev = v1;
-    v1->next = v0;
-    v00->next = v10;
-    v10->prev = v00;
+    vblock[v0].prev = v1;
+    vblock[v1].next = v0;
+    vblock[v00].next = v10;
+    vblock[v10].prev = v00;
 
-    if (h1->minXy->point.x < h0->minXy->point.x) h0->minXy = h1->minXy;
-    if (h1->maxXy->point.x >= h0->maxXy->point.x) h0->maxXy = h1->maxXy;
+    if (vblock[h1->minXy].point.x < vblock[h0->minXy].point.x) h0->minXy = h1->minXy;
+    if (vblock[h1->maxXy].point.x >= vblock[h0->maxXy].point.x) h0->maxXy = h1->maxXy;
     h0->maxYx = h1->maxYx;
 
     *c0 = v00;
@@ -850,8 +842,8 @@ __device__ inline bool bt_mergeProjection(BtIntermediateHull* h0, BtIntermediate
 }
 
 // Check circularity of a vertex's edge ring. Returns 0 if OK, -1 if broken.
-__device__ inline int bt_checkEdgeRing(BtVertex* v, const char* /*label*/) {
-    BtEdge* e = v->edges;
+__device__ inline int bt_checkEdgeRing(BtVIndex v, const char* /*label*/, BtVertex* __restrict__ vblock) {
+    BtEdge* e = vblock[v].edges;
     if (!e) return 0;
     BtEdge* start = e;
     for (int i = 0; i < 10000; i++) {
@@ -864,15 +856,15 @@ __device__ inline int bt_checkEdgeRing(BtVertex* v, const char* /*label*/) {
 
 __device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtIntermediateHull* h1) {
     // Single-thread merge (caller is the one active thread).
-    if (!h1->maxXy) return;
-    if (!h0->maxXy) { *h0 = *h1; return; }
+    if (h1->maxXy == BT_VI_NULL) return;
+    if (h0->maxXy == BT_VI_NULL) { *h0 = *h1; return; }
 
-    BtVertex* c0 = NULL;
+    BtVIndex c0 = BT_VI_NULL;
     BtEdge* toPrev0 = NULL;
     BtEdge* firstNew0 = NULL;
     BtEdge* pendingHead0 = NULL;
     BtEdge* pendingTail0 = NULL;
-    BtVertex* c1 = NULL;
+    BtVIndex c1 = BT_VI_NULL;
     BtEdge* toPrev1 = NULL;
     BtEdge* firstNew1 = NULL;
     BtEdge* pendingHead1 = NULL;
@@ -886,63 +878,63 @@ __device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtInterme
     }
     int mergeStamp = dc->mergeStamp;
 
-    if (bt_mergeProjection(h0, h1, &c0, &c1)) {
-        BtPoint32 sd = bp32_sub(c1->point, c0->point);
+    if (bt_mergeProjection(h0, h1, &c0, &c1, dc->vblock)) {
+        BtPoint32 sd = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
         BtPoint64 normal = bp32_cross(bp32(0,0,-1), sd);
         BtPoint64 t = bp32_cross64(sd, normal);
 
-        BtEdge* e = c0->edges;
+        BtEdge* e = dc->vblock[c0].edges;
         BtEdge* start0 = NULL;
         if (e) {
             do {
-                long long dot = bp32_dot64(bp32_sub(e->target->point, c0->point), normal);
-                if ((dot == 0) && (bp32_dot64(bp32_sub(e->target->point, c0->point), t) > 0)) {
-                    if (!start0 || (bt_getOrientation(start0, e, sd, bp32(0,0,-1)) == BT_CLOCKWISE))
+                long long dot = bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), normal);
+                if ((dot == 0) && (bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), t) > 0)) {
+                    if (!start0 || (bt_getOrientation(start0, e, sd, bp32(0,0,-1), dc->vblock) == BT_CLOCKWISE))
                         start0 = e;
                 }
                 e = e->next;
-            } while (e != c0->edges);
+            } while (e != dc->vblock[c0].edges);
         }
 
-        e = c1->edges;
+        e = dc->vblock[c1].edges;
         BtEdge* start1 = NULL;
         if (e) {
             do {
-                long long dot = bp32_dot64(bp32_sub(e->target->point, c1->point), normal);
-                if ((dot == 0) && (bp32_dot64(bp32_sub(e->target->point, c1->point), t) > 0)) {
-                    if (!start1 || (bt_getOrientation(start1, e, sd, bp32(0,0,-1)) == BT_COUNTER_CLOCKWISE))
+                long long dot = bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), normal);
+                if ((dot == 0) && (bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), t) > 0)) {
+                    if (!start1 || (bt_getOrientation(start1, e, sd, bp32(0,0,-1), dc->vblock) == BT_COUNTER_CLOCKWISE))
                         start1 = e;
                 }
                 e = e->next;
-            } while (e != c1->edges);
+            } while (e != dc->vblock[c1].edges);
         }
 
         if (start0 || start1) {
-            bt_findEdgeForCoplanarFaces(mergeStamp, c0, c1, &start0, &start1, NULL, NULL);
+            bt_findEdgeForCoplanarFaces(mergeStamp, c0, c1, &start0, &start1, BT_VI_NULL, BT_VI_NULL, dc->vblock);
             if (start0) c0 = start0->target;
             if (start1) c1 = start1->target;
         }
-        prevPoint = c1->point;
+        prevPoint = dc->vblock[c1].point;
         prevPoint.z++;
     } else {
-        prevPoint = c1->point;
+        prevPoint = dc->vblock[c1].point;
         prevPoint.x++;
     }
 
-    BtVertex* first0 = c0;
-    BtVertex* first1 = c1;
+    BtVIndex first0 = c0;
+    BtVIndex first1 = c1;
     bool firstRun = true;
 
     while (true) {
-        BtPoint32 sd = bp32_sub(c1->point, c0->point);
-        BtPoint32 r = bp32_sub(prevPoint, c0->point);
+        BtPoint32 sd = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
+        BtPoint32 r = bp32_sub(prevPoint, dc->vblock[c0].point);
         BtPoint64 rxs = bp32_cross(r, sd);
         BtPoint64 sxrxs = bp32_cross64(sd, rxs);
 
         BtRational64 minCot0, minCot1;
         int ec0 = 0, ec1 = 0;
-        BtEdge* min0 = bt_findMaxAngle(mergeStamp, false, c0, sd, rxs, sxrxs, &minCot0, &ec0);
-        BtEdge* min1 = bt_findMaxAngle(mergeStamp, true,  c1, sd, rxs, sxrxs, &minCot1, &ec1);
+        BtEdge* min0 = bt_findMaxAngle(mergeStamp, false, c0, sd, rxs, sxrxs, &minCot0, &ec0, dc->vblock);
+        BtEdge* min1 = bt_findMaxAngle(mergeStamp, true,  c1, sd, rxs, sxrxs, &minCot1, &ec1, dc->vblock);
 
 #ifdef COACD_BEAM_DEBUG
         dc->fma_total_edges += ec0 + ec1;
@@ -957,10 +949,10 @@ __device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtInterme
             BtEdge* e = bt_newEdgePair(dc, c0, c1);
             if (!e) { DPRINTF("[BUG] bt_merge OOM at final edge, blk=%d lane=%d\n", blockIdx.x, threadIdx.x); return; }
             bt_edge_link(e, e);
-            c0->edges = e;
+            dc->vblock[c0].edges = e;
             e = e->reverse;
             bt_edge_link(e, e);
-            c1->edges = e;
+            dc->vblock[c1].edges = e;
             return;
         }
 
@@ -985,7 +977,7 @@ __device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtInterme
         BtEdge* e1 = min1;
 
         if (cmp == 0) {
-            bt_findEdgeForCoplanarFaces(mergeStamp, c0, c1, &e0, &e1, NULL, NULL);
+            bt_findEdgeForCoplanarFaces(mergeStamp, c0, c1, &e0, &e1, BT_VI_NULL, BT_VI_NULL, dc->vblock);
         }
 
         if ((cmp >= 0) && e1) {
@@ -1003,7 +995,7 @@ __device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtInterme
             } else if (!toPrev1) {
                 firstNew1 = min1;
             }
-            prevPoint = c1->point;
+            prevPoint = dc->vblock[c1].point;
             c1 = e1->target;
             toPrev1 = e1->reverse;
         }
@@ -1023,7 +1015,7 @@ __device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtInterme
             } else if (!toPrev0) {
                 firstNew0 = min0;
             }
-            prevPoint = c0->point;
+            prevPoint = dc->vblock[c0].point;
             c0 = e0->target;
             toPrev0 = e0->reverse;
         }
@@ -1031,7 +1023,7 @@ __device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtInterme
         if ((c0 == first0) && (c1 == first1)) {
             if (toPrev0 == NULL) {
                 bt_edge_link(pendingHead0, pendingTail0);
-                c0->edges = pendingTail0;
+                dc->vblock[c0].edges = pendingTail0;
             } else {
                 for (BtEdge *e = toPrev0->prev, *n = NULL; e != firstNew0; e = n) {
                     n = e->prev;
@@ -1044,7 +1036,7 @@ __device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtInterme
             }
             if (toPrev1 == NULL) {
                 bt_edge_link(pendingTail1, pendingHead1);
-                c1->edges = pendingTail1;
+                dc->vblock[c1].edges = pendingTail1;
             } else {
                 for (BtEdge *e = toPrev1->next, *n = NULL; e != firstNew1; e = n) {
                     n = e->next;
@@ -1065,26 +1057,26 @@ __device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtInterme
 // computeInternal base case — handles n <= 2
 // ============================================================================
 
-__device__ inline void bt_computeBase(BtDCState* dc, BtVertex* vertexBase, int start, int end, BtIntermediateHull* result) {
+__device__ inline void bt_computeBase(BtDCState* __restrict__ dc, int start, int end, BtIntermediateHull* result) {
     int n = end - start;
     switch (n) {
     case 0:
-        result->minXy = NULL; result->maxXy = NULL;
-        result->minYx = NULL; result->maxYx = NULL;
+        result->minXy = BT_VI_NULL; result->maxXy = BT_VI_NULL;
+        result->minYx = BT_VI_NULL; result->maxYx = BT_VI_NULL;
         return;
     case 2: {
-        BtVertex* v = &vertexBase[start];
-        BtVertex* w = v + 1;
-        if (bp32_ne(v->point, w->point)) {
-            int dx = v->point.x - w->point.x;
-            int dy = v->point.y - w->point.y;
+        BtVIndex v = start;
+        BtVIndex w = start + 1;
+        if (bp32_ne(dc->vblock[v].point, dc->vblock[w].point)) {
+            int dx = dc->vblock[v].point.x - dc->vblock[w].point.x;
+            int dy = dc->vblock[v].point.y - dc->vblock[w].point.y;
             if ((dx == 0) && (dy == 0)) {
-                if (v->point.z > w->point.z) { BtVertex* t = w; w = v; v = t; }
-                v->next = v; v->prev = v;
+                if (dc->vblock[v].point.z > dc->vblock[w].point.z) { BtVIndex t = w; w = v; v = t; }
+                dc->vblock[v].next = v; dc->vblock[v].prev = v;
                 result->minXy = v; result->maxXy = v;
                 result->minYx = v; result->maxYx = v;
             } else {
-                v->next = w; v->prev = w; w->next = v; w->prev = v;
+                dc->vblock[v].next = w; dc->vblock[v].prev = w; dc->vblock[w].next = v; dc->vblock[w].prev = v;
                 if ((dx < 0) || ((dx == 0) && (dy < 0))) {
                     result->minXy = v; result->maxXy = w;
                 } else {
@@ -1098,17 +1090,17 @@ __device__ inline void bt_computeBase(BtDCState* dc, BtVertex* vertexBase, int s
             }
             BtEdge* e = bt_newEdgePair(dc, v, w);
             if (!e) { DPRINTF("[BUG] bt_merge OOM at coplanar edge, blk=%d lane=%d\n", blockIdx.x, threadIdx.x); return; }
-            bt_edge_link(e, e); v->edges = e;
+            bt_edge_link(e, e); dc->vblock[v].edges = e;
             e = e->reverse;
-            bt_edge_link(e, e); w->edges = e;
+            bt_edge_link(e, e); dc->vblock[w].edges = e;
             return;
         }
     }
     // fallthrough
     case 1: {
-        BtVertex* v = &vertexBase[start];
-        v->edges = NULL;
-        v->next = v; v->prev = v;
+        BtVIndex v = start;
+        dc->vblock[v].edges = NULL;
+        dc->vblock[v].next = v; dc->vblock[v].prev = v;
         result->minXy = v; result->maxXy = v;
         result->minYx = v; result->maxYx = v;
         return;
@@ -1122,7 +1114,7 @@ __device__ inline void bt_computeBase(BtDCState* dc, BtVertex* vertexBase, int s
 
 #define BT_ERR_DC_STACK     4
 
-__device__ inline void bt_computeInternal(BtDCState* dc, BtVertex* vertexBase, int start, int end, BtIntermediateHull* result,
+__device__ inline void bt_computeInternal(BtDCState* __restrict__ dc, int start, int end, BtIntermediateHull* result,
                                           CheckedBuf<BtDCStackItem> stack) {
     int sp = 0;
 
@@ -1130,8 +1122,8 @@ __device__ inline void bt_computeInternal(BtDCState* dc, BtVertex* vertexBase, i
     stack[sp].start = start;
     stack[sp].end = end;
     stack[sp].stage = 0;
-    stack[sp].right_hull.minXy = NULL; stack[sp].right_hull.maxXy = NULL;
-    stack[sp].right_hull.minYx = NULL; stack[sp].right_hull.maxYx = NULL;
+    stack[sp].right_hull.minXy = BT_VI_NULL; stack[sp].right_hull.maxXy = BT_VI_NULL;
+    stack[sp].right_hull.minYx = BT_VI_NULL; stack[sp].right_hull.maxYx = BT_VI_NULL;
     stack[sp].result = result;
     sp++;
 
@@ -1142,19 +1134,19 @@ __device__ inline void bt_computeInternal(BtDCState* dc, BtVertex* vertexBase, i
         if (item->stage == 0) {
             int n = item->end - item->start;
             if (n <= 2) {
-                bt_computeBase(dc, vertexBase, item->start, item->end, item->result);
+                bt_computeBase(dc, item->start, item->end, item->result);
             } else {
                 int split0 = item->start + n / 2;
-                BtPoint32 p = vertexBase[split0 - 1].point;
+                BtPoint32 p = dc->vblock[split0 - 1].point;
                 int split1 = split0;
-                while ((split1 < item->end) && bp32_eq(vertexBase[split1].point, p)) split1++;
+                while ((split1 < item->end) && bp32_eq(dc->vblock[split1].point, p)) split1++;
 
                 BtIntermediateHull* res = item->result;
 
                 // Convert current item to merge (stage 1)
                 item->stage = 1;
-                item->right_hull.minXy = NULL; item->right_hull.maxXy = NULL;
-                item->right_hull.minYx = NULL; item->right_hull.maxYx = NULL;
+                item->right_hull.minXy = BT_VI_NULL; item->right_hull.maxXy = BT_VI_NULL;
+                item->right_hull.minYx = BT_VI_NULL; item->right_hull.maxYx = BT_VI_NULL;
                 item->result = res;
                 sp++;  // re-push (it's already in place)
                 BtDCStackItem* merge_ptr = &stack[sp - 1];
@@ -1164,8 +1156,8 @@ __device__ inline void bt_computeInternal(BtDCState* dc, BtVertex* vertexBase, i
                 stack[sp].start = split1;
                 stack[sp].end = item->end;
                 stack[sp].stage = 0;
-                stack[sp].right_hull.minXy = NULL; stack[sp].right_hull.maxXy = NULL;
-                stack[sp].right_hull.minYx = NULL; stack[sp].right_hull.maxYx = NULL;
+                stack[sp].right_hull.minXy = BT_VI_NULL; stack[sp].right_hull.maxXy = BT_VI_NULL;
+                stack[sp].right_hull.minYx = BT_VI_NULL; stack[sp].right_hull.maxYx = BT_VI_NULL;
                 stack[sp].result = &merge_ptr->right_hull;
                 sp++;
 
@@ -1174,8 +1166,8 @@ __device__ inline void bt_computeInternal(BtDCState* dc, BtVertex* vertexBase, i
                 stack[sp].start = item->start;
                 stack[sp].end = split0;
                 stack[sp].stage = 0;
-                stack[sp].right_hull.minXy = NULL; stack[sp].right_hull.maxXy = NULL;
-                stack[sp].right_hull.minYx = NULL; stack[sp].right_hull.maxYx = NULL;
+                stack[sp].right_hull.minXy = BT_VI_NULL; stack[sp].right_hull.maxXy = BT_VI_NULL;
+                stack[sp].right_hull.minYx = BT_VI_NULL; stack[sp].right_hull.maxYx = BT_VI_NULL;
                 stack[sp].result = merge_ptr->result;
                 sp++;
             }
@@ -1217,62 +1209,62 @@ __device__ inline int bt_extractMesh(BtHullState* s,
     *n_verts_out = 0;
     *n_tris_out  = 0;
 
-    if (!s->vertexList) return 0;
+    if (s->vertexList == BT_VI_NULL) return 0;
 
-    BtVertex** queue = (BtVertex**)bt_alloc(s->wp, s->npoints * (int)sizeof(BtVertex*));
+    BtVIndex* queue = (BtVIndex*)bt_alloc(s->wp, s->npoints * (int)sizeof(BtVIndex));
     if (!queue) return -1;
     int n_verts = 0;
     int n_tris  = 0;
 
     int vstamp = --s->mergeStamp;
-    s->vertexList->copy = vstamp;
+    s->vblock[s->vertexList].copy = vstamp;
     queue[n_verts++] = s->vertexList;
 
     // BFS: discover all hull vertices
     int qhead = 0;
     while (qhead < n_verts) {
-        BtVertex* v = queue[qhead++];
-        BtEdge* e = v->edges;
+        BtVIndex v = queue[qhead++];
+        BtEdge* e = s->vblock[v].edges;
         if (!e) continue;
         do {
-            if (e->target->copy != vstamp) {
-                e->target->copy = vstamp;
+            if (s->vblock[e->target].copy != vstamp) {
+                s->vblock[e->target].copy = vstamp;
                 queue[n_verts++] = e->target;
             }
             e = e->next;
-        } while (e != v->edges);
+        } while (e != s->vblock[v].edges);
     }
 
     if (out_verts) {
         // Extract mode: encode vertex indices, write verts, fan-triangulate faces.
         int idx_base = --s->mergeStamp;
         for (int i = 0; i < n_verts; i++)
-            queue[i]->copy = idx_base - i;
+            s->vblock[queue[i]].copy = idx_base - i;
 
         int medAx = s->medAxis, maxAx = s->maxAxis, minAx = s->minAxis;
         float sc_med = s->scaling[medAx], sc_max = s->scaling[maxAx], sc_min = s->scaling[minAx];
         float cn_med = s->center[medAx],  cn_max = s->center[maxAx],  cn_min = s->center[minAx];
         for (int i = 0; i < n_verts; i++) {
-            BtVertex* v = queue[i];
-            out_verts[i * 3 + medAx] = bv_xval(v) * sc_med + cn_med;
-            out_verts[i * 3 + maxAx] = bv_yval(v) * sc_max + cn_max;
-            out_verts[i * 3 + minAx] = bv_zval(v) * sc_min + cn_min;
+            BtVIndex v = queue[i];
+            out_verts[i * 3 + medAx] = (float)s->vblock[v].point.x * sc_med + cn_med;
+            out_verts[i * 3 + maxAx] = (float)s->vblock[v].point.y * sc_max + cn_max;
+            out_verts[i * 3 + minAx] = (float)s->vblock[v].point.z * sc_min + cn_min;
         }
 
         int fstamp = --s->mergeStamp;
         for (int i = 0; i < n_verts; i++) {
-            BtVertex* v = queue[i];
-            BtEdge* e = v->edges;
+            BtVIndex v = queue[i];
+            BtEdge* e = s->vblock[v].edges;
             if (!e) continue;
             do {
                 if (e->copy != fstamp) {
-                    BtVertex* a = NULL, *b = NULL;
+                    BtVIndex a = BT_VI_NULL, b = BT_VI_NULL;
                     BtEdge* f = e;
                     do {
-                        if (a && b) {
-                            out_tris[n_tris * 3 + 0] = idx_base - v->copy;
-                            out_tris[n_tris * 3 + 1] = idx_base - a->copy;
-                            out_tris[n_tris * 3 + 2] = idx_base - b->copy;
+                        if (a != BT_VI_NULL && b != BT_VI_NULL) {
+                            out_tris[n_tris * 3 + 0] = idx_base - s->vblock[v].copy;
+                            out_tris[n_tris * 3 + 1] = idx_base - s->vblock[a].copy;
+                            out_tris[n_tris * 3 + 2] = idx_base - s->vblock[b].copy;
                             n_tris++;
                         }
                         f->copy = fstamp;
@@ -1282,14 +1274,14 @@ __device__ inline int bt_extractMesh(BtHullState* s,
                     } while (f != e);
                 }
                 e = e->next;
-            } while (e != v->edges);
+            } while (e != s->vblock[v].edges);
         }
     } else {
         // Count-only mode: count triangles via fan formula (k edges → k-2 tris).
         int fstamp = --s->mergeStamp;
         for (int i = 0; i < n_verts; i++) {
-            BtVertex* v = queue[i];
-            BtEdge* e = v->edges;
+            BtVIndex v = queue[i];
+            BtEdge* e = s->vblock[v].edges;
             if (!e) continue;
             do {
                 if (e->copy != fstamp) {
@@ -1299,7 +1291,7 @@ __device__ inline int bt_extractMesh(BtHullState* s,
                     if (k >= 3) n_tris += k - 2;
                 }
                 e = e->next;
-            } while (e != v->edges);
+            } while (e != s->vblock[v].edges);
         }
     }
 
@@ -1424,11 +1416,10 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 
     // All lanes: init vertices in parallel
     for (int i = lane; i < count; i += WARP_SIZE) {
-        BtVertex* v = &vblock[i];
-        v->edges = NULL;
-        v->next = NULL; v->prev = NULL;
-        v->point = points[i];
-        v->copy = -1;
+        vblock[i].edges = NULL;
+        vblock[i].next = BT_VI_NULL; vblock[i].prev = BT_VI_NULL;
+        vblock[i].point = points[i];
+        vblock[i].copy = -1;
     }
     __syncwarp();
 
@@ -1540,10 +1531,11 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 
 #ifdef BT_SERIAL_MERGE
     // --- Serial D&C: only lane 0 builds full hull (for debugging) ---
-    s_hulls[0].minXy = NULL; s_hulls[0].maxXy = NULL;
-    s_hulls[0].minYx = NULL; s_hulls[0].maxYx = NULL;
+    s_hulls[0].minXy = BT_VI_NULL; s_hulls[0].maxXy = BT_VI_NULL;
+    s_hulls[0].minYx = BT_VI_NULL; s_hulls[0].maxYx = BT_VI_NULL;
     if (lane == 0 && count > 0) {
-        bt_computeInternal(&my_dc, vblock, 0, count, &s_hulls[0], my_dc_stack);
+        my_dc.vblock = vblock;
+        bt_computeInternal(&my_dc, 0, count, &s_hulls[0], my_dc_stack);
     }
     __syncwarp();
     {
@@ -1554,11 +1546,12 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     }
 #else
     // --- Phase 1: Each lane builds hull of its group (parallel D&C) ---
-    s_hulls[lane].minXy = NULL; s_hulls[lane].maxXy = NULL;
-    s_hulls[lane].minYx = NULL; s_hulls[lane].maxYx = NULL;
+    s_hulls[lane].minXy = BT_VI_NULL; s_hulls[lane].maxXy = BT_VI_NULL;
+    s_hulls[lane].minYx = BT_VI_NULL; s_hulls[lane].maxYx = BT_VI_NULL;
 
+    my_dc.vblock = vblock;
     if (my_end - my_start > 0) {
-        bt_computeInternal(&my_dc, vblock, my_start, my_end, &s_hulls[lane], my_dc_stack);
+        bt_computeInternal(&my_dc, my_start, my_end, &s_hulls[lane], my_dc_stack);
     }
     __syncwarp();
 
@@ -1604,6 +1597,7 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     // --- Result is in s_hulls[0] ---
     if (lane == 0) {
         s->vertexList = s_hulls[0].minXy;
+        s->vblock = vblock;
         // Set mergeStamp from shared counter for use by extractMesh
         s->mergeStamp = s_mergeStamp;
         s->mergeStampPtr = NULL;  // extractMesh uses local stamp, not shared
@@ -1683,7 +1677,7 @@ __device__ inline Mesh hull_dandc_warp_mesh(
     if (lane == 0) {
         state->wp           = &s_pool;
         state->scratch_heap = scratch_heap;
-        state->vertexList   = NULL;
+        state->vertexList   = BT_VI_NULL;
         state->mergeStampPtr = NULL;
 #ifdef COACD_BEAM_DEBUG
         state->fma_total_edges = 0;

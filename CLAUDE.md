@@ -137,7 +137,7 @@ One `DevicePool` with bump allocator backs two embedded `DeviceHeap` instances (
 
 ### Algorithm Overview
 
-**D&C Convex Hull** (`hull_dandc.cuh`): Warp-level parallel tree merge — 32 lanes each build a small hull, then 5 rounds of pairwise merging. See `docs/api_hull_dandc.md`.
+**D&C Convex Hull** (`hull_dandc.cuh`): Warp-level parallel tree merge — 32 lanes each build a small hull, then 5 rounds of pairwise merging. All `BtVertex*` pointer fields (`next`, `prev`, `BtEdge::target`, `BtIntermediateHull` extremals) are stored as `BtVIndex` (int index into the shared `vblock` array) to reduce memory and improve locality. See `docs/api_hull_dandc.md`.
 
 **Plane Cut** (`plane_cut.cuh`): Block-level (64 threads) mesh splitting along an arbitrary plane. Produces `PartPair` with pos/neg meshes. See `docs/api_plane_cut.md`.
 
