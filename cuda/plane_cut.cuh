@@ -161,7 +161,7 @@ __device__ inline PartPair plane_cut_block(
     // Cap triangles (ear-clip) are appended to pos_tris/neg_tris at index n_pos/n_neg.
     // poly_n <= 2*n_boundary <= 4*n_tris, so n_cap <= 4*n_tris + 1024.
     int max_cap_tris       = n_tris * 4 + 1024;
-    int sort_scratch_bytes = max_cross_edges * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
+    // sort_scratch_bytes computed after phase 3 when n_cross is known.
     // dir_edges/dir_sort/boundary_flags are now sized from actual n_trace after phase 6.
 
     // s_counters: [0]=n_cross, [1]=n_all_verts, [2]=n_pos, [3]=n_neg
@@ -254,9 +254,7 @@ __device__ inline PartPair plane_cut_block(
             { s_alloc_ok = 0; p = NULL; }
         s_cross_edges = (Edge2i*)p;
 
-        if (heap_alloc(scratch_heap, (unsigned int)sort_scratch_bytes, &p) != HEAP_OK)
-            { s_alloc_ok = 0; p = NULL; }
-        s_sort_scratch = (char*)p;
+        // sort_scratch deferred to after phase 3 when n_cross is known.
 
         if (heap_alloc(scratch_heap, (unsigned int)(max_cross_edges * (int)sizeof(int)), &p) != HEAP_OK)
             { s_alloc_ok = 0; p = NULL; }
@@ -331,6 +329,20 @@ __device__ inline PartPair plane_cut_block(
             PC_FREE_ALL_SHARED_SCRATCH();
         }
         __syncthreads();
+        return s_result;
+    }
+
+    // Alloc sort_scratch now that n_cross is known.
+    if (tid == 0) {
+        int sort_scratch_bytes = n_cross * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
+        void* p;
+        if (heap_alloc(scratch_heap, (unsigned int)sort_scratch_bytes, &p) != HEAP_OK)
+            { s_alloc_ok = 0; p = NULL; }
+        s_sort_scratch = (char*)p;
+    }
+    __syncthreads();
+    if (!s_alloc_ok) {
+        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
         return s_result;
     }
 
