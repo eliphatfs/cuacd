@@ -503,8 +503,11 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 #define BT_DC_MAX_STACK  4096
 #define BT_DC_MAX_STACK_LOCAL 2048
 
-// Error codes (distinct from pool OOM = 1)
-#define BT_ERR_SORT_STACK  2
+// Error codes (binary flags, combined via OR)
+#define BT_ERR_WARP_POOL_OOM  1   // bt_alloc failed (WarpPool capacity exceeded)
+#define BT_ERR_SORT_STACK     2
+#define BT_ERR_HEAP_TO_WARP  16   // heap_alloc for WarpPool backing failed
+#define BT_ERR_HEAP_OUTPUT   32   // heap_alloc for output mesh chunk failed
 
 // ============================================================================
 // Scratch size calculation
@@ -1774,7 +1777,7 @@ __device__ inline Mesh hull_dandc_warp_mesh(
             s_pool.error    = 0;
         } else {
             s_pool_backing = NULL;
-            local_err = 1;
+            local_err = BT_ERR_HEAP_TO_WARP;
         }
     }
     __syncwarp();
@@ -1853,7 +1856,7 @@ __device__ inline Mesh hull_dandc_warp_mesh(
                 size_t rb = 16;
                 void* chunk = NULL;
                 if (heap_alloc(heap, (unsigned int)(va + ta + rb), &chunk) != HEAP_OK)
-                    { local_err = 1; goto done; }
+                    { local_err = BT_ERR_HEAP_OUTPUT; goto done; }
                 float* ov = (float*)chunk;
                 int*   ot = (int*)((char*)chunk + va);
                 int*   rc = (int*)((char*)chunk + va + ta);
