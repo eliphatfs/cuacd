@@ -86,8 +86,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     int lane = threadIdx.x & (WARP_SIZE - 1);
 
     // Shared state
-    __shared__ float  s_max[KDOP_N_AXES];
-    __shared__ float  s_min[KDOP_N_AXES];
     __shared__ int    s_extreme_idx[KDOP_MAX_EXTREMES]; // max/min index per axis
     __shared__ float* s_extreme_pts;  // centroid-subtracted extreme pts (scratch)
     __shared__ int    s_n_extreme;
@@ -164,8 +162,8 @@ __device__ __forceinline__ Mesh kdop_hull_block(
             if (om < lmin) { lmin = om; lmin_i = oi; }
         }
         if (lane == 0) {
-            s_max[a] = lmax;  s_extreme_idx[a * 2    ] = lmax_i;
-            s_min[a] = lmin;  s_extreme_idx[a * 2 + 1] = lmin_i;
+            s_extreme_idx[a * 2    ] = lmax_i;
+            s_extreme_idx[a * 2 + 1] = lmin_i;
         }
     }
     __syncwarp();

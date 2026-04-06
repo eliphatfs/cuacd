@@ -225,8 +225,6 @@ __device__ inline PartPair plane_cut_block(
     __shared__ void*  s_w_ptrs[2];   // loop_blk, cap_ptr
     __shared__ int    s_w_kern_ok;
     __shared__ int    s_w_n_loops;
-    __shared__ int    s_w_pu;
-    __shared__ int    s_w_pv_ax;
     __shared__ int    s_mid_lo, s_mid_hi;
     if (tid == 0) {
         s_signs = NULL; s_all_verts = NULL;

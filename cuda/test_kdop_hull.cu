@@ -21,7 +21,6 @@ extern "C" __global__ void kdop_hull_kernel(
 {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
-    int lane = tid & (WARP_SIZE - 1);
     if (bid >= n_hulls) return;
 
     int start = offsets[bid];
