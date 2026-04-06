@@ -137,7 +137,9 @@ One `DevicePool` with bump allocator backs two embedded `DeviceHeap` instances (
 
 ### Algorithm Overview
 
-**D&C Convex Hull** (`hull_dandc.cuh`): Warp-level parallel tree merge — 16 primary lanes each build a small hull (BT_HULL_GROUPS=16), then 4 rounds of pairwise merging using 16×2 thread pairs. Within each merge, both threads in a pair call `bt_findMaxAngle` convergedly (primary for c0/h0, secondary for c1/h1); results are exchanged via warp shuffle. All `BtVertex*` pointer fields (`next`, `prev`, `BtEdge::target`, `BtIntermediateHull` extremals) are stored as `BtVIndex` (int index into the shared `vblock` array) to reduce memory and improve locality. See `docs/api_hull_dandc.md`.
+**D&C Convex Hull** (`hull_dandc.cuh`): Warp-level parallel tree merge — 16 primary lanes each build a small hull (BT_HULL_GROUPS=16), then 4 rounds of pairwise merging using 16×2 thread pairs. Within each merge, both threads in a pair call `bt_findMaxAngle` convergedly (primary for c0/h0, secondary for c1/h1); results are exchanged via warp shuffle. All `BtVertex*` pointer fields (`next`, `prev`, `BtEdge::target`, `BtIntermediateHull` extremals) are stored as `BtVIndex` (int index into the shared `vblock` array) to reduce memory and improve locality.
+
+Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-allocated from `scratch_heap` (not WarpPool) and freed immediately after the vertex-init copy in postsort, before the D&C phase. Edge pools (BtPool + initial slabs) exist only for BT_HULL_GROUPS=16 primaries — secondaries never allocate edges, so `edgePool.blocks` is indexed by `group` (not `lane`). WarpPool backing covers only sort scratch + postsort persistent data + D&C stacks/BFS queues. See `docs/api_hull_dandc.md`.
 
 **Plane Cut** (`plane_cut.cuh`): Block-level (64 threads) mesh splitting along an arbitrary plane. Produces `PartPair` with pos/neg meshes. See `docs/api_plane_cut.md`.
 
