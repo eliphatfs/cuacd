@@ -364,21 +364,6 @@ __device__ inline int btpool_add_block(BtPool* p) {
     return 0;
 }
 
-// Initialise per-lane pool with one heap-allocated slab of slab_edges objects.
-// Safe to call from multiple lanes concurrently (heap_alloc uses per-arena locks).
-__device__ inline int btpool_init_sized(BtPool* p, DeviceHeap* scratch_heap, int objSize, int slab_edges,
-                                        CheckedBuf<void*> blocks_buf) {
-    p->scratch_heap = scratch_heap;
-    p->objSize      = (objSize + 3) & ~3;
-    p->freeList     = NULL;
-    p->error        = 0;
-    p->nblocks      = 0;
-    p->blocks       = blocks_buf;
-    p->growSlabSize = slab_edges;
-    if (btpool_add_block(p) < 0) return -1;
-    return 0;
-}
-
 // Initialise pool with 2 pre-allocated slabs. Lane 0 only.
 __device__ inline int btpool_init(BtPool* p, DeviceHeap* scratch_heap, int objSize,
                                   CheckedBuf<void*> blocks_buf) {
