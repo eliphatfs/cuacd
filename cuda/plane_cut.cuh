@@ -176,7 +176,6 @@ __device__ inline PartPair plane_cut_block(
 
     // Upper-bound sizes (all derived from n_verts / n_tris)
     int max_cross_edges    = n_tris * 2;
-    int max_out_tris       = n_tris * 3;   // phase-6 upper bound; also sizes dir_edges
     // Cap triangles are kept in a separate cap_tris buffer (sized from n_boundary after phase 9b)
     // and merged into the output during phase 13.
     // sort_scratch_bytes computed after phase 3 when n_cross is known.
@@ -310,6 +309,9 @@ __device__ inline PartPair plane_cut_block(
     }
     __syncthreads();
     int n_cross = s_n_cross;
+    // Each crossing triangle contributes ≤1 extra tri per side; a tri with 1 crossing edge
+    // (vertex on plane) can count as 1 crossing, so use n_cross*2 for safety.
+    int max_out_tris = min(n_tris + n_cross * 2, n_tris * 3);
 
     if (n_cross == 0) {
         // No crossing — entire mesh on one side.
@@ -648,6 +650,7 @@ __device__ inline PartPair plane_cut_block(
         int kern_ok    = 1;
         int n_cap      = 0;
         int n_boundary = s_n_boundary;
+        if (lane == 0) s_w_n_loops = 0;
         void* lv_ptr   = (void*)s_be_a;  // boundary edge pairs (be_a), freed after loop recon
 
         // Lane-0-only scratch — all NULL so heap_free is always safe.
@@ -738,6 +741,7 @@ __device__ inline PartPair plane_cut_block(
                         __syncwarp();
                         if (loop_sizes[n_loops] > 0) n_loops++;
                     }
+                    if (lane == 0) s_w_n_loops = n_loops;
 
                     // be_a (lv_ptr) no longer needed — free to reclaim memory.
                     if (lane == 0) { heap_free(scratch_heap, lv_ptr); lv_ptr = NULL; s_be_a = NULL; }
@@ -994,6 +998,8 @@ __device__ inline PartPair plane_cut_block(
         }
     } // end if (warp_id == 0) phases 10-12
     __syncthreads();
+    if (tid == 0) DPRINTF("[pc] block=%d nv=%d nt=%d n_cross=%d n_boundary=%d n_loops=%d\n",
+        blockIdx.x, n_verts, n_tris, n_cross, s_n_boundary, s_w_n_loops);
 
     // =========================================================================
     // Phase 13: compact verts per side, heap-alloc output, fill PartPair.
