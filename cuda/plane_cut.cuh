@@ -56,6 +56,21 @@ struct Edge2iCmp {
     }
 };
 
+// Comparator for directed edges sorted by unordered (min,max) key.
+// Used in phase 8 so that (a,b) and (b,a) land adjacent after sort.
+struct Edge2iNormCmp {
+    static __device__ inline int cmp(Edge2i x, Edge2i y) {
+        int xlo = min(x.a, x.b), xhi = max(x.a, x.b);
+        int ylo = min(y.a, y.b), yhi = max(y.a, y.b);
+        if (xlo != ylo) return (xlo < ylo) ? -1 : 1;
+        if (xhi != yhi) return (xhi < yhi) ? -1 : 1;
+        return 0;
+    }
+    static __device__ inline Edge2i sentinel() {
+        Edge2i s; s.a = 0x7fffffff; s.b = 0x7fffffff; return s;
+    }
+};
+
 // ============================================================================
 // Device helpers
 // ============================================================================
@@ -559,7 +574,7 @@ __device__ inline PartPair plane_cut_block(
 
     // === Phase 8: Sort directed edges (warp 0) ===
     if (warp_id == 0) {
-        int serr = warp_sort_t<Edge2i, Edge2iCmp>(dir_edges.raw(), s_dir_sort, n_de, lane);
+        int serr = warp_sort_t<Edge2i, Edge2iNormCmp>(dir_edges.raw(), s_dir_sort, n_de, lane);
         if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
     }
     __syncthreads();
@@ -569,10 +584,22 @@ __device__ inline PartPair plane_cut_block(
         heap_free(scratch_heap, (void*)s_dir_sort); s_dir_sort = NULL;
     }
 
-    // === Phase 9: Binary search for boundary edges ===
+    // === Phase 9: Detect boundary edges via neighbor scan ===
+    // After sorting by (min,max) key, internal edge pairs (a,b)+(b,a) are adjacent.
+    // A boundary edge has no normalized-equal neighbor on either side.
     for (int i = tid; i < n_de; i += PC_BLOCK) {
-        int a = dir_edges[i].a, b = dir_edges[i].b;
-        boundary_flags[i] = (pc_edge_bsearch(dir_edges.raw(), n_de, b, a) < 0) ? 1 : 0;
+        Edge2i e = dir_edges[i];
+        int elo = min(e.a, e.b), ehi = max(e.a, e.b);
+        bool prev_dup = false, next_dup = false;
+        if (i > 0) {
+            Edge2i p = dir_edges[i-1];
+            prev_dup = (min(p.a,p.b)==elo && max(p.a,p.b)==ehi);
+        }
+        if (i < n_de-1) {
+            Edge2i n = dir_edges[i+1];
+            next_dup = (min(n.a,n.b)==elo && max(n.a,n.b)==ehi);
+        }
+        boundary_flags[i] = (prev_dup || next_dup) ? 0 : 1;
     }
     __syncthreads();
 
