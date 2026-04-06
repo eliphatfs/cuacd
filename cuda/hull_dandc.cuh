@@ -1,8 +1,10 @@
 // hull_dandc.cuh — Warp-based D&C convex hull volume and mesh extraction.
 //
 // Faithful port of btConvexHullComputer by Ole Kniemeyer (MAXON, zlib license).
-// Parallel tree merge: points split into 32 groups, each lane builds a small
-// hull independently, then 5 rounds of pairwise merging (16×2 → 8 → 4 → 2 → 1).
+// Parallel tree merge: points split into 16 groups (BT_HULL_GROUPS), each
+// primary lane builds a small hull independently, then 4 rounds of pairwise
+// merging (8×2 → 4×2 → 2×2 → 1×2). Within each merge, paired lanes run
+// bt_findMaxAngle in parallel: lane 2g handles c0/h0, lane 2g+1 handles c1/h1.
 // Uses int32 coordinates with exact int64/int128 predicates.
 //
 // All 32 threads must call hull_dandc_warp_mesh with identical arguments.
@@ -295,6 +297,31 @@ struct BtDCStackItem {
 __device__ inline void bt_edge_link(BtEdge* a, BtEdge* n) {
     a->next = n;
     n->prev = a;
+}
+
+// ============================================================================
+// Number of hull groups for parallel tree merge (16 groups × 2 threads each)
+// ============================================================================
+#define BT_HULL_GROUPS (WARP_SIZE / 2)
+
+// Warp-shuffle helpers for pointer and BtRational64 transfer between lane pairs.
+// shfl_ll: shuffle a long long (2 int32 shuffles).
+__device__ inline long long shfl_ll(long long v, int src, unsigned mask) {
+    unsigned int lo = __shfl_sync(mask, (unsigned int)(unsigned long long)v,         src);
+    unsigned int hi = __shfl_sync(mask, (unsigned int)((unsigned long long)v >> 32), src);
+    return (long long)((unsigned long long)lo | ((unsigned long long)hi << 32));
+}
+// shfl_edge_ptr: shuffle a BtEdge* (pointer) from src lane.
+__device__ inline BtEdge* shfl_edge_ptr(BtEdge* p, int src, unsigned mask) {
+    return (BtEdge*)(unsigned long long)shfl_ll((long long)(unsigned long long)p, src, mask);
+}
+// shfl_br64: shuffle a BtRational64 (5 int32 shuffles) from src lane.
+__device__ inline BtRational64 shfl_br64(BtRational64 r, int src, unsigned mask) {
+    BtRational64 out;
+    out.num  = (unsigned long long)shfl_ll((long long)r.num, src, mask);
+    out.den  = (unsigned long long)shfl_ll((long long)r.den, src, mask);
+    out.sign = __shfl_sync(mask, r.sign, src);
+    return out;
 }
 
 // ============================================================================
@@ -1053,6 +1080,259 @@ __device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtInterme
     }
 }
 
+// bt_merge_pair — two-thread cooperative bt_merge.
+//
+// Both threads of a group (primary: lane&1==0, secondary: lane&1==1) enter.
+// Primary owns all state (c0, c1, prevPoint, edge lists). At each loop
+// iteration the primary broadcasts the bt_findMaxAngle arguments via warp
+// shuffle; both threads then call bt_findMaxAngle convergedly (primary for
+// the c0/h0 side, secondary for the c1/h1 side). Primary reads the secondary's
+// result back with another shuffle, then does all bookkeeping.
+//
+// partner_lane = lane ^ 1 (the other thread in this group).
+// pair_mask    = 3u << (lane & ~1u)  — only the two threads participate in shuffles.
+__device__ inline void bt_merge_pair(
+    BtDCState* dc, BtIntermediateHull* h0, BtIntermediateHull* h1,
+    bool is_primary, int partner_lane)
+{
+    int my_lane     = (int)(threadIdx.x % WARP_SIZE);
+    int primary_lane = is_primary ? my_lane : partner_lane;
+    unsigned pair_mask = 3u << (my_lane & ~1u);
+
+    // --- Early exit (primary decides, broadcasts to secondary) ---
+    int skip = 0;
+    if (is_primary) {
+        if (h1->maxXy == BT_VI_NULL) skip = 1;
+        else if (h0->maxXy == BT_VI_NULL) { *h0 = *h1; skip = 1; }
+    }
+    skip = __shfl_sync(pair_mask, skip, primary_lane);
+    if (skip) return;
+
+    // --- Primary initialises merge state ---
+    BtVIndex c0 = BT_VI_NULL, c1 = BT_VI_NULL;
+    BtEdge* toPrev0    = NULL; BtEdge* firstNew0   = NULL;
+    BtEdge* pendingHead0 = NULL; BtEdge* pendingTail0 = NULL;
+    BtEdge* toPrev1    = NULL; BtEdge* firstNew1   = NULL;
+    BtEdge* pendingHead1 = NULL; BtEdge* pendingTail1 = NULL;
+    BtPoint32 prevPoint;
+    BtVIndex first0 = BT_VI_NULL, first1 = BT_VI_NULL;
+    bool firstRun = true;
+    int mergeStamp = 0;
+
+    if (is_primary) {
+        if (dc->mergeStampPtr) {
+            dc->mergeStamp = atomicAdd(dc->mergeStampPtr, -1) - 1;
+        } else {
+            dc->mergeStamp--;
+        }
+        mergeStamp = dc->mergeStamp;
+
+        if (bt_mergeProjection(h0, h1, &c0, &c1, dc->vblock)) {
+            BtPoint32 sd = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
+            BtPoint64 normal = bp32_cross(bp32(0,0,-1), sd);
+            BtPoint64 t = bp32_cross64(sd, normal);
+            BtEdge* e = dc->vblock[c0].edges;
+            BtEdge* start0 = NULL;
+            if (e) {
+                do {
+                    long long dot = bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), normal);
+                    if ((dot == 0) && (bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), t) > 0)) {
+                        if (!start0 || (bt_getOrientation(start0, e, sd, bp32(0,0,-1), dc->vblock) == BT_CLOCKWISE))
+                            start0 = e;
+                    }
+                    e = e->next;
+                } while (e != dc->vblock[c0].edges);
+            }
+            e = dc->vblock[c1].edges;
+            BtEdge* start1 = NULL;
+            if (e) {
+                do {
+                    long long dot = bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), normal);
+                    if ((dot == 0) && (bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), t) > 0)) {
+                        if (!start1 || (bt_getOrientation(start1, e, sd, bp32(0,0,-1), dc->vblock) == BT_COUNTER_CLOCKWISE))
+                            start1 = e;
+                    }
+                    e = e->next;
+                } while (e != dc->vblock[c1].edges);
+            }
+            if (start0 || start1) {
+                bt_findEdgeForCoplanarFaces(mergeStamp, c0, c1, &start0, &start1, BT_VI_NULL, BT_VI_NULL, dc->vblock);
+                if (start0) c0 = start0->target;
+                if (start1) c1 = start1->target;
+            }
+            prevPoint = dc->vblock[c1].point;
+            prevPoint.z++;
+        } else {
+            prevPoint = dc->vblock[c1].point;
+            prevPoint.x++;
+        }
+        first0 = c0; first1 = c1;
+    }
+
+    // Broadcast mergeStamp to secondary (needed by bt_findMaxAngle).
+    mergeStamp = __shfl_sync(pair_mask, mergeStamp, primary_lane);
+
+    // --- Main merge loop ---
+    // Primary sets done=0 (keep going) or done!=0 (stop).
+    // Secondary reads the broadcast at the top of each iteration.
+    int done = 0;
+    while (true) {
+        // Broadcast continuation to secondary.
+        int cont = __shfl_sync(pair_mask, done == 0 ? 1 : 0, primary_lane);
+        if (!cont) break;
+
+        // Primary computes per-iteration geometry; secondary will read via shuffle.
+        BtPoint32 s_dir = {0,0,0,0};
+        BtPoint64 rxs   = {0,0,0};
+        BtPoint64 sxrxs = {0,0,0};
+        BtVIndex  c1_bcast = 0;
+        if (is_primary) {
+            BtPoint32 sd  = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
+            BtPoint32 r   = bp32_sub(prevPoint, dc->vblock[c0].point);
+            rxs   = bp32_cross(r, sd);
+            sxrxs = bp32_cross64(sd, rxs);
+            s_dir = sd;
+            c1_bcast = c1;
+        }
+
+        // Broadcast geometry to secondary (both threads execute every __shfl_sync).
+        s_dir.x  = __shfl_sync(pair_mask, s_dir.x,  primary_lane);
+        s_dir.y  = __shfl_sync(pair_mask, s_dir.y,  primary_lane);
+        s_dir.z  = __shfl_sync(pair_mask, s_dir.z,  primary_lane);
+        rxs.x    = shfl_ll(rxs.x,    primary_lane, pair_mask);
+        rxs.y    = shfl_ll(rxs.y,    primary_lane, pair_mask);
+        rxs.z    = shfl_ll(rxs.z,    primary_lane, pair_mask);
+        sxrxs.x  = shfl_ll(sxrxs.x,  primary_lane, pair_mask);
+        sxrxs.y  = shfl_ll(sxrxs.y,  primary_lane, pair_mask);
+        sxrxs.z  = shfl_ll(sxrxs.z,  primary_lane, pair_mask);
+        c1_bcast = __shfl_sync(pair_mask, c1_bcast, primary_lane);
+
+        // Both threads call bt_findMaxAngle convergedly.
+        BtVIndex my_start = is_primary ? c0 : c1_bcast;
+        bool     my_ccw   = !is_primary;
+        BtRational64 my_minCot;
+        BtEdge* my_min = bt_findMaxAngle(mergeStamp, my_ccw, my_start,
+                                          s_dir, rxs, sxrxs, &my_minCot, NULL, dc->vblock);
+
+        // Both execute shuffles; primary reads secondary's results.
+        BtEdge*      min1_shfl    = shfl_edge_ptr(my_min,    partner_lane, pair_mask);
+        BtRational64 minCot1_shfl = shfl_br64(my_minCot, partner_lane, pair_mask);
+
+        // Primary does all bookkeeping.
+        if (is_primary) {
+            BtEdge*      min0    = my_min;
+            BtRational64 minCot0 = my_minCot;
+            BtEdge*      min1    = min1_shfl;
+            BtRational64 minCot1 = minCot1_shfl;
+
+#ifdef COACD_BEAM_DEBUG
+            dc->fma_calls += 2;
+#endif
+
+            if (!min0 && !min1) {
+                BtEdge* e = bt_newEdgePair(dc, c0, c1);
+                if (!e) { DPRINTF("[BUG] bt_merge_pair OOM at final edge, blk=%d lane=%d\n", blockIdx.x, threadIdx.x); done = -1; }
+                else {
+                    bt_edge_link(e, e); dc->vblock[c0].edges = e;
+                    e = e->reverse; bt_edge_link(e, e); dc->vblock[c1].edges = e;
+                    done = 1;
+                }
+            } else {
+                int cmp = !min0 ? 1 : !min1 ? -1 : br64_cmp(minCot0, minCot1);
+
+                if (firstRun || ((cmp >= 0) ? !br64_isNegInf(minCot1) : !br64_isNegInf(minCot0))) {
+                    BtEdge* e = bt_newEdgePair(dc, c0, c1);
+                    if (!e) { DPRINTF("[BUG] bt_merge_pair OOM at bridge edge, blk=%d lane=%d\n", blockIdx.x, threadIdx.x); done = -1; }
+                    else {
+                        if (pendingTail0) pendingTail0->prev = e;
+                        else pendingHead0 = e;
+                        e->next = pendingTail0; pendingTail0 = e;
+                        e = e->reverse;
+                        if (pendingTail1) pendingTail1->next = e;
+                        else pendingHead1 = e;
+                        e->prev = pendingTail1; pendingTail1 = e;
+                    }
+                }
+
+                if (done == 0) {
+                    BtEdge* e0 = min0;
+                    BtEdge* e1 = min1;
+                    if (cmp == 0) {
+                        bt_findEdgeForCoplanarFaces(mergeStamp, c0, c1, &e0, &e1, BT_VI_NULL, BT_VI_NULL, dc->vblock);
+                    }
+
+                    if ((cmp >= 0) && e1) {
+                        if (toPrev1) {
+                            for (BtEdge *e = toPrev1->next, *n = NULL; e != min1; e = n) {
+                                n = e->next; bt_removeEdgePair(dc, e);
+                            }
+                        }
+                        if (pendingTail1) {
+                            if (toPrev1) bt_edge_link(toPrev1, pendingHead1);
+                            else { bt_edge_link(min1->prev, pendingHead1); firstNew1 = pendingHead1; }
+                            bt_edge_link(pendingTail1, min1);
+                            pendingHead1 = NULL; pendingTail1 = NULL;
+                        } else if (!toPrev1) {
+                            firstNew1 = min1;
+                        }
+                        prevPoint = dc->vblock[c1].point;
+                        c1 = e1->target;
+                        toPrev1 = e1->reverse;
+                    }
+
+                    if ((cmp <= 0) && e0) {
+                        if (toPrev0) {
+                            for (BtEdge *e = toPrev0->prev, *n = NULL; e != min0; e = n) {
+                                n = e->prev; bt_removeEdgePair(dc, e);
+                            }
+                        }
+                        if (pendingTail0) {
+                            if (toPrev0) bt_edge_link(pendingHead0, toPrev0);
+                            else { bt_edge_link(pendingHead0, min0->next); firstNew0 = pendingHead0; }
+                            bt_edge_link(min0, pendingTail0);
+                            pendingHead0 = NULL; pendingTail0 = NULL;
+                        } else if (!toPrev0) {
+                            firstNew0 = min0;
+                        }
+                        prevPoint = dc->vblock[c0].point;
+                        c0 = e0->target;
+                        toPrev0 = e0->reverse;
+                    }
+
+                    if ((c0 == first0) && (c1 == first1)) {
+                        if (toPrev0 == NULL) {
+                            bt_edge_link(pendingHead0, pendingTail0);
+                            dc->vblock[c0].edges = pendingTail0;
+                        } else {
+                            for (BtEdge *e = toPrev0->prev, *n = NULL; e != firstNew0; e = n) {
+                                n = e->prev; bt_removeEdgePair(dc, e);
+                            }
+                            if (pendingTail0) {
+                                bt_edge_link(pendingHead0, toPrev0);
+                                bt_edge_link(firstNew0, pendingTail0);
+                            }
+                        }
+                        if (toPrev1 == NULL) {
+                            bt_edge_link(pendingTail1, pendingHead1);
+                            dc->vblock[c1].edges = pendingTail1;
+                        } else {
+                            for (BtEdge *e = toPrev1->next, *n = NULL; e != firstNew1; e = n) {
+                                n = e->next; bt_removeEdgePair(dc, e);
+                            }
+                            if (pendingTail1) {
+                                bt_edge_link(toPrev1, pendingHead1);
+                                bt_edge_link(pendingTail1, firstNew1);
+                            }
+                        }
+                        done = 1;
+                    }
+                    firstRun = false;
+                }
+            }
+        }
+    }
+}
+
 // ============================================================================
 // computeInternal base case — handles n <= 2
 // ============================================================================
@@ -1425,31 +1705,35 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 
     if (lane == 0) s->npoints = count;
 
-    __shared__ BtIntermediateHull s_hulls[WARP_SIZE];
+    __shared__ BtIntermediateHull s_hulls[BT_HULL_GROUPS];
     __shared__ int   s_mergeStamp;
 
     if (lane == 0) s_mergeStamp = -3;
 
-    // --- Per-lane group boundaries (with dedup at split points) ---
+    // --- Per-group boundaries (BT_HULL_GROUPS groups; 2 lanes share each group) ---
     // Like serial D&C's split logic, advance each split past runs of
     // equal points so that identical vertices are never split across
-    // two lanes. Without this, degenerate sub-hulls at lane boundaries
+    // two groups. Without this, degenerate sub-hulls at group boundaries
     // trigger edge cases in bt_merge (pending chain use-after-free).
-    __shared__ int s_splits[WARP_SIZE + 1];
+    __shared__ int s_splits[BT_HULL_GROUPS + 1];
     if (lane == 0) {
         s_splits[0] = 0;
-        for (int g = 1; g < WARP_SIZE; g++) {
-            int split = g * count / WARP_SIZE;
+        for (int g = 1; g < BT_HULL_GROUPS; g++) {
+            int split = g * count / BT_HULL_GROUPS;
             // Advance past equal points (same logic as bt_computeInternal)
             BtPoint32 p = vblock[split - 1].point;
             while (split < count && bp32_eq(vblock[split].point, p)) split++;
             s_splits[g] = split;
         }
-        s_splits[WARP_SIZE] = count;
+        s_splits[BT_HULL_GROUPS] = count;
     }
     __syncwarp();
-    int my_start = s_splits[lane];
-    int my_end   = s_splits[lane + 1];
+    // group = lane / 2; is_primary = (lane & 1) == 0
+    int group      = lane / 2;
+    bool is_primary = (lane & 1) == 0;
+    int partner_lane = lane ^ 1;
+    int my_start = s_splits[group];
+    int my_end   = s_splits[group + 1];
 
     // --- Per-lane D&C state (lightweight: only edgePool + mergeStamp) ---
     // Common fields (scaling, center, axes, wp, etc.) stay in shared BtHullState *s.
@@ -1545,13 +1829,15 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         if (my_err) { shared_wp->error = my_err; return; }
     }
 #else
-    // --- Phase 1: Each lane builds hull of its group (parallel D&C) ---
-    s_hulls[lane].minXy = BT_VI_NULL; s_hulls[lane].maxXy = BT_VI_NULL;
-    s_hulls[lane].minYx = BT_VI_NULL; s_hulls[lane].maxYx = BT_VI_NULL;
-
-    my_dc.vblock = vblock;
-    if (my_end - my_start > 0) {
-        bt_computeInternal(&my_dc, my_start, my_end, &s_hulls[lane], my_dc_stack);
+    // --- Phase 1: Group primaries build BT_HULL_GROUPS sub-hulls in parallel ---
+    // Secondary lanes (lane&1==1) are idle here; they will participate in Phase 2.
+    my_dc.vblock = vblock;  // All lanes need vblock for Phase 2 bt_findMaxAngle calls.
+    if (is_primary) {
+        s_hulls[group].minXy = BT_VI_NULL; s_hulls[group].maxXy = BT_VI_NULL;
+        s_hulls[group].minYx = BT_VI_NULL; s_hulls[group].maxYx = BT_VI_NULL;
+        if (my_end - my_start > 0) {
+            bt_computeInternal(&my_dc, my_start, my_end, &s_hulls[group], my_dc_stack);
+        }
     }
     __syncwarp();
 
@@ -1564,19 +1850,18 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         if (my_err) { shared_wp->error = my_err; return; }
     }
 
-    // --- Phase 2: Tree merge (5 rounds) ---
-    // Round r: 32>>>(r+1) independent merges, each handled by one lane.
-    // Lane i merges s_hulls[i*stride] with s_hulls[i*stride + stride/2].
-    for (int round = 0; round < 5; round++) {
-        int stride = 1 << (round + 1);
-        int merge_count = WARP_SIZE >> (round + 1);
-        if (lane < merge_count) {
-            int left  = lane * stride;
+    // --- Phase 2: Tree merge (4 rounds, 2-thread cooperative) ---
+    // Round r: BT_HULL_GROUPS>>>(r+1) independent merges, each handled by
+    // a pair (2g, 2g+1). Group g merges s_hulls[g*stride] + s_hulls[g*stride+stride/2].
+    // Both threads in the pair call bt_findMaxAngle convergedly each iteration.
+    for (int round = 0; round < 4; round++) {
+        int stride      = 1 << (round + 1);               // 2, 4, 8, 16
+        int merge_count = BT_HULL_GROUPS >> (round + 1);  // 8, 4, 2, 1
+        if (group < merge_count) {
+            int left  = group * stride;
             int right = left + (stride >> 1);
-            //DPRINTF("[tree] blk=%d lane=%d round=%d merge hulls[%d]+hulls[%d]\n",
-            //        blockIdx.x, lane, round, left, right);
-            bt_merge(&my_dc, &s_hulls[left], &s_hulls[right]);
-            // bt_merge writes result into s_hulls[left] via bt_mergeProjection
+            bt_merge_pair(&my_dc, &s_hulls[left], &s_hulls[right],
+                          is_primary, partner_lane);
         }
         __syncwarp();
 
