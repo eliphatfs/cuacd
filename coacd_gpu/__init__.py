@@ -165,6 +165,57 @@ class Context:
     # batch_hull_dandc_mesh — hull mesh extraction
     # ------------------------------------------------------------------
 
+    def batch_kdop_hull_mesh(self, pts_list):
+        """Compute approximate convex hull mesh via k-DOP for a batch of point clouds.
+
+        Uses 40 icosphere-L1 axes (80 half-spaces) to build a k-DOP, then
+        extracts the exact hull of the k-DOP vertices via polar duality and D&C.
+        Faster than D&C hull for large point clouds; result is a superset of the
+        true convex hull (it contains the input).
+
+        Returns list of (hull_verts, hull_tris, hull_volume) per input.
+        """
+        n_hulls = len(pts_list)
+        if n_hulls == 0:
+            return []
+        pts_arrays = [_as_f32(p) for p in pts_list]
+        packed = np.concatenate([p.reshape(-1, 3) for p in pts_arrays], axis=0)
+        offsets = np.zeros(n_hulls + 1, dtype=np.int32)
+        for i, p in enumerate(pts_arrays):
+            offsets[i + 1] = offsets[i] + len(p)
+
+        # k-DOP has up to 80 dual points. Their convex hull has at most 2*80-4=156
+        # triangles (Euler), each becoming a primal vertex. The final hull of those
+        # ≤156 primal vertices has at most 2*156-4=308 triangles.
+        max_hv = 160  # primal verts = dual triangles ≤ 2*80-4
+        max_ht = 320  # final hull tris ≤ 2*160-4
+        total_pts = int(offsets[-1])
+
+        out_verts   = np.empty(n_hulls * max_hv * 3, dtype=np.float32)
+        out_tris    = np.empty(n_hulls * max_ht * 3, dtype=np.int32)
+        out_nv      = np.empty(n_hulls, dtype=np.int32)
+        out_nt      = np.empty(n_hulls, dtype=np.int32)
+        out_volumes = np.empty(n_hulls, dtype=np.float32)
+        errors      = np.empty(n_hulls, dtype=np.int32)
+
+        _gpu.kdop_hull(
+            packed.ctypes.data, total_pts,
+            offsets.ctypes.data, n_hulls,
+            max_hv, max_ht,
+            out_verts.ctypes.data, out_tris.ctypes.data,
+            out_nv.ctypes.data, out_nt.ctypes.data,
+            out_volumes.ctypes.data, errors.ctypes.data)
+
+        results = []
+        for i in range(n_hulls):
+            nv = int(out_nv[i])
+            nt = int(out_nt[i])
+            hv = out_verts[i * max_hv * 3 : i * max_hv * 3 + nv * 3].reshape(nv, 3).copy()
+            ht = out_tris [i * max_ht * 3 : i * max_ht * 3 + nt * 3].reshape(nt, 3).copy()
+            vol = float(out_volumes[i]) if nt > 0 else 0.0
+            results.append((hv, ht, vol))
+        return results
+
     def batch_hull_dandc_mesh(self, pts_list):
         """Compute D&C hull mesh for a batch of point clouds.
 

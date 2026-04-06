@@ -69,6 +69,7 @@ int beam_init(beam_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     cuModuleGetFunction(&ctx->fn_batch_mesh_volume,   ctx->module, "batch_mesh_volume_kernel");
     cuModuleGetFunction(&ctx->fn_plane_cut,           ctx->module, "plane_cut_kernel");
     cuModuleGetFunction(&ctx->fn_heap_init,           ctx->module, "heap_init_kernel");
+    cuModuleGetFunction(&ctx->fn_kdop_hull,           ctx->module, "kdop_hull_kernel");
 
     // Determine pool size: default to 80% of free device memory
     if (pool_bytes == 0) {
@@ -487,7 +488,7 @@ int beam_decompose(
             void* args[] = { &d_current, &ctx->d_pool_struct, &d_err };
             int nblocks = 2 * 3 * cuts_per_axis * cur_nitems;
             if (nblocks < 1) nblocks = 1;
-            LCHECK(cuLaunchKernel(fn_hull, nblocks, 1, 1, 32, 1, 1,
+            LCHECK(cuLaunchKernel(fn_hull, nblocks, 1, 1, 64, 1, 1,
                                   0, s, args, NULL));
         }
 

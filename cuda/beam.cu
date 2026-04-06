@@ -10,6 +10,7 @@
 #include "plane_cut.cuh"
 #include "warp_common.cuh"
 #include "hull_dandc.cuh"
+#include "kdop_hull.cuh"
 #include "mesh_volume.cuh"
 #include "warp_sort.cuh"
 
@@ -247,9 +248,9 @@ extern "C" __global__ void beam_expansion(
     }
 }
 
-// beam_hull: <<<2*current->nitems, 32>>>
-// Each block (one warp) computes the convex hull of one of the last two parts
-// of a WorkItem and stores it in Part.hull.
+// beam_hull: <<<2*current->nitems, KDOP_BLOCK>>>
+// Each block computes the approximate convex hull (k-DOP) of one of the last
+// two parts of a WorkItem and stores it in Part.hull + Part.hull_vol.
 // Block b: item_idx = b / 2, part_offset = b % 2 (0 = nparts-2, 1 = nparts-1).
 // Early-exits (no error) if item_idx >= nitems or hull already computed.
 extern "C" __global__ void beam_hull(
@@ -259,7 +260,7 @@ extern "C" __global__ void beam_hull(
 {
     if (*err) return;
 
-    int lane     = threadIdx.x;  // 0..31
+    int tid      = threadIdx.x;
     int item_idx = blockIdx.x / 2;
     int part_off = blockIdx.x % 2;  // 0 = second-to-last, 1 = last
 
@@ -267,26 +268,21 @@ extern "C" __global__ void beam_hull(
 
     WorkItem* wi = &current->items[item_idx];
     int       np = wi->nparts;
-    // Need at least 2 parts for part_off=0 to make sense; for safety clamp:
     int part_idx = np - 2 + part_off;
     if (part_idx < 0 || part_idx >= np) return;
 
     Part* p = &wi->parts[part_idx];
     if (p->hull.verts != NULL) return;  // already computed
 
-    // HULL_DUMP disabled — re-enable to extract failing point clouds
+    float hvol = 0.0f;
+    Mesh hull = kdop_hull_block(
+        p->mesh.verts, p->mesh.nv,
+        &pool->heap, &pool->scratch,
+        &hvol, err);
 
-    Mesh hull = hull_dandc_warp_mesh(
-        p->mesh.verts, p->mesh.nv, lane,
-        &pool->heap, &pool->scratch, err);
-
-    if (lane == 0)
-        p->hull = hull;
-
-    if (hull.nt > 0) {
-        float hvol = mesh_volume_warp(&hull, lane);
-        if (lane == 0)
-            p->hull_vol = hvol;
+    if (tid == 0) {
+        p->hull     = hull;
+        p->hull_vol = hvol;
     }
 }
 

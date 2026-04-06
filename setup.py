@@ -90,6 +90,7 @@ _CUDA_MODULES = [
     "test_mesh_volume.cu",
     "test_plane_cut.cu",
     "beam.cu",
+    "test_kdop_hull.cu",
 ]
 
 

@@ -314,6 +314,35 @@ static PyObject* py_decompose(PyObject* self, PyObject* args, PyObject* kwargs) 
 }
 
 // ---------------------------------------------------------------------------
+// kdop_hull(pts_ptr, total_pts, offsets_ptr, n_hulls, max_hv, max_ht,
+//           verts_ptr, tris_ptr, nv_ptr, nt_ptr, vols_ptr, errors_ptr) -> None
+// ---------------------------------------------------------------------------
+
+static PyObject* py_kdop_hull(PyObject* self, PyObject* args) {
+    unsigned long long pts_ptr, offsets_ptr, verts_ptr, tris_ptr;
+    unsigned long long nv_ptr, nt_ptr, vols_ptr, errors_ptr;
+    int total_pts, n_hulls, max_hv, max_ht;
+    if (!PyArg_ParseTuple(args, "KiKiiiKKKKKK",
+            &pts_ptr, &total_pts, &offsets_ptr, &n_hulls,
+            &max_hv, &max_ht,
+            &verts_ptr, &tris_ptr, &nv_ptr, &nt_ptr, &vols_ptr, &errors_ptr))
+        return NULL;
+    REQUIRE_CTX();
+    int rc = beam_kdop_hull(g_state.ctx,
+        (const float*)(uintptr_t)pts_ptr, total_pts,
+        (const int*)  (uintptr_t)offsets_ptr, n_hulls,
+        max_hv, max_ht,
+        (float*)(uintptr_t)verts_ptr,
+        (int*)  (uintptr_t)tris_ptr,
+        (int*)  (uintptr_t)nv_ptr,
+        (int*)  (uintptr_t)nt_ptr,
+        (float*)(uintptr_t)vols_ptr,
+        (int*)  (uintptr_t)errors_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -332,6 +361,7 @@ static PyMethodDef gpu_methods[] = {
     { "test_mesh_volume",   py_test_mesh_volume,   METH_VARARGS, "Mesh volume (single mesh)." },
     { "batch_mesh_volume",  py_batch_mesh_volume,  METH_VARARGS, "Batch mesh volume (divergence theorem)." },
     { "test_plane_cut",     py_test_plane_cut,     METH_VARARGS, "GPU plane cut with cap triangulation." },
+    { "kdop_hull",          py_kdop_hull,          METH_VARARGS, "k-DOP approximate hull mesh extraction." },
     { "decompose",          (PyCFunction)py_decompose, METH_VARARGS | METH_KEYWORDS,
       "decompose(verts_ptr, nv, tris_ptr, nt, hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,\n"
       "          max_iters, cuts_per_axis, threshold, max_keep, verbose=0, debug=0)\n"

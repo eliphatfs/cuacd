@@ -82,6 +82,7 @@ struct beam_ctx {
     CUfunction fn_batch_mesh_volume;
     CUfunction fn_plane_cut;
     CUfunction fn_heap_init;      // replaces fn_heap_compact; beam.c update pending
+    CUfunction fn_kdop_hull;
 
     // Heaps embedded in d_pool_struct (beam.c update pending).
     // Fields d_heap, d_scratch, d_heap_compact_buf, d_scratch_compact_buf removed.

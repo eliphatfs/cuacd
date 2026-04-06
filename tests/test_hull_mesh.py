@@ -177,3 +177,61 @@ class TestHullMeshExtraction:
             tris_i = out_tris[i * max_ht * 3 : i * max_ht * 3 + nt * 3].reshape(nt, 3)
             assert tris_i.min() >= 0
             assert tris_i.max() < nv
+
+
+class TestKdopHull:
+    @pytest.fixture(scope="class")
+    def ctx(self):
+        import coacd_gpu
+        c = coacd_gpu.Context(device=0)
+        yield c
+        c.close()
+
+    def test_cube_valid(self, ctx):
+        """k-DOP hull of a cube should produce a valid closed mesh."""
+        pts = _cube_points()
+        (verts, tris, vol), = ctx.batch_kdop_hull_mesh([pts])
+        assert len(verts) >= 4
+        assert len(tris) >= 4
+        assert tris.min() >= 0
+        assert tris.max() < len(verts)
+
+    def test_cube_volume_contains(self, ctx):
+        """k-DOP hull volume of a unit cube should be >= 1.0 (contains the cube)."""
+        pts = _cube_points()
+        (verts, tris, vol), = ctx.batch_kdop_hull_mesh([pts])
+        assert vol >= 0.99, f"k-DOP hull volume {vol} < 1.0 for unit cube"
+
+    def test_tetrahedron_valid(self, ctx):
+        """k-DOP hull of a tetrahedron should produce a valid mesh."""
+        pts = _tetrahedron_points()
+        (verts, tris, vol), = ctx.batch_kdop_hull_mesh([pts])
+        assert len(verts) >= 4
+        assert len(tris) >= 4
+        assert tris.min() >= 0
+        assert tris.max() < len(verts)
+        assert vol > 0.0
+
+    def test_gaussian_volume_close_to_dandc(self, ctx):
+        """k-DOP hull volume should be within 50% of D&C hull volume for Gaussian pts."""
+        rng = np.random.default_rng(42)
+        pts = rng.standard_normal((200, 3)).astype(np.float32)
+        (kdop_verts, kdop_tris, kdop_vol), = ctx.batch_kdop_hull_mesh([pts])
+        dandc_verts, dandc_tris, dandc_hull_vol = ctx.batch_hull_dandc_mesh([pts])[0]
+        assert kdop_vol >= dandc_hull_vol * 0.9, (
+            f"k-DOP vol {kdop_vol:.4f} much less than D&C vol {dandc_hull_vol:.4f}")
+        assert kdop_vol <= dandc_hull_vol * 2.0, (
+            f"k-DOP vol {kdop_vol:.4f} far exceeds D&C vol {dandc_hull_vol:.4f}")
+
+    def test_batch_multiple(self, ctx):
+        """Batch of k-DOP hulls should all succeed."""
+        rng = np.random.default_rng(7)
+        pts_list = [rng.standard_normal((50, 3)).astype(np.float32) for _ in range(4)]
+        results = ctx.batch_kdop_hull_mesh(pts_list)
+        assert len(results) == 4
+        for i, (verts, tris, vol) in enumerate(results):
+            assert len(verts) >= 4, f"Hull {i}: only {len(verts)} vertices"
+            assert len(tris) >= 4, f"Hull {i}: only {len(tris)} triangles"
+            assert tris.min() >= 0
+            assert tris.max() < len(verts)
+            assert vol > 0.0, f"Hull {i}: zero volume"

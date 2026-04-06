@@ -138,6 +138,24 @@ int beam_decompose(
 void beam_result_free(struct beam_result* result);
 
 // ---------------------------------------------------------------------------
+// kdop_hull — approximate convex hull via k-DOP for a batch of point clouds
+// ---------------------------------------------------------------------------
+int beam_kdop_hull(
+    beam_ctx_t   ctx,
+    const float* pts,
+    int          total_pts,
+    const int*   offsets,
+    int          n_hulls,
+    int          max_hull_verts,
+    int          max_hull_tris,
+    float*       out_verts,
+    int*         out_tris,
+    int*         out_nv,
+    int*         out_nt,
+    float*       out_volumes,
+    int*         out_errors);
+
+// ---------------------------------------------------------------------------
 // test_plane_cut — GPU plane cut with cap triangulation
 // ---------------------------------------------------------------------------
 // Returns separate pos and neg vertex + triangle arrays.

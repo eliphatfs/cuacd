@@ -349,3 +349,75 @@ cleanup_err:
     cuMemFree(d_counts); cuMemFree(d_kerr);
     return -1;
 }
+
+// ---------------------------------------------------------------------------
+// beam_kdop_hull
+// ---------------------------------------------------------------------------
+// Approximate convex hull via k-DOP for a batch of point clouds.
+// Uses persistent pool->heap (output) and pool->scratch (scratch).
+
+int beam_kdop_hull(
+    beam_ctx_t   ctx,
+    const float* pts,
+    int          total_pts,
+    const int*   offsets,
+    int          n_hulls,
+    int          max_hull_verts,
+    int          max_hull_tris,
+    float*       out_verts,
+    int*         out_tris,
+    int*         out_nv,
+    int*         out_nt,
+    float*       out_volumes,
+    int*         out_errors)
+{
+    if (!ctx || !ctx->fn_kdop_hull) return -1;
+    if (!ctx->d_pool_struct) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "persistent heaps not initialized; call beam_init first");
+        return -1;
+    }
+    CUstream s = NULL;
+
+    CUdeviceptr d_heap    = D_HEAP(ctx);
+    CUdeviceptr d_scratch = D_SCRATCH(ctx);
+
+    CUdeviceptr d_pts, d_off, d_overts, d_otris, d_onv, d_ont, d_ovols, d_oerr;
+    CHECK_CU(cuMemAlloc(&d_pts,    (size_t)total_pts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_off,    (size_t)(n_hulls + 1) * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_overts, (size_t)n_hulls * max_hull_verts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_otris,  (size_t)n_hulls * max_hull_tris  * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_onv,    (size_t)n_hulls * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_ont,    (size_t)n_hulls * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_ovols,  (size_t)n_hulls * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_oerr,   (size_t)n_hulls * sizeof(int)));
+
+    CHECK_CU(cuMemcpyHtoDAsync(d_pts, pts,     (size_t)total_pts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_off, offsets, (size_t)(n_hulls + 1) * sizeof(int),   s));
+
+    int block_size = 64;  // KDOP_BLOCK
+    int n_blocks   = n_hulls;
+
+    void* args[] = {
+        &d_pts, &d_off, &n_hulls,
+        &max_hull_verts, &max_hull_tris,
+        &d_overts, &d_otris, &d_onv, &d_ont, &d_ovols, &d_oerr,
+        &d_heap, &d_scratch
+    };
+    CHECK_CU(cuLaunchKernel(ctx->fn_kdop_hull, n_blocks, 1, 1,
+                            block_size, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_verts,   d_overts, (size_t)n_hulls * max_hull_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_tris,    d_otris,  (size_t)n_hulls * max_hull_tris  * 3 * sizeof(int),   s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_nv,      d_onv,    (size_t)n_hulls * sizeof(int), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_nt,      d_ont,    (size_t)n_hulls * sizeof(int), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_volumes, d_ovols,  (size_t)n_hulls * sizeof(float), s));
+    CHECK_CU(cuMemcpyDtoHAsync(out_errors,  d_oerr,   (size_t)n_hulls * sizeof(int), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_pts); cuMemFree(d_off);
+    cuMemFree(d_overts); cuMemFree(d_otris);
+    cuMemFree(d_onv); cuMemFree(d_ont);
+    cuMemFree(d_ovols); cuMemFree(d_oerr);
+    return 0;
+}

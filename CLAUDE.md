@@ -22,12 +22,14 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   hull_dandc.cuh      #   Preparata-Hong D&C hull (Bullet port); hull_dandc_warp_mesh returns Mesh via heap
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
+  kdop_hull.cuh       #   kdop_hull_block: block-level (64 threads) approximate hull via k-DOP (40 icosphere axes)
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   structs.cuh         #   Device-side: Mesh, Part, PartPair, WorkItem, AlgoState
   mm.cu               #   heap_init_kernel
   beam.cu             #   beam_expansion, beam_hull, beam_sort, beam_finalize kernels
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel
+  test_kdop_hull.cu   #   Test kernel: kdop_hull_kernel
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel
 csrc/                 # C host code
   structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, beam_ctx
@@ -36,10 +38,10 @@ csrc/                 # C host code
   test_beam.c         #   Test host launchers
   beam_module.c       #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
-  __init__.py         #   Context class (batch_hull_volume, batch_mesh_volume, batch_hull_dandc_mesh)
+  __init__.py         #   Context class (batch_hull_volume, batch_mesh_volume, batch_hull_dandc_mesh, batch_kdop_hull_mesh)
 tests/                # All tests
   test_hull.py        #   Hull volume + mesh volume tests
-  test_hull_mesh.py   #   D&C hull mesh extraction tests
+  test_hull_mesh.py   #   D&C hull mesh extraction tests + k-DOP hull tests
   test_warp_sort.py   #   Tests for warp_sort_bp32
   test_plane_cut.py   #   Plane cut tests (14 tests)
   test_decompose.py   #   beam_decompose tests (cube, lshape, octocat, octocat_debug_steps)
@@ -52,6 +54,7 @@ docs/                 # Detailed documentation
   api_plane_cut.md    #   plane_cut_block API details
   api_beam.md         #   Beam search kernel APIs (initialize, expansion, hull, sort, finalize, decompose)
   api_heap_allocator.md#  Heap arena allocator design
+  api_kdop_hull.md    #   k-DOP approximate hull algorithm and kdop_hull_block API
   implementation_notes.md# Resolved bugs and implementation gotchas
 CoACD/                # Reference C++ CoACD (embedded repo, not a submodule)
 ```
@@ -122,7 +125,8 @@ import coacd_gpu
 with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto (70% free VRAM)
     volumes, errors = ctx.batch_hull_volume(pts_list)
     volumes = ctx.batch_mesh_volume(verts_list, tris_list)
-    results = ctx.batch_hull_dandc_mesh(pts_list)  # list of (verts, tris, volume)
+    results = ctx.batch_hull_dandc_mesh(pts_list)   # list of (verts, tris, volume) — exact D&C hull
+    results = ctx.batch_kdop_hull_mesh(pts_list)    # list of (verts, tris, volume) — approximate k-DOP hull
     used = ctx.pool_usage()     # bytes consumed from pool (monotonic high-water mark)
     ctx.heap_compact()          # no-op (coalescing handled by heap_free)
 ```
@@ -143,7 +147,9 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 **Plane Cut** (`plane_cut.cuh`): Block-level (64 threads) mesh splitting along an arbitrary plane. Produces `PartPair` with pos/neg meshes. See `docs/api_plane_cut.md`.
 
-**Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → sort`. Pipelined in stream order, sync only after finalize. See `docs/api_beam.md`.
+**k-DOP Approximate Hull** (`kdop_hull.cuh`): Block-level (64 threads) approximate convex hull using 40 icosphere-L1 face normals as k-DOP axes (80 half-spaces total). Algorithm: centroid → block-parallel k-DOP extreme projections → polar dual vertices → D&C hull of dual points (warp 0) → 3-plane intersection per dual triangle → D&C hull of primal vertices (warp 0) → volume. Exposed as `ctx.batch_kdop_hull_mesh()`. Used by `beam_hull` kernel. The k-DOP overestimates the true convex hull volume — this inflates the concavity cost `hull_vol - mesh_vol` and causes the beam search to over-decompose unless a correction factor is applied.
+
+**Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → sort`. Pipelined in stream order, sync only after finalize. `beam_hull` uses `kdop_hull_block` (64 threads/block). See `docs/api_beam.md`.
 
 ### Utility Functions
 
@@ -152,6 +158,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 | `signed_tet_volume` | per-thread | geometry.cuh |
 | `block_reduce_sum/bbox/max/count` | block (syncthreads) | reduce.cuh |
 | `mesh_volume_warp` | warp (32 lanes) | mesh_volume.cuh |
+| `kdop_hull_block` | block (64 threads) | kdop_hull.cuh |
 | `pool_alloc` | thread 0 only | allocator.cuh |
 | `heap_alloc` / `heap_free` | thread 0 only | allocator.cuh |
 | `atomicMinF` / `atomicMaxF` | per-thread | common.cuh |
@@ -171,6 +178,10 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 ### Working
 - D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
+- k-DOP approximate hull (`kdop_hull_block`, `batch_kdop_hull_mesh`) — 5 tests pass. Used by `beam_hull`.
+
+### Known Limitations
+- k-DOP hull **overestimates** true convex hull volume (it is a superset). In `beam_hull` this inflates `hull_vol - mesh_vol`, causing the decomposition to split more aggressively than with exact hull. A volume correction factor or fallback to D&C hull may be needed for production quality.
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input
