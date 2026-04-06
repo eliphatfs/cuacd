@@ -11,8 +11,10 @@
 //   1-2  Classify vertices, copy to scratch           (parallel, 64 threads)
 //   3    Collect crossing edges                        (parallel, 64 threads)
 //   4    Sort crossing edges                           (warp 0)
+//        Free sort_scratch; alloc all_verts (n_verts+n_cross, tighter bound).
+//   4b   Copy original vertices into all_verts         (parallel, 64 threads)
 //   5    Dedup + create intersection vertices          (thread 0)
-//        Free sort_scratch; alloc pos_tris, neg_tris (phase-6 only).
+//        Alloc pos_tris, neg_tris (phase-6 only).
 //   6    Split triangles                               (parallel, 64 threads)
 //        Free signs, cross_edges, isect_idx.
 //   7    Collect directed edges from pos_tris          (parallel, 64 threads)
@@ -158,8 +160,6 @@ __device__ inline PartPair plane_cut_block(
     int          n_tris    = mesh->nt;
 
     // Upper-bound sizes (all derived from n_verts / n_tris)
-    int max_new_verts      = n_tris * 2;
-    int total_verts_cap    = n_verts + max_new_verts;
     int max_cross_edges    = n_tris * 2;
     int max_out_tris       = n_tris * 3;   // phase-6 upper bound; also sizes dir_edges
     // Cap triangles are kept in a separate cap_tris buffer (sized from n_boundary after phase 9b)
@@ -227,10 +227,6 @@ __device__ inline PartPair plane_cut_block(
         if (heap_alloc(scratch_heap, (unsigned int)(n_verts * (int)sizeof(signed char)), &p) != HEAP_OK)
             { s_alloc_ok = 0; p = NULL; }
         s_signs = (signed char*)p;
-
-        if (heap_alloc(scratch_heap, (unsigned int)(total_verts_cap * 3 * (int)sizeof(float)), &p) != HEAP_OK)
-            { s_alloc_ok = 0; p = NULL; }
-        s_all_verts = (float*)p;
     }
     __syncthreads();
     if (!s_alloc_ok) {
@@ -238,18 +234,13 @@ __device__ inline PartPair plane_cut_block(
         return s_result;
     }
 
-    PC_BUF(signed char, signs, s_signs,   n_verts);
-    PC_BUF(float, all_verts, s_all_verts, total_verts_cap * 3);
+    PC_BUF(signed char, signs, s_signs, n_verts);
 
     // === Phase 1: Classify vertices ===
     for (int v = tid; v < n_verts; v += PC_BLOCK) {
         float val = pa*vertices[v*3] + pb*vertices[v*3+1] + pc_n*vertices[v*3+2] + pd;
         signs[v] = (val > PC_EPS) ? 1 : ((val < -PC_EPS) ? -1 : 0);
     }
-
-    // === Phase 2: Copy original vertices ===
-    for (int i = tid; i < n_verts * 3; i += PC_BLOCK)
-        all_verts[i] = vertices[i];
     __syncthreads();
 
     // =========================================================================
@@ -366,9 +357,36 @@ __device__ inline PartPair plane_cut_block(
     // Phase 5: Dedup + intersection vertices  (thread 0)
     // Also: free sort_scratch (done); alloc pos_tris + neg_tris.
     // =========================================================================
+    // =========================================================================
+    // Alloc all_verts now that n_cross is known; tighter bound than max_new_verts.
+    // =========================================================================
     if (tid == 0) {
         heap_free(scratch_heap, (void*)s_sort_scratch); s_sort_scratch = NULL;
 
+        void* p;
+        s_alloc_ok = 1;
+        if (heap_alloc(scratch_heap, (unsigned int)((n_verts + n_cross) * 3 * (int)sizeof(float)), &p) != HEAP_OK)
+            { s_alloc_ok = 0; p = NULL; }
+        s_all_verts = (float*)p;
+    }
+    __syncthreads();
+    if (!s_alloc_ok) {
+        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+        return s_result;
+    }
+
+    PC_BUF(float, all_verts, s_all_verts, (n_verts + n_cross) * 3);
+
+    // === Phase 4b: Copy original vertices ===
+    for (int i = tid; i < n_verts * 3; i += PC_BLOCK)
+        all_verts[i] = vertices[i];
+    __syncthreads();
+
+    // =========================================================================
+    // Phase 5: Dedup + intersection vertices  (thread 0)
+    // Also: alloc pos_tris + neg_tris.
+    // =========================================================================
+    if (tid == 0) {
         void* p;
         s_alloc_ok = 1;
         if (heap_alloc(scratch_heap, (unsigned int)(max_out_tris * 3 * (int)sizeof(int)), &p) != HEAP_OK)
