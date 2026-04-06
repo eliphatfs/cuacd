@@ -206,6 +206,13 @@ __device__ inline PartPair plane_cut_block(
     __shared__ int    s_pbase[PC_BLOCK];
     __shared__ int    s_nbase[PC_BLOCK];
 
+    // Warp-cooperative phases 10-12: shared broadcast slots for heap pointers
+    __shared__ void*  s_w_ptrs[7];   // ls, lsz, lv2, poly, cap, ep, sb
+    __shared__ int    s_w_kern_ok;
+    __shared__ int    s_w_n_loops;
+    __shared__ int    s_w_pu;
+    __shared__ int    s_w_pv_ax;
+
     if (tid == 0) {
         s_signs = NULL; s_all_verts = NULL;
         s_cross_edges = NULL; s_sort_scratch = NULL; s_isect_idx = NULL;
@@ -601,20 +608,22 @@ __device__ inline PartPair plane_cut_block(
     __syncthreads();
 
     // =========================================================================
-    // Phases 10-12: thread 0 only.
+    // Phases 10-12: warp 0 cooperative.
     //
-    // All local scratch is void* locals (init NULL), freed inline as early as
-    // possible.  kern_ok gates work after the first failure.
+    // Lane 0 handles heap alloc/free and serial control flow.
+    // All 32 lanes cooperate on inner scans (edge chain search, ray-cast
+    // point-in-polygon, ear-clip point-in-triangle) for ~32× speedup on
+    // those hot loops.
     // At the end, kern_ok + total_pos/neg + remap ptrs are broadcast to all
     // threads via shared memory for the parallel phase 13.
     // =========================================================================
-    if (tid == 0) {
+    if (warp_id == 0) {
         int kern_ok    = 1;
         int n_cap      = 0;
         int n_boundary = s_n_boundary;
         void* lv_ptr   = (void*)s_be_a;  // boundary edge pairs (be_a), freed after loop recon
 
-        // Thread-0-only scratch — all NULL so heap_free is always safe.
+        // Lane-0-only scratch — all NULL so heap_free is always safe.
         void* lv2_ptr  = NULL;  // loop vertex sequence (lv)
         void* ls_ptr   = NULL;  // loop_starts
         void* lsz_ptr  = NULL;  // loop_sizes
@@ -625,14 +634,26 @@ __device__ inline PartPair plane_cut_block(
 
             // --- Phase 10-12: loop reconstruction + polygon + ear-clip ---
             if (n_boundary > 0) {
-                if (heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &ls_ptr)  != HEAP_OK) { kern_ok = 0; }
-                if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &lsz_ptr) != HEAP_OK) { kern_ok = 0; }
-                if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &lv2_ptr) != HEAP_OK) { kern_ok = 0; }
-                if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * (int)sizeof(int)), &poly_ptr) != HEAP_OK) { kern_ok = 0; }
-                if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * (int)sizeof(int)), &cap_ptr)  != HEAP_OK) { kern_ok = 0; }
-                if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * 2 * (int)sizeof(int)), &ep_ptr)   != HEAP_OK) { kern_ok = 0; }
-                if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(256 * (int)sizeof(int) + 256 * (int)sizeof(float)), &sb_ptr) != HEAP_OK) { kern_ok = 0; }
-                if (!kern_ok) atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);
+                if (lane == 0) {
+                    if (heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &ls_ptr)  != HEAP_OK) { kern_ok = 0; }
+                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &lsz_ptr) != HEAP_OK) { kern_ok = 0; }
+                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &lv2_ptr) != HEAP_OK) { kern_ok = 0; }
+                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * (int)sizeof(int)), &poly_ptr) != HEAP_OK) { kern_ok = 0; }
+                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * (int)sizeof(int)), &cap_ptr)  != HEAP_OK) { kern_ok = 0; }
+                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * 2 * (int)sizeof(int)), &ep_ptr)   != HEAP_OK) { kern_ok = 0; }
+                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(256 * (int)sizeof(int) + 256 * (int)sizeof(float)), &sb_ptr) != HEAP_OK) { kern_ok = 0; }
+                    if (!kern_ok) atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);
+                    // Broadcast pointers to all lanes via shared memory
+                    s_w_ptrs[0] = ls_ptr; s_w_ptrs[1] = lsz_ptr; s_w_ptrs[2] = lv2_ptr;
+                    s_w_ptrs[3] = poly_ptr; s_w_ptrs[4] = cap_ptr; s_w_ptrs[5] = ep_ptr;
+                    s_w_ptrs[6] = sb_ptr;
+                    s_w_kern_ok = kern_ok;
+                }
+                __syncwarp();
+                kern_ok = s_w_kern_ok;
+                ls_ptr = s_w_ptrs[0]; lsz_ptr = s_w_ptrs[1]; lv2_ptr = s_w_ptrs[2];
+                poly_ptr = s_w_ptrs[3]; cap_ptr = s_w_ptrs[4]; ep_ptr = s_w_ptrs[5];
+                sb_ptr = s_w_ptrs[6];
 
                 if (kern_ok) {
                     int poly_cap = n_boundary * 4 + 64;
@@ -646,9 +667,11 @@ __device__ inline PartPair plane_cut_block(
                     float* inner_max_u  = (float*)((int*)sb_ptr + 256);
 
                     // Phase 10: reconstruct loops from boundary edge pairs
+                    // Lane 0 drives chain-following; all lanes help with inner search.
                     PC_BUF(int, be_a2, lv_ptr, n_boundary * 2);
                     int* be_used = loop_starts.raw();  // borrow before it's filled
-                    for (int i = 0; i < n_boundary; i++) be_used[i] = 0;
+                    for (int i = lane; i < n_boundary; i += 32) be_used[i] = 0;
+                    __syncwarp();
 
                     int n_loops = 0, lvi = 0;
                     for (int start = 0; start < n_boundary; start++) {
@@ -657,26 +680,38 @@ __device__ inline PartPair plane_cut_block(
                         int first = be_a2[start*2], cur = be_a2[start*2+1];
                         be_used[start] = 1;  // aliases loop_starts[start]; loop_starts[n_loops] set below
                         if (lvi >= n_boundary) break;
-                        lv[lvi++] = first;
+                        if (lane == 0) lv[lvi] = first;
+                        lvi++;
                         int safety = n_boundary + 2;
                         while (cur != first && safety-- > 0) {
                             if (lvi >= n_boundary) break;
-                            lv[lvi++] = cur;
-                            int found = 0;
-                            for (int i = 0; i < n_boundary; i++) {
+                            if (lane == 0) lv[lvi] = cur;
+                            lvi++;
+                            // Warp-parallel edge search: each lane checks a stride
+                            int my_found_i = -1;
+                            for (int i = lane; i < n_boundary; i += 32) {
                                 if (!be_used[i] && be_a2[i*2] == cur) {
-                                    cur = be_a2[i*2+1]; be_used[i] = 1; found = 1; break;
+                                    my_found_i = i; break;
                                 }
                             }
-                            if (!found) break;
+                            unsigned mask = __ballot_sync(0xFFFFFFFF, my_found_i >= 0);
+                            if (mask == 0) break;  // not found
+                            int winner = __ffs(mask) - 1;  // lowest lane with a match
+                            int found_i = __shfl_sync(0xFFFFFFFF, my_found_i, winner);
+                            cur = be_a2[found_i*2+1];
+                            be_used[found_i] = 1;
                         }
-                        loop_starts[n_loops] = lvi_start;  // set after be_used writes (avoids alias clobber)
-                        loop_sizes[n_loops] = lvi - lvi_start;
+                        if (lane == 0) {
+                            loop_starts[n_loops] = lvi_start;
+                            loop_sizes[n_loops] = lvi - lvi_start;
+                        }
+                        __syncwarp();
                         if (loop_sizes[n_loops] > 0) n_loops++;
                     }
 
                     // be_a (lv_ptr) no longer needed — free to reclaim memory.
-                    heap_free(scratch_heap, lv_ptr); lv_ptr = NULL; s_be_a = NULL;
+                    if (lane == 0) { heap_free(scratch_heap, lv_ptr); lv_ptr = NULL; s_be_a = NULL; }
+                    __syncwarp();
 
                     // 2D projection axes (drop largest normal component)
                     int pu, pv_ax;
@@ -697,9 +732,12 @@ __device__ inline PartPair plane_cut_block(
 
                     // Orient all loops: positive area = CCW (outer), negative = CW (hole).
                     for (int i = 0; i < n_loops; i++) {
-                        float a = pc_signed_area(all_verts.raw(), lv.raw()+loop_starts[i], loop_sizes[i], pu, pv_ax);
-                        if (a < 0) pc_reverse(lv.raw()+loop_starts[i], loop_sizes[i]);
+                        if (lane == 0) {
+                            float a = pc_signed_area(all_verts.raw(), lv.raw()+loop_starts[i], loop_sizes[i], pu, pv_ax);
+                            if (a < 0) pc_reverse(lv.raw()+loop_starts[i], loop_sizes[i]);
+                        }
                     }
+                    __syncwarp();
 
                     // Classify: is_hole[i] = 1 if loop i's first vertex is inside some other loop.
                     // parent[i] = enclosing loop index (smallest enclosing area), or -1.
@@ -722,104 +760,121 @@ __device__ inline PartPair plane_cut_block(
                         float best_area = 1e30f;
                         for (int j = 0; j < n_loops && j < max_loops; j++) {
                             if (j == i || loop_sizes[j] < 3) continue;
-                            // Ray-casting point-in-polygon (2D, along +u axis)
+                            // Warp-parallel ray-casting point-in-polygon (2D, along +u axis)
                             int* lp = lv.raw() + loop_starts[j];
                             int ls_ = loop_sizes[j];
-                            int crossings = 0;
-                            for (int k = 0; k < ls_; k++) {
+                            int my_crossings = 0;
+                            for (int k = lane; k < ls_; k += 32) {
                                 int kn = (k+1) % ls_;
                                 float ay = all_verts[lp[k]*3+pv_ax], by = all_verts[lp[kn]*3+pv_ax];
                                 if ((ay <= pv_) == (by <= pv_)) continue;
                                 float ax = all_verts[lp[k]*3+pu], bx = all_verts[lp[kn]*3+pu];
                                 float t = (pv_ - ay) / (by - ay);
-                                if (ax + t * (bx - ax) > pu_) crossings++;
+                                if (ax + t * (bx - ax) > pu_) my_crossings++;
                             }
-                            if (crossings & 1) {
+                            // Warp-reduce crossings
+                            for (int s = 16; s > 0; s >>= 1)
+                                my_crossings += __shfl_xor_sync(0xFFFFFFFF, my_crossings, s);
+                            if (my_crossings & 1) {
                                 // i is inside j — pick smallest enclosing
                                 float a = fabsf(pc_signed_area(all_verts.raw(), lp, ls_, pu, pv_ax));
-                                if (a < best_area) { best_area = a; parent[i] = j; }
+                                if (a < best_area) { best_area = a; if (lane == 0) parent[i] = j; }
                             }
                         }
+                        __syncwarp();
                         if (parent[i] >= 0) is_hole[i] = 1;
                     }
 
                     // Reverse hole loops to CW winding (they were oriented CCW above).
                     for (int i = 0; i < n_loops && i < max_loops; i++) {
-                        if (is_hole[i]) pc_reverse(lv.raw()+loop_starts[i], loop_sizes[i]);
+                        if (lane == 0 && is_hole[i]) pc_reverse(lv.raw()+loop_starts[i], loop_sizes[i]);
                     }
+                    __syncwarp();
 
                     // Process each outer loop (non-hole) and its direct children.
                     for (int oi = 0; oi < n_loops && oi < max_loops; oi++) {
                         if (is_hole[oi] || loop_sizes[oi] < 3) continue;
 
-                        // Copy outer loop into polygon
+                        // Copy outer loop into polygon (lane 0)
                         int poly_n = loop_sizes[oi];
-                        for (int i = 0; i < poly_n; i++)
-                            polygon[i] = lv[loop_starts[oi]+i];
+                        if (lane == 0) {
+                            for (int i = 0; i < poly_n; i++)
+                                polygon[i] = lv[loop_starts[oi]+i];
+                        }
+                        __syncwarp();
 
                         // Collect direct holes (parent == oi), sorted by rightmost u descending
+                        // (lane 0 only — small n_inner)
                         int n_inner = 0;
-                        for (int i = 0; i < n_loops && n_inner < 128; i++) {
-                            if (parent[i] != oi || loop_sizes[i] < 3) continue;
-                            float mu = -1e30f;
-                            for (int j = 0; j < loop_sizes[i]; j++) {
-                                float u = all_verts[lv[loop_starts[i]+j]*3+pu];
-                                if (u > mu) mu = u;
+                        if (lane == 0) {
+                            for (int i = 0; i < n_loops && n_inner < 128; i++) {
+                                if (parent[i] != oi || loop_sizes[i] < 3) continue;
+                                float mu = -1e30f;
+                                for (int j = 0; j < loop_sizes[i]; j++) {
+                                    float u = all_verts[lv[loop_starts[i]+j]*3+pu];
+                                    if (u > mu) mu = u;
+                                }
+                                h_idx[n_inner] = i; h_max_u[n_inner] = mu; n_inner++;
                             }
-                            h_idx[n_inner] = i; h_max_u[n_inner] = mu; n_inner++;
-                        }
-                        for (int i = 0; i < n_inner-1; i++) {
-                            int best = i;
-                            for (int j = i+1; j < n_inner; j++)
-                                if (h_max_u[j] > h_max_u[best]) best = j;
-                            if (best != i) {
-                                int ti=h_idx[i]; h_idx[i]=h_idx[best]; h_idx[best]=ti;
-                                float tf=h_max_u[i]; h_max_u[i]=h_max_u[best]; h_max_u[best]=tf;
+                            for (int i = 0; i < n_inner-1; i++) {
+                                int best = i;
+                                for (int j = i+1; j < n_inner; j++)
+                                    if (h_max_u[j] > h_max_u[best]) best = j;
+                                if (best != i) {
+                                    int ti=h_idx[i]; h_idx[i]=h_idx[best]; h_idx[best]=ti;
+                                    float tf=h_max_u[i]; h_max_u[i]=h_max_u[best]; h_max_u[best]=tf;
+                                }
                             }
                         }
+                        n_inner = __shfl_sync(0xFFFFFFFF, n_inner, 0);
 
-                        // Bridge each hole into polygon
-                        for (int ii = 0; ii < n_inner; ii++) {
-                            int hi = h_idx[ii], hs = loop_sizes[hi];
-                            int* hole = lv.raw() + loop_starts[hi];
-                            int m_idx = 0; float max_u = -1e30f;
-                            for (int j = 0; j < hs; j++) {
-                                float u = all_verts[hole[j]*3+pu];
-                                if (u > max_u) { max_u=u; m_idx=j; }
+                        // Bridge each hole into polygon (lane 0 — modifies polygon)
+                        if (lane == 0) {
+                            for (int ii = 0; ii < n_inner; ii++) {
+                                int hi = h_idx[ii], hs = loop_sizes[hi];
+                                int* hole = lv.raw() + loop_starts[hi];
+                                int m_idx = 0; float max_u = -1e30f;
+                                for (int j = 0; j < hs; j++) {
+                                    float u = all_verts[hole[j]*3+pu];
+                                    if (u > max_u) { max_u=u; m_idx=j; }
+                                }
+                                float mu_ = all_verts[hole[m_idx]*3+pu];
+                                float mv_ = all_verts[hole[m_idx]*3+pv_ax];
+                                float best_t = 1e30f; int best_edge = -1;
+                                for (int j = 0; j < poly_n; j++) {
+                                    int jn = (j+1)%poly_n;
+                                    float au=all_verts[polygon[j]*3+pu],  av2=all_verts[polygon[j]*3+pv_ax];
+                                    float bu=all_verts[polygon[jn]*3+pu], bv2=all_verts[polygon[jn]*3+pv_ax];
+                                    float dv = bv2-av2; if (fabsf(dv)<1e-10f) continue;
+                                    float s_ = (mv_-av2)/dv;
+                                    if (s_<-1e-10f||s_>1.0f+1e-10f) continue;
+                                    float tv = au+s_*(bu-au)-mu_;
+                                    if (tv>1e-10f && tv<best_t) { best_t=tv; best_edge=j; }
+                                }
+                                if (best_edge < 0) continue;
+                                int jn=(best_edge+1)%poly_n;
+                                int p_pos = (all_verts[polygon[best_edge]*3+pu] >= all_verts[polygon[jn]*3+pu])
+                                            ? best_edge : jn;
+                                int k = 0;
+                                for (int j=0; j<=p_pos; j++) cap_tris[k++]=polygon[j];
+                                for (int j=0; j<hs; j++) cap_tris[k++]=hole[(m_idx+j)%hs];
+                                cap_tris[k++]=hole[m_idx]; cap_tris[k++]=polygon[p_pos];
+                                for (int j=p_pos+1; j<poly_n; j++) cap_tris[k++]=polygon[j];
+                                for (int j=0; j<k; j++) polygon[j]=cap_tris[j];
+                                poly_n=k;
                             }
-                            float mu_ = all_verts[hole[m_idx]*3+pu];
-                            float mv_ = all_verts[hole[m_idx]*3+pv_ax];
-                            float best_t = 1e30f; int best_edge = -1;
-                            for (int j = 0; j < poly_n; j++) {
-                                int jn = (j+1)%poly_n;
-                                float au=all_verts[polygon[j]*3+pu],  av2=all_verts[polygon[j]*3+pv_ax];
-                                float bu=all_verts[polygon[jn]*3+pu], bv2=all_verts[polygon[jn]*3+pv_ax];
-                                float dv = bv2-av2; if (fabsf(dv)<1e-10f) continue;
-                                float s = (mv_-av2)/dv;
-                                if (s<-1e-10f||s>1.0f+1e-10f) continue;
-                                float tv = au+s*(bu-au)-mu_;
-                                if (tv>1e-10f && tv<best_t) { best_t=tv; best_edge=j; }
-                            }
-                            if (best_edge < 0) continue;
-                            int jn=(best_edge+1)%poly_n;
-                            int p_pos = (all_verts[polygon[best_edge]*3+pu] >= all_verts[polygon[jn]*3+pu])
-                                        ? best_edge : jn;
-                            int k = 0;
-                            for (int j=0; j<=p_pos; j++) cap_tris[k++]=polygon[j];
-                            for (int j=0; j<hs; j++) cap_tris[k++]=hole[(m_idx+j)%hs];
-                            cap_tris[k++]=hole[m_idx]; cap_tris[k++]=polygon[p_pos];
-                            for (int j=p_pos+1; j<poly_n; j++) cap_tris[k++]=polygon[j];
-                            for (int j=0; j<k; j++) polygon[j]=cap_tris[j];
-                            poly_n=k;
                         }
+                        poly_n = __shfl_sync(0xFFFFFFFF, poly_n, 0);
+                        __syncwarp();
 
-                        // Ear-clip this polygon
+                        // Ear-clip this polygon (warp-cooperative)
                         if (poly_n >= 3) {
                             int* prev_a = ear_prevnext.raw();
                             int* next_a = ear_prevnext.raw() + poly_n;
-                            for (int i = 0; i < poly_n; i++) {
+                            for (int i = lane; i < poly_n; i += 32) {
                                 prev_a[i]=(i+poly_n-1)%poly_n; next_a[i]=(i+1)%poly_n;
                             }
+                            __syncwarp();
                             int remaining=poly_n, cur=0, max_iter=poly_n*poly_n, iter=0;
                             while (remaining > 3 && iter < max_iter) {
                                 iter++;
@@ -830,79 +885,96 @@ __device__ inline PartPair plane_cut_block(
                                 float un=all_verts[vn*3+pu],  vn_=all_verts[vn*3+pv_ax];
                                 float cross=(uc-up)*(vn_-vp_)-(vc_-vp_)*(un-up);
                                 if (cross<=1e-10f) { cur=next_a[cur]; continue; }
-                                int ear=1, chk=next_a[n];
-                                while (chk != p) {
-                                    int vi_=polygon[chk];
+                                // Warp-parallel point-in-triangle test: scan all
+                                // polygon indices, skip removed vertices.
+                                int ear=1;
+                                for (int idx = lane; idx < poly_n; idx += 32) {
+                                    if (idx == p || idx == cur || idx == n) continue;
+                                    // Check if vertex is still active (not removed)
+                                    if (next_a[prev_a[idx]] != idx) continue;
+                                    int vi_=polygon[idx];
                                     float cu=all_verts[vi_*3+pu], cv=all_verts[vi_*3+pv_ax];
                                     if (fabsf(cu-up)+fabsf(cv-vp_)>1e-6f &&
                                         fabsf(cu-uc)+fabsf(cv-vc_)>1e-6f &&
                                         fabsf(cu-un)+fabsf(cv-vn_)>1e-6f &&
                                         pc_pt_in_tri(cu,cv,up,vp_,uc,vc_,un,vn_))
-                                        { ear=0; break; }
-                                    chk=next_a[chk];
+                                        { ear=0; }
                                 }
+                                if (__ballot_sync(0xFFFFFFFF, !ear))
+                                    ear = 0;
+                                else
+                                    ear = 1;
                                 if (ear) {
-                                    cap_tris[n_cap*3]=vp; cap_tris[n_cap*3+1]=vc; cap_tris[n_cap*3+2]=vn;
-                                    n_cap++; next_a[p]=n; prev_a[n]=p; remaining--; cur=n; iter=0;
+                                    if (lane == 0) {
+                                        cap_tris[n_cap*3]=vp; cap_tris[n_cap*3+1]=vc; cap_tris[n_cap*3+2]=vn;
+                                        n_cap++; next_a[p]=n; prev_a[n]=p;
+                                    }
+                                    remaining--; cur=n; iter=0;
+                                    __syncwarp();  // ensure prev_a/next_a visible
                                 } else { cur=next_a[cur]; }
                             }
-                            if (remaining == 3) {
+                            if (remaining == 3 && lane == 0) {
                                 int p=prev_a[cur], n=next_a[cur];
                                 cap_tris[n_cap*3]=polygon[p]; cap_tris[n_cap*3+1]=polygon[cur]; cap_tris[n_cap*3+2]=polygon[n];
                                 n_cap++;
                             }
+                            __syncwarp();
                         }
                     } // end for each outer loop
 
                     // lv, loop_starts, loop_sizes, sort buf no longer needed
-                    heap_free(scratch_heap, lv2_ptr);   lv2_ptr = NULL;
-                    heap_free(scratch_heap, ls_ptr);     ls_ptr  = NULL;
-                    heap_free(scratch_heap, lsz_ptr);    lsz_ptr = NULL;
-                    heap_free(scratch_heap, sb_ptr);      sb_ptr  = NULL;
+                    if (lane == 0) {
+                        heap_free(scratch_heap, lv2_ptr);   lv2_ptr = NULL;
+                        heap_free(scratch_heap, ls_ptr);     ls_ptr  = NULL;
+                        heap_free(scratch_heap, lsz_ptr);    lsz_ptr = NULL;
+                        heap_free(scratch_heap, sb_ptr);      sb_ptr  = NULL;
 
-                    // polygon and ear_prevnext no longer needed
-                    heap_free(scratch_heap, poly_ptr); poly_ptr = NULL;
-                    heap_free(scratch_heap, ep_ptr);   ep_ptr   = NULL;
+                        // polygon and ear_prevnext no longer needed
+                        heap_free(scratch_heap, poly_ptr); poly_ptr = NULL;
+                        heap_free(scratch_heap, ep_ptr);   ep_ptr   = NULL;
 
-                    // Compute cap winding flip; broadcast cap state to shared memory.
-                    // Cap tris stay in cap_ptr and are merged into output during phase 13.
-                    {
-                        float n2d[3]={0,0,0};
-                        if      (pu==0 && pv_ax==1) n2d[2]=1.0f;
-                        else if (pu==1 && pv_ax==2) n2d[0]=1.0f;
-                        else                        n2d[1]=-1.0f;
-                        s_flip_pos = (n2d[0]*(-pa)+n2d[1]*(-pb)+n2d[2]*(-pc_n) < 0) ? 1 : 0;
+                        // Compute cap winding flip; broadcast cap state to shared memory.
+                        // Cap tris stay in cap_ptr and are merged into output during phase 13.
+                        {
+                            float n2d[3]={0,0,0};
+                            if      (pu==0 && pv_ax==1) n2d[2]=1.0f;
+                            else if (pu==1 && pv_ax==2) n2d[0]=1.0f;
+                            else                        n2d[1]=-1.0f;
+                            s_flip_pos = (n2d[0]*(-pa)+n2d[1]*(-pb)+n2d[2]*(-pc_n) < 0) ? 1 : 0;
+                        }
+                        s_cap_tris = (int*)cap_ptr; cap_ptr = NULL;  // ownership transferred to shared
                     }
-                    s_cap_tris = (int*)cap_ptr; cap_ptr = NULL;  // ownership transferred to shared
                 } // kern_ok after loop-phase alloc
             } // n_boundary > 0
         // Broadcast phase-13 state.  Local scratch lv_ptr..sb_ptr are all NULL
         // at this point (freed inline above); heap_free is NULL-safe.
-        s_n_cap     = n_cap;
-        s_total_pos = n_pos;
-        s_total_neg = n_neg;
-        s_alloc_ok  = kern_ok;   // repurpose flag for phase-13 gate
-        s_pr_ptr = NULL; s_nr_ptr = NULL;
-        if (kern_ok) {
-            void* p;
-            if (heap_alloc(scratch_heap, (unsigned int)(n_all * (int)sizeof(int)), &p) == HEAP_OK)
-                s_pr_ptr = (int*)p;
-            else { s_alloc_ok = 0; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
-            if (s_alloc_ok) {
+        if (lane == 0) {
+            s_n_cap     = n_cap;
+            s_total_pos = n_pos;
+            s_total_neg = n_neg;
+            s_alloc_ok  = kern_ok;   // repurpose flag for phase-13 gate
+            s_pr_ptr = NULL; s_nr_ptr = NULL;
+            if (kern_ok) {
+                void* p;
                 if (heap_alloc(scratch_heap, (unsigned int)(n_all * (int)sizeof(int)), &p) == HEAP_OK)
-                    s_nr_ptr = (int*)p;
+                    s_pr_ptr = (int*)p;
                 else { s_alloc_ok = 0; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+                if (s_alloc_ok) {
+                    if (heap_alloc(scratch_heap, (unsigned int)(n_all * (int)sizeof(int)), &p) == HEAP_OK)
+                        s_nr_ptr = (int*)p;
+                    else { s_alloc_ok = 0; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+                }
             }
+            heap_free(scratch_heap, lv_ptr); s_be_a = NULL;
+            heap_free(scratch_heap, lv2_ptr);
+            heap_free(scratch_heap, ls_ptr);
+            heap_free(scratch_heap, lsz_ptr);
+            heap_free(scratch_heap, poly_ptr);
+            // cap_ptr ownership transferred to s_cap_tris; freed via PC_FREE_ALL_SHARED_SCRATCH
+            heap_free(scratch_heap, ep_ptr);
+            heap_free(scratch_heap, sb_ptr);
         }
-        heap_free(scratch_heap, lv_ptr); s_be_a = NULL;
-        heap_free(scratch_heap, lv2_ptr);
-        heap_free(scratch_heap, ls_ptr);
-        heap_free(scratch_heap, lsz_ptr);
-        heap_free(scratch_heap, poly_ptr);
-        // cap_ptr ownership transferred to s_cap_tris; freed via PC_FREE_ALL_SHARED_SCRATCH
-        heap_free(scratch_heap, ep_ptr);
-        heap_free(scratch_heap, sb_ptr);
-    } // end if (tid == 0) phases 10-12
+    } // end if (warp_id == 0) phases 10-12
     __syncthreads();
 
     // =========================================================================
