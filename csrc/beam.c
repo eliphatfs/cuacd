@@ -488,7 +488,7 @@ int beam_decompose(
             void* args[] = { &d_current, &ctx->d_pool_struct, &d_err };
             int nblocks = 2 * 3 * cuts_per_axis * cur_nitems;
             if (nblocks < 1) nblocks = 1;
-            LCHECK(cuLaunchKernel(fn_hull, nblocks, 1, 1, 64, 1, 1,
+            LCHECK(cuLaunchKernel(fn_hull, nblocks, 1, 1, 32, 1, 1,
                                   0, s, args, NULL));
         }
 

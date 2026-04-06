@@ -31,6 +31,7 @@ extern "C" __global__ void kdop_hull_kernel(
     int err = 0;
     Mesh mesh = kdop_hull_block(
         pts + (long long)start * 3, count,
+        NULL, 0,
         heap, scratch_heap,
         &volume, &err);
 

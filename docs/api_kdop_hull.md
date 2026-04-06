@@ -1,69 +1,85 @@
-# k-DOP Approximate Convex Hull — `kdop_hull_block`
+# Convex Hull via Extreme-Point Prefilter — `kdop_hull_block`
 
 ## Overview
 
-`kdop_hull_block` (`cuda/kdop_hull.cuh`) computes an approximate convex hull of a point cloud using a Discrete Oriented Polytope (k-DOP) with 40 icosphere-level-1 face normals as axes (80 half-spaces total). The result is a superset of the true convex hull — it contains all input points but may have larger volume.
+`kdop_hull_block` (`cuda/kdop_hull.cuh`) computes an exact convex hull of a point cloud using a two-stage algorithm:
 
-**Block-level**: all `KDOP_BLOCK` (64) threads in the block must call with identical arguments.
+- **Fast path** (`nv ≤ 1024`): runs `hull_dandc_warp_mesh` directly on the input.
+- **Main path** (`nv > 1024`): uses 40 icosphere-L1 axes to identify up to 80 extreme vertices, builds a rough inner hull from those extremes, filters interior points via a face half-space test, then runs `hull_dandc_warp_mesh` on the survivor set.
+
+**Single-warp**: all `KDOP_BLOCK` (32) threads — i.e. exactly one warp — must call with identical arguments.
 
 ## Signature
 
 ```c
 __device__ inline Mesh kdop_hull_block(
     const float* verts, int nv,
-    DeviceHeap* heap,          // output: final mesh chunk
-    DeviceHeap* scratch_heap,  // temporaries (freed on return)
-    float* out_volume,         // result written to *out_volume on all threads
-    int* kernel_error)         // atomicOr'd on failure
+    const int*   tris,  int nt,  // accepted but unused
+    DeviceHeap*  heap,           // output: final mesh chunk
+    DeviceHeap*  scratch_heap,   // temporaries (freed on return)
+    float*       out_volume,     // written on all threads
+    int*         kernel_error)   // atomicOr'd on failure
 ```
 
 Returns a heap-allocated `Mesh`. Returns `{NULL,NULL,0,0}` if `nv < 4`.
 
 ## Algorithm
 
-### Step 1 — Centroid
-Block-parallel sum over all vertices for x, y, z. Warp shuffle within each warp, then accumulate via shared memory across warps. Divide by `nv`. O(nv / KDOP_BLOCK) work per thread.
+### Fast path — nv ≤ 1024
 
-### Step 2 — k-DOP Extremes
-For each of 40 axes (loop), all threads scan their assigned vertices and compute local max/min of the dot product with `vert - centroid`. Warp reduce, then inter-warp reduce via shared memory → `s_max[40]` and `s_min[40]`. Gives 80 half-spaces: `axis_i · x ≤ s_max[i]` and `(-axis_i) · x ≤ -s_min[i]`.
+Call `hull_dandc_warp_mesh(verts, nv, lane, heap, scratch_heap, &err)` directly, then `mesh_volume_warp`. Returns the exact D&C hull.
 
-### Step 3 — Polar Dual Vertices (thread 0)
-For each half-space with outward normal `n` and offset `h > ε`, the dual point is `n / h`. Up to 80 dual points stored in scratch heap (`KDOP_MAX_DUAL_PTS * 3 * sizeof(float)`). Degenerate half-spaces (`|h| < KDOP_EPS = 1e-7`) are skipped.
+### Main path — nv > 1024
 
-### Step 4 — Convex Hull of Dual Points (warp 0)
-`hull_dandc_warp_mesh(dual_pts, n_dual, lane, scratch_heap, scratch_heap, err)`. The dual hull is allocated on `scratch_heap` (temporary).
+#### Step 1 — Centroid
+Warp-level sum over all vertices for x, y, z. Divide by `nv`. O(nv / 32) work per lane.
 
-### Step 5 — Primal Vertices (thread 0)
-Each triangle `(d_a, d_b, d_c)` of the dual hull corresponds to one primal vertex: solve the 3×3 system `[d_a; d_b; d_c] · x = (1, 1, 1)` via Cramer's rule. Degenerate triangles (near-singular matrix) are skipped. Primal points allocated on scratch heap (`nt_dual * 3 * sizeof(float)`).
+#### Step 2 — Extreme vertices (warp argmax/argmin with index)
+For each of 40 axes, all lanes scan their assigned vertices and maintain a local `(value, index)` pair for max and min of `axis · (vert - centroid)`. Warp-shuffle reduction yields the global argmax and argmin per axis. Lane 0 stores the 80 result indices in `s_extreme_idx[80]`.
 
-The dual hull mesh is freed immediately after primal vertices are extracted.
+#### Step 3 — Deduplicated extreme point array (lane 0)
+Collect unique vertex indices from `s_extreme_idx` (O(80²) dedup). Copy centroid-subtracted coordinates into scratch-heap buffer `s_extreme_pts` (≤ 80 × 3 floats).
 
-### Step 6 — Convex Hull of Primal Vertices (warp 0)
-`hull_dandc_warp_mesh(primal_pts, n_primal, lane, heap, scratch_heap, err)`. Output allocated on `heap` (persistent).
+#### Step 4 — Rough inner hull (all lanes)
+`hull_dandc_warp_mesh(s_extreme_pts, n_extreme, lane, scratch_heap, scratch_heap, err)` — exact D&C hull of the extreme points. Result is an inner approximation of the true convex hull.
 
-### Step 6b — Translate Back (block-parallel)
-Add centroid to all output vertices (the centroid was subtracted before step 2).
+#### Step 5 — Allocate filtered buffer (lane 0)
+Scratch-heap buffer for up to `nv + ext_hull.nv` float3 entries.
 
-### Step 7 — Volume (warp 0)
+#### Step 6 — Filter original vertices (all lanes, ballot/popcount)
+For each original vertex `v`, check all faces of the rough hull: compute outward normal `n = cross(b−a, c−a)`, flip so centroid (origin) is inside, test `n·v > n·a`. Keep vertex if ANY face says outside. Collect survivors using warp ballot/popcount into the filtered buffer.
+
+#### Step 7 — Append rough-hull vertices (all lanes)
+Copy all vertices of the rough hull into the filtered buffer (ensures boundary coverage regardless of floating-point sign at hull faces).
+
+Free the rough hull from scratch_heap.
+
+#### Step 8 — Final hull (all lanes)
+`hull_dandc_warp_mesh(s_filtered, n_filtered, lane, heap, scratch_heap, err)` — exact D&C hull of the filtered + boundary set.
+
+#### Step 8b — Translate back (warp-parallel)
+Add centroid to all output vertices.
+
+#### Step 9 — Volume
 `mesh_volume_warp(&s_result, lane)`.
 
 ## Memory Usage (scratch heap)
 
 | Allocation | Size | Lifetime |
 |---|---|---|
-| Dual points | `KDOP_MAX_DUAL_PTS * 3 * 4` = 960 B | Steps 3–5 |
-| Dual hull mesh | `hull_dandc_warp_mesh` scratch + output | Freed end of step 5 |
-| Primal points | `nt_dual * 3 * 4` ≤ 2 KB | Steps 5–6 |
+| Extreme pts | `80 × 3 × 4` = 960 B | Steps 3–cleanup |
+| Rough hull mesh | `hull_dandc_warp_mesh` scratch + output | Freed after step 7 |
+| Filtered buffer | `(nv + ext_hull.nv) × 3 × 4` | Steps 5–cleanup |
 
 All scratch freed before return.
 
 ## Axes
 
-40 normalized face normals of a level-1 icosphere (icosahedron subdivided once → 80 faces, antipodal pairs merged). Stored as `__device__ static const float KDOP_AXES[40][3]`.
+40 normalized face normals of a level-1 icosphere (icosahedron subdivided once → 80 faces, antipodal pairs merged). Stored as `__device__ static const float KDOP_AXES[40][3]`. Used only for finding extreme-point indices; not used to define the output hull geometry.
 
-## Known Limitation: Volume Overestimate
+## Correctness
 
-The k-DOP is a bounding volume — it always **contains** the true convex hull. When used in beam search decomposition, `hull_vol - mesh_vol` is inflated vs. the exact D&C hull, causing the cost function to remain high and triggering more splits than intended. Mitigation options: scale the k-DOP volume down by an empirical factor, or switch to exact hull once parts are small enough.
+The filtered set contains all true convex hull vertices because the rough hull (convex hull of extreme points) is an inner approximation of the true hull. Any true hull vertex that is not one of the 80 extreme points lies outside the rough hull and therefore passes the filter. The extreme-hull vertices are explicitly appended in step 7.
 
 ## Python API
 
@@ -73,4 +89,4 @@ with coacd_gpu.Context() as ctx:
     # results[i] = (verts: np.ndarray (nv,3), tris: np.ndarray (nt,3), volume: float)
 ```
 
-Output buffer bounds: `max_hv=160`, `max_ht=320` (derived from Euler's formula on the dual hull of ≤80 points).
+Output buffer bounds: `max_hv=4096`, `max_ht=8192`.

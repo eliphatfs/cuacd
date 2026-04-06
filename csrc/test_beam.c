@@ -395,7 +395,7 @@ int beam_kdop_hull(
     CHECK_CU(cuMemcpyHtoDAsync(d_pts, pts,     (size_t)total_pts * 3 * sizeof(float), s));
     CHECK_CU(cuMemcpyHtoDAsync(d_off, offsets, (size_t)(n_hulls + 1) * sizeof(int),   s));
 
-    int block_size = 64;  // KDOP_BLOCK
+    int block_size = 32;  // KDOP_BLOCK
     int n_blocks   = n_hulls;
 
     void* args[] = {

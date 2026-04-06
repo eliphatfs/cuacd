@@ -277,6 +277,7 @@ extern "C" __global__ void beam_hull(
     float hvol = 0.0f;
     Mesh hull = kdop_hull_block(
         p->mesh.verts, p->mesh.nv,
+        p->mesh.tris, p->mesh.nt,
         &pool->heap, &pool->scratch,
         &hvol, err);
 

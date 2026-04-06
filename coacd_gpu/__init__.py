@@ -166,12 +166,12 @@ class Context:
     # ------------------------------------------------------------------
 
     def batch_kdop_hull_mesh(self, pts_list):
-        """Compute approximate convex hull mesh via k-DOP for a batch of point clouds.
+        """Compute convex hull mesh for a batch of point clouds.
 
-        Uses 40 icosphere-L1 axes (80 half-spaces) to build a k-DOP, then
-        extracts the exact hull of the k-DOP vertices via polar duality and D&C.
-        Faster than D&C hull for large point clouds; result is a superset of the
-        true convex hull (it contains the input).
+        For meshes with ≤1024 vertices, runs the exact D&C hull directly.
+        For larger meshes, finds 80 extreme vertices (40 icosphere axes ×
+        max/min), builds a rough inner hull, filters interior points via
+        half-space test, then runs the exact D&C hull on the survivor set.
 
         Returns list of (hull_verts, hull_tris, hull_volume) per input.
         """
@@ -184,11 +184,11 @@ class Context:
         for i, p in enumerate(pts_arrays):
             offsets[i + 1] = offsets[i] + len(p)
 
-        # k-DOP has up to 80 dual points. Their convex hull has at most 2*80-4=156
-        # triangles (Euler), each becoming a primal vertex. The final hull of those
-        # ≤156 primal vertices has at most 2*156-4=308 triangles.
-        max_hv = 160  # primal verts = dual triangles ≤ 2*80-4
-        max_ht = 320  # final hull tris ≤ 2*160-4
+        # Output bounds: the final hull is an exact D&C hull of the filtered
+        # point set. In the worst case the hull has O(n) verts/tris, but we
+        # bound by a generous fixed cap sufficient for typical meshes.
+        max_hv = 4096
+        max_ht = 8192
         total_pts = int(offsets[-1])
 
         out_verts   = np.empty(n_hulls * max_hv * 3, dtype=np.float32)

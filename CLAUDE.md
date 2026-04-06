@@ -22,7 +22,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   hull_dandc.cuh      #   Preparata-Hong D&C hull (Bullet port); hull_dandc_warp_mesh returns Mesh via heap
   warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
-  kdop_hull.cuh       #   kdop_hull_block: block-level (64 threads) approximate hull via k-DOP (40 icosphere axes)
+  kdop_hull.cuh       #   kdop_hull_block: single-warp (32 threads) exact hull via extreme-point prefilter + D&C
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   structs.cuh         #   Device-side: Mesh, Part, PartPair, WorkItem, AlgoState
   mm.cu               #   heap_init_kernel
@@ -54,7 +54,7 @@ docs/                 # Detailed documentation
   api_plane_cut.md    #   plane_cut_block API details
   api_beam.md         #   Beam search kernel APIs (initialize, expansion, hull, sort, finalize, decompose)
   api_heap_allocator.md#  Heap arena allocator design
-  api_kdop_hull.md    #   k-DOP approximate hull algorithm and kdop_hull_block API
+  api_kdop_hull.md    #   kdop_hull_block algorithm and API (extreme-point prefilter + D&C)
   implementation_notes.md# Resolved bugs and implementation gotchas
 CoACD/                # Reference C++ CoACD (embedded repo, not a submodule)
 ```
@@ -147,9 +147,9 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 **Plane Cut** (`plane_cut.cuh`): Block-level (64 threads) mesh splitting along an arbitrary plane. Produces `PartPair` with pos/neg meshes. See `docs/api_plane_cut.md`.
 
-**k-DOP Approximate Hull** (`kdop_hull.cuh`): Block-level (64 threads) approximate convex hull using 40 icosphere-L1 face normals as k-DOP axes (80 half-spaces total). Algorithm: centroid → block-parallel k-DOP extreme projections → polar dual vertices → D&C hull of dual points (warp 0) → 3-plane intersection per dual triangle → D&C hull of primal vertices (warp 0) → volume. Exposed as `ctx.batch_kdop_hull_mesh()`. Used by `beam_hull` kernel. The k-DOP overestimates the true convex hull volume — this inflates the concavity cost `hull_vol - mesh_vol` and causes the beam search to over-decompose unless a correction factor is applied.
+**Hull with Extreme-Point Prefilter** (`kdop_hull.cuh`): Single-warp (32 threads). Fast path: direct D&C hull for nv ≤ 1024. Main path: warp argmax/argmin over 40 icosphere axes finds up to 80 extreme vertices → D&C rough inner hull → ballot/popcount half-space filter discards interior points → D&C final hull of survivors. Result is the exact convex hull. Exposed as `ctx.batch_kdop_hull_mesh()`. Used by `beam_hull` kernel. See `docs/api_kdop_hull.md`.
 
-**Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → sort`. Pipelined in stream order, sync only after finalize. `beam_hull` uses `kdop_hull_block` (64 threads/block). See `docs/api_beam.md`.
+**Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → sort`. Pipelined in stream order, sync only after finalize. `beam_hull` uses `kdop_hull_block` (32 threads/block). See `docs/api_beam.md`.
 
 ### Utility Functions
 
@@ -158,7 +158,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 | `signed_tet_volume` | per-thread | geometry.cuh |
 | `block_reduce_sum/bbox/max/count` | block (syncthreads) | reduce.cuh |
 | `mesh_volume_warp` | warp (32 lanes) | mesh_volume.cuh |
-| `kdop_hull_block` | block (64 threads) | kdop_hull.cuh |
+| `kdop_hull_block` | warp (32 threads) | kdop_hull.cuh |
 | `pool_alloc` | thread 0 only | allocator.cuh |
 | `heap_alloc` / `heap_free` | thread 0 only | allocator.cuh |
 | `atomicMinF` / `atomicMaxF` | per-thread | common.cuh |
@@ -178,10 +178,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 ### Working
 - D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
-- k-DOP approximate hull (`kdop_hull_block`, `batch_kdop_hull_mesh`) — 5 tests pass. Used by `beam_hull`.
-
-### Known Limitations
-- k-DOP hull **overestimates** true convex hull volume (it is a superset). In `beam_hull` this inflates `hull_vol - mesh_vol`, causing the decomposition to split more aggressively than with exact hull. A volume correction factor or fallback to D&C hull may be needed for production quality.
+- `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Used by `beam_hull`. Produces exact hull via extreme-point prefilter + D&C.
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input
