@@ -6,7 +6,7 @@
 //
 // Main path (nv > 1024):
 //   1. Find 40 max + 40 min extreme vertices using KDOP_AXES (warp argmax/argmin).
-//   2. Deduplicate and collect up to 80 unique extreme vertices.
+//   2. Collect up to 80 extreme vertices (hull_dandc handles deduplication).
 //   3. Run hull_dandc_warp_mesh on extreme vertices → rough inner hull.
 //   4. Filter original vertices: keep any point strictly outside at least one face
 //      of the rough hull (ballot/popcount collect).
@@ -183,24 +183,14 @@ __device__ inline Mesh kdop_hull_block(
             s_extreme_pts = (float*)ptr;
             PC_BUF(float, ep, s_extreme_pts, KDOP_MAX_EXTREMES * 3);
             PC_BUF(float, vb, (float*)verts, nv * 3);
-            int n_ext = 0;
-            int seen[KDOP_MAX_EXTREMES];
             for (int i = 0; i < KDOP_MAX_EXTREMES; i++) {
                 int idx = s_extreme_idx[i];
-                bool dup = false;
-                for (int j = 0; j < n_ext; j++) {
-                    if (seen[j] == idx) { dup = true; break; }
-                }
-                if (!dup) {
-                    seen[n_ext] = idx;
-                    ep[n_ext * 3 + 0] = vb[idx * 3 + 0];
-                    ep[n_ext * 3 + 1] = vb[idx * 3 + 1];
-                    ep[n_ext * 3 + 2] = vb[idx * 3 + 2];
-                    n_ext++;
-                }
+                ep[i * 3 + 0] = vb[idx * 3 + 0];
+                ep[i * 3 + 1] = vb[idx * 3 + 1];
+                ep[i * 3 + 2] = vb[idx * 3 + 2];
             }
-            s_n_extreme = n_ext;
-            DPRINTF("[kdop blk=%d] step2: %d unique extremes (nv=%d)\n", blockIdx.x, n_ext, nv);
+            s_n_extreme = KDOP_MAX_EXTREMES;
+            DPRINTF("[kdop blk=%d] step2: %d extremes (nv=%d)\n", blockIdx.x, KDOP_MAX_EXTREMES, nv);
         }
     }
     __syncwarp();
