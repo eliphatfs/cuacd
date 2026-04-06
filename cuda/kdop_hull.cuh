@@ -120,8 +120,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         if (lane == 0) {
             s_result = m;
             if (err) s_local_err = err;
-            DPRINTF("[kdop blk=%d] fast path done: nv=%d nt=%d err=%d\n",
-                    blockIdx.x, m.nv, m.nt, err);
         }
         __syncwarp();
         if (!s_local_err && s_result.verts) {
@@ -187,7 +185,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
                 ep[i * 3 + 2] = vb[idx * 3 + 2];
             }
             s_n_extreme = KDOP_MAX_EXTREMES;
-            DPRINTF("[kdop blk=%d] step2: %d extremes (nv=%d)\n", blockIdx.x, KDOP_MAX_EXTREMES, nv);
         }
     }
     __syncwarp();
@@ -208,8 +205,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         if (lane == 0) {
             s_ext_hull = em;
             if (err) s_local_err = 2;
-            DPRINTF("[kdop blk=%d] step3: rough hull nv=%d nt=%d err=%d\n",
-                    blockIdx.x, em.nv, em.nt, err);
         }
     }
     __syncwarp();
@@ -223,8 +218,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         int max_pts = nv + s_ext_hull.nv;
         if (heap_alloc(scratch_heap, max_pts * 3 * sizeof(float), &ptr) != HEAP_OK) {
             s_local_err = 3;
-            DPRINTF("[kdop blk=%d] step4: filtered alloc failed (max_pts=%d)\n",
-                    blockIdx.x, max_pts);
         } else {
             s_filtered = (float*)ptr;
             s_n_filtered = 0;
@@ -339,8 +332,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
             if (lane == 0) {
                 s_result = fm;
                 if (err) s_local_err = 4;
-                DPRINTF("[kdop blk=%d] step7: final hull nv=%d nt=%d err=%d\n",
-                        blockIdx.x, fm.nv, fm.nt, err);
             }
         }
     }

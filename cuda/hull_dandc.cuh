@@ -1802,8 +1802,6 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     }
     __syncwarp();
 
-    //if (lane == 0) DPRINTF("[postsort] blk=%d n=%d arena=%d\n", blockIdx.x, count, arena_bytes);
-
     // --- Allocate per-lane D&C stacks from WarpPool (lane 0), rewind after D&C ---
     BtDCStackItem* all_dc_stacks = NULL;
     int pre_dc_offset = 0;
