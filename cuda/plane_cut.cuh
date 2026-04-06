@@ -207,7 +207,7 @@ __device__ inline PartPair plane_cut_block(
     __shared__ int    s_nbase[PC_BLOCK];
 
     // Warp-cooperative phases 10-12: shared broadcast slots for heap pointers
-    __shared__ void*  s_w_ptrs[7];   // ls, lsz, lv2, poly, cap, ep, sb
+    __shared__ void*  s_w_ptrs[2];   // loop_blk, cap_ptr
     __shared__ int    s_w_kern_ok;
     __shared__ int    s_w_n_loops;
     __shared__ int    s_w_pu;
@@ -624,47 +624,50 @@ __device__ inline PartPair plane_cut_block(
         void* lv_ptr   = (void*)s_be_a;  // boundary edge pairs (be_a), freed after loop recon
 
         // Lane-0-only scratch — all NULL so heap_free is always safe.
-        void* lv2_ptr  = NULL;  // loop vertex sequence (lv)
-        void* ls_ptr   = NULL;  // loop_starts
-        void* lsz_ptr  = NULL;  // loop_sizes
-        void* poly_ptr = NULL;  // polygon
-        void* cap_ptr  = NULL;  // cap_tris (ear-clip output)
-        void* ep_ptr   = NULL;  // ear_prevnext
-        void* sb_ptr   = NULL;  // inner sort buf (inner_idx + inner_max_u, 256 each)
+        void* loop_blk = NULL;  // merged block for ls/lsz/lv2/poly/ep/sb
+        void* cap_ptr  = NULL;  // cap_tris (separate: ownership transfers to s_cap_tris)
 
             // --- Phase 10-12: loop reconstruction + polygon + ear-clip ---
             if (n_boundary > 0) {
                 if (lane == 0) {
-                    if (heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &ls_ptr)  != HEAP_OK) { kern_ok = 0; }
-                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &lsz_ptr) != HEAP_OK) { kern_ok = 0; }
-                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(n_boundary * (int)sizeof(int)), &lv2_ptr) != HEAP_OK) { kern_ok = 0; }
-                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * (int)sizeof(int)), &poly_ptr) != HEAP_OK) { kern_ok = 0; }
-                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * (int)sizeof(int)), &cap_ptr)  != HEAP_OK) { kern_ok = 0; }
-                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)((n_boundary*4+64) * 2 * (int)sizeof(int)), &ep_ptr)   != HEAP_OK) { kern_ok = 0; }
-                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(256 * (int)sizeof(int) + 256 * (int)sizeof(float)), &sb_ptr) != HEAP_OK) { kern_ok = 0; }
+                    // Merged allocation: ls + lsz + lv2 + poly + ep + sb
+                    // All int-sized, so natural alignment within the block is fine.
+                    int poly_cap_ = n_boundary * 4 + 64;
+                    int sb_ints = 256 + 256;  // inner_idx(256 int) + inner_max_u(256 float)
+                    unsigned int loop_blk_sz = (unsigned int)(
+                        (n_boundary * 3            // ls + lsz + lv2
+                         + poly_cap_               // polygon
+                         + poly_cap_ * 2           // ear_prevnext
+                         + sb_ints                 // inner sort buf
+                        ) * (int)sizeof(int));
+                    if (heap_alloc(scratch_heap, loop_blk_sz, &loop_blk) != HEAP_OK) { kern_ok = 0; }
+                    if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(poly_cap_ * (int)sizeof(int)), &cap_ptr) != HEAP_OK) { kern_ok = 0; }
                     if (!kern_ok) atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);
-                    // Broadcast pointers to all lanes via shared memory
-                    s_w_ptrs[0] = ls_ptr; s_w_ptrs[1] = lsz_ptr; s_w_ptrs[2] = lv2_ptr;
-                    s_w_ptrs[3] = poly_ptr; s_w_ptrs[4] = cap_ptr; s_w_ptrs[5] = ep_ptr;
-                    s_w_ptrs[6] = sb_ptr;
+                    s_w_ptrs[0] = loop_blk; s_w_ptrs[1] = cap_ptr;
                     s_w_kern_ok = kern_ok;
                 }
                 __syncwarp();
                 kern_ok = s_w_kern_ok;
-                ls_ptr = s_w_ptrs[0]; lsz_ptr = s_w_ptrs[1]; lv2_ptr = s_w_ptrs[2];
-                poly_ptr = s_w_ptrs[3]; cap_ptr = s_w_ptrs[4]; ep_ptr = s_w_ptrs[5];
-                sb_ptr = s_w_ptrs[6];
+                loop_blk = s_w_ptrs[0]; cap_ptr = s_w_ptrs[1];
 
                 if (kern_ok) {
                     int poly_cap = n_boundary * 4 + 64;
-                    PC_BUF(int,   loop_starts,  ls_ptr,   n_boundary);
-                    PC_BUF(int,   loop_sizes,   lsz_ptr,  n_boundary);
-                    PC_BUF(int,   lv,           lv2_ptr,  n_boundary);
-                    PC_BUF(int,   polygon,      poly_ptr, poly_cap);
+                    // Carve sub-buffers from merged block
+                    int* blk_base       = (int*)loop_blk;
+                    int* ls_raw         = blk_base;
+                    int* lsz_raw        = ls_raw   + n_boundary;
+                    int* lv2_raw        = lsz_raw  + n_boundary;
+                    int* poly_raw       = lv2_raw  + n_boundary;
+                    int* ep_raw         = poly_raw + poly_cap;
+                    int* sb_raw         = ep_raw   + poly_cap * 2;
+                    PC_BUF(int,   loop_starts,  ls_raw,   n_boundary);
+                    PC_BUF(int,   loop_sizes,   lsz_raw,  n_boundary);
+                    PC_BUF(int,   lv,           lv2_raw,  n_boundary);
+                    PC_BUF(int,   polygon,      poly_raw, poly_cap);
                     PC_BUF(int,   cap_tris,     cap_ptr,  poly_cap * 3);
-                    PC_BUF(int,   ear_prevnext, ep_ptr,   poly_cap * 2);
-                    PC_BUF(int,   inner_idx,    sb_ptr,   256);
-                    float* inner_max_u  = (float*)((int*)sb_ptr + 256);
+                    PC_BUF(int,   ear_prevnext, ep_raw,   poly_cap * 2);
+                    PC_BUF(int,   inner_idx,    sb_raw,   256);
+                    float* inner_max_u  = (float*)(sb_raw + 256);
 
                     // Phase 10: reconstruct loops from boundary edge pairs
                     // Lane 0 drives chain-following; all lanes help with inner search.
@@ -922,16 +925,9 @@ __device__ inline PartPair plane_cut_block(
                         }
                     } // end for each outer loop
 
-                    // lv, loop_starts, loop_sizes, sort buf no longer needed
+                    // Merged loop block no longer needed
                     if (lane == 0) {
-                        heap_free(scratch_heap, lv2_ptr);   lv2_ptr = NULL;
-                        heap_free(scratch_heap, ls_ptr);     ls_ptr  = NULL;
-                        heap_free(scratch_heap, lsz_ptr);    lsz_ptr = NULL;
-                        heap_free(scratch_heap, sb_ptr);      sb_ptr  = NULL;
-
-                        // polygon and ear_prevnext no longer needed
-                        heap_free(scratch_heap, poly_ptr); poly_ptr = NULL;
-                        heap_free(scratch_heap, ep_ptr);   ep_ptr   = NULL;
+                        heap_free(scratch_heap, loop_blk); loop_blk = NULL;
 
                         // Compute cap winding flip; broadcast cap state to shared memory.
                         // Cap tris stay in cap_ptr and are merged into output during phase 13.
@@ -966,13 +962,8 @@ __device__ inline PartPair plane_cut_block(
                 }
             }
             heap_free(scratch_heap, lv_ptr); s_be_a = NULL;
-            heap_free(scratch_heap, lv2_ptr);
-            heap_free(scratch_heap, ls_ptr);
-            heap_free(scratch_heap, lsz_ptr);
-            heap_free(scratch_heap, poly_ptr);
+            heap_free(scratch_heap, loop_blk);
             // cap_ptr ownership transferred to s_cap_tris; freed via PC_FREE_ALL_SHARED_SCRATCH
-            heap_free(scratch_heap, ep_ptr);
-            heap_free(scratch_heap, sb_ptr);
         }
     } // end if (warp_id == 0) phases 10-12
     __syncthreads();
