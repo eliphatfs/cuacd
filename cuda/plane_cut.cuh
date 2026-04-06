@@ -168,6 +168,7 @@ __device__ inline PartPair plane_cut_block(
     int tid     = threadIdx.x;
     int lane    = tid & 31;
     int warp_id = tid >> 5;
+    long long t_start = clock64();
 
     const float* vertices  = mesh->verts;
     const int*   triangles = mesh->tris;
@@ -227,7 +228,6 @@ __device__ inline PartPair plane_cut_block(
     __shared__ int    s_w_pu;
     __shared__ int    s_w_pv_ax;
     __shared__ int    s_mid_lo, s_mid_hi;
-
     if (tid == 0) {
         s_signs = NULL; s_all_verts = NULL;
         s_cross_edges = NULL; s_sort_scratch = NULL; s_isect_idx = NULL;
@@ -950,8 +950,8 @@ __device__ inline PartPair plane_cut_block(
                                 prev_a[i]=(i+poly_n-1)%poly_n; next_a[i]=(i+1)%poly_n;
                             }
                             __syncwarp();
-                            int remaining=poly_n, cur=0, max_iter=poly_n*poly_n, iter=0;
-                            while (remaining > 3 && iter < max_iter) {
+                            int remaining=poly_n, cur=0, iter=0;
+                            while (remaining > 3 && iter < remaining) {
                                 iter++;
                                 int p=prev_a[cur], n=next_a[cur];
                                 int vp=polygon[p], vc=polygon[cur], vn=polygon[n];
@@ -1039,8 +1039,6 @@ __device__ inline PartPair plane_cut_block(
         }
     } // end if (warp_id == 0) phases 10-12
     __syncthreads();
-    if (tid == 0) DPRINTF("[pc] block=%d nv=%d nt=%d n_cross=%d n_boundary=%d n_loops=%d\n",
-        blockIdx.x, n_verts, n_tris, n_cross, s_n_boundary, s_w_n_loops);
 
     // =========================================================================
     // Phase 13: compact verts per side, heap-alloc output, fill PartPair.
@@ -1231,5 +1229,7 @@ __device__ inline PartPair plane_cut_block(
         PC_FREE_ALL_SHARED_SCRATCH();
     }
     __syncthreads();
+    if (tid == 0) DPRINTF("[pc] block=%d nv=%d nt=%d n_cross=%d n_boundary=%d n_loops=%d dt=%lld\n",
+        blockIdx.x, n_verts, n_tris, n_cross, s_n_boundary, s_w_n_loops, clock64() - t_start);
     return s_result;
 }

@@ -117,7 +117,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     // Fast path: small mesh → exact D&C hull directly
     // ========================================================================
     if (nv <= 1024) {
-        DPRINTF("[kdop blk=%d lane=%d] fast path nv=%d\n", blockIdx.x, lane, nv);
         int err = 0;
         Mesh m = hull_dandc_warp_mesh(verts, nv, lane, heap, scratch_heap, &err);
         if (lane == 0) {
@@ -304,8 +303,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         }
     }
     __syncwarp();
-    DPRINTF("[kdop blk=%d lane=%d] step5: filtered %d / %d verts\n",
-            blockIdx.x, lane, s_n_filtered, nv);
 
     // ========================================================================
     // Step 6: Append extreme-hull vertices to filtered set (boundary coverage)
@@ -336,8 +333,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     // ========================================================================
     {
         int n_filt = s_n_filtered;
-        DPRINTF("[kdop blk=%d lane=%d] step7: final dandc on %d pts\n",
-                blockIdx.x, lane, n_filt);
         if (n_filt >= 4) {
             int err = 0;
             Mesh fm = hull_dandc_warp_mesh(
