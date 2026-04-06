@@ -20,7 +20,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   geometry.cuh        #   signed_tet_volume (divergence theorem kernel helper)
   warp_common.cuh     #   WarpPool allocator + warp reductions (warp_min_f, warp_max_f, etc.)
   hull_dandc.cuh      #   Preparata-Hong D&C hull (Bullet port); hull_dandc_warp_mesh returns Mesh via heap
-  warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>) + BtPoint32 legacy API
+  warp_sort.cuh       #   Generic warp-cooperative quicksort template (warp_sort_t<T,Cmp>, warp_sort_inner, warp_pick_pivot, warp_partition) + BtPoint32 legacy API
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   kdop_hull.cuh       #   kdop_hull_block: single-warp (32 threads) exact hull via extreme-point prefilter + D&C
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh

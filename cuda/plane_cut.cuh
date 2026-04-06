@@ -226,6 +226,7 @@ __device__ inline PartPair plane_cut_block(
     __shared__ int    s_w_n_loops;
     __shared__ int    s_w_pu;
     __shared__ int    s_w_pv_ax;
+    __shared__ int    s_mid_lo, s_mid_hi;
 
     if (tid == 0) {
         s_signs = NULL; s_all_verts = NULL;
@@ -533,7 +534,8 @@ __device__ inline PartPair plane_cut_block(
         }
 
         int n_de_alloc = s_n_trace * 3;
-        int de_sort_bytes = n_de_alloc * (int)sizeof(Edge2i) + WS_MAX_STACK * 2 * (int)sizeof(int);
+        // 4 stack arrays (lo+hi for each of 2 warps) instead of 2.
+        int de_sort_bytes = n_de_alloc * (int)sizeof(Edge2i) + WS_MAX_STACK * 4 * (int)sizeof(int);
 
         void* p;
         s_alloc_ok = 1;
@@ -574,10 +576,49 @@ __device__ inline PartPair plane_cut_block(
     }
     __syncthreads();
 
-    // === Phase 8: Sort directed edges (warp 0) ===
-    if (warp_id == 0) {
-        int serr = warp_sort_t<Edge2i, Edge2iNormCmp>(dir_edges.raw(), s_dir_sort, n_de, lane);
-        if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
+    // === Phase 8: Sort directed edges — two-warp parallel quicksort ===
+    // Scratch layout: tmp (n_de * 8B) | stack_lo_w0 | stack_hi_w0 | stack_lo_w1 | stack_hi_w1
+    // (each stack array: WS_MAX_STACK ints)
+    {
+        Edge2i* dir_tmp   = (Edge2i*)s_dir_sort;
+        int* stack_lo_w0  = (int*)(s_dir_sort + n_de * (int)sizeof(Edge2i));
+        int* stack_hi_w0  = stack_lo_w0 + WS_MAX_STACK;
+        int* stack_lo_w1  = stack_hi_w0 + WS_MAX_STACK;
+        int* stack_hi_w1  = stack_lo_w1 + WS_MAX_STACK;
+
+        if (n_de <= 32) {
+            // Small: single bitonic sort by warp 0, nothing left for phase 8b.
+            if (warp_id == 0) {
+                int serr = warp_sort_t<Edge2i, Edge2iNormCmp>(dir_edges.raw(), s_dir_sort, n_de, lane);
+                if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
+                if (lane == 0) { s_mid_lo = 0; s_mid_hi = n_de; }
+            }
+        } else {
+            // Phase 8a: warp 0 does one pivot+partition pass.
+            if (warp_id == 0) {
+                Edge2i pivot = warp_pick_pivot<Edge2i, Edge2iNormCmp>(dir_edges.raw(), 0, n_de, lane);
+                int mid_lo, mid_hi;
+                warp_partition<Edge2i, Edge2iNormCmp>(
+                    dir_edges.raw(), dir_tmp, 0, n_de, pivot, &mid_lo, &mid_hi, lane);
+                if (lane == 0) { s_mid_lo = mid_lo; s_mid_hi = mid_hi; }
+            }
+        }
+        __syncthreads();
+
+        // Phase 8b: warp 0 sorts left half [0..mid_lo), warp 1 sorts right half [mid_hi..n_de).
+        if (n_de > 32) {
+            int mid_lo = s_mid_lo, mid_hi = s_mid_hi;
+            if (warp_id == 0 && mid_lo > 1) {
+                int serr = warp_sort_inner<Edge2i, Edge2iNormCmp>(
+                    dir_edges.raw(), dir_tmp, stack_lo_w0, stack_hi_w0, 0, mid_lo, lane);
+                if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
+            }
+            if (warp_id == 1 && (n_de - mid_hi) > 1) {
+                int serr = warp_sort_inner<Edge2i, Edge2iNormCmp>(
+                    dir_edges.raw(), dir_tmp, stack_lo_w1, stack_hi_w1, mid_hi, n_de, lane);
+                if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
+            }
+        }
     }
     __syncthreads();
 
