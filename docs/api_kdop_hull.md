@@ -31,36 +31,30 @@ Call `hull_dandc_warp_mesh(verts, nv, lane, heap, scratch_heap, &err)` directly,
 
 ### Main path — nv > 1024
 
-#### Step 1 — Centroid
-Warp-level sum over all vertices for x, y, z. Divide by `nv`. O(nv / 32) work per lane.
+#### Step 1 — Extreme vertices (warp argmax/argmin with index)
+For each of 40 axes, all lanes scan their assigned vertices and maintain a local `(value, index)` pair for max and min of `axis · vert`. Warp-shuffle reduction yields the global argmax and argmin per axis. Lane 0 stores the 80 result indices in `s_extreme_idx[80]`.
 
-#### Step 2 — Extreme vertices (warp argmax/argmin with index)
-For each of 40 axes, all lanes scan their assigned vertices and maintain a local `(value, index)` pair for max and min of `axis · (vert - centroid)`. Warp-shuffle reduction yields the global argmax and argmin per axis. Lane 0 stores the 80 result indices in `s_extreme_idx[80]`.
+#### Step 2 — Deduplicated extreme point array (lane 0)
+Collect unique vertex indices from `s_extreme_idx` (O(80²) dedup). Copy original coordinates into scratch-heap buffer `s_extreme_pts` (≤ 80 × 3 floats).
 
-#### Step 3 — Deduplicated extreme point array (lane 0)
-Collect unique vertex indices from `s_extreme_idx` (O(80²) dedup). Copy centroid-subtracted coordinates into scratch-heap buffer `s_extreme_pts` (≤ 80 × 3 floats).
-
-#### Step 4 — Rough inner hull (all lanes)
+#### Step 3 — Rough inner hull (all lanes)
 `hull_dandc_warp_mesh(s_extreme_pts, n_extreme, lane, scratch_heap, scratch_heap, err)` — exact D&C hull of the extreme points. Result is an inner approximation of the true convex hull.
 
-#### Step 5 — Allocate filtered buffer (lane 0)
+#### Step 4 — Allocate filtered buffer (lane 0)
 Scratch-heap buffer for up to `nv + ext_hull.nv` float3 entries.
 
-#### Step 6 — Filter original vertices (all lanes, ballot/popcount)
-For each original vertex `v`, check all faces of the rough hull: compute outward normal `n = cross(b−a, c−a)`, flip so centroid (origin) is inside, test `n·v > n·a`. Keep vertex if ANY face says outside. Collect survivors using warp ballot/popcount into the filtered buffer.
+#### Step 5 — Filter original vertices (all lanes, ballot/popcount)
+Lane 0 computes the centroid of the rough-hull vertices as an interior reference point. For each original vertex `v`, check all faces of the rough hull: compute normal `n = cross(b−a, c−a)`, orient outward (away from interior reference), test `n·v > n·a`. Keep vertex if ANY face says outside. Collect survivors using warp ballot/popcount into the filtered buffer.
 
-#### Step 7 — Append rough-hull vertices (all lanes)
+#### Step 6 — Append rough-hull vertices (all lanes)
 Copy all vertices of the rough hull into the filtered buffer (ensures boundary coverage regardless of floating-point sign at hull faces).
 
 Free the rough hull from scratch_heap.
 
-#### Step 8 — Final hull (all lanes)
+#### Step 7 — Final hull (all lanes)
 `hull_dandc_warp_mesh(s_filtered, n_filtered, lane, heap, scratch_heap, err)` — exact D&C hull of the filtered + boundary set.
 
-#### Step 8b — Translate back (warp-parallel)
-Add centroid to all output vertices.
-
-#### Step 9 — Volume
+#### Step 8 — Volume
 `mesh_volume_warp(&s_result, lane)`.
 
 ## Memory Usage (scratch heap)

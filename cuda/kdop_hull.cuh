@@ -5,15 +5,14 @@
 // Fast path (nv <= 1024): run hull_dandc_warp_mesh directly.
 //
 // Main path (nv > 1024):
-//   1. Compute centroid (warp reduce).
-//   2. Find 40 max + 40 min extreme vertices using KDOP_AXES (warp argmax/argmin).
-//   3. Deduplicate and collect up to 80 unique extreme vertices (centroid-subtracted).
-//   4. Run hull_dandc_warp_mesh on extreme vertices → rough inner hull.
-//   5. Filter original vertices: keep any point strictly outside at least one face
+//   1. Find 40 max + 40 min extreme vertices using KDOP_AXES (warp argmax/argmin).
+//   2. Deduplicate and collect up to 80 unique extreme vertices.
+//   3. Run hull_dandc_warp_mesh on extreme vertices → rough inner hull.
+//   4. Filter original vertices: keep any point strictly outside at least one face
 //      of the rough hull (ballot/popcount collect).
-//   6. Append extreme-hull vertices to the filtered set (ensures boundary coverage).
-//   7. Run hull_dandc_warp_mesh on filtered set → final hull.
-//   8. Translate back by centroid, compute volume.
+//   5. Append extreme-hull vertices to the filtered set (ensures boundary coverage).
+//   6. Run hull_dandc_warp_mesh on filtered set → final hull.
+//   7. Compute volume.
 
 #pragma once
 #include "common.cuh"
@@ -87,7 +86,6 @@ __device__ inline Mesh kdop_hull_block(
     int lane = threadIdx.x & (WARP_SIZE - 1);
 
     // Shared state
-    __shared__ float  s_centroid[3];
     __shared__ float  s_max[KDOP_N_AXES];
     __shared__ float  s_min[KDOP_N_AXES];
     __shared__ int    s_extreme_idx[KDOP_MAX_EXTREMES]; // max/min index per axis
@@ -141,30 +139,16 @@ __device__ inline Mesh kdop_hull_block(
     }
 
     // ========================================================================
-    // Step 1: Centroid (warp reduce)
-    // ========================================================================
-    for (int axis = 0; axis < 3; axis++) {
-        float sum = 0.0f;
-        for (int i = lane; i < nv; i += WARP_SIZE)
-            sum += verts[i * 3 + axis];
-        for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
-            sum += __shfl_down_sync(WARP_MASK, sum, off);
-        if (lane == 0) s_centroid[axis] = sum / (float)nv;
-    }
-    __syncwarp();
-    float cx = s_centroid[0], cy = s_centroid[1], cz = s_centroid[2];
-
-    // ========================================================================
-    // Step 2: Find extreme vertices (warp argmax/argmin, with index)
+    // Step 1: Find extreme vertices (warp argmax/argmin, with index)
     // ========================================================================
     for (int a = 0; a < KDOP_N_AXES; a++) {
         float dx = KDOP_AXES[a][0], dy = KDOP_AXES[a][1], dz = KDOP_AXES[a][2];
         float lmax = -1e30f; int lmax_i = 0;
         float lmin =  1e30f; int lmin_i = 0;
         for (int i = lane; i < nv; i += WARP_SIZE) {
-            float d = dx * (verts[i*3+0] - cx)
-                    + dy * (verts[i*3+1] - cy)
-                    + dz * (verts[i*3+2] - cz);
+            float d = dx * verts[i*3+0]
+                    + dy * verts[i*3+1]
+                    + dz * verts[i*3+2];
             if (d > lmax) { lmax = d; lmax_i = i; }
             if (d < lmin) { lmin = d; lmin_i = i; }
         }
@@ -188,13 +172,13 @@ __device__ inline Mesh kdop_hull_block(
     __syncwarp();
 
     // ========================================================================
-    // Step 3: Build deduplicated extreme point array (thread 0, centroid-sub)
+    // Step 2: Build deduplicated extreme point array (thread 0)
     // ========================================================================
     if (lane == 0) {
         void* ptr = NULL;
         if (heap_alloc(scratch_heap, KDOP_MAX_EXTREMES * 3 * sizeof(float), &ptr) != HEAP_OK) {
             s_local_err = 1;
-            DPRINTF("[kdop blk=%d] step3: extreme_pts alloc failed\n", blockIdx.x);
+            DPRINTF("[kdop blk=%d] step2: extreme_pts alloc failed\n", blockIdx.x);
         } else {
             s_extreme_pts = (float*)ptr;
             PC_BUF(float, ep, s_extreme_pts, KDOP_MAX_EXTREMES * 3);
@@ -209,14 +193,14 @@ __device__ inline Mesh kdop_hull_block(
                 }
                 if (!dup) {
                     seen[n_ext] = idx;
-                    ep[n_ext * 3 + 0] = vb[idx * 3 + 0] - cx;
-                    ep[n_ext * 3 + 1] = vb[idx * 3 + 1] - cy;
-                    ep[n_ext * 3 + 2] = vb[idx * 3 + 2] - cz;
+                    ep[n_ext * 3 + 0] = vb[idx * 3 + 0];
+                    ep[n_ext * 3 + 1] = vb[idx * 3 + 1];
+                    ep[n_ext * 3 + 2] = vb[idx * 3 + 2];
                     n_ext++;
                 }
             }
             s_n_extreme = n_ext;
-            DPRINTF("[kdop blk=%d] step3: %d unique extremes (nv=%d)\n", blockIdx.x, n_ext, nv);
+            DPRINTF("[kdop blk=%d] step2: %d unique extremes (nv=%d)\n", blockIdx.x, n_ext, nv);
         }
     }
     __syncwarp();
@@ -227,7 +211,7 @@ __device__ inline Mesh kdop_hull_block(
     }
 
     // ========================================================================
-    // Step 4: D&C hull on extreme points → rough inner hull (on scratch_heap)
+    // Step 3: D&C hull on extreme points → rough inner hull (on scratch_heap)
     // ========================================================================
     {
         int err = 0;
@@ -237,7 +221,7 @@ __device__ inline Mesh kdop_hull_block(
         if (lane == 0) {
             s_ext_hull = em;
             if (err) s_local_err = 2;
-            DPRINTF("[kdop blk=%d] step4: rough hull nv=%d nt=%d err=%d\n",
+            DPRINTF("[kdop blk=%d] step3: rough hull nv=%d nt=%d err=%d\n",
                     blockIdx.x, em.nv, em.nt, err);
         }
     }
@@ -245,14 +229,14 @@ __device__ inline Mesh kdop_hull_block(
     if (s_local_err) goto cleanup;
 
     // ========================================================================
-    // Step 5: Allocate filtered vertex buffer (worst case: nv + ext_hull.nv)
+    // Step 4: Allocate filtered vertex buffer (worst case: nv + ext_hull.nv)
     // ========================================================================
     if (lane == 0) {
         void* ptr = NULL;
         int max_pts = nv + s_ext_hull.nv;
         if (heap_alloc(scratch_heap, max_pts * 3 * sizeof(float), &ptr) != HEAP_OK) {
             s_local_err = 3;
-            DPRINTF("[kdop blk=%d] step5: filtered alloc failed (max_pts=%d)\n",
+            DPRINTF("[kdop blk=%d] step4: filtered alloc failed (max_pts=%d)\n",
                     blockIdx.x, max_pts);
         } else {
             s_filtered = (float*)ptr;
@@ -263,8 +247,9 @@ __device__ inline Mesh kdop_hull_block(
     if (s_local_err) goto cleanup;
 
     // ========================================================================
-    // Step 6: Filter original vertices (keep if outside any rough-hull face)
+    // Step 5: Filter original vertices (keep if outside any rough-hull face)
     //         Collect survivors via ballot/popcount.
+    //         Uses first rough-hull vertex as interior reference for face orientation.
     // ========================================================================
     {
         int nt_ext = s_ext_hull.nt;
@@ -274,13 +259,25 @@ __device__ inline Mesh kdop_hull_block(
         PC_BUF(int,   et, s_ext_hull.tris,  nt_ext * 3);
         PC_BUF(float, fv, s_filtered, max_filtered_floats);
         PC_BUF(float, vb, (float*)verts, nv * 3);
+        // Interior reference: centroid of rough hull vertices (thread 0 computes, shared via broadcast)
+        __shared__ float s_ref[3];
+        if (lane == 0) {
+            float rx = 0.f, ry = 0.f, rz = 0.f;
+            for (int j = 0; j < nv_ext; j++) {
+                rx += ev[j*3+0]; ry += ev[j*3+1]; rz += ev[j*3+2];
+            }
+            float inv = 1.f / (float)nv_ext;
+            s_ref[0] = rx * inv; s_ref[1] = ry * inv; s_ref[2] = rz * inv;
+        }
+        __syncwarp();
+        float rx = s_ref[0], ry = s_ref[1], rz = s_ref[2];
         for (int i0 = 0; i0 < nv; i0 += WARP_SIZE) {
             int i = i0 + lane;
             bool keep = false;
             if (i < nv) {
-                float px = vb[i*3+0] - cx;
-                float py = vb[i*3+1] - cy;
-                float pz = vb[i*3+2] - cz;
+                float px = vb[i*3+0];
+                float py = vb[i*3+1];
+                float pz = vb[i*3+2];
                 for (int t = 0; t < nt_ext && !keep; t++) {
                     int ia = et[t*3+0];
                     int ib = et[t*3+1];
@@ -292,12 +289,12 @@ __device__ inline Mesh kdop_hull_block(
                     float e2x = ev[ic*3+0] - ax;
                     float e2y = ev[ic*3+1] - ay;
                     float e2z = ev[ic*3+2] - az;
-                    // Outward normal (ensure centroid=origin is inside: dot(n,0) < d → d > 0)
                     float nx = e1y*e2z - e1z*e2y;
                     float ny = e1z*e2x - e1x*e2z;
                     float nz = e1x*e2y - e1y*e2x;
                     float d  = nx*ax + ny*ay + nz*az;
-                    if (d < 0.0f) { nx = -nx; ny = -ny; nz = -nz; d = -d; }
+                    // Orient normal outward (away from interior reference)
+                    if (nx*rx + ny*ry + nz*rz > d) { nx=-nx; ny=-ny; nz=-nz; d=-d; }
                     if (d == 0.0f) continue; // degenerate face, skip
                     if (nx*px + ny*py + nz*pz > d) keep = true;
                 }
@@ -310,18 +307,18 @@ __device__ inline Mesh kdop_hull_block(
             base = __shfl_sync(WARP_MASK, base, 0);
             if (keep) {
                 int dst = base + prefix;
-                fv[dst*3+0] = vb[i*3+0] - cx;
-                fv[dst*3+1] = vb[i*3+1] - cy;
-                fv[dst*3+2] = vb[i*3+2] - cz;
+                fv[dst*3+0] = vb[i*3+0];
+                fv[dst*3+1] = vb[i*3+1];
+                fv[dst*3+2] = vb[i*3+2];
             }
         }
     }
     __syncwarp();
-    DPRINTF("[kdop blk=%d lane=%d] step6: filtered %d / %d verts\n",
+    DPRINTF("[kdop blk=%d lane=%d] step5: filtered %d / %d verts\n",
             blockIdx.x, lane, s_n_filtered, nv);
 
     // ========================================================================
-    // Step 7: Append extreme-hull vertices to filtered set (boundary coverage)
+    // Step 6: Append extreme-hull vertices to filtered set (boundary coverage)
     // ========================================================================
     {
         int ext_base;
@@ -345,11 +342,11 @@ __device__ inline Mesh kdop_hull_block(
     __syncwarp();
 
     // ========================================================================
-    // Step 8: D&C hull on filtered set → final hull (on heap)
+    // Step 7: D&C hull on filtered set → final hull (on heap)
     // ========================================================================
     {
         int n_filt = s_n_filtered;
-        DPRINTF("[kdop blk=%d lane=%d] step8: final dandc on %d pts\n",
+        DPRINTF("[kdop blk=%d lane=%d] step7: final dandc on %d pts\n",
                 blockIdx.x, lane, n_filt);
         if (n_filt >= 4) {
             int err = 0;
@@ -359,7 +356,7 @@ __device__ inline Mesh kdop_hull_block(
             if (lane == 0) {
                 s_result = fm;
                 if (err) s_local_err = 4;
-                DPRINTF("[kdop blk=%d] step8: final hull nv=%d nt=%d err=%d\n",
+                DPRINTF("[kdop blk=%d] step7: final hull nv=%d nt=%d err=%d\n",
                         blockIdx.x, fm.nv, fm.nt, err);
             }
         }
@@ -368,20 +365,7 @@ __device__ inline Mesh kdop_hull_block(
     if (s_local_err) goto cleanup;
 
     // ========================================================================
-    // Step 8b: Translate result vertices back by centroid (warp-parallel)
-    // ========================================================================
-    {
-        int final_nv = s_result.nv;
-        for (int i = lane; i < final_nv; i += WARP_SIZE) {
-            s_result.verts[i*3+0] += cx;
-            s_result.verts[i*3+1] += cy;
-            s_result.verts[i*3+2] += cz;
-        }
-    }
-    __syncwarp();
-
-    // ========================================================================
-    // Step 9: Volume
+    // Step 8: Volume
     // ========================================================================
     if (s_result.verts) {
         float vol = mesh_volume_warp(&s_result, lane);
