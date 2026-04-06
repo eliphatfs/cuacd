@@ -75,7 +75,7 @@ __device__ static const float KDOP_AXES[KDOP_N_AXES][3] = {
 // tris/nt are accepted for API compatibility but not used.
 // Returns Mesh (heap-allocated) and volume via out_volume.
 // On error, returns {NULL,NULL,0,0} and sets *kernel_error.
-__device__ inline Mesh kdop_hull_block(
+__device__ __forceinline__ Mesh kdop_hull_block(
     const float* verts, int nv,
     const int*   tris,  int nt,
     DeviceHeap*  heap,

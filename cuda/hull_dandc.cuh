@@ -1921,7 +1921,7 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 //
 // Returns a Mesh with verts/tris in heap. Returns {NULL,NULL,0,0} on error or n<4.
 // *err is set to a nonzero error code on failure (all lanes see the same value).
-__device__ inline Mesh hull_dandc_warp_mesh(
+__device__ __forceinline__ Mesh hull_dandc_warp_mesh(
     const float* pts, int n, int lane,
     DeviceHeap* heap, DeviceHeap* scratch_heap,
     int* err)
