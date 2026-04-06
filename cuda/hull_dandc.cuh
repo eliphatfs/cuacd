@@ -385,8 +385,9 @@ __device__ inline void* btpool_new(BtPool* p) {
     }
     void* obj = p->freeList;
     p->freeList = *(void**)obj;
-    int* c = (int*)obj;
-    for (int i = 0; i < p->objSize / 4; i++) c[i] = 0;
+    // pool object does not need zero init.
+    // int* c = (int*)obj;
+    // for (int i = 0; i < p->objSize / 4; i++) c[i] = 0;
     return obj;
 }
 
