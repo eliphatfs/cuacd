@@ -137,6 +137,10 @@ __device__ inline BtPoint64 bp32_cross(BtPoint32 a, BtPoint32 b) {
                 (long long)a.z*b.x - (long long)a.x*b.z,
                 (long long)a.x*b.y - (long long)a.y*b.x);
 }
+// cross(bp32(0,0,-1), a) -> Point32: result is (a.y, -a.x, 0)
+__device__ inline BtPoint32 bp32_cross_z_neg1(BtPoint32 a) {
+    return bp32(a.y, -a.x, 0);
+}
 // Point32 cross Point64
 __device__ inline BtPoint64 bp32_cross64(BtPoint32 a, BtPoint64 b) {
     return bp64((long long)a.y*b.z - (long long)a.z*b.y,
@@ -910,13 +914,13 @@ __device__ inline void bt_merge_pair(
 
         if (bt_mergeProjection(h0, h1, &c0, &c1, dc->vblock)) {
             BtPoint32 sd = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
-            BtPoint64 normal = bp32_cross(bp32(0,0,-1), sd);
-            BtPoint64 t = bp32_cross64(sd, normal);
+            BtPoint32 normal = bp32_cross_z_neg1(sd);
+            BtPoint64 t = bp32_cross(sd, normal);
             BtEdge* e = dc->vblock[c0].edges;
             BtEdge* start0 = NULL;
             if (e) {
                 do {
-                    long long dot = bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), normal);
+                    long long dot = bp32_dot64_32(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), normal);
                     if ((dot == 0) && (bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), t) > 0)) {
                         if (!start0 || (bt_getOrientation(start0, e, sd, bp32(0,0,-1), dc->vblock) == BT_CLOCKWISE))
                             start0 = e;
@@ -928,7 +932,7 @@ __device__ inline void bt_merge_pair(
             BtEdge* start1 = NULL;
             if (e) {
                 do {
-                    long long dot = bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), normal);
+                    long long dot = bp32_dot64_32(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), normal);
                     if ((dot == 0) && (bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), t) > 0)) {
                         if (!start1 || (bt_getOrientation(start1, e, sd, bp32(0,0,-1), dc->vblock) == BT_COUNTER_CLOCKWISE))
                             start1 = e;
