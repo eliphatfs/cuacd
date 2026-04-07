@@ -147,6 +147,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     }
     __syncwarp();
 
+    long long t_ep = clock64();
     // ========================================================================
     // Step 3: D&C hull on extreme points → rough inner hull (on scratch_heap)
     // ========================================================================
@@ -176,6 +177,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     __syncwarp();
     if (s_local_err) goto cleanup;
 
+    long long t_ephull = clock64();
     // ========================================================================
     // Step 5: Filter original vertices (keep if outside any rough-hull face)
     //         Collect survivors via ballot/popcount.
@@ -285,6 +287,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     }
     __syncwarp();
 
+    long long t_filtered = clock64();
     // ========================================================================
     // Step 7: D&C hull on filtered set → final hull (on heap)
     // ========================================================================
@@ -326,8 +329,10 @@ cleanup:
     }
     __syncwarp();
 
-    if (lane == 0) DPRINTF("[kdop] block=%d SLOW nv=%d n_filtered=%d result_nv=%d result_nt=%d dt=%lld\n",
-        blockIdx.x, nv, s_n_filtered, s_result.nv, s_result.nt, clock64() - t_start);
+    long long t_final = clock64();
+
+    if (lane == 0) DPRINTF("[kdop] block=%d SLOW nv=%d n_filtered=%d result_nv=%d result_nt=%d dt=%lld dt_ep=%lld dt_ephull=%lld dt_filtered=%lld dt_final=%lld \n",
+        blockIdx.x, nv, s_n_filtered, s_result.nv, s_result.nt, t_final - t_start, t_ep - t_start, t_ephull - t_ep, t_filtered - t_ephull, t_final - t_filtered);
     *out_volume = s_volume;
     return s_result;
 }
