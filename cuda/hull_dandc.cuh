@@ -214,50 +214,19 @@ __device__ inline BtRational64 shfl_br64(BtRational64 r, unsigned mask) {
 
 // BtPool: free list of fixed-size objects, backed by heap slabs.
 // All operations (init, new, free) are lane-0-only.
+struct BtLanePoolCleanup;  // forward declaration
+
 struct BtPool {
     void*       freeList;
     DeviceHeap* scratch_heap;
     int         objSize;    // padded to multiple of 4
-    int         growSlabSize;   // edges per growth slab
     int         error;
-    int         nblocks;
-    CheckedBuf<void*> blocks;  // allocated from WarpPool, capacity BTPOOL_MAX_BLOCKS
+    BtLanePoolCleanup* cleanup;  // points into shared memory
 };
 
-// Allocate one slab from scratch_heap and prepend to the free list.
-// Uses growSlabSize if set, else BTPOOL_BLOCK_SIZE. Heap-backed only.
-__device__ inline int btpool_add_block(BtPool* p) {
-    if (p->nblocks >= BTPOOL_MAX_BLOCKS || !p->blocks.raw()) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
-    int slab_n = p->growSlabSize;
-    void* block = NULL;
-    if (heap_alloc(p->scratch_heap, (unsigned int)(slab_n * p->objSize), &block) != HEAP_OK) {
-        p->error = BT_ERR_POOL_EXHAUST; return -1;
-    }
-    p->blocks[p->nblocks++] = block;
-    // slot[0] -> existing freeList; slot[i] -> slot[i-1] for i > 0
-    char* b = (char*)block;
-    int   padded = p->objSize;
-    *(void**)b = p->freeList;
-    for (int i = 1; i < slab_n; i++)
-        *(void**)(b + i * padded) = b + (i - 1) * padded;
-    p->freeList = b + (slab_n - 1) * padded;  // head = last slot
-    return 0;
-}
+// Allocate one slab (BTPOOL_BLOCK_SIZE) from scratch_heap and prepend to the free list.
+__device__ inline int btpool_add_block(BtPool* p);
 
-// Initialise pool with 2 pre-allocated slabs. Lane 0 only.
-__device__ inline int btpool_init(BtPool* p, DeviceHeap* scratch_heap, int objSize,
-                                  CheckedBuf<void*> blocks_buf) {
-    p->scratch_heap = scratch_heap;
-    p->objSize      = (objSize + 3) & ~3;
-    p->freeList     = NULL;
-    p->error        = 0;
-    p->nblocks      = 0;
-    p->blocks       = blocks_buf;
-    p->growSlabSize = 0;
-    if (btpool_add_block(p) < 0) return -1;
-    if (btpool_add_block(p) < 0) return -1;
-    return 0;
-}
 
 __device__ inline void* btpool_new(BtPool* p) {
     if (!p->freeList) {
@@ -1316,8 +1285,27 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* __restrict__ s, con
 // Per-lane edge pool cleanup info saved for deferred freeing after extractMesh.
 struct BtLanePoolCleanup {
     int    nblocks;
-    void** blocks;  // points into WarpPool-allocated array, capacity BTPOOL_MAX_BLOCKS
+    CheckedBuf<void*> blocks;  // WarpPool-allocated, capacity BTPOOL_MAX_BLOCKS
 };
+
+// Allocate one slab (BTPOOL_BLOCK_SIZE) from scratch_heap and prepend to the free list.
+__device__ inline int btpool_add_block(BtPool* p) {
+    BtLanePoolCleanup* c = p->cleanup;
+    if (c->nblocks >= BTPOOL_MAX_BLOCKS || !c->blocks.raw()) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
+    void* block = NULL;
+    if (heap_alloc(p->scratch_heap, (unsigned int)(BTPOOL_BLOCK_SIZE * p->objSize), &block) != HEAP_OK) {
+        p->error = BT_ERR_POOL_EXHAUST; return -1;
+    }
+    c->blocks[c->nblocks++] = block;
+    // slot[0] -> existing freeList; slot[i] -> slot[i-1] for i > 0
+    char* b = (char*)block;
+    int   padded = p->objSize;
+    *(void**)b = p->freeList;
+    for (int i = 1; i < BTPOOL_BLOCK_SIZE; i++)
+        *(void**)(b + i * padded) = b + (i - 1) * padded;
+    p->freeList = b + (BTPOOL_BLOCK_SIZE - 1) * padded;  // head = last slot
+    return 0;
+}
 
 // 3. Tree merge: 5 rounds (16×2 → 8×4 → … → 1×32), each round's
 //    independent merges run in parallel across warp lanes.
@@ -1328,7 +1316,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     WarpPool* shared_wp = s->wp;
     DeviceHeap* shared_sh = s->scratch_heap;
 
-    // Lane 0: allocate vblock + per-lane pool blocks
+    // Lane 0: allocate vblock + per-group pool blocks arrays
     BtVertex* vblock = NULL;
     void** all_pool_blocks = NULL;
     if (lane == 0) {
@@ -1341,6 +1329,12 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     { long long pb = __shfl_sync(WARP_MASK, (long long)all_pool_blocks, 0);
       all_pool_blocks = (void**)pb; }
     if (!all_pool_blocks) return;
+
+    // Initialize cleanup blocks pointers (all lanes, but only groups matter)
+    if (lane < BT_HULL_GROUPS)
+        out_cleanup[lane].blocks = CheckedBuf<void*>(
+            all_pool_blocks + lane * BTPOOL_MAX_BLOCKS, BTPOOL_MAX_BLOCKS, "cleanup.blocks");
+    __syncwarp();
 
     // All lanes: init vertices in parallel
     for (int i = lane; i < count; i += WARP_SIZE) {
@@ -1422,21 +1416,18 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         __syncwarp();
         if (shared_wp->error) return;
 
-        // All lanes share blocks array by group (secondary never allocates, safe to share).
-        my_dc.edgePool.blocks = CheckedBuf<void*>(
-            all_pool_blocks + group * BTPOOL_MAX_BLOCKS, BTPOOL_MAX_BLOCKS, "edgePool.blocks");
+        // Each primary's edgePool points to its group's cleanup entry in shared memory.
+        my_dc.edgePool.cleanup      = &out_cleanup[group];
         my_dc.edgePool.scratch_heap = shared_sh;
         my_dc.edgePool.objSize      = padded;
         my_dc.edgePool.freeList     = NULL;
         my_dc.edgePool.error        = 0;
-        my_dc.edgePool.nblocks      = 0;
-        my_dc.edgePool.growSlabSize = slab_edges;
         // Primaries only: build free list from pre-allocated slab.
-        // The single base allocation is tracked only in group 0's edgePool.blocks
+        // The single base allocation is tracked only in group 0's cleanup.blocks
         // so it is freed exactly once during cleanup.
         if (is_primary) {
             if (group == 0)
-                my_dc.edgePool.blocks[my_dc.edgePool.nblocks++] = s_edge_slab_base;
+                out_cleanup[0].blocks[out_cleanup[0].nblocks++] = s_edge_slab_base;
             {
                 void* blk = (char*)s_edge_slab_base + group * slab_stride;
                 char* b = (char*)blk;
@@ -1530,13 +1521,6 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
 #endif
     }
 
-    // Each lane's edgePool.blocks already points into all_pool_blocks; just record
-    // the pointer and count for deferred cleanup in hull_dandc_warp_mesh.
-    // Use group-based indexing to match the edgePool.blocks allocation.
-    if (is_primary) {
-        out_cleanup[group].blocks = all_pool_blocks + group * BTPOOL_MAX_BLOCKS;
-        out_cleanup[group].nblocks = my_dc.edgePool.nblocks;
-    }
     __syncwarp();
 }
 
