@@ -1288,12 +1288,13 @@ struct BtLanePoolCleanup {
 // Allocate one slab (BTPOOL_BLOCK_SIZE) from scratch_heap and prepend to the free list.
 __device__ inline int btpool_add_block(BtPool* p) {
     BtLanePoolCleanup* c = p->cleanup;
-    if (c->nblocks >= BTPOOL_MAX_BLOCKS || !c->blocks) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
+    int idx = atomicAdd(&c->nblocks, 1);
+    if (idx >= BT_HULL_GROUPS * BTPOOL_MAX_BLOCKS || !c->blocks) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
     void* block = NULL;
     if (heap_alloc(p->scratch_heap, (unsigned int)(BTPOOL_BLOCK_SIZE * p->objSize), &block) != HEAP_OK) {
         p->error = BT_ERR_POOL_EXHAUST; return -1;
     }
-    c->blocks[c->nblocks++] = block;
+    c->blocks[idx] = block;
     // slot[0] -> existing freeList; slot[i] -> slot[i-1] for i > 0
     char* b = (char*)block;
     int   padded = p->objSize;
@@ -1306,7 +1307,7 @@ __device__ inline int btpool_add_block(BtPool* p) {
 
 // 3. Tree merge: 5 rounds (16×2 → 8×4 → … → 1×32), each round's
 //    independent merges run in parallel across warp lanes.
-// out_cleanup: __shared__ BtLanePoolCleanup[WARP_SIZE] — each lane saves its pool blocks here.
+// out_cleanup: __shared__ BtLanePoolCleanup — single shared cleanup struct for all groups.
 // pts_scratch_ref: pointer to the shared variable holding the points allocation; zeroed after free.
 __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint32* __restrict__ points, int count, int lane,
                                            BtLanePoolCleanup* __restrict__ out_cleanup, BtPoint32** pts_scratch_ref) {
@@ -1327,9 +1328,9 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
       all_pool_blocks = (void**)pb; }
     if (!all_pool_blocks) return;
 
-    // Initialize cleanup blocks pointers (all lanes, but only groups matter)
-    if (lane < BT_HULL_GROUPS)
-        out_cleanup[lane].blocks = all_pool_blocks + lane * BTPOOL_MAX_BLOCKS;
+    // Initialize cleanup blocks pointer (single shared struct, full backing area)
+    if (lane == 0)
+        out_cleanup->blocks = all_pool_blocks;
     __syncwarp();
 
     // All lanes: init vertices in parallel
@@ -1410,8 +1411,8 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         __syncwarp();
         if (shared_wp->error) return;
 
-        // Each primary's edgePool points to its group's cleanup entry in shared memory.
-        my_dc.edgePool.cleanup      = &out_cleanup[group];
+        // All groups share a single cleanup struct.
+        my_dc.edgePool.cleanup      = out_cleanup;
         my_dc.edgePool.scratch_heap = shared_sh;
         my_dc.edgePool.objSize      = padded;
         my_dc.edgePool.freeList     = NULL;
@@ -1421,7 +1422,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         // so it is freed exactly once during cleanup.
         if (is_primary) {
             if (group == 0)
-                out_cleanup[0].blocks[out_cleanup[0].nblocks++] = s_edge_slab_base;
+                out_cleanup->blocks[out_cleanup->nblocks++] = s_edge_slab_base;
             {
                 void* blk = (char*)s_edge_slab_base + group * slab_stride;
                 char* b = (char*)blk;
@@ -1539,13 +1540,13 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
 {
     __shared__ WarpPool           s_pool;
     __shared__ BtPoint32*         s_points_scratch; // heap-allocated presort array, freed after vertex init
-    __shared__ BtLanePoolCleanup  s_lane_cleanup[BT_HULL_GROUPS];
+    __shared__ BtLanePoolCleanup  s_lane_cleanup;
     __shared__ BtHullState        s_state;
 
     // Use a local error variable to avoid racing on *err with other blocks.
     // Only lane 0 writes; atomicOr to *err at the end.
     int local_err = 0;
-    if (lane < BT_HULL_GROUPS) s_lane_cleanup[lane].nblocks = 0;
+    if (lane == 0) s_lane_cleanup.nblocks = 0;
     if (lane == 0) { s_result->verts = NULL; s_result->tris = NULL;
                      s_result->nv = 0; s_result->nt = 0; s_result->refcount = NULL;
                      s_pool.base = NULL; s_points_scratch = NULL; }
@@ -1614,7 +1615,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
 
         // --- Phase 3: post-sort D&C (vertex init: all lanes, D&C + edgePool init: lane 0) ---
         // postsort frees points (via s_points_scratch) after copying into vblock.
-        bt_compute_postsort(state, points, n, lane, s_lane_cleanup, &s_points_scratch);
+        bt_compute_postsort(state, points, n, lane, &s_lane_cleanup, &s_points_scratch);
 
         if (lane == 0) {
             if (s_pool.error) {
@@ -1669,11 +1670,8 @@ done:
     // free all lane edge pool blocks, then free WarpPool backing itself.
     if (lane == 0) {
         if (s_points_scratch) heap_free(scratch_heap, s_points_scratch);
-        for (int g = 0; g < BT_HULL_GROUPS; g++) {
-            BtLanePoolCleanup* c = &s_lane_cleanup[g];
-            for (int i = 0; i < c->nblocks; i++)
-                heap_free(scratch_heap, c->blocks[i]);
-        }
+        for (int i = 0; i < s_lane_cleanup.nblocks; i++)
+            heap_free(scratch_heap, s_lane_cleanup.blocks[i]);
         heap_free(scratch_heap, s_pool.base);
     }
     __syncwarp();
