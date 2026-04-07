@@ -18,9 +18,9 @@ Instrumentation (`#ifdef COACD_BEAM_DEBUG`): `BtDCState` carries 4 counter field
 
 ## hull_dandc_warp_mesh API
 
-`hull_dandc_warp_mesh(pts, n, lane, heap, scratch_heap, err) -> Mesh` -- warp device function (all 32 lanes call with identical args).
+`hull_dandc_warp_mesh(pts, n, lane, heap, scratch_heap, err, s_result)` -- warp device function (all 32 lanes call with identical args).
 
-- **Output**: returns a `Mesh` struct directly. Allocates a single combined chunk from `DeviceHeap* heap`. Returns `{NULL,NULL,0,0,NULL}` on error or n<4.
+- **Output**: writes into `Mesh* s_result` (must point to `__shared__` memory; zeroed on entry). Allocates a single combined chunk from `DeviceHeap* heap`. Sets `*s_result` to `{NULL,NULL,0,0,NULL}` on error or n<4.
 - **Heap chunk layout**: `[verts (nv*3 floats, 16-byte aligned) | tris (nt*3 ints, 16-byte aligned) | refcount(16B)]`; exact sizes from a count pass. `Mesh.refcount` points to the trailing `int`, initialized to 1.
 - **No volume**: the function only produces the mesh; volume is computed separately via `mesh_volume_warp`.
 - **Scratch**: `DeviceHeap* scratch_heap` backs (a) the `WarpPool` (allocated as a single heap chunk via `dandc_scratch_bytes(n)`) and (b) per-lane `BtEdge` pool slabs (`BTPOOL_BLOCK_SIZE=1024` edges each, 2 initial per lane + dynamic expansion). All scratch is heap-freed before return -- scratch_heap is clean after call.

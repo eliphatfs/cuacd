@@ -42,35 +42,36 @@ extern "C" __global__ void hull_dandc_kernel(
     int start = offsets[warp_id];
     int count = offsets[warp_id + 1] - start;
 
+    __shared__ Mesh s_mesh;
     int err = 0;
-    Mesh mesh = hull_dandc_warp_mesh(
+    hull_dandc_warp_mesh(
         pts + (long long)start * 3, count, lane,
-        heap, scratch_heap, &err);
+        heap, scratch_heap, &err, &s_mesh);
 
     // Write counts (lane 0)
     if (lane == 0) {
         out_errors[warp_id] = err;
-        out_nv[warp_id]     = mesh.nv;
-        out_nt[warp_id]     = mesh.nt;
+        out_nv[warp_id]     = s_mesh.nv;
+        out_nt[warp_id]     = s_mesh.nt;
     }
 
     // Parallel warp copy of verts
-    if (mesh.verts && mesh.nv <= max_hull_verts) {
+    if (s_mesh.verts && s_mesh.nv <= max_hull_verts) {
         float* dv = out_verts + (long long)warp_id * max_hull_verts * 3;
-        for (int i = lane; i < mesh.nv * 3; i += WARP_SIZE)
-            dv[i] = mesh.verts[i];
+        for (int i = lane; i < s_mesh.nv * 3; i += WARP_SIZE)
+            dv[i] = s_mesh.verts[i];
     }
 
     // Parallel warp copy of tris
-    if (mesh.tris && mesh.nt <= max_hull_tris) {
+    if (s_mesh.tris && s_mesh.nt <= max_hull_tris) {
         int* dt = out_tris + (long long)warp_id * max_hull_tris * 3;
-        for (int i = lane; i < mesh.nt * 3; i += WARP_SIZE)
-            dt[i] = mesh.tris[i];
+        for (int i = lane; i < s_mesh.nt * 3; i += WARP_SIZE)
+            dt[i] = s_mesh.tris[i];
     }
 
     __syncwarp();
 
     // Free output allocation from heap (lane 0 only)
-    if (lane == 0 && mesh.verts)
-        heap_free(heap, mesh.verts);
+    if (lane == 0 && s_mesh.verts)
+        heap_free(heap, s_mesh.verts);
 }

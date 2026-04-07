@@ -1530,20 +1530,21 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
 // hull_dandc_warp_mesh: D&C convex hull mesh extraction.
 // All 32 lanes must call with identical arguments.
 //
+// s_result     — pointer to a Mesh in __shared__ memory; zeroed on entry,
+//                filled with heap-allocated verts/tris on success.
 // heap         — output heap: one chunk allocated for [verts | tris].
 // scratch_heap — scratch heap: WarpPool backing + edge pool slabs, all freed on return.
 //
-// Returns a Mesh with verts/tris in heap. Returns {NULL,NULL,0,0} on error or n<4.
+// On error or n<4, *s_result is {NULL,NULL,0,0,NULL}.
 // *err is set to a nonzero error code on failure (all lanes see the same value).
-__device__ __forceinline__ Mesh hull_dandc_warp_mesh(
+__device__ __forceinline__ void hull_dandc_warp_mesh(
     const float* __restrict__ pts, int n, int lane,
     DeviceHeap* __restrict__ heap, DeviceHeap* __restrict__ scratch_heap,
-    int* __restrict__ err)
+    int* __restrict__ err, Mesh* __restrict__ s_result)
 {
     __shared__ WarpPool           s_pool;
     __shared__ void*              s_pool_backing;
     __shared__ BtPoint32*         s_points_scratch; // heap-allocated presort array, freed after vertex init
-    __shared__ Mesh               s_result;
     __shared__ BtLanePoolCleanup  s_lane_cleanup[BT_HULL_GROUPS];
     __shared__ BtHullState        s_state;
 
@@ -1551,11 +1552,11 @@ __device__ __forceinline__ Mesh hull_dandc_warp_mesh(
     // Only lane 0 writes; atomicOr to *err at the end.
     int local_err = 0;
     if (lane < BT_HULL_GROUPS) s_lane_cleanup[lane].nblocks = 0;
-    if (lane == 0) { s_result.verts = NULL; s_result.tris = NULL;
-                     s_result.nv = 0; s_result.nt = 0; s_result.refcount = NULL;
+    if (lane == 0) { s_result->verts = NULL; s_result->tris = NULL;
+                     s_result->nv = 0; s_result->nt = 0; s_result->refcount = NULL;
                      s_points_scratch = NULL; }
 
-    if (n < 4) { __syncwarp(); return s_result; }
+    if (n < 4) { __syncwarp(); return; }
 
     // --- Allocate WarpPool backing from scratch_heap (lane 0) ---
     if (lane == 0) {
@@ -1576,7 +1577,7 @@ __device__ __forceinline__ Mesh hull_dandc_warp_mesh(
     if (!s_pool_backing) {
         local_err = __shfl_sync(WARP_MASK, local_err, 0);
         if (lane == 0 && local_err) atomicOr(err, local_err);
-        return s_result;
+        return;
     }
 
     // --- Phase 1: pre-sort (all lanes) ---
@@ -1664,9 +1665,9 @@ __device__ __forceinline__ Mesh hull_dandc_warp_mesh(
                     { local_err = 6; goto done; }
                 bt_rewind(&s_pool, pre_ext);
 
-                s_result.verts = ov; s_result.tris = ot;
-                s_result.nv    = nv; s_result.nt   = nt;
-                s_result.refcount = rc;
+                s_result->verts = ov; s_result->tris = ot;
+                s_result->nv    = nv; s_result->nt   = nt;
+                s_result->refcount = rc;
             }
         }
     }
@@ -1688,5 +1689,4 @@ done:
     // Publish local error to the global error word (visible to host / other blocks).
     local_err = __shfl_sync(WARP_MASK, local_err, 0);
     if (lane == 0 && local_err) atomicOr(err, local_err);
-    return s_result;
 }

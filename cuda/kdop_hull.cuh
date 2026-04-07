@@ -77,11 +77,8 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     // ========================================================================
     if (nv <= 1024) {
         int err = 0;
-        Mesh m = hull_dandc_warp_mesh(verts, nv, lane, heap, scratch_heap, &err);
-        if (lane == 0) {
-            s_result = m;
-            if (err) s_local_err = err;
-        }
+        hull_dandc_warp_mesh(verts, nv, lane, heap, scratch_heap, &err, &s_result);
+        if (lane == 0 && err) s_local_err = err;
         __syncwarp();
         if (!s_local_err && s_result.verts) {
             float vol = mesh_volume_warp(&s_result, lane);
@@ -155,13 +152,10 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     // ========================================================================
     {
         int err = 0;
-        Mesh em = hull_dandc_warp_mesh(
+        hull_dandc_warp_mesh(
             s_extreme_pts, s_n_extreme, lane,
-            scratch_heap, scratch_heap, &err);
-        if (lane == 0) {
-            s_ext_hull = em;
-            if (err) s_local_err = 2;
-        }
+            scratch_heap, scratch_heap, &err, &s_ext_hull);
+        if (lane == 0 && err) s_local_err = 2;
     }
     __syncwarp();
     if (s_local_err) goto cleanup;
@@ -298,13 +292,10 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         int n_filt = s_n_filtered;
         if (n_filt >= 4) {
             int err = 0;
-            Mesh fm = hull_dandc_warp_mesh(
+            hull_dandc_warp_mesh(
                 s_filtered, n_filt, lane,
-                heap, scratch_heap, &err);
-            if (lane == 0) {
-                s_result = fm;
-                if (err) s_local_err = 5;
-            }
+                heap, scratch_heap, &err, &s_result);
+            if (lane == 0 && err) s_local_err = 5;
         }
     }
     __syncwarp();

@@ -26,7 +26,7 @@ Returns a heap-allocated `Mesh`. Returns `{NULL,NULL,0,0}` if `nv < 4`.
 
 ### Fast path — nv ≤ 1024
 
-Call `hull_dandc_warp_mesh(verts, nv, lane, heap, scratch_heap, &err)` directly, then `mesh_volume_warp`. Returns the exact D&C hull.
+Call `hull_dandc_warp_mesh(verts, nv, lane, heap, scratch_heap, &err, &s_result)` directly, then `mesh_volume_warp`. Returns the exact D&C hull.
 
 ### Main path — nv > 1024
 
@@ -37,7 +37,7 @@ For each of 40 axes, all lanes scan their assigned vertices and maintain a local
 Collect unique vertex indices from `s_extreme_idx` (O(80²) dedup). Copy original coordinates into scratch-heap buffer `s_extreme_pts` (≤ 80 × 3 floats).
 
 #### Step 3 — Rough inner hull (all lanes)
-`hull_dandc_warp_mesh(s_extreme_pts, n_extreme, lane, scratch_heap, scratch_heap, err)` — exact D&C hull of the extreme points. Result is an inner approximation of the true convex hull.
+`hull_dandc_warp_mesh(s_extreme_pts, n_extreme, lane, scratch_heap, scratch_heap, err, &s_ext_hull)` — exact D&C hull of the extreme points. Result is an inner approximation of the true convex hull.
 
 #### Step 4 — Allocate filtered buffer (lane 0)
 Scratch-heap buffer for up to `nv + ext_hull.nv` float3 entries.
@@ -51,7 +51,7 @@ Copy all vertices of the rough hull into the filtered buffer (ensures boundary c
 Free the rough hull from scratch_heap.
 
 #### Step 7 — Final hull (all lanes)
-`hull_dandc_warp_mesh(s_filtered, n_filtered, lane, heap, scratch_heap, err)` — exact D&C hull of the filtered + boundary set.
+`hull_dandc_warp_mesh(s_filtered, n_filtered, lane, heap, scratch_heap, err, &s_result)` — exact D&C hull of the filtered + boundary set.
 
 #### Step 8 — Volume
 `mesh_volume_warp(&s_result, lane)`.
