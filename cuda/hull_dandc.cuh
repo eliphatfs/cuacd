@@ -1534,8 +1534,10 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     // Each lane's edgePool.blocks already points into all_pool_blocks; just record
     // the pointer and count for deferred cleanup in hull_dandc_warp_mesh.
     // Use group-based indexing to match the edgePool.blocks allocation.
-    out_cleanup[lane].blocks = all_pool_blocks + group * BTPOOL_MAX_BLOCKS;
-    out_cleanup[lane].nblocks = my_dc.edgePool.nblocks;
+    if (is_primary) {
+        out_cleanup[group].blocks = all_pool_blocks + group * BTPOOL_MAX_BLOCKS;
+        out_cleanup[group].nblocks = my_dc.edgePool.nblocks;
+    }
     __syncwarp();
 }
 
@@ -1560,13 +1562,13 @@ __device__ __forceinline__ Mesh hull_dandc_warp_mesh(
     __shared__ void*              s_pool_backing;
     __shared__ BtPoint32*         s_points_scratch; // heap-allocated presort array, freed after vertex init
     __shared__ Mesh               s_result;
-    __shared__ BtLanePoolCleanup  s_lane_cleanup[WARP_SIZE];
+    __shared__ BtLanePoolCleanup  s_lane_cleanup[BT_HULL_GROUPS];
     __shared__ BtHullState        s_state;
 
     // Use a local error variable to avoid racing on *err with other blocks.
     // Only lane 0 writes; atomicOr to *err at the end.
     int local_err = 0;
-    s_lane_cleanup[lane].nblocks = 0;
+    if (lane < BT_HULL_GROUPS) s_lane_cleanup[lane].nblocks = 0;
     if (lane == 0) { s_result.verts = NULL; s_result.tris = NULL;
                      s_result.nv = 0; s_result.nt = 0; s_result.refcount = NULL;
                      s_points_scratch = NULL; }
@@ -1692,7 +1694,7 @@ done:
     // free all lane edge pool blocks, then free WarpPool backing itself.
     if (lane == 0) {
         if (s_points_scratch) heap_free(scratch_heap, s_points_scratch);
-        for (int g = 0; g < WARP_SIZE; g++) {
+        for (int g = 0; g < BT_HULL_GROUPS; g++) {
             BtLanePoolCleanup* c = &s_lane_cleanup[g];
             for (int i = 0; i < c->nblocks; i++)
                 heap_free(scratch_heap, c->blocks[i]);
