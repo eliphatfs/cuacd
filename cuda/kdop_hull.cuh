@@ -90,6 +90,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     __shared__ float* s_extreme_pts;  // centroid-subtracted extreme pts (scratch)
     __shared__ int    s_n_extreme;
     __shared__ Mesh   s_ext_hull;     // rough hull of extreme pts (scratch)
+    __shared__ float* s_planes;        // precomputed oriented planes (scratch): nt*4 floats (nx,ny,nz,d)
     __shared__ float* s_filtered;     // filtered verts (scratch)
     __shared__ int    s_n_filtered;
     __shared__ Mesh   s_result;
@@ -102,6 +103,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         s_ext_hull.verts = NULL; s_ext_hull.tris = NULL;
         s_ext_hull.nv = 0; s_ext_hull.nt = 0; s_ext_hull.refcount = NULL;
         s_extreme_pts = NULL;
+        s_planes = NULL;
         s_filtered = NULL;
         s_n_extreme = 0; s_n_filtered = 0;
         s_volume = 0.0f;
@@ -221,7 +223,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         void* ptr = NULL;
         int max_pts = nv + s_ext_hull.nv;
         if (heap_alloc(scratch_heap, max_pts * 3 * sizeof(float), &ptr) != HEAP_OK) {
-            s_local_err = 3;
+            s_local_err = 4;
         } else {
             s_filtered = (float*)ptr;
             s_n_filtered = 0;
@@ -255,6 +257,37 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         }
         __syncwarp();
         float rx = s_ref[0], ry = s_ref[1], rz = s_ref[2];
+
+        // Precompute oriented planes (nx,ny,nz,d) into scratch — one float4 per triangle.
+        if (lane == 0) {
+            void* ptr = NULL;
+            if (heap_alloc(scratch_heap, nt_ext * 4 * sizeof(float), &ptr) != HEAP_OK) {
+                s_local_err = 3;
+            } else {
+                s_planes = (float*)ptr;
+            }
+        }
+        __syncwarp();
+        if (s_local_err) goto cleanup;
+
+        {
+            PC_BUF(float, pl, s_planes,         nt_ext * 4);
+            for (int t = lane; t < nt_ext; t += WARP_SIZE) {
+                int ia = et[t*3+0], ib = et[t*3+1], ic = et[t*3+2];
+                float ax = ev[ia*3+0], ay = ev[ia*3+1], az = ev[ia*3+2];
+                float e1x = ev[ib*3+0] - ax, e1y = ev[ib*3+1] - ay, e1z = ev[ib*3+2] - az;
+                float e2x = ev[ic*3+0] - ax, e2y = ev[ic*3+1] - ay, e2z = ev[ic*3+2] - az;
+                float pnx = e1y*e2z - e1z*e2y;
+                float pny = e1z*e2x - e1x*e2z;
+                float pnz = e1x*e2y - e1y*e2x;
+                float pd  = pnx*ax + pny*ay + pnz*az;
+                if (pnx*rx + pny*ry + pnz*rz > pd) { pnx=-pnx; pny=-pny; pnz=-pnz; pd=-pd; }
+                pl[t*4+0] = pnx; pl[t*4+1] = pny; pl[t*4+2] = pnz; pl[t*4+3] = pd;
+            }
+        }
+        __syncwarp();
+
+        PC_BUF(float, pl, s_planes, nt_ext * 4);
         for (int i0 = 0; i0 < nv; i0 += WARP_SIZE) {
             int i = i0 + lane;
             bool keep = false;
@@ -263,24 +296,9 @@ __device__ __forceinline__ Mesh kdop_hull_block(
                 float py = vb[i*3+1];
                 float pz = vb[i*3+2];
                 for (int t = 0; t < nt_ext && !keep; t++) {
-                    int ia = et[t*3+0];
-                    int ib = et[t*3+1];
-                    int ic = et[t*3+2];
-                    float ax = ev[ia*3+0], ay = ev[ia*3+1], az = ev[ia*3+2];
-                    float e1x = ev[ib*3+0] - ax;
-                    float e1y = ev[ib*3+1] - ay;
-                    float e1z = ev[ib*3+2] - az;
-                    float e2x = ev[ic*3+0] - ax;
-                    float e2y = ev[ic*3+1] - ay;
-                    float e2z = ev[ic*3+2] - az;
-                    float nx = e1y*e2z - e1z*e2y;
-                    float ny = e1z*e2x - e1x*e2z;
-                    float nz = e1x*e2y - e1y*e2x;
-                    float d  = nx*ax + ny*ay + nz*az;
-                    // Orient normal outward (away from interior reference)
-                    if (nx*rx + ny*ry + nz*rz > d) { nx=-nx; ny=-ny; nz=-nz; d=-d; }
-                    if (d == 0.0f) continue; // degenerate face, skip
-                    if (nx*px + ny*py + nz*pz > d) keep = true;
+                    float pnx = pl[t*4+0], pny = pl[t*4+1], pnz = pl[t*4+2], pd = pl[t*4+3];
+                    if (pd == 0.0f) continue; // degenerate face, skip
+                    if (pnx*px + pny*py + pnz*pz > pd) keep = true;
                 }
             }
             unsigned ballot = __ballot_sync(WARP_MASK, keep);
@@ -335,7 +353,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
                 heap, scratch_heap, &err);
             if (lane == 0) {
                 s_result = fm;
-                if (err) s_local_err = 4;
+                if (err) s_local_err = 5;
             }
         }
     }
@@ -353,6 +371,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
 
 cleanup:
     if (lane == 0) {
+        if (s_planes)      heap_free(scratch_heap, s_planes);
         if (s_filtered)    heap_free(scratch_heap, s_filtered);
         if (s_ext_hull.verts) heap_free(scratch_heap, s_ext_hull.verts);
         if (s_extreme_pts) heap_free(scratch_heap, s_extreme_pts);
