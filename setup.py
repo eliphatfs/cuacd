@@ -85,6 +85,7 @@ def _fatbin_gencode_flags():
 # Modules compiled separately; kernels.cu is the old monolithic entry point (unused).
 _CUDA_MODULES = [
     "mm.cu",
+    "kdop_const.cu",
     "test_warp_sort.cu",
     "test_hull_dandc.cu",
     "test_mesh_volume.cu",

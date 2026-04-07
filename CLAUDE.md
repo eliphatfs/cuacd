@@ -26,9 +26,11 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   structs.cuh         #   Device-side: Mesh, Part, PartPair, WorkItem, AlgoState
   mm.cu               #   heap_init_kernel
+  kdop_const.cu       #   __constant__ KDOP_AXES[40][3] definition (broadcast-cached icosphere axes)
   beam.cu             #   beam_expansion, beam_hull, beam_sort, beam_finalize kernels
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel
+  test_mesh_volume.cu #   Test kernel: mesh_volume_kernel
   test_kdop_hull.cu   #   Test kernel: kdop_hull_kernel
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel
 csrc/                 # C host code
@@ -45,6 +47,7 @@ tests/                # All tests
   test_warp_sort.py   #   Tests for warp_sort_bp32
   test_plane_cut.py   #   Plane cut tests (14 tests)
   test_decompose.py   #   beam_decompose tests (cube, lshape, octocat, octocat_debug_steps)
+  test_edge_tracking.py # Max edge pairs stress test for D&C hull (requires COACD_TRACK_EDGES=1 build)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling
   bench_mm.py         #   Memory management benchmark
   bench_arena_sweep.py#   Arena count sweep benchmark

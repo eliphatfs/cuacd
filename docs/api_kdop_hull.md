@@ -14,7 +14,6 @@
 ```c
 __device__ inline Mesh kdop_hull_block(
     const float* verts, int nv,
-    const int*   tris,  int nt,  // accepted but unused
     DeviceHeap*  heap,           // output: final mesh chunk
     DeviceHeap*  scratch_heap,   // temporaries (freed on return)
     float*       out_volume,     // written on all threads
@@ -69,7 +68,7 @@ All scratch freed before return.
 
 ## Axes
 
-40 normalized face normals of a level-1 icosphere (icosahedron subdivided once → 80 faces, antipodal pairs merged). Stored as `__device__ static const float KDOP_AXES[40][3]`. Used only for finding extreme-point indices; not used to define the output hull geometry.
+40 normalized face normals of a level-1 icosphere (icosahedron subdivided once → 80 faces, antipodal pairs merged). Defined as `__constant__ float KDOP_AXES[40][3]` in `cuda/kdop_const.cu` (declared `extern __constant__` in `kdop_hull.cuh`); constant memory gives broadcast-cached reads since all warp lanes access the same axis index each iteration. Used only for finding extreme-point indices; not used to define the output hull geometry.
 
 ## Correctness
 
