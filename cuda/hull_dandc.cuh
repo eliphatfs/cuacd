@@ -1310,7 +1310,7 @@ __device__ inline int btpool_add_block(BtPool* p) {
 // out_cleanup: __shared__ BtLanePoolCleanup — single shared cleanup struct for all groups.
 // pts_scratch_ref: pointer to the shared variable holding the points allocation; zeroed after free.
 __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint32* __restrict__ points, int count, int lane,
-                                           BtLanePoolCleanup* __restrict__ out_cleanup, BtPoint32** pts_scratch_ref) {
+                                           BtLanePoolCleanup* __restrict__ out_cleanup, BtPoint32** pts_scratch_ref, long long* t_subhull, long long* t_treemerge) {
     WarpPool* shared_wp = s->wp;
     DeviceHeap* shared_sh = s->scratch_heap;
 
@@ -1463,7 +1463,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         }
     }
     __syncwarp();
-
+    *t_subhull = clock64();
     // Check for errors from any lane
     {
         int my_err = my_dc.edgePool.error;
@@ -1517,6 +1517,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     }
 
     __syncwarp();
+    *t_treemerge = clock64();
 }
 
 // ============================================================================
@@ -1545,6 +1546,8 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
 
     // Use a local error variable to avoid racing on *err with other blocks.
     // Only lane 0 writes; atomicOr to *err at the end.
+    long long t_start = clock64();
+    long long t_sort = t_start, t_subhull = t_start, t_treemerge = t_start;
     int local_err = 0;
     if (lane == 0) s_lane_cleanup.nblocks = 0;
     if (lane == 0) { s_result->verts = NULL; s_result->tris = NULL;
@@ -1615,7 +1618,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
 
         // --- Phase 3: post-sort D&C (vertex init: all lanes, D&C + edgePool init: lane 0) ---
         // postsort frees points (via s_points_scratch) after copying into vblock.
-        bt_compute_postsort(state, points, n, lane, &s_lane_cleanup, &s_points_scratch);
+        bt_compute_postsort(state, points, n, lane, &s_lane_cleanup, &s_points_scratch, &t_subhull, &t_treemerge);
 
         if (lane == 0) {
             if (s_pool.error) {
@@ -1675,6 +1678,9 @@ done:
         heap_free(scratch_heap, s_pool.base);
     }
     __syncwarp();
+    if (lane == 0 && (n == 5549 || n == 4423)) DPRINTF("[hull] block=%d SLOW nv=%d n_filtered=%d result_nv=%d result_nt=%d dt=%lld dt_sort=%lld dt_subhull=%lld dt_treemerge=%lld dt_final=%lld \n",
+        blockIdx.x, n, n, s_result.nv, s_result.nt, clock64() - t_start, t_sort - t_start, t_subhull - t_sort, t_treemerge - t_subhull, clock64() - t_treemerge);
+    
 
     // Publish local error to the global error word (visible to host / other blocks).
     local_err = __shfl_sync(WARP_MASK, local_err, 0);
