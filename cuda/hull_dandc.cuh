@@ -1679,7 +1679,7 @@ done:
     }
     __syncwarp();
     if (lane == 0 && (n == 5549 || n == 4423)) DPRINTF("[hull] block=%d SLOW nv=%d n_filtered=%d result_nv=%d result_nt=%d dt=%lld dt_sort=%lld dt_subhull=%lld dt_treemerge=%lld dt_final=%lld \n",
-        blockIdx.x, n, n, s_result.nv, s_result.nt, clock64() - t_start, t_sort - t_start, t_subhull - t_sort, t_treemerge - t_subhull, clock64() - t_treemerge);
+        blockIdx.x, n, n, s_result->nv, s_result->nt, clock64() - t_start, t_sort - t_start, t_subhull - t_sort, t_treemerge - t_subhull, clock64() - t_treemerge);
     
 
     // Publish local error to the global error word (visible to host / other blocks).
