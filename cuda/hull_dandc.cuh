@@ -1404,7 +1404,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     // Lane 0 allocates 2 slabs per group (BT_HULL_GROUPS*2 total) from scratch_heap.
     // Secondaries never allocate edges, so only primaries (one per group) need a pool.
     // Growth slabs are allocated dynamically per-lane via heap_alloc during D&C.
-    __shared__ void* s_edge_slabs[BT_HULL_GROUPS];
+    __shared__ void* s_edge_slab_base;
     {
         int slab_edges = 3 * count;
         if (slab_edges > BTPOOL_BLOCK_SIZE) slab_edges = BTPOOL_BLOCK_SIZE;
@@ -1416,8 +1416,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
             if (heap_alloc(shared_sh, (unsigned int)slab_stride * BT_HULL_GROUPS, &blk) != HEAP_OK) {
                 shared_wp->error = BT_ERR_POOL_EXHAUST;
             } else {
-                for (int g = 0; g < BT_HULL_GROUPS; g++)
-                    s_edge_slabs[g] = (char*)blk + g * slab_stride;
+                s_edge_slab_base = blk;
             }
         }
         __syncwarp();
@@ -1432,14 +1431,14 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         my_dc.edgePool.error        = 0;
         my_dc.edgePool.nblocks      = 0;
         my_dc.edgePool.growSlabSize = slab_edges;
-        // Primaries only: build free list from two pre-allocated slabs.
+        // Primaries only: build free list from pre-allocated slab.
         // The single base allocation is tracked only in group 0's edgePool.blocks
         // so it is freed exactly once during cleanup.
         if (is_primary) {
             if (group == 0)
-                my_dc.edgePool.blocks[my_dc.edgePool.nblocks++] = s_edge_slabs[0];
-            for (int si = 0; si < 1; si++) {
-                void* blk = s_edge_slabs[group + si];
+                my_dc.edgePool.blocks[my_dc.edgePool.nblocks++] = s_edge_slab_base;
+            {
+                void* blk = (char*)s_edge_slab_base + group * slab_stride;
                 char* b = (char*)blk;
                 *(void**)b = my_dc.edgePool.freeList;
                 for (int i = 1; i < slab_edges; i++)
