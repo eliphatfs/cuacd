@@ -75,7 +75,7 @@ struct Edge2iNormCmp {
 // Device helpers
 // ============================================================================
 
-__device__ inline int pc_edge_bsearch(const Edge2i* arr, int n, int key_a, int key_b) {
+__device__ inline int pc_edge_bsearch(const Edge2i* __restrict__ arr, int n, int key_a, int key_b) {
     Edge2i key = {key_a, key_b};
     int lo = 0, hi = n - 1;
     while (lo <= hi) {
@@ -100,7 +100,7 @@ __device__ inline int pc_pt_in_tri(float px, float py,
              (d1> 1e-10f||d2> 1e-10f||d3> 1e-10f));
 }
 
-__device__ inline float pc_signed_area(const float* verts, const int* poly, int n, int pu, int pv) {
+__device__ inline float pc_signed_area(const float* __restrict__ verts, const int* __restrict__ poly, int n, int pu, int pv) {
     float area = 0.0f;
     for (int i = 0; i < n; i++) {
         int j = (i+1) % n;
@@ -134,7 +134,7 @@ __device__ inline void pc_intersect(
 #define PC_KERR_POOL_OOM    2
 #define PC_KERR_SORT_ERR    4
 
-__device__ inline void pc_zero_part(Part* p) {
+__device__ inline void pc_zero_part(Part* __restrict__ p) {
     p->mesh.verts = NULL; p->mesh.tris = NULL; p->mesh.nv = 0; p->mesh.nt = 0; p->mesh.refcount = NULL;
     p->hull.verts = NULL; p->hull.tris = NULL; p->hull.nv = 0; p->hull.nt = 0; p->hull.refcount = NULL;
     p->mesh_vol = 0.0f; p->hull_vol = 0.0f; p->hausdorff = 0.0f;
@@ -161,8 +161,8 @@ __device__ inline PartPair plane_cut_block(
     // Input
     const Mesh* __restrict__ mesh,
     float pa, float pb, float pc_n, float pd,
-    DeviceHeap* heap,          // output heap (persistent mesh data)
-    DeviceHeap* scratch_heap,  // scratch heap (all allocs freed within this call)
+    DeviceHeap* __restrict__ heap,          // output heap (persistent mesh data)
+    DeviceHeap* __restrict__ scratch_heap,  // scratch heap (all allocs freed within this call)
     int* __restrict__ kernel_error)
 {
     int tid     = threadIdx.x;

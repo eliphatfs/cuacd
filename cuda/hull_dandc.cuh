@@ -211,7 +211,7 @@ __device__ inline BtRational128 br128_from_i64(long long val) {
 }
 
 // DMul<Int128, uint64_t>::mul — 128x128 -> (256 bits as) low128, high128
-__device__ inline void bt_dmul_128(BtInt128 a, BtInt128 b, BtInt128* lo, BtInt128* hi) {
+__device__ inline void bt_dmul_128(BtInt128 a, BtInt128 b, BtInt128* __restrict__ lo, BtInt128* __restrict__ hi) {
     BtInt128 p00 = bt128_umul(a.low, b.low);
     BtInt128 p01 = bt128_umul(a.low, b.high);
     BtInt128 p10 = bt128_umul(a.high, b.low);
@@ -531,7 +531,7 @@ __device__ inline BtEdge* bt_newEdgePair(BtDCState* __restrict__ dc, BtVIndex fr
     return e;
 }
 
-__device__ inline void bt_removeEdgePair(BtDCState* dc, BtEdge* edge) {
+__device__ inline void bt_removeEdgePair(BtDCState* __restrict__ dc, BtEdge* edge) {
     BtEdge* n = edge->next;
     BtEdge* r = edge->reverse;
     if (n != edge) {
@@ -577,8 +577,8 @@ __device__ inline BtOrientation bt_getOrientation(BtEdge* prev_e, BtEdge* next_e
 }
 
 __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVIndex start,
-    BtPoint32 s_dir, BtPoint64 rxs, BtPoint64 sxrxs, BtRational64* minCot,
-    int* edge_count, BtVertex* __restrict__ vblock)
+    BtPoint32 s_dir, BtPoint64 rxs, BtPoint64 sxrxs, BtRational64* __restrict__ minCot,
+    int* __restrict__ edge_count, BtVertex* __restrict__ vblock)
 {
     BtEdge* minEdge = NULL;
     BtEdge* e = vblock[start].edges;
@@ -736,7 +736,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
     }
 }
 
-__device__ inline bool bt_mergeProjection(BtIntermediateHull* h0, BtIntermediateHull* h1, BtVIndex* c0, BtVIndex* c1, BtVertex* __restrict__ vblock) {
+__device__ inline bool bt_mergeProjection(BtIntermediateHull* __restrict__ h0, BtIntermediateHull* __restrict__ h1, BtVIndex* __restrict__ c0, BtVIndex* __restrict__ c1, BtVertex* __restrict__ vblock) {
     BtVIndex v0 = h0->maxYx;
     BtVIndex v1 = h1->minYx;
     if ((vblock[v0].point.x == vblock[v1].point.x) && (vblock[v0].point.y == vblock[v1].point.y)) {
@@ -873,7 +873,7 @@ __device__ inline int bt_checkEdgeRing(BtVIndex v, const char* /*label*/, BtVert
 // pair_mask = 3u << (lane & ~1u) — only the two threads participate in shuffles.
 // primary is always the even lane; primary_lane = my_lane & ~1u.
 __device__ inline void bt_merge_pair(
-    BtDCState* dc, BtIntermediateHull* h0, BtIntermediateHull* h1,
+    BtDCState* __restrict__ dc, BtIntermediateHull* h0, BtIntermediateHull* h1,
     bool is_primary)
 {
     int my_lane      = (int)(threadIdx.x % WARP_SIZE);
@@ -1106,7 +1106,7 @@ __device__ inline void bt_merge_pair(
 // computeInternal base case — handles n <= 2
 // ============================================================================
 
-__device__ inline void bt_computeBase(BtDCState* __restrict__ dc, int start, int end, BtIntermediateHull* result) {
+__device__ inline void bt_computeBase(BtDCState* __restrict__ dc, int start, int end, BtIntermediateHull* __restrict__ result) {
     int n = end - start;
     switch (n) {
     case 0:
@@ -1258,9 +1258,9 @@ struct BtPointCmp {
 // Callers rewind the WarpPool offset between count and extract passes.
 //
 // Returns 0 on success, -1 on pool OOM.
-__device__ inline int bt_extractMesh(BtHullState* s,
-    float* out_verts, int* out_tris,
-    int* n_verts_out, int* n_tris_out)
+__device__ inline int bt_extractMesh(BtHullState* __restrict__ s,
+    float* __restrict__ out_verts, int* __restrict__ out_tris,
+    int* __restrict__ n_verts_out, int* __restrict__ n_tris_out)
 {
     *n_verts_out = 0;
     *n_tris_out  = 0;
@@ -1360,7 +1360,7 @@ __device__ inline int bt_extractMesh(BtHullState* s,
 
 // Pre-sort phase (lane 0): AABB, scaling, fill Point32 array, allocate pool memory.
 // Returns pointer to the unsorted BtPoint32 array (in pool), or NULL on error.
-__device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts, int count, int lane) {
+__device__ inline BtPoint32* bt_compute_presort(BtHullState* __restrict__ s, const float* __restrict__ pts, int count, int lane) {
     // --- AABB: warp-parallel strided reduction ---
     float mn0 = 1e30f, mn1 = 1e30f, mn2 = 1e30f;
     float mx0 = -1e30f, mx1 = -1e30f, mx2 = -1e30f;
@@ -1438,8 +1438,8 @@ struct BtLanePoolCleanup {
 //    independent merges run in parallel across warp lanes.
 // out_cleanup: __shared__ BtLanePoolCleanup[WARP_SIZE] — each lane saves its pool blocks here.
 // pts_scratch_ref: pointer to the shared variable holding the points allocation; zeroed after free.
-__device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count, int lane,
-                                           BtLanePoolCleanup* out_cleanup, BtPoint32** pts_scratch_ref) {
+__device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint32* __restrict__ points, int count, int lane,
+                                           BtLanePoolCleanup* __restrict__ out_cleanup, BtPoint32** pts_scratch_ref) {
     WarpPool* shared_wp = s->wp;
     DeviceHeap* shared_sh = s->scratch_heap;
 
@@ -1667,9 +1667,9 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
 // Returns a Mesh with verts/tris in heap. Returns {NULL,NULL,0,0} on error or n<4.
 // *err is set to a nonzero error code on failure (all lanes see the same value).
 __device__ __forceinline__ Mesh hull_dandc_warp_mesh(
-    const float* pts, int n, int lane,
-    DeviceHeap* heap, DeviceHeap* scratch_heap,
-    int* err)
+    const float* __restrict__ pts, int n, int lane,
+    DeviceHeap* __restrict__ heap, DeviceHeap* __restrict__ scratch_heap,
+    int* __restrict__ err)
 {
     __shared__ WarpPool           s_pool;
     __shared__ void*              s_pool_backing;
