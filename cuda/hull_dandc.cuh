@@ -137,6 +137,12 @@ __device__ inline BtPoint64 bp32_cross(BtPoint32 a, BtPoint32 b) {
                 (long long)a.z*b.x - (long long)a.x*b.z,
                 (long long)a.x*b.y - (long long)a.y*b.x);
 }
+// Point32 cross -> Point32 (safe when components <= ~10216, so products fit int32)
+__device__ inline BtPoint32 bp32_cross32(BtPoint32 a, BtPoint32 b) {
+    return bp32(a.y*b.z - a.z*b.y,
+                a.z*b.x - a.x*b.z,
+                a.x*b.y - a.y*b.x);
+}
 // cross(bp32(0,0,-1), a) -> Point32: result is (a.y, -a.x, 0)
 __device__ inline BtPoint32 bp32_cross_z_neg1(BtPoint32 a) {
     return bp32(a.y, -a.x, 0);
@@ -146,10 +152,6 @@ __device__ inline BtPoint64 bp32_cross64(BtPoint32 a, BtPoint64 b) {
     return bp64((long long)a.y*b.z - (long long)a.z*b.y,
                 (long long)a.z*b.x - (long long)a.x*b.z,
                 (long long)a.x*b.y - (long long)a.y*b.x);
-}
-// Point32 dot Point32 -> int64
-__device__ inline long long bp32_dot(BtPoint32 a, BtPoint32 b) {
-    return (long long)a.x*b.x + (long long)a.y*b.y + (long long)a.z*b.z;
 }
 // Point32 dot Point64 -> int64
 __device__ inline long long bp32_dot64(BtPoint32 a, BtPoint64 b) {
@@ -629,20 +631,20 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
     BtPoint32 et0 = start0 ? vblock[start0->target].point : vblock[c0].point;
     BtPoint32 et1 = start1 ? vblock[start1->target].point : vblock[c1].point;
     BtPoint32 s_dir = bp32_sub(vblock[c1].point, vblock[c0].point);
-    BtPoint64 normal = bp32_cross(bp32(0,0,-1), s_dir);
+    BtPoint32 normal = bp32_cross32(bp32(0,0,-1), s_dir);
     // Use whichever start edge exists to define the coplanar normal
     if (start0 || start1) {
         BtVIndex ref = (start0 ? start0 : start1)->target;
-        normal = bp32_cross(bp32_sub(vblock[ref].point, vblock[c0].point), s_dir);
+        normal = bp32_cross32(bp32_sub(vblock[ref].point, vblock[c0].point), s_dir);
     }
-    long long dist = bp32_dot64(vblock[c0].point, normal);
-    BtPoint64 perp = bp32_cross64(s_dir, normal);
+    long long dist = bp32_dot64_32(vblock[c0].point, normal);
+    BtPoint64 perp = bp32_cross(s_dir, normal);
 
     long long maxDot0 = bp32_dot64(et0, perp);
     if (*e0) {
         while ((*e0)->target != stop0) {
             BtEdge* e = (*e0)->reverse->prev;
-            if (bp32_dot64(vblock[e->target].point, normal) < dist) break;
+            if (bp32_dot64_32(vblock[e->target].point, normal) < dist) break;
             if (e->copy == mergeStamp) break;
             long long dot = bp32_dot64(vblock[e->target].point, perp);
             if (dot <= maxDot0) break;
@@ -656,7 +658,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
     if (*e1) {
         while ((*e1)->target != stop1) {
             BtEdge* e = (*e1)->reverse->next;
-            if (bp32_dot64(vblock[e->target].point, normal) < dist) break;
+            if (bp32_dot64_32(vblock[e->target].point, normal) < dist) break;
             if (e->copy == mergeStamp) break;
             long long dot = bp32_dot64(vblock[e->target].point, perp);
             if (dot <= maxDot1) break;
@@ -687,7 +689,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
                 BtEdge* f1 = (*e1)->reverse->next;
                 if (f1->copy > mergeStamp) {
                     BtPoint32 d1 = bp32_sub(vblock[f1->target].point, et1);
-                    if (bp32_dot64(d1, normal) == 0) {
+                    if (bp32_dot64_32(d1, normal) == 0) {
                         long long dx1 = bp32_dot64(d1, perp);
                         long long dy1 = bp32_dot64_32(d1, s_dir);
                         long long dxn = bp32_dot64(bp32_sub(vblock[f1->target].point, et0), perp);
@@ -722,7 +724,7 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
                 BtEdge* f0 = (*e0)->reverse->prev;
                 if (f0->copy > mergeStamp) {
                     BtPoint32 d0 = bp32_sub(vblock[f0->target].point, et0);
-                    if (bp32_dot64(d0, normal) == 0) {
+                    if (bp32_dot64_32(d0, normal) == 0) {
                         long long dx0 = bp32_dot64(d0, perp);
                         long long dy0 = bp32_dot64_32(d0, s_dir);
                         long long dxn = bp32_dot64(bp32_sub(et1, vblock[f0->target].point), perp);
@@ -915,13 +917,13 @@ __device__ inline void bt_merge_pair(
         if (bt_mergeProjection(h0, h1, &c0, &c1, dc->vblock)) {
             BtPoint32 sd = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
             BtPoint32 normal = bp32_cross_z_neg1(sd);
-            BtPoint64 t = bp32_cross(sd, normal);
+            BtPoint32 t = bp32_cross32(sd, normal);
             BtEdge* e = dc->vblock[c0].edges;
             BtEdge* start0 = NULL;
             if (e) {
                 do {
                     long long dot = bp32_dot64_32(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), normal);
-                    if ((dot == 0) && (bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), t) > 0)) {
+                    if ((dot == 0) && (bp32_dot64_32(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), t) > 0)) {
                         if (!start0 || (bt_getOrientation(start0, e, sd, bp32(0,0,-1), dc->vblock) == BT_CLOCKWISE))
                             start0 = e;
                     }
@@ -933,7 +935,7 @@ __device__ inline void bt_merge_pair(
             if (e) {
                 do {
                     long long dot = bp32_dot64_32(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), normal);
-                    if ((dot == 0) && (bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), t) > 0)) {
+                    if ((dot == 0) && (bp32_dot64_32(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), t) > 0)) {
                         if (!start1 || (bt_getOrientation(start1, e, sd, bp32(0,0,-1), dc->vblock) == BT_COUNTER_CLOCKWISE))
                             start1 = e;
                     }
