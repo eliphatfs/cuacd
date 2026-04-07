@@ -1285,13 +1285,13 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* __restrict__ s, con
 // Per-lane edge pool cleanup info saved for deferred freeing after extractMesh.
 struct BtLanePoolCleanup {
     int    nblocks;
-    CheckedBuf<void*> blocks;  // WarpPool-allocated, capacity BTPOOL_MAX_BLOCKS
+    void** blocks;  // WarpPool-allocated, capacity BTPOOL_MAX_BLOCKS
 };
 
 // Allocate one slab (BTPOOL_BLOCK_SIZE) from scratch_heap and prepend to the free list.
 __device__ inline int btpool_add_block(BtPool* p) {
     BtLanePoolCleanup* c = p->cleanup;
-    if (c->nblocks >= BTPOOL_MAX_BLOCKS || !c->blocks.raw()) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
+    if (c->nblocks >= BTPOOL_MAX_BLOCKS || !c->blocks) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
     void* block = NULL;
     if (heap_alloc(p->scratch_heap, (unsigned int)(BTPOOL_BLOCK_SIZE * p->objSize), &block) != HEAP_OK) {
         p->error = BT_ERR_POOL_EXHAUST; return -1;
@@ -1332,8 +1332,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
 
     // Initialize cleanup blocks pointers (all lanes, but only groups matter)
     if (lane < BT_HULL_GROUPS)
-        out_cleanup[lane].blocks = CheckedBuf<void*>(
-            all_pool_blocks + lane * BTPOOL_MAX_BLOCKS, BTPOOL_MAX_BLOCKS, "cleanup.blocks");
+        out_cleanup[lane].blocks = all_pool_blocks + lane * BTPOOL_MAX_BLOCKS;
     __syncwarp();
 
     // All lanes: init vertices in parallel
