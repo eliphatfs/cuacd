@@ -343,6 +343,31 @@ static PyObject* py_kdop_hull(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// test_hausdorff(hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,
+//               mesh_verts_ptr, mesh_nv, mesh_tris_ptr, mesh_nt,
+//               out_ptr)  -> None
+// ---------------------------------------------------------------------------
+
+static PyObject* py_test_hausdorff(PyObject* self, PyObject* args) {
+    unsigned long long hv_ptr, ht_ptr, mv_ptr, mt_ptr, out_ptr;
+    int hull_nv, hull_nt, mesh_nv, mesh_nt;
+    if (!PyArg_ParseTuple(args, "KiKiKiKiK",
+            &hv_ptr, &hull_nv, &ht_ptr, &hull_nt,
+            &mv_ptr, &mesh_nv, &mt_ptr, &mesh_nt,
+            &out_ptr))
+        return NULL;
+    REQUIRE_CTX();
+    int rc = beam_test_hausdorff(g_state.ctx,
+        (const float*)(uintptr_t)hv_ptr, hull_nv,
+        (const int*)  (uintptr_t)ht_ptr, hull_nt,
+        (const float*)(uintptr_t)mv_ptr, mesh_nv,
+        (const int*)  (uintptr_t)mt_ptr, mesh_nt,
+        (float*)      (uintptr_t)out_ptr);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -362,6 +387,7 @@ static PyMethodDef gpu_methods[] = {
     { "batch_mesh_volume",  py_batch_mesh_volume,  METH_VARARGS, "Batch mesh volume (divergence theorem)." },
     { "test_plane_cut",     py_test_plane_cut,     METH_VARARGS, "GPU plane cut with cap triangulation." },
     { "kdop_hull",          py_kdop_hull,          METH_VARARGS, "k-DOP approximate hull mesh extraction." },
+    { "test_hausdorff",     py_test_hausdorff,     METH_VARARGS, "Bidirectional Hausdorff distance." },
     { "decompose",          (PyCFunction)py_decompose, METH_VARARGS | METH_KEYWORDS,
       "decompose(verts_ptr, nv, tris_ptr, nt, hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,\n"
       "          max_iters, cuts_per_axis, threshold, max_keep, verbose=0, debug=0)\n"

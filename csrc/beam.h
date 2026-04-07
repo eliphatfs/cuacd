@@ -156,6 +156,17 @@ int beam_kdop_hull(
     int*         out_errors);
 
 // ---------------------------------------------------------------------------
+// test_hausdorff — bidirectional Hausdorff distance between two meshes
+// ---------------------------------------------------------------------------
+int beam_test_hausdorff(
+    beam_ctx_t   ctx,
+    const float* hull_verts, int hull_nv,
+    const int*   hull_tris,  int hull_nt,
+    const float* mesh_verts, int mesh_nv,
+    const int*   mesh_tris,  int mesh_nt,
+    float*       out_hausdorff);
+
+// ---------------------------------------------------------------------------
 // test_plane_cut — GPU plane cut with cap triangulation
 // ---------------------------------------------------------------------------
 // Returns separate pos and neg vertex + triangle arrays.

@@ -70,6 +70,7 @@ int beam_init(beam_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     cuModuleGetFunction(&ctx->fn_plane_cut,           ctx->module, "plane_cut_kernel");
     cuModuleGetFunction(&ctx->fn_heap_init,           ctx->module, "heap_init_kernel");
     cuModuleGetFunction(&ctx->fn_kdop_hull,           ctx->module, "kdop_hull_kernel");
+    cuModuleGetFunction(&ctx->fn_hausdorff,           ctx->module, "hausdorff_kernel");
 
     // Determine pool size: default to 80% of free device memory
     if (pool_bytes == 0) {
@@ -330,12 +331,13 @@ int beam_decompose(
 
     // Resolve beam kernels
     CUfunction fn_init = NULL, fn_expand = NULL, fn_hull = NULL,
-               fn_sort = NULL, fn_finalize = NULL;
-    LCHECK(cuModuleGetFunction(&fn_init,     ctx->module, "beam_initialize"));
-    LCHECK(cuModuleGetFunction(&fn_expand,   ctx->module, "beam_expansion"));
-    LCHECK(cuModuleGetFunction(&fn_hull,     ctx->module, "beam_hull"));
-    LCHECK(cuModuleGetFunction(&fn_sort,     ctx->module, "beam_sort"));
-    LCHECK(cuModuleGetFunction(&fn_finalize, ctx->module, "beam_finalize"));
+               fn_hausdorff = NULL, fn_sort = NULL, fn_finalize = NULL;
+    LCHECK(cuModuleGetFunction(&fn_init,      ctx->module, "beam_initialize"));
+    LCHECK(cuModuleGetFunction(&fn_expand,    ctx->module, "beam_expansion"));
+    LCHECK(cuModuleGetFunction(&fn_hull,      ctx->module, "beam_hull"));
+    LCHECK(cuModuleGetFunction(&fn_hausdorff, ctx->module, "beam_hausdorff"));
+    LCHECK(cuModuleGetFunction(&fn_sort,      ctx->module, "beam_sort"));
+    LCHECK(cuModuleGetFunction(&fn_finalize,  ctx->module, "beam_finalize"));
 
     // ------------------------------------------------------------------
     // Allocate and upload input mesh + hull buffers
@@ -508,6 +510,33 @@ int beam_decompose(
             unsigned long long _pu2 = 0;
             cuMemcpyDtoH(&_pu2, ctx->d_pool_off, sizeof(unsigned long long));
             fprintf(stderr, "[beam] iter %d: hull OK  pool=%.1f MB\n", iter, (double)_pu2 / (1024*1024));
+        }
+
+        // ---- beam_hausdorff: same grid as hull, 256 threads/block ----
+        {
+            void* args[] = { &d_current, &ctx->d_pool_struct, &d_err };
+            int nblocks = 2 * 3 * cuts_per_axis * cur_nitems;
+            if (nblocks < 1) nblocks = 1;
+            LCHECK(cuLaunchKernel(fn_hausdorff, nblocks, 1, 1, 256, 1, 1,
+                                  0, s, args, NULL));
+        }
+
+        if (debug) {
+            CUresult _sr = cuStreamSynchronize(s);
+            if (_sr != CUDA_SUCCESS) {
+                const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
+                fprintf(stderr, "[beam] iter %d HAUSDORFF CRASH: %s\n", iter, _msg ? _msg : "?");
+                result_code = (int)_sr; goto cleanup;
+            }
+            int _he = 0;
+            cuMemcpyDtoH(&_he, d_err, sizeof(int));
+            if (_he) {
+                fprintf(stderr, "[beam] iter %d HAUSDORFF err=0x%x\n", iter, _he);
+                result_code = _he; goto cleanup;
+            }
+            unsigned long long _pu2h = 0;
+            cuMemcpyDtoH(&_pu2h, ctx->d_pool_off, sizeof(unsigned long long));
+            fprintf(stderr, "[beam] iter %d: hausdorff OK  pool=%.1f MB\n", iter, (double)_pu2h / (1024*1024));
         }
 
         // ---- beam_sort: over-provisioned grid, self-checks nitems ----

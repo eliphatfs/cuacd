@@ -13,6 +13,7 @@
 #include "kdop_hull.cuh"
 #include "mesh_volume.cuh"
 #include "warp_sort.cuh"
+#include "hausdorff.cuh"
 
 // Error code for exceeding WORK_ITEM_MAX_PARTS (distinct from plane_cut errors).
 #define BEAM_ERR_OVERFLOW      0x10000
@@ -283,6 +284,37 @@ extern "C" __global__ void beam_hull(
     if (tid == 0) {
         p->hull     = hull;
         p->hull_vol = hvol;
+    }
+}
+
+// beam_hausdorff: <<<2*max_expand, HD_BLOCK>>>
+// Each block (256 threads) computes the bidirectional Hausdorff distance
+// between one part's hull and its mesh. Same block->item mapping as beam_hull.
+extern "C" __global__ void beam_hausdorff(
+    AlgoState*  current,
+    DevicePool* pool,
+    int*        err)
+{
+    if (*err) return;
+
+    int tid      = threadIdx.x;
+    int item_idx = blockIdx.x / 2;
+    int part_off = blockIdx.x % 2;
+
+    if (item_idx >= current->nitems) return;
+
+    WorkItem* wi = &current->items[item_idx];
+    int       np = wi->nparts;
+    int part_idx = np - 2 + part_off;
+    if (part_idx < 0 || part_idx >= np) return;
+
+    Part* p = &wi->parts[part_idx];
+    if (p->hull.verts == NULL) return;  // no hull yet
+
+    float h = hausdorff_block(&p->hull, &p->mesh, &pool->scratch, err);
+
+    if (tid == 0) {
+        p->hausdorff = h;
     }
 }
 

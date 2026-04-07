@@ -92,6 +92,7 @@ _CUDA_MODULES = [
     "test_plane_cut.cu",
     "beam.cu",
     "test_kdop_hull.cu",
+    "test_hausdorff.cu",
 ]
 
 

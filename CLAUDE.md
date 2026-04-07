@@ -24,15 +24,17 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   plane_cut.cuh       #   plane_cut_block device function + Edge2i/Edge2iCmp structs; returns PartPair via DeviceHeap
   kdop_hull.cuh       #   kdop_hull_block: single-warp (32 threads) exact hull via extreme-point prefilter + D&C
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
+  hausdorff.cuh       #   hausdorff_block: block-level (256 threads) bidirectional Hausdorff distance via sampling + linear BVH
   structs.cuh         #   Device-side: Mesh, Part, PartPair, WorkItem, AlgoState
   mm.cu               #   heap_init_kernel
   kdop_const.cu       #   __constant__ KDOP_AXES[40][3] definition (broadcast-cached icosphere axes)
-  beam.cu             #   beam_expansion, beam_hull, beam_sort, beam_finalize kernels
+  beam.cu             #   beam_expansion, beam_hull, beam_hausdorff, beam_sort, beam_finalize kernels
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel
   test_mesh_volume.cu #   Test kernel: mesh_volume_kernel
   test_kdop_hull.cu   #   Test kernel: kdop_hull_kernel
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel
+  test_hausdorff.cu   #   Test kernel: hausdorff_kernel
 csrc/                 # C host code
   structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, beam_ctx
   beam.h              #   Public C API (beam_ctx_t, beam_init/destroy/compact/pool_usage, batch ops)
@@ -46,6 +48,7 @@ tests/                # All tests
   test_hull_mesh.py   #   D&C hull mesh extraction tests + k-DOP hull tests
   test_warp_sort.py   #   Tests for warp_sort_bp32
   test_plane_cut.py   #   Plane cut tests (14 tests)
+  test_hausdorff.py   #   Hausdorff distance tests (5 tests)
   test_decompose.py   #   beam_decompose tests (cube, lshape, octocat, octocat_debug_steps)
   test_edge_tracking.py # Max edge pairs stress test for D&C hull (requires COACD_TRACK_EDGES=1 build)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling
@@ -152,7 +155,9 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 **Hull with Extreme-Point Prefilter** (`kdop_hull.cuh`): Single-warp (32 threads). Fast path: direct D&C hull for nv ≤ 1024. Main path: warp argmax/argmin over 40 icosphere axes finds up to 80 extreme vertices → D&C rough inner hull → ballot/popcount half-space filter discards interior points → D&C final hull of survivors. Result is the exact convex hull. Exposed as `ctx.batch_kdop_hull_mesh()`. Used by `beam_hull` kernel. See `docs/api_kdop_hull.md`.
 
-**Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → sort`. Pipelined in stream order, sync only after finalize. `beam_hull` uses `kdop_hull_block` (32 threads/block). See `docs/api_beam.md`.
+**Hausdorff Distance** (`hausdorff.cuh`): Block-level (256 threads, 8 warps). Computes bidirectional Hausdorff distance between two meshes via sampling + linear BVH. CoACD-matching area-proportional sampling with Wang hash pseudo-random barycentric coordinates. Brute-force path for ≤64 target triangles; linear BVH (Karras 2012 radix tree) for larger meshes with cooperative 4-warp Morton code sort. Used by `beam_hausdorff` kernel to fill `Part.hausdorff`.
+
+**Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → hausdorff → sort`. Pipelined in stream order, sync only after finalize. `beam_hull` uses `kdop_hull_block` (32 threads/block). `beam_hausdorff` uses `hausdorff_block` (256 threads/block). See `docs/api_beam.md`.
 
 ### Utility Functions
 
@@ -161,6 +166,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 | `signed_tet_volume` | per-thread | geometry.cuh |
 | `block_reduce_sum/bbox/max/count` | block (syncthreads) | reduce.cuh |
 | `mesh_volume_warp` | warp (32 lanes) | mesh_volume.cuh |
+| `hausdorff_block` | block (256 threads) | hausdorff.cuh |
 | `kdop_hull_block` | warp (32 threads) | kdop_hull.cuh |
 | `pool_alloc` | thread 0 only | allocator.cuh |
 | `heap_alloc` / `heap_free` | thread 0 only | allocator.cuh |
@@ -180,8 +186,9 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 ## Current Status
 
 ### Working
-- D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
+- D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all 120 tests pass.
 - `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Used by `beam_hull`. Produces exact hull via extreme-point prefilter + D&C.
+- `hausdorff_block` — 5 tests pass. Used by `beam_hausdorff`. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input

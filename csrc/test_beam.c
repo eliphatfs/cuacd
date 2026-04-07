@@ -421,3 +421,59 @@ int beam_kdop_hull(
     cuMemFree(d_ovols); cuMemFree(d_oerr);
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// beam_test_hausdorff
+// ---------------------------------------------------------------------------
+
+int beam_test_hausdorff(
+    beam_ctx_t   ctx,
+    const float* hull_verts, int hull_nv,
+    const int*   hull_tris,  int hull_nt,
+    const float* mesh_verts, int mesh_nv,
+    const int*   mesh_tris,  int mesh_nt,
+    float*       out_hausdorff)
+{
+    if (!ctx || !ctx->fn_hausdorff) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_hverts, d_htris, d_mverts, d_mtris, d_out, d_err;
+    CUdeviceptr d_scratch = ctx->d_pool_struct + offsetof(struct DevicePool, scratch);
+
+    CHECK_CU(cuMemAlloc(&d_hverts, (size_t)hull_nv * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_htris,  (size_t)hull_nt * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_mverts, (size_t)mesh_nv * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_mtris,  (size_t)mesh_nt * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_out,    sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_err,    sizeof(int)));
+
+    CHECK_CU(cuMemcpyHtoDAsync(d_hverts, hull_verts, (size_t)hull_nv * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_htris,  hull_tris,  (size_t)hull_nt * 3 * sizeof(int),   s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_mverts, mesh_verts, (size_t)mesh_nv * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_mtris,  mesh_tris,  (size_t)mesh_nt * 3 * sizeof(int),   s));
+    CHECK_CU(cuMemsetD32Async(d_err, 0, 1, s));
+
+    void* args[] = {
+        &d_hverts, &d_htris, &hull_nv, &hull_nt,
+        &d_mverts, &d_mtris, &mesh_nv, &mesh_nt,
+        &d_out, &d_scratch, &d_err
+    };
+    CHECK_CU(cuLaunchKernel(ctx->fn_hausdorff, 1, 1, 1, 256, 1, 1,
+                            0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_hausdorff, d_out, sizeof(float), s));
+    int h_err = 0;
+    CHECK_CU(cuMemcpyDtoHAsync(&h_err, d_err, sizeof(int), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_hverts); cuMemFree(d_htris);
+    cuMemFree(d_mverts); cuMemFree(d_mtris);
+    cuMemFree(d_out); cuMemFree(d_err);
+
+    if (h_err) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "hausdorff kernel error: 0x%x", h_err);
+        return h_err;
+    }
+    return 0;
+}
