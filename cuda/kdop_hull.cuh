@@ -109,6 +109,8 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     }
     __syncwarp();
 
+    long long t_start = clock64();
+
     if (nv < 4) { *out_volume = 0.0f; return s_result; }
 
     // ========================================================================
@@ -129,6 +131,8 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         } else if (s_local_err) {
             if (lane == 0) atomicOr(kernel_error, 0x100000);
         }
+        if (lane == 0) DPRINTF("[kdop] block=%d FAST nv=%d result_nv=%d result_nt=%d dt=%lld\n",
+            blockIdx.x, nv, s_result.nv, s_result.nt, clock64() - t_start);
         *out_volume = s_volume;
         return s_result;
     }
@@ -362,6 +366,8 @@ cleanup:
     }
     __syncwarp();
 
+    if (lane == 0) DPRINTF("[kdop] block=%d SLOW nv=%d n_filtered=%d result_nv=%d result_nt=%d dt=%lld\n",
+        blockIdx.x, nv, s_n_filtered, s_result.nv, s_result.nt, clock64() - t_start);
     *out_volume = s_volume;
     return s_result;
 }

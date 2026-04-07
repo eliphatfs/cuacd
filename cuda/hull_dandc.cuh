@@ -479,6 +479,7 @@ struct BtHullState {
     int minAxis, medAxis, maxAxis;
     BtVIndex vertexList;
     BtVertex* __restrict__ vblock;
+    const float* pts;          // original input float3 array (indexed by point.index)
     WarpPool*   wp;
     DeviceHeap* scratch_heap;  // backing for edgePool slabs
     int         npoints;       // original point count (queue size bound)
@@ -1506,14 +1507,12 @@ __device__ inline int bt_extractMesh(BtHullState* s,
         for (int i = 0; i < n_verts; i++)
             s->vblock[queue[i]].copy = idx_base - i;
 
-        int medAx = s->medAxis, maxAx = s->maxAxis, minAx = s->minAxis;
-        float sc_med = s->scaling[medAx], sc_max = s->scaling[maxAx], sc_min = s->scaling[minAx];
-        float cn_med = s->center[medAx],  cn_max = s->center[maxAx],  cn_min = s->center[minAx];
         for (int i = 0; i < n_verts; i++) {
             BtVIndex v = queue[i];
-            out_verts[i * 3 + medAx] = (float)s->vblock[v].point.x * sc_med + cn_med;
-            out_verts[i * 3 + maxAx] = (float)s->vblock[v].point.y * sc_max + cn_max;
-            out_verts[i * 3 + minAx] = (float)s->vblock[v].point.z * sc_min + cn_min;
+            int idx = s->vblock[v].point.index;
+            out_verts[i * 3 + 0] = s->pts[idx * 3 + 0];
+            out_verts[i * 3 + 1] = s->pts[idx * 3 + 1];
+            out_verts[i * 3 + 2] = s->pts[idx * 3 + 2];
         }
 
         int fstamp = --s->mergeStamp;
@@ -1609,6 +1608,7 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* s, const float* pts
         s->medAxis = medAx;
         s->scaling[0] = sc[0]; s->scaling[1] = sc[1]; s->scaling[2] = sc[2];
         s->center[0] = (mn0+mx0)*0.5f; s->center[1] = (mn1+mx1)*0.5f; s->center[2] = (mn2+mx2)*0.5f;
+        s->pts = pts;
         void* pts_block = NULL;
         if (heap_alloc(s->scratch_heap, (unsigned int)(count * (int)sizeof(BtPoint32)), &pts_block) == HEAP_OK)
             points = (BtPoint32*)pts_block;
