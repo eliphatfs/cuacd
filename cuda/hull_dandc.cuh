@@ -305,21 +305,15 @@ __device__ inline void bt_edge_link(BtEdge* a, BtEdge* n) {
 #define BT_HULL_GROUPS (WARP_SIZE / 2)
 
 // Warp-shuffle helpers for pointer and BtRational64 transfer between lane pairs.
-// shfl_ll: shuffle a long long (2 int32 shuffles).
-__device__ inline long long shfl_ll(long long v, int src, unsigned mask) {
-    unsigned int lo = __shfl_sync(mask, (unsigned int)(unsigned long long)v,         src);
-    unsigned int hi = __shfl_sync(mask, (unsigned int)((unsigned long long)v >> 32), src);
-    return (long long)((unsigned long long)lo | ((unsigned long long)hi << 32));
-}
 // shfl_edge_ptr: shuffle a BtEdge* (pointer) from src lane.
 __device__ inline BtEdge* shfl_edge_ptr(BtEdge* p, int src, unsigned mask) {
-    return (BtEdge*)(unsigned long long)shfl_ll((long long)(unsigned long long)p, src, mask);
+    return (BtEdge*)(unsigned long long)__shfl_sync(mask, (unsigned long long)p, src);
 }
-// shfl_br64: shuffle a BtRational64 (5 int32 shuffles) from src lane.
+// shfl_br64: shuffle a BtRational64 from src lane.
 __device__ inline BtRational64 shfl_br64(BtRational64 r, int src, unsigned mask) {
     BtRational64 out;
-    out.num  = (unsigned long long)shfl_ll((long long)r.num, src, mask);
-    out.den  = (unsigned long long)shfl_ll((long long)r.den, src, mask);
+    out.num  = (unsigned long long)__shfl_sync(mask, (unsigned long long)r.num, src);
+    out.den  = (unsigned long long)__shfl_sync(mask, (unsigned long long)r.den, src);
     out.sign = __shfl_sync(mask, r.sign, src);
     return out;
 }
@@ -968,34 +962,23 @@ __device__ inline void bt_merge_pair(
         int cont = __shfl_sync(pair_mask, done == 0 ? 1 : 0, primary_lane);
         if (!cont) break;
 
-        // Primary computes per-iteration geometry; secondary will read via shuffle.
-        BtPoint32 s_dir = {0,0,0,0};
-        BtPoint64 rxs   = {0,0,0};
-        BtPoint64 sxrxs = {0,0,0};
-        BtVIndex  c1_bcast = 0;
-        if (is_primary) {
-            BtPoint32 sd  = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
-            BtPoint32 r   = bp32_sub(prevPoint, dc->vblock[c0].point);
-            rxs   = bp32_cross(r, sd);
-            sxrxs = bp32_cross64(sd, rxs);
-            s_dir = sd;
-            c1_bcast = c1;
-        }
+        // Broadcast c0, c1, prevPoint from primary; both threads recompute geometry.
+        BtVIndex c0_bcast = __shfl_sync(pair_mask, c0, primary_lane);
+        BtVIndex c1_bcast = __shfl_sync(pair_mask, c1, primary_lane);
+        BtPoint32 prev_bcast;
+        prev_bcast.x = __shfl_sync(pair_mask, prevPoint.x, primary_lane);
+        prev_bcast.y = __shfl_sync(pair_mask, prevPoint.y, primary_lane);
+        prev_bcast.z = __shfl_sync(pair_mask, prevPoint.z, primary_lane);
 
-        // Broadcast geometry to secondary (both threads execute every __shfl_sync).
-        s_dir.x  = __shfl_sync(pair_mask, s_dir.x,  primary_lane);
-        s_dir.y  = __shfl_sync(pair_mask, s_dir.y,  primary_lane);
-        s_dir.z  = __shfl_sync(pair_mask, s_dir.z,  primary_lane);
-        rxs.x    = shfl_ll(rxs.x,    primary_lane, pair_mask);
-        rxs.y    = shfl_ll(rxs.y,    primary_lane, pair_mask);
-        rxs.z    = shfl_ll(rxs.z,    primary_lane, pair_mask);
-        sxrxs.x  = shfl_ll(sxrxs.x,  primary_lane, pair_mask);
-        sxrxs.y  = shfl_ll(sxrxs.y,  primary_lane, pair_mask);
-        sxrxs.z  = shfl_ll(sxrxs.z,  primary_lane, pair_mask);
-        c1_bcast = __shfl_sync(pair_mask, c1_bcast, primary_lane);
+        // Both threads independently compute geometry from shared inputs.
+        BtPoint32 sd  = bp32_sub(dc->vblock[c1_bcast].point, dc->vblock[c0_bcast].point);
+        BtPoint32 r   = bp32_sub(prev_bcast, dc->vblock[c0_bcast].point);
+        BtPoint64 rxs   = bp32_cross(r, sd);
+        BtPoint64 sxrxs = bp32_cross64(sd, rxs);
+        BtPoint32 s_dir = sd;
 
         // Both threads call bt_findMaxAngle convergedly.
-        BtVIndex my_start = is_primary ? c0 : c1_bcast;
+        BtVIndex my_start = is_primary ? c0_bcast : c1_bcast;
         bool     my_ccw   = !is_primary;
         BtRational64 my_minCot;
         BtEdge* my_min = bt_findMaxAngle(mergeStamp, my_ccw, my_start,
