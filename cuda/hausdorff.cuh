@@ -303,7 +303,7 @@ __device__ inline void hd_block_prefix_sum(
 // hausdorff_block — main entry point (256 threads per block)
 // ============================================================================
 
-__device__ inline float hausdorff_block(
+__device__ __forceinline__ float hausdorff_block(
     const Mesh* __restrict__ a,
     const Mesh* __restrict__ b,
     DeviceHeap* __restrict__ scratch_heap,
