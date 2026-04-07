@@ -867,205 +867,6 @@ __device__ inline int bt_checkEdgeRing(BtVIndex v, const char* /*label*/, BtVert
     return -1;
 }
 
-__device__ inline void bt_merge(BtDCState* dc, BtIntermediateHull* h0, BtIntermediateHull* h1) {
-    // Single-thread merge (caller is the one active thread).
-    if (h1->maxXy == BT_VI_NULL) return;
-    if (h0->maxXy == BT_VI_NULL) { *h0 = *h1; return; }
-
-    BtVIndex c0 = BT_VI_NULL;
-    BtEdge* toPrev0 = NULL;
-    BtEdge* firstNew0 = NULL;
-    BtEdge* pendingHead0 = NULL;
-    BtEdge* pendingTail0 = NULL;
-    BtVIndex c1 = BT_VI_NULL;
-    BtEdge* toPrev1 = NULL;
-    BtEdge* firstNew1 = NULL;
-    BtEdge* pendingHead1 = NULL;
-    BtEdge* pendingTail1 = NULL;
-    BtPoint32 prevPoint;
-
-    if (dc->mergeStampPtr) {
-        dc->mergeStamp = atomicAdd(dc->mergeStampPtr, -1) - 1;
-    } else {
-        dc->mergeStamp--;
-    }
-    int mergeStamp = dc->mergeStamp;
-
-    if (bt_mergeProjection(h0, h1, &c0, &c1, dc->vblock)) {
-        BtPoint32 sd = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
-        BtPoint64 normal = bp32_cross(bp32(0,0,-1), sd);
-        BtPoint64 t = bp32_cross64(sd, normal);
-
-        BtEdge* e = dc->vblock[c0].edges;
-        BtEdge* start0 = NULL;
-        if (e) {
-            do {
-                long long dot = bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), normal);
-                if ((dot == 0) && (bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c0].point), t) > 0)) {
-                    if (!start0 || (bt_getOrientation(start0, e, sd, bp32(0,0,-1), dc->vblock) == BT_CLOCKWISE))
-                        start0 = e;
-                }
-                e = e->next;
-            } while (e != dc->vblock[c0].edges);
-        }
-
-        e = dc->vblock[c1].edges;
-        BtEdge* start1 = NULL;
-        if (e) {
-            do {
-                long long dot = bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), normal);
-                if ((dot == 0) && (bp32_dot64(bp32_sub(dc->vblock[e->target].point, dc->vblock[c1].point), t) > 0)) {
-                    if (!start1 || (bt_getOrientation(start1, e, sd, bp32(0,0,-1), dc->vblock) == BT_COUNTER_CLOCKWISE))
-                        start1 = e;
-                }
-                e = e->next;
-            } while (e != dc->vblock[c1].edges);
-        }
-
-        if (start0 || start1) {
-            bt_findEdgeForCoplanarFaces(mergeStamp, c0, c1, &start0, &start1, BT_VI_NULL, BT_VI_NULL, dc->vblock);
-            if (start0) c0 = start0->target;
-            if (start1) c1 = start1->target;
-        }
-        prevPoint = dc->vblock[c1].point;
-        prevPoint.z++;
-    } else {
-        prevPoint = dc->vblock[c1].point;
-        prevPoint.x++;
-    }
-
-    BtVIndex first0 = c0;
-    BtVIndex first1 = c1;
-    bool firstRun = true;
-
-    while (true) {
-        BtPoint32 sd = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
-        BtPoint32 r = bp32_sub(prevPoint, dc->vblock[c0].point);
-        BtPoint64 rxs = bp32_cross(r, sd);
-        BtPoint64 sxrxs = bp32_cross64(sd, rxs);
-
-        BtRational64 minCot0, minCot1;
-        int ec0 = 0, ec1 = 0;
-        BtEdge* min0 = bt_findMaxAngle(mergeStamp, false, c0, sd, rxs, sxrxs, &minCot0, &ec0, dc->vblock);
-        BtEdge* min1 = bt_findMaxAngle(mergeStamp, true,  c1, sd, rxs, sxrxs, &minCot1, &ec1, dc->vblock);
-
-#ifdef COACD_BEAM_DEBUG
-        dc->fma_total_edges += ec0 + ec1;
-        if (ec0 < dc->fma_min_edges) dc->fma_min_edges = ec0;
-        if (ec1 < dc->fma_min_edges) dc->fma_min_edges = ec1;
-        if (ec0 > dc->fma_max_edges) dc->fma_max_edges = ec0;
-        if (ec1 > dc->fma_max_edges) dc->fma_max_edges = ec1;
-        dc->fma_calls += 2;
-#endif
-
-        if (!min0 && !min1) {
-            BtEdge* e = bt_newEdgePair(dc, c0, c1);
-            if (!e) { DPRINTF("[BUG] bt_merge OOM at final edge, blk=%d lane=%d\n", blockIdx.x, threadIdx.x); return; }
-            bt_edge_link(e, e);
-            dc->vblock[c0].edges = e;
-            e = e->reverse;
-            bt_edge_link(e, e);
-            dc->vblock[c1].edges = e;
-            return;
-        }
-
-        int cmp = !min0 ? 1 : !min1 ? -1 : br64_cmp(minCot0, minCot1);
-
-        if (firstRun || ((cmp >= 0) ? !br64_isNegInf(minCot1) : !br64_isNegInf(minCot0))) {
-            BtEdge* e = bt_newEdgePair(dc, c0, c1);
-            if (!e) { DPRINTF("[BUG] bt_merge OOM at bridge edge, blk=%d lane=%d\n", blockIdx.x, threadIdx.x); return; }
-            if (pendingTail0) pendingTail0->prev = e;
-            else pendingHead0 = e;
-            e->next = pendingTail0;
-            pendingTail0 = e;
-
-            e = e->reverse;
-            if (pendingTail1) pendingTail1->next = e;
-            else pendingHead1 = e;
-            e->prev = pendingTail1;
-            pendingTail1 = e;
-        }
-
-        BtEdge* e0 = min0;
-        BtEdge* e1 = min1;
-
-        if (cmp == 0) {
-            bt_findEdgeForCoplanarFaces(mergeStamp, c0, c1, &e0, &e1, BT_VI_NULL, BT_VI_NULL, dc->vblock);
-        }
-
-        if ((cmp >= 0) && e1) {
-            if (toPrev1) {
-                for (BtEdge *e = toPrev1->next, *n = NULL; e != min1; e = n) {
-                    n = e->next;
-                    bt_removeEdgePair(dc, e);
-                }
-            }
-            if (pendingTail1) {
-                if (toPrev1) bt_edge_link(toPrev1, pendingHead1);
-                else { bt_edge_link(min1->prev, pendingHead1); firstNew1 = pendingHead1; }
-                bt_edge_link(pendingTail1, min1);
-                pendingHead1 = NULL; pendingTail1 = NULL;
-            } else if (!toPrev1) {
-                firstNew1 = min1;
-            }
-            prevPoint = dc->vblock[c1].point;
-            c1 = e1->target;
-            toPrev1 = e1->reverse;
-        }
-
-        if ((cmp <= 0) && e0) {
-            if (toPrev0) {
-                for (BtEdge *e = toPrev0->prev, *n = NULL; e != min0; e = n) {
-                    n = e->prev;
-                    bt_removeEdgePair(dc, e);
-                }
-            }
-            if (pendingTail0) {
-                if (toPrev0) bt_edge_link(pendingHead0, toPrev0);
-                else { bt_edge_link(pendingHead0, min0->next); firstNew0 = pendingHead0; }
-                bt_edge_link(min0, pendingTail0);
-                pendingHead0 = NULL; pendingTail0 = NULL;
-            } else if (!toPrev0) {
-                firstNew0 = min0;
-            }
-            prevPoint = dc->vblock[c0].point;
-            c0 = e0->target;
-            toPrev0 = e0->reverse;
-        }
-
-        if ((c0 == first0) && (c1 == first1)) {
-            if (toPrev0 == NULL) {
-                bt_edge_link(pendingHead0, pendingTail0);
-                dc->vblock[c0].edges = pendingTail0;
-            } else {
-                for (BtEdge *e = toPrev0->prev, *n = NULL; e != firstNew0; e = n) {
-                    n = e->prev;
-                    bt_removeEdgePair(dc, e);
-                }
-                if (pendingTail0) {
-                    bt_edge_link(pendingHead0, toPrev0);
-                    bt_edge_link(firstNew0, pendingTail0);
-                }
-            }
-            if (toPrev1 == NULL) {
-                bt_edge_link(pendingTail1, pendingHead1);
-                dc->vblock[c1].edges = pendingTail1;
-            } else {
-                for (BtEdge *e = toPrev1->next, *n = NULL; e != firstNew1; e = n) {
-                    n = e->next;
-                    bt_removeEdgePair(dc, e);
-                }
-                if (pendingTail1) {
-                    bt_edge_link(toPrev1, pendingHead1);
-                    bt_edge_link(pendingTail1, firstNew1);
-                }
-            }
-            return;
-        }
-        firstRun = false;
-    }
-}
-
 // bt_merge_pair — two-thread cooperative bt_merge.
 //
 // Both threads of a group (primary: lane&1==0, secondary: lane&1==1) enter.
@@ -1380,8 +1181,14 @@ __device__ inline void bt_computeBase(BtDCState* __restrict__ dc, int start, int
 
 #define BT_ERR_DC_STACK     4
 
+// bt_computeInternal — two-thread cooperative iterative D&C hull.
+//
+// Both primary and secondary run the same stack loop deterministically (same
+// vblock data → same splits → same push/pop order → merge calls are in sync).
+// Base cases are primary-only; every merge uses bt_merge_pair so the secondary
+// participates in bt_findMaxAngle convergedly.
 __device__ inline void bt_computeInternal(BtDCState* __restrict__ dc, int start, int end, BtIntermediateHull* result,
-                                          CheckedBuf<BtDCStackItem> stack) {
+                                          CheckedBuf<BtDCStackItem> stack, bool is_primary, int partner_lane) {
     int sp = 0;
 
     // Push root
@@ -1400,7 +1207,8 @@ __device__ inline void bt_computeInternal(BtDCState* __restrict__ dc, int start,
         if (item->stage == 0) {
             int n = item->end - item->start;
             if (n <= 2) {
-                bt_computeBase(dc, item->start, item->end, item->result);
+                if (is_primary)
+                    bt_computeBase(dc, item->start, item->end, item->result);
             } else {
                 int split0 = item->start + n / 2;
                 BtPoint32 p = dc->vblock[split0 - 1].point;
@@ -1438,7 +1246,7 @@ __device__ inline void bt_computeInternal(BtDCState* __restrict__ dc, int start,
                 sp++;
             }
         } else {
-            bt_merge(dc, item->result, &item->right_hull);
+            bt_merge_pair(dc, item->result, &item->right_hull, is_primary, partner_lane);
         }
     }
 }
@@ -1650,23 +1458,8 @@ struct BtLanePoolCleanup {
 // pts_scratch_ref: pointer to the shared variable holding the points allocation; zeroed after free.
 __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, int count, int lane,
                                            BtLanePoolCleanup* out_cleanup, BtPoint32** pts_scratch_ref) {
-    // --- Broadcast shared state from lane 0 (only lane 0's s is valid) ---
-    float sc0 = 0, sc1 = 0, sc2 = 0, cn0 = 0, cn1 = 0, cn2 = 0;
-    int minAx = 0, medAx = 0, maxAx = 0;
-    long long wp_ll = 0, sh_ll = 0;
-    if (lane == 0) {
-        sc0 = s->scaling[0]; sc1 = s->scaling[1]; sc2 = s->scaling[2];
-        cn0 = s->center[0];  cn1 = s->center[1];  cn2 = s->center[2];
-        minAx = s->minAxis; medAx = s->medAxis; maxAx = s->maxAxis;
-        wp_ll = (long long)s->wp;
-        sh_ll = (long long)s->scratch_heap;
-    }
-    sc0 = __shfl_sync(WARP_MASK, sc0, 0); sc1 = __shfl_sync(WARP_MASK, sc1, 0); sc2 = __shfl_sync(WARP_MASK, sc2, 0);
-    cn0 = __shfl_sync(WARP_MASK, cn0, 0); cn1 = __shfl_sync(WARP_MASK, cn1, 0); cn2 = __shfl_sync(WARP_MASK, cn2, 0);
-    minAx = __shfl_sync(WARP_MASK, minAx, 0); medAx = __shfl_sync(WARP_MASK, medAx, 0); maxAx = __shfl_sync(WARP_MASK, maxAx, 0);
-    wp_ll = __shfl_sync(WARP_MASK, wp_ll, 0); sh_ll = __shfl_sync(WARP_MASK, sh_ll, 0);
-    WarpPool* shared_wp = (WarpPool*)wp_ll;
-    DeviceHeap* shared_sh = (DeviceHeap*)sh_ll;
+    WarpPool* shared_wp = s->wp;
+    DeviceHeap* shared_sh = s->scratch_heap;
 
     // Lane 0: allocate vblock + per-lane pool blocks
     BtVertex* vblock = NULL;
@@ -1803,38 +1596,23 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     CheckedBuf<BtDCStackItem> my_dc_stack(
         all_dc_stacks + lane * BT_DC_MAX_STACK_LOCAL, BT_DC_MAX_STACK_LOCAL, "dc_stack");
 
-#ifdef BT_SERIAL_MERGE
-    // --- Serial D&C: only lane 0 builds full hull (for debugging) ---
-    s_hulls[0].minXy = BT_VI_NULL; s_hulls[0].maxXy = BT_VI_NULL;
-    s_hulls[0].minYx = BT_VI_NULL; s_hulls[0].maxYx = BT_VI_NULL;
-    if (lane == 0 && count > 0) {
-        my_dc.vblock = vblock;
-        bt_computeInternal(&my_dc, 0, count, &s_hulls[0], my_dc_stack);
-    }
-    __syncwarp();
+    // --- Phase 1: All lanes cooperate in pairs to build BT_HULL_GROUPS sub-hulls ---
+    // Primary and secondary of each group run bt_computeInternal together:
+    // primary drives stack/base cases, both participate in every bt_merge_pair call.
+    my_dc.vblock = vblock;
     {
-        int my_err = my_dc.edgePool.error;
-        for (int off = 16; off > 0; off >>= 1)
-            my_err |= __shfl_xor_sync(WARP_MASK, my_err, off);
-        if (my_err) { shared_wp->error = my_err; return; }
-    }
-#else
-    // --- Phase 1: Group primaries build BT_HULL_GROUPS sub-hulls in parallel ---
-    // Secondary lanes (lane&1==1) are idle here; they will participate in Phase 2.
-    my_dc.vblock = vblock;  // All lanes need vblock for Phase 2 bt_findMaxAngle calls.
-    if (is_primary) {
         s_hulls[group].minXy = BT_VI_NULL; s_hulls[group].maxXy = BT_VI_NULL;
         s_hulls[group].minYx = BT_VI_NULL; s_hulls[group].maxYx = BT_VI_NULL;
         if (my_end - my_start > 0) {
-            bt_computeInternal(&my_dc, my_start, my_end, &s_hulls[group], my_dc_stack);
+            bt_computeInternal(&my_dc, my_start, my_end, &s_hulls[group], my_dc_stack,
+                               is_primary, partner_lane);
         }
     }
     __syncwarp();
 
-    // Check for errors from any lane — propagate actual error bits
+    // Check for errors from any lane
     {
         int my_err = my_dc.edgePool.error;
-        // OR all lanes' errors together via warp reduction
         for (int off = 16; off > 0; off >>= 1)
             my_err |= __shfl_xor_sync(WARP_MASK, my_err, off);
         if (my_err) { shared_wp->error = my_err; return; }
@@ -1863,7 +1641,6 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
             if (my_err) { shared_wp->error = my_err; return; }
         }
     }
-#endif
 
     // Rewind D&C stacks (no longer needed after tree merge)
     if (lane == 0) bt_rewind(shared_wp, pre_dc_offset);
