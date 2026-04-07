@@ -1615,7 +1615,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
 
         if (lane == 0) bt_rewind(&s_pool, pre_sort_offset);
         __syncwarp();
-
+        t_sort = clock64();
         // --- Phase 3: post-sort D&C (vertex init: all lanes, D&C + edgePool init: lane 0) ---
         // postsort frees points (via s_points_scratch) after copying into vblock.
         bt_compute_postsort(state, points, n, lane, &s_lane_cleanup, &s_points_scratch, &t_subhull, &t_treemerge);
