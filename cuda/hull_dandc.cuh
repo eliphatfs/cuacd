@@ -305,16 +305,16 @@ __device__ inline void bt_edge_link(BtEdge* a, BtEdge* n) {
 #define BT_HULL_GROUPS (WARP_SIZE / 2)
 
 // Warp-shuffle helpers for pointer and BtRational64 transfer between lane pairs.
-// shfl_edge_ptr: shuffle a BtEdge* (pointer) from src lane.
-__device__ inline BtEdge* shfl_edge_ptr(BtEdge* p, int src, unsigned mask) {
-    return (BtEdge*)(unsigned long long)__shfl_sync(mask, (unsigned long long)p, src);
+// shfl_edge_ptr: exchange BtEdge* with partner lane (XOR lane-bit 1).
+__device__ inline BtEdge* shfl_edge_ptr(BtEdge* p, unsigned mask) {
+    return (BtEdge*)(unsigned long long)__shfl_xor_sync(mask, (unsigned long long)p, 1);
 }
-// shfl_br64: shuffle a BtRational64 from src lane.
-__device__ inline BtRational64 shfl_br64(BtRational64 r, int src, unsigned mask) {
+// shfl_br64: exchange BtRational64 with partner lane (XOR lane-bit 1).
+__device__ inline BtRational64 shfl_br64(BtRational64 r, unsigned mask) {
     BtRational64 out;
-    out.num  = (unsigned long long)__shfl_sync(mask, (unsigned long long)r.num, src);
-    out.den  = (unsigned long long)__shfl_sync(mask, (unsigned long long)r.den, src);
-    out.sign = __shfl_sync(mask, r.sign, src);
+    out.num  = (unsigned long long)__shfl_xor_sync(mask, (unsigned long long)r.num, 1);
+    out.den  = (unsigned long long)__shfl_xor_sync(mask, (unsigned long long)r.den, 1);
+    out.sign = __shfl_xor_sync(mask, r.sign, 1);
     return out;
 }
 
@@ -870,15 +870,15 @@ __device__ inline int bt_checkEdgeRing(BtVIndex v, const char* /*label*/, BtVert
 // the c0/h0 side, secondary for the c1/h1 side). Primary reads the secondary's
 // result back with another shuffle, then does all bookkeeping.
 //
-// partner_lane = lane ^ 1 (the other thread in this group).
-// pair_mask    = 3u << (lane & ~1u)  — only the two threads participate in shuffles.
+// pair_mask = 3u << (lane & ~1u) — only the two threads participate in shuffles.
+// primary is always the even lane; primary_lane = my_lane & ~1u.
 __device__ inline void bt_merge_pair(
     BtDCState* dc, BtIntermediateHull* h0, BtIntermediateHull* h1,
-    bool is_primary, int partner_lane)
+    bool is_primary)
 {
-    int my_lane     = (int)(threadIdx.x % WARP_SIZE);
-    int primary_lane = is_primary ? my_lane : partner_lane;
-    unsigned pair_mask = 3u << (my_lane & ~1u);
+    int my_lane      = (int)(threadIdx.x % WARP_SIZE);
+    int primary_lane = my_lane & ~1;
+    unsigned pair_mask = 3u << (unsigned)primary_lane;
 
     // --- Early exit (primary decides, broadcasts to secondary) ---
     int skip = 0;
@@ -963,30 +963,29 @@ __device__ inline void bt_merge_pair(
         if (!cont) break;
 
         // Broadcast c0, c1, prevPoint from primary; both threads recompute geometry.
-        BtVIndex c0_bcast = __shfl_sync(pair_mask, c0, primary_lane);
-        BtVIndex c1_bcast = __shfl_sync(pair_mask, c1, primary_lane);
-        BtPoint32 prev_bcast;
-        prev_bcast.x = __shfl_sync(pair_mask, prevPoint.x, primary_lane);
-        prev_bcast.y = __shfl_sync(pair_mask, prevPoint.y, primary_lane);
-        prev_bcast.z = __shfl_sync(pair_mask, prevPoint.z, primary_lane);
+        c0 = __shfl_sync(pair_mask, c0, primary_lane);
+        c1 = __shfl_sync(pair_mask, c1, primary_lane);
+        prevPoint.x = __shfl_sync(pair_mask, prevPoint.x, primary_lane);
+        prevPoint.y = __shfl_sync(pair_mask, prevPoint.y, primary_lane);
+        prevPoint.z = __shfl_sync(pair_mask, prevPoint.z, primary_lane);
 
         // Both threads independently compute geometry from shared inputs.
-        BtPoint32 sd  = bp32_sub(dc->vblock[c1_bcast].point, dc->vblock[c0_bcast].point);
-        BtPoint32 r   = bp32_sub(prev_bcast, dc->vblock[c0_bcast].point);
+        BtPoint32 sd    = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
+        BtPoint32 r     = bp32_sub(prevPoint, dc->vblock[c0].point);
         BtPoint64 rxs   = bp32_cross(r, sd);
         BtPoint64 sxrxs = bp32_cross64(sd, rxs);
         BtPoint32 s_dir = sd;
 
         // Both threads call bt_findMaxAngle convergedly.
-        BtVIndex my_start = is_primary ? c0_bcast : c1_bcast;
+        BtVIndex my_start = is_primary ? c0 : c1;
         bool     my_ccw   = !is_primary;
         BtRational64 my_minCot;
         BtEdge* my_min = bt_findMaxAngle(mergeStamp, my_ccw, my_start,
                                           s_dir, rxs, sxrxs, &my_minCot, NULL, dc->vblock);
 
         // Both execute shuffles; primary reads secondary's results.
-        BtEdge*      min1_shfl    = shfl_edge_ptr(my_min,    partner_lane, pair_mask);
-        BtRational64 minCot1_shfl = shfl_br64(my_minCot, partner_lane, pair_mask);
+        BtEdge*      min1_shfl    = shfl_edge_ptr(my_min,    pair_mask);
+        BtRational64 minCot1_shfl = shfl_br64(my_minCot, pair_mask);
 
         // Primary does all bookkeeping.
         if (is_primary) {
@@ -1171,7 +1170,7 @@ __device__ inline void bt_computeBase(BtDCState* __restrict__ dc, int start, int
 // Base cases are primary-only; every merge uses bt_merge_pair so the secondary
 // participates in bt_findMaxAngle convergedly.
 __device__ inline void bt_computeInternal(BtDCState* __restrict__ dc, int start, int end, BtIntermediateHull* result,
-                                          CheckedBuf<BtDCStackItem> stack, bool is_primary, int partner_lane) {
+                                          CheckedBuf<BtDCStackItem> stack, bool is_primary) {
     int sp = 0;
 
     // Push root
@@ -1229,7 +1228,7 @@ __device__ inline void bt_computeInternal(BtDCState* __restrict__ dc, int start,
                 sp++;
             }
         } else {
-            bt_merge_pair(dc, item->result, &item->right_hull, is_primary, partner_lane);
+            bt_merge_pair(dc, item->result, &item->right_hull, is_primary);
         }
     }
 }
@@ -1498,7 +1497,6 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
     // group = lane / 2; is_primary = (lane & 1) == 0
     int group      = lane / 2;
     bool is_primary = (lane & 1) == 0;
-    int partner_lane = lane ^ 1;
     int my_start = s_splits[group];
     int my_end   = s_splits[group + 1];
 
@@ -1591,7 +1589,7 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         s_hulls[group].minYx = BT_VI_NULL; s_hulls[group].maxYx = BT_VI_NULL;
         if (my_end - my_start > 0) {
             bt_computeInternal(&my_dc, my_start, my_end, &s_hulls[group], my_dc_stack,
-                               is_primary, partner_lane);
+                               is_primary);
         }
     }
     __syncwarp();
@@ -1615,7 +1613,7 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
             int left  = group * stride;
             int right = left + (stride >> 1);
             bt_merge_pair(&my_dc, &s_hulls[left], &s_hulls[right],
-                          is_primary, partner_lane);
+                          is_primary);
         }
         __syncwarp();
 
