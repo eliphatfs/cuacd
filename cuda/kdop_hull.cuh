@@ -44,8 +44,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     int lane = threadIdx.x & (WARP_SIZE - 1);
 
     // Shared state
-    __shared__ int    s_extreme_idx[KDOP_MAX_EXTREMES]; // max/min index per axis
-    __shared__ float* s_extreme_pts;  // centroid-subtracted extreme pts (scratch)
+    __shared__ float* s_extreme_pts;  // extreme pts (scratch)
     __shared__ int    s_n_extreme;
     __shared__ Mesh   s_ext_hull;     // rough hull of extreme pts (scratch)
     __shared__ float* s_planes;        // precomputed oriented planes (scratch): nt*4 floats (nx,ny,nz,d)
@@ -98,8 +97,25 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     }
 
     // ========================================================================
-    // Step 1: Find extreme vertices (warp argmax/argmin, with index)
+    // Step 1+2: Find extreme vertices and fill extreme point array directly
     // ========================================================================
+    if (lane == 0) {
+        void* ptr = NULL;
+        if (heap_alloc(scratch_heap, KDOP_MAX_EXTREMES * 3 * sizeof(float), &ptr) != HEAP_OK) {
+            s_local_err = 1;
+            DPRINTF("[kdop blk=%d] step1: extreme_pts alloc failed\n", blockIdx.x);
+        } else {
+            s_extreme_pts = (float*)ptr;
+            s_n_extreme = KDOP_MAX_EXTREMES;
+        }
+    }
+    __syncwarp();
+    if (s_local_err) {
+        if (lane == 0) atomicOr(kernel_error, 0x100000);
+        *out_volume = 0.0f;
+        return s_result;
+    }
+
     for (int a = 0; a < KDOP_N_AXES; a++) {
         float dx = KDOP_AXES[a][0], dy = KDOP_AXES[a][1], dz = KDOP_AXES[a][2];
         float lmax = -1e30f; int lmax_i = 0;
@@ -124,39 +140,15 @@ __device__ __forceinline__ Mesh kdop_hull_block(
             if (om < lmin) { lmin = om; lmin_i = oi; }
         }
         if (lane == 0) {
-            s_extreme_idx[a * 2    ] = lmax_i;
-            s_extreme_idx[a * 2 + 1] = lmin_i;
+            s_extreme_pts[(a * 2) * 3 + 0] = verts[lmax_i * 3 + 0];
+            s_extreme_pts[(a * 2) * 3 + 1] = verts[lmax_i * 3 + 1];
+            s_extreme_pts[(a * 2) * 3 + 2] = verts[lmax_i * 3 + 2];
+            s_extreme_pts[(a * 2 + 1) * 3 + 0] = verts[lmin_i * 3 + 0];
+            s_extreme_pts[(a * 2 + 1) * 3 + 1] = verts[lmin_i * 3 + 1];
+            s_extreme_pts[(a * 2 + 1) * 3 + 2] = verts[lmin_i * 3 + 2];
         }
     }
     __syncwarp();
-
-    // ========================================================================
-    // Step 2: Build deduplicated extreme point array (thread 0)
-    // ========================================================================
-    if (lane == 0) {
-        void* ptr = NULL;
-        if (heap_alloc(scratch_heap, KDOP_MAX_EXTREMES * 3 * sizeof(float), &ptr) != HEAP_OK) {
-            s_local_err = 1;
-            DPRINTF("[kdop blk=%d] step2: extreme_pts alloc failed\n", blockIdx.x);
-        } else {
-            s_extreme_pts = (float*)ptr;
-            PC_BUF(float, ep, s_extreme_pts, KDOP_MAX_EXTREMES * 3);
-            PC_BUF(float, vb, (float*)verts, nv * 3);
-            for (int i = 0; i < KDOP_MAX_EXTREMES; i++) {
-                int idx = s_extreme_idx[i];
-                ep[i * 3 + 0] = vb[idx * 3 + 0];
-                ep[i * 3 + 1] = vb[idx * 3 + 1];
-                ep[i * 3 + 2] = vb[idx * 3 + 2];
-            }
-            s_n_extreme = KDOP_MAX_EXTREMES;
-        }
-    }
-    __syncwarp();
-    if (s_local_err) {
-        if (lane == 0) atomicOr(kernel_error, 0x100000);
-        *out_volume = 0.0f;
-        return s_result;
-    }
 
     // ========================================================================
     // Step 3: D&C hull on extreme points → rough inner hull (on scratch_heap)
