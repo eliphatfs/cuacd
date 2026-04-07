@@ -1544,14 +1544,14 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         if (slab_edges > BTPOOL_BLOCK_SIZE) slab_edges = BTPOOL_BLOCK_SIZE;
         int padded = ((int)sizeof(BtEdge) + 3) & ~3;
         int slab_bytes = slab_edges * padded;
+        int slab_stride = (slab_bytes + 15) & ~15;  // 16-byte aligned stride (largest CUDA alignment)
         if (lane == 0) {
-            for (int g = 0; g < BT_HULL_GROUPS * 2; g++) {
-                void* blk = NULL;
-                if (heap_alloc(shared_sh, (unsigned int)slab_bytes, &blk) != HEAP_OK) {
-                    shared_wp->error = BT_ERR_POOL_EXHAUST;
-                    break;
-                }
-                s_edge_slabs[g] = blk;
+            void* blk = NULL;
+            if (heap_alloc(shared_sh, (unsigned int)slab_stride * BT_HULL_GROUPS * 2, &blk) != HEAP_OK) {
+                shared_wp->error = BT_ERR_POOL_EXHAUST;
+            } else {
+                for (int g = 0; g < BT_HULL_GROUPS * 2; g++)
+                    s_edge_slabs[g] = (char*)blk + g * slab_stride;
             }
         }
         __syncwarp();
@@ -1567,10 +1567,13 @@ __device__ inline void bt_compute_postsort(BtHullState* s, BtPoint32* points, in
         my_dc.edgePool.nblocks      = 0;
         my_dc.edgePool.growSlabSize = slab_edges;
         // Primaries only: build free list from two pre-allocated slabs.
+        // The single base allocation is tracked only in group 0's edgePool.blocks
+        // so it is freed exactly once during cleanup.
         if (is_primary) {
+            if (group == 0)
+                my_dc.edgePool.blocks[my_dc.edgePool.nblocks++] = s_edge_slabs[0];
             for (int si = 0; si < 2; si++) {
                 void* blk = s_edge_slabs[group * 2 + si];
-                my_dc.edgePool.blocks[my_dc.edgePool.nblocks++] = blk;
                 char* b = (char*)blk;
                 *(void**)b = my_dc.edgePool.freeList;
                 for (int i = 1; i < slab_edges; i++)
