@@ -567,11 +567,11 @@ enum BtOrientation { BT_NONE, BT_CLOCKWISE, BT_COUNTER_CLOCKWISE };
 __device__ inline BtOrientation bt_getOrientation(BtEdge* prev_e, BtEdge* next_e, BtPoint32 s_dir, BtPoint32 t_dir, BtVertex* __restrict__ vblock) {
     if (prev_e->next == next_e) {
         if (prev_e->prev == next_e) {
-            BtPoint64 n = bp32_cross(t_dir, s_dir);
-            BtPoint64 m = bp32_cross(
+            BtPoint32 n = bp32_cross32(t_dir, s_dir);
+            BtPoint32 m = bp32_cross32(
                 bp32_sub(vblock[prev_e->target].point, vblock[next_e->reverse->target].point),
                 bp32_sub(vblock[next_e->target].point, vblock[next_e->reverse->target].point));
-            long long dot = bp64_dot64(n, m);
+            long long dot = bp32_dot64_32(n, m);
             return (dot > 0) ? BT_COUNTER_CLOCKWISE : BT_CLOCKWISE;
         }
         return BT_COUNTER_CLOCKWISE;
@@ -583,7 +583,7 @@ __device__ inline BtOrientation bt_getOrientation(BtEdge* prev_e, BtEdge* next_e
 }
 
 __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVIndex start,
-    BtPoint32 s_dir, BtPoint64 rxs, BtPoint64 sxrxs, BtRational64* __restrict__ minCot,
+    BtPoint32 s_dir, BtPoint32 rxs, BtPoint64 sxrxs, BtRational64* __restrict__ minCot,
     int* __restrict__ edge_count, BtVertex* __restrict__ vblock)
 {
     BtEdge* minEdge = NULL;
@@ -594,7 +594,7 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVIndex sta
         count++;
         if (e->copy > mergeStamp) {
             BtPoint32 t = bp32_sub(vblock[e->target].point, vblock[start].point);
-            BtRational64 cot = br64_make(bp32_dot64(t, sxrxs), bp32_dot64(t, rxs));
+            BtRational64 cot = br64_make(bp32_dot64(t, sxrxs), bp32_dot64_32(t, rxs));
             if (!br64_isNaN(cot)) {
                 if (minEdge == NULL) {
                     *minCot = cot;
@@ -978,16 +978,15 @@ __device__ inline void bt_merge_pair(
         // Both threads independently compute geometry from shared inputs.
         BtPoint32 sd    = bp32_sub(dc->vblock[c1].point, dc->vblock[c0].point);
         BtPoint32 r     = bp32_sub(prevPoint, dc->vblock[c0].point);
-        BtPoint64 rxs   = bp32_cross(r, sd);
-        BtPoint64 sxrxs = bp32_cross64(sd, rxs);
-        BtPoint32 s_dir = sd;
+        BtPoint32 rxs   = bp32_cross32(r, sd);
+        BtPoint64 sxrxs = bp32_cross(sd, rxs);
 
         // Both threads call bt_findMaxAngle convergedly.
         BtVIndex my_start = is_primary ? c0 : c1;
         bool     my_ccw   = !is_primary;
         BtRational64 my_minCot;
         BtEdge* my_min = bt_findMaxAngle(mergeStamp, my_ccw, my_start,
-                                          s_dir, rxs, sxrxs, &my_minCot, NULL, dc->vblock);
+                                          sd, rxs, sxrxs, &my_minCot, NULL, dc->vblock);
 
         // Both execute shuffles; primary reads secondary's results.
         BtEdge*      min1_shfl    = shfl_edge_ptr(my_min,    pair_mask);
