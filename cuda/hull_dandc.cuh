@@ -1352,28 +1352,26 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     if (lane == 0) s_mergeStamp = -3;
 
     // --- Per-group boundaries (BT_HULL_GROUPS groups; 2 lanes share each group) ---
-    // Like serial D&C's split logic, advance each split past runs of
-    // equal points so that identical vertices are never split across
-    // two groups. Without this, degenerate sub-hulls at group boundaries
-    // trigger edge cases in bt_merge (pending chain use-after-free).
-    __shared__ int s_splits[BT_HULL_GROUPS + 1];
-    if (lane == 0) {
-        s_splits[0] = 0;
-        for (int g = 1; g < BT_HULL_GROUPS; g++) {
-            int split = g * count / BT_HULL_GROUPS;
-            // Advance past equal points (same logic as bt_computeInternal)
-            BtPoint32 p = vblock[split - 1].point;
-            while (split < count && bp32_eq(vblock[split].point, p)) split++;
-            s_splits[g] = split;
-        }
-        s_splits[BT_HULL_GROUPS] = count;
-    }
-    __syncwarp();
+    // Each lane computes its own group's start/end directly. The start point
+    // is shrunk backward past runs of equal points so identical vertices
+    // stay in one group.
     // group = lane / 2; is_primary = (lane & 1) == 0
     int group      = lane / 2;
     bool is_primary = (lane & 1) == 0;
-    int my_start = s_splits[group];
-    int my_end   = s_splits[group + 1];
+    int my_start, my_end;
+    {
+        if (group == 0) {
+            my_start = 0;
+        } else {
+            my_start = group * count / BT_HULL_GROUPS;
+            // Advance past equal points so identical vertices stay in one group
+            while (my_start < (group + 1) * count / BT_HULL_GROUPS
+                   && my_start > 0
+                   && bp32_eq(vblock[my_start].point, vblock[my_start - 1].point))
+                my_start++;
+        }
+        my_end = (group + 1 >= BT_HULL_GROUPS) ? count : (group + 1) * count / BT_HULL_GROUPS;
+    }
 
     // --- Per-lane D&C state (lightweight: only edgePool + mergeStamp) ---
     // Common fields (scaling, center, axes, wp, etc.) stay in shared BtHullState *s.
