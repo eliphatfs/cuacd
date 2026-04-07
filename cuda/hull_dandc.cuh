@@ -332,17 +332,17 @@ struct BtPool {
     void*       freeList;
     DeviceHeap* scratch_heap;
     int         objSize;    // padded to multiple of 4
+    int         growSlabSize;   // edges per growth slab
     int         error;
     int         nblocks;
     CheckedBuf<void*> blocks;  // allocated from WarpPool, capacity BTPOOL_MAX_BLOCKS
-    int         growSlabSize;   // edges per growth slab
 };
 
 // Allocate one slab from scratch_heap and prepend to the free list.
 // Uses growSlabSize if set, else BTPOOL_BLOCK_SIZE. Heap-backed only.
 __device__ inline int btpool_add_block(BtPool* p) {
     if (p->nblocks >= BTPOOL_MAX_BLOCKS || !p->blocks.raw()) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
-    int slab_n = (p->growSlabSize > 0) ? p->growSlabSize : BTPOOL_BLOCK_SIZE;
+    int slab_n = p->growSlabSize;
     void* block = NULL;
     if (heap_alloc(p->scratch_heap, (unsigned int)(slab_n * p->objSize), &block) != HEAP_OK) {
         p->error = BT_ERR_POOL_EXHAUST; return -1;
@@ -1519,7 +1519,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     // Lane 0 allocates 2 slabs per group (BT_HULL_GROUPS*2 total) from scratch_heap.
     // Secondaries never allocate edges, so only primaries (one per group) need a pool.
     // Growth slabs are allocated dynamically per-lane via heap_alloc during D&C.
-    __shared__ void* s_edge_slabs[BT_HULL_GROUPS * 2];
+    __shared__ void* s_edge_slabs[BT_HULL_GROUPS];
     {
         int slab_edges = 3 * count;
         if (slab_edges > BTPOOL_BLOCK_SIZE) slab_edges = BTPOOL_BLOCK_SIZE;
@@ -1528,10 +1528,10 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         int slab_stride = (slab_bytes + 15) & ~15;  // 16-byte aligned stride (largest CUDA alignment)
         if (lane == 0) {
             void* blk = NULL;
-            if (heap_alloc(shared_sh, (unsigned int)slab_stride * BT_HULL_GROUPS * 2, &blk) != HEAP_OK) {
+            if (heap_alloc(shared_sh, (unsigned int)slab_stride * BT_HULL_GROUPS, &blk) != HEAP_OK) {
                 shared_wp->error = BT_ERR_POOL_EXHAUST;
             } else {
-                for (int g = 0; g < BT_HULL_GROUPS * 2; g++)
+                for (int g = 0; g < BT_HULL_GROUPS; g++)
                     s_edge_slabs[g] = (char*)blk + g * slab_stride;
             }
         }
@@ -1553,8 +1553,8 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         if (is_primary) {
             if (group == 0)
                 my_dc.edgePool.blocks[my_dc.edgePool.nblocks++] = s_edge_slabs[0];
-            for (int si = 0; si < 2; si++) {
-                void* blk = s_edge_slabs[group * 2 + si];
+            for (int si = 0; si < 1; si++) {
+                void* blk = s_edge_slabs[group + si];
                 char* b = (char*)blk;
                 *(void**)b = my_dc.edgePool.freeList;
                 for (int i = 1; i < slab_edges; i++)
