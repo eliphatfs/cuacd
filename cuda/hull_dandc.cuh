@@ -29,29 +29,6 @@ struct BtInt128 {
 __device__ inline BtInt128 bt128_make(unsigned long long lo, unsigned long long hi) {
     BtInt128 r; r.low = lo; r.high = hi; return r;
 }
-__device__ inline BtInt128 bt128_from_i64(long long v) {
-    BtInt128 r; r.low = (unsigned long long)v; r.high = (v >= 0) ? 0ULL : ~0ULL; return r;
-}
-__device__ inline BtInt128 bt128_from_u64(unsigned long long v) {
-    BtInt128 r; r.low = v; r.high = 0; return r;
-}
-__device__ inline BtInt128 bt128_neg(BtInt128 a) {
-    BtInt128 r;
-    r.low = (unsigned long long)(-(long long)a.low);
-    r.high = ~a.high + (a.low == 0);
-    return r;
-}
-__device__ inline BtInt128 bt128_add(BtInt128 a, BtInt128 b) {
-    unsigned long long lo = a.low + b.low;
-    BtInt128 r; r.low = lo; r.high = a.high + b.high + (lo < a.low);
-    return r;
-}
-__device__ inline BtInt128 bt128_sub(BtInt128 a, BtInt128 b) {
-    return bt128_add(a, bt128_neg(b));
-}
-__device__ inline int bt128_sign(BtInt128 a) {
-    return ((long long)a.high < 0) ? -1 : (a.high || a.low) ? 1 : 0;
-}
 __device__ inline int bt128_ucmp(BtInt128 a, BtInt128 b) {
     if (a.high < b.high) return -1;
     if (a.high > b.high) return 1;
@@ -59,10 +36,6 @@ __device__ inline int bt128_ucmp(BtInt128 a, BtInt128 b) {
     if (a.low > b.low) return 1;
     return 0;
 }
-__device__ inline bool bt128_lt(BtInt128 a, BtInt128 b) {
-    return (a.high < b.high) || ((a.high == b.high) && (a.low < b.low));
-}
-
 // Unsigned 64x64 -> 128 multiply
 __device__ inline BtInt128 bt128_umul(unsigned long long a, unsigned long long b) {
     unsigned long long a_lo = a & 0xffffffffULL, a_hi = a >> 32;
@@ -78,30 +51,6 @@ __device__ inline BtInt128 bt128_umul(unsigned long long a, unsigned long long b
     return r;
 }
 
-// Signed 64x64 -> 128 multiply
-__device__ inline BtInt128 bt128_smul(long long a, long long b) {
-    bool neg = (a < 0);
-    if (neg) a = -a;
-    if (b < 0) { neg = !neg; b = -b; }
-    BtInt128 r = bt128_umul((unsigned long long)a, (unsigned long long)b);
-    return neg ? bt128_neg(r) : r;
-}
-
-// 128 * 64 -> 128
-__device__ inline BtInt128 bt128_mul_i64(BtInt128 a, long long b) {
-    bool neg = ((long long)a.high < 0);
-    if (neg) a = bt128_neg(a);
-    if (b < 0) { neg = !neg; b = -b; }
-    BtInt128 r = bt128_umul(a.low, (unsigned long long)b);
-    r.high += a.high * (unsigned long long)b;
-    return neg ? bt128_neg(r) : r;
-}
-
-__device__ inline float bt128_to_float(BtInt128 a) {
-    return ((long long)a.high >= 0)
-        ? (float)((double)a.high * 18446744073709551616.0 + (double)a.low)
-        : -(float)((double)(bt128_neg(a)).high * 18446744073709551616.0 + (double)(bt128_neg(a)).low);
-}
 
 // ============================================================================
 // Point types
@@ -189,75 +138,6 @@ __device__ inline int br64_cmp(BtRational64 a, BtRational64 b) {
     if (a.sign != b.sign) return a.sign - b.sign;
     if (a.sign == 0) return 0;
     return a.sign * bt128_ucmp(bt128_umul(a.num, b.den), bt128_umul(a.den, b.num));
-}
-
-// ============================================================================
-// PointR128 for intersection vertices
-// ============================================================================
-
-// ============================================================================
-// Rational128 for exact vertex dot products
-// ============================================================================
-
-struct BtRational128 {
-    BtInt128 num;
-    BtInt128 den;
-    int sign;
-    bool isInt64;
-};
-
-__device__ inline BtRational128 br128_from_i64(long long val) {
-    BtRational128 r;
-    if (val > 0) { r.sign = 1; r.num = bt128_from_i64(val); }
-    else if (val < 0) { r.sign = -1; r.num = bt128_from_i64(-val); }
-    else { r.sign = 0; r.num = bt128_from_u64(0); }
-    r.den = bt128_from_u64(1);
-    r.isInt64 = true;
-    return r;
-}
-
-// DMul<Int128, uint64_t>::mul — 128x128 -> (256 bits as) low128, high128
-__device__ inline void bt_dmul_128(BtInt128 a, BtInt128 b, BtInt128* __restrict__ lo, BtInt128* __restrict__ hi) {
-    BtInt128 p00 = bt128_umul(a.low, b.low);
-    BtInt128 p01 = bt128_umul(a.low, b.high);
-    BtInt128 p10 = bt128_umul(a.high, b.low);
-    BtInt128 p11 = bt128_umul(a.high, b.high);
-    BtInt128 p0110 = bt128_add(bt128_from_u64(p01.low), bt128_from_u64(p10.low));
-    p11 = bt128_add(p11, bt128_from_u64(p01.high));
-    p11 = bt128_add(p11, bt128_from_u64(p10.high));
-    p11 = bt128_add(p11, bt128_from_u64(p0110.high));
-    // shlHalf(p0110): p0110.high = p0110.low; p0110.low = 0;
-    BtInt128 p0110s = bt128_make(0, p0110.low);
-    BtInt128 sum = bt128_add(p00, p0110s);
-    // carry: if sum < p00
-    if (bt128_lt(sum, p00)) p11 = bt128_add(p11, bt128_from_u64(1));
-    *lo = sum;
-    *hi = p11;
-}
-
-__device__ inline int br128_cmp_i64(BtRational128 a, long long b);
-
-__device__ inline int br128_cmp(BtRational128 a, BtRational128 b) {
-    if (a.sign != b.sign) return a.sign - b.sign;
-    if (a.sign == 0) return 0;
-    if (a.isInt64) return -br128_cmp_i64(b, a.sign * (long long)a.num.low);
-    BtInt128 nbdLo, nbdHi, dbnLo, dbnHi;
-    bt_dmul_128(a.num, b.den, &nbdLo, &nbdHi);
-    bt_dmul_128(a.den, b.num, &dbnLo, &dbnHi);
-    int c = bt128_ucmp(nbdHi, dbnHi);
-    if (c) return c * a.sign;
-    return bt128_ucmp(nbdLo, dbnLo) * a.sign;
-}
-
-__device__ inline int br128_cmp_i64(BtRational128 a, long long b) {
-    if (a.isInt64) {
-        long long av = a.sign * (long long)a.num.low;
-        return (av > b) ? 1 : (av < b) ? -1 : 0;
-    }
-    if (b > 0) { if (a.sign <= 0) return -1; }
-    else if (b < 0) { if (a.sign >= 0) return 1; b = -b; }
-    else return a.sign;
-    return bt128_ucmp(a.num, bt128_mul_i64(a.den, b)) * a.sign;
 }
 
 // ============================================================================
