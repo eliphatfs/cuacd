@@ -325,7 +325,7 @@ struct BtHullState {
     float center[3];
     int mergeStamp;
     int* mergeStampPtr;    // if non-null, use atomicAdd on shared stamp
-    int minAxis, medAxis, maxAxis;
+
     BtVIndex vertexList;
     BtVertex* __restrict__ vblock;
     const float* pts;          // original input float3 array (indexed by point.index)
@@ -1247,9 +1247,6 @@ __device__ inline BtPoint32* bt_compute_presort(BtHullState* __restrict__ s, con
     // --- Lane 0: write state and allocate ---
     BtPoint32* points = NULL;
     if (lane == 0) {
-        s->maxAxis = maxAx;
-        s->minAxis = minAx;
-        s->medAxis = medAx;
         s->scaling[0] = sc[0]; s->scaling[1] = sc[1]; s->scaling[2] = sc[2];
         s->center[0] = (mn0+mx0)*0.5f; s->center[1] = (mn1+mx1)*0.5f; s->center[2] = (mn2+mx2)*0.5f;
         s->pts = pts;
@@ -1543,7 +1540,6 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
     int* __restrict__ err, Mesh* __restrict__ s_result)
 {
     __shared__ WarpPool           s_pool;
-    __shared__ void*              s_pool_backing;
     __shared__ BtPoint32*         s_points_scratch; // heap-allocated presort array, freed after vertex init
     __shared__ BtLanePoolCleanup  s_lane_cleanup[BT_HULL_GROUPS];
     __shared__ BtHullState        s_state;
@@ -1554,7 +1550,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
     if (lane < BT_HULL_GROUPS) s_lane_cleanup[lane].nblocks = 0;
     if (lane == 0) { s_result->verts = NULL; s_result->tris = NULL;
                      s_result->nv = 0; s_result->nt = 0; s_result->refcount = NULL;
-                     s_points_scratch = NULL; }
+                     s_pool.base = NULL; s_points_scratch = NULL; }
 
     if (n < 4) { __syncwarp(); return; }
 
@@ -1563,18 +1559,16 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
         int sz = dandc_scratch_bytes(n);
         void* bk = NULL;
         if (heap_alloc(scratch_heap, (unsigned int)sz, &bk) == HEAP_OK) {
-            s_pool_backing  = bk;
             s_pool.base     = (char*)bk;
             s_pool.offset   = 0;
             s_pool.capacity = sz;
             s_pool.error    = 0;
         } else {
-            s_pool_backing = NULL;
             local_err = BT_ERR_HEAP_TO_WARP;
         }
     }
     __syncwarp();
-    if (!s_pool_backing) {
+    if (!s_pool.base) {
         local_err = __shfl_sync(WARP_MASK, local_err, 0);
         if (lane == 0 && local_err) atomicOr(err, local_err);
         return;
@@ -1682,7 +1676,7 @@ done:
             for (int i = 0; i < c->nblocks; i++)
                 heap_free(scratch_heap, c->blocks[i]);
         }
-        heap_free(scratch_heap, s_pool_backing);
+        heap_free(scratch_heap, s_pool.base);
     }
     __syncwarp();
 
