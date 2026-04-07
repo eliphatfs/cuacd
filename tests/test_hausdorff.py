@@ -75,9 +75,7 @@ def test_concentric_cubes():
     # is distance sqrt(0.5^2+0.5^2+0.5^2) = ~0.866.
     # And from inner cube corner (-0.5,-0.5,-0.5) to hull surface at z=-1 is 0.5.
     # So the bidirectional Hausdorff should be ~0.866.
-    # Point-point Hausdorff overestimates vs point-triangle since
-    # nearest sample may be farther than nearest surface point.
-    assert 0.4 < h < 1.5, f"Expected ~0.87-1.2, got {h}"
+    assert 0.4 < h < 1.2, f"Expected ~0.87, got {h}"
 
 
 def test_hull_encloses_mesh():
