@@ -11,8 +11,8 @@
 #include <math.h>
 
 // Timing helpers
-#if defined(_POSIX_C_SOURCE) || defined(__linux__)
 #include <time.h>
+#if defined(_POSIX_C_SOURCE) || defined(__linux__) || defined(__APPLE__)
 #define TSTAMP(t) clock_gettime(CLOCK_MONOTONIC, &(t))
 #define TELAPSED_MS(a,b) (((b).tv_sec-(a).tv_sec)*1e3 + ((b).tv_nsec-(a).tv_nsec)*1e-6)
 #else
