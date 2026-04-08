@@ -287,10 +287,7 @@ __device__ inline void hd_block_prefix_sum(
 #define HD_FREE_ALL_SCRATCH() do { \
     heap_free(scratch_heap, (void*)s_counts_a); \
     heap_free(scratch_heap, (void*)s_counts_b); \
-    heap_free(scratch_heap, (void*)s_samples_a); \
-    heap_free(scratch_heap, (void*)s_samples_b); \
-    heap_free(scratch_heap, (void*)s_tri_ids_a); \
-    heap_free(scratch_heap, (void*)s_tri_ids_b); \
+    heap_free(scratch_heap, (void*)s_samples_a); /* single block for samples+tri_ids */ \
     heap_free(scratch_heap, (void*)s_morton_a); \
     heap_free(scratch_heap, (void*)s_morton_b); \
     heap_free(scratch_heap, (void*)s_sort_scratch); \
@@ -492,21 +489,23 @@ __device__ __forceinline__ float hausdorff_block(
     // Phase 2: Allocate sample buffers and generate sample points.
     // =================================================================
 
+    // Allocate all sample buffers as a single heap block to avoid
+    // overlap from fragmented free-list allocations.
     if (tid == 0) {
-        void *p1 = NULL, *p2 = NULL, *p3 = NULL, *p4 = NULL;
+        unsigned int sa_bytes = (unsigned int)(n_sa * 3) * (unsigned int)sizeof(float);
+        unsigned int ta_bytes = (unsigned int)n_sa * (unsigned int)sizeof(int);
+        unsigned int sb_bytes = (unsigned int)(n_sb * 3) * (unsigned int)sizeof(float);
+        unsigned int tb_bytes = (unsigned int)n_sb * (unsigned int)sizeof(int);
+        unsigned int total = sa_bytes + ta_bytes + sb_bytes + tb_bytes;
+        void* buf = NULL;
         s_alloc_ok = 1;
-        if (heap_alloc(scratch_heap, (unsigned int)(n_sa * 3 * (int)sizeof(float)), &p1) != HEAP_OK)
-            { s_alloc_ok = 0; p1 = NULL; }
-        if (heap_alloc(scratch_heap, (unsigned int)(n_sa * (int)sizeof(int)), &p2) != HEAP_OK)
-            { s_alloc_ok = 0; p2 = NULL; }
-        if (heap_alloc(scratch_heap, (unsigned int)(n_sb * 3 * (int)sizeof(float)), &p3) != HEAP_OK)
-            { s_alloc_ok = 0; p3 = NULL; }
-        if (heap_alloc(scratch_heap, (unsigned int)(n_sb * (int)sizeof(int)), &p4) != HEAP_OK)
-            { s_alloc_ok = 0; p4 = NULL; }
-        s_samples_a  = (float*)p1;
-        s_tri_ids_a  = (int*)p2;
-        s_samples_b  = (float*)p3;
-        s_tri_ids_b  = (int*)p4;
+        if (heap_alloc(scratch_heap, total, &buf) != HEAP_OK)
+            { s_alloc_ok = 0; buf = NULL; }
+        char* p = (char*)buf;
+        s_samples_a = (float*)p;               p += sa_bytes;
+        s_tri_ids_a = (int*)p;                 p += ta_bytes;
+        s_samples_b = (float*)p;               p += sb_bytes;
+        s_tri_ids_b = (int*)p;
     }
     __syncthreads();
     if (!s_alloc_ok) {
@@ -991,7 +990,13 @@ __device__ __forceinline__ float hausdorff_block(
             int delta_node = hd_delta(morton, n, i, j);
             int s = 0;
             int max_len = (j > i) ? (j - i) : (i - j);
-            for (int t = (max_len + 1) >> 1; t >= 1; t >>= 1) {
+            // Start t at the largest power of 2 <= max_len so the binary
+            // search can express every integer in [0, max_len].  The old
+            // (max_len+1)>>1 start skipped valid positions when max_len
+            // was not a power of two.
+            int t_start = 1;
+            while (t_start * 2 <= max_len) t_start *= 2;
+            for (int t = t_start; t >= 1; t >>= 1) {
                 if (hd_delta(morton, n, i, i + (s + t) * d) > delta_node)
                     s += t;
             }
@@ -1090,7 +1095,7 @@ __device__ __forceinline__ float hausdorff_block(
         }
         __syncthreads();
 
-        // Build internal nodes.
+        // Build internal nodes (serial — see note in first BVH block).
         for (int i = tid; i < n - 1; i += HD_BLOCK) {
             int d_val = hd_delta(morton, n, i, i + 1) - hd_delta(morton, n, i, i - 1);
             int d = (d_val > 0) ? 1 : -1;
@@ -1110,7 +1115,13 @@ __device__ __forceinline__ float hausdorff_block(
             int delta_node = hd_delta(morton, n, i, j);
             int s = 0;
             int max_len = (j > i) ? (j - i) : (i - j);
-            for (int t = (max_len + 1) >> 1; t >= 1; t >>= 1) {
+            // Start t at the largest power of 2 <= max_len so the binary
+            // search can express every integer in [0, max_len].  The old
+            // (max_len+1)>>1 start skipped valid positions when max_len
+            // was not a power of two.
+            int t_start = 1;
+            while (t_start * 2 <= max_len) t_start *= 2;
+            for (int t = t_start; t >= 1; t >>= 1) {
                 if (hd_delta(morton, n, i, i + (s + t) * d) > delta_node)
                     s += t;
             }
@@ -1157,8 +1168,7 @@ __device__ __forceinline__ float hausdorff_block(
     if (tid == 0) {
         heap_free(scratch_heap, (void*)s_morton_a); s_morton_a = NULL;
         heap_free(scratch_heap, (void*)s_morton_b); s_morton_b = NULL;
-        heap_free(scratch_heap, (void*)s_tri_ids_a); s_tri_ids_a = NULL;
-        heap_free(scratch_heap, (void*)s_tri_ids_b); s_tri_ids_b = NULL;
+        // s_tri_ids_a/b are part of the single samples allocation — not freed separately
     }
     __syncthreads();
 
@@ -1269,6 +1279,7 @@ __device__ __forceinline__ float hausdorff_block(
         float dir_ba = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ba = dir_ba;
         __syncthreads();
+
     } else if (need_bvh_a && n_sa <= 1) {
         // Too few samples for BVH — brute force against all target triangles.
         float local_max = 0.0f;

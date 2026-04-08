@@ -38,3 +38,11 @@ Use-1 can exceed `n_boundary * 3` when the merged polygon grows during bridging,
 ## plane_cut Phase 10: lv Buffer Overflow in Loop Reconstruction
 
 `lv` (loop vertex sequence) was allocated with `n_boundary` elements. When boundary edges don't form clean closed loops (e.g., non-manifold geometry, safety counter exhaustion), the while loop in phase 10 could write past the buffer end. Writing one element beyond `lv` corrupts the adjacent heap block's header, causing cascading failures: corrupted output meshes with -1 vertex indices -> OOB `all_verts` accesses -> misaligned address errors (CUDA error 716) in subsequent iterations. Fix: guard `lvi >= n_boundary` before each `lv[lvi++]` write.
+
+## hausdorff BVH: Karras Split Binary Search Off-by-One
+
+The Karras 2012 linear BVH construction finds the split point gamma via a power-of-2 binary search. The original implementation started `t` at `(max_len + 1) >> 1`, which for non-power-of-two `max_len` produces a halving sequence (e.g. 10, 5, 2, 1 for max_len=19) whose subset sums cannot express every integer in [0, max_len]. This caused some internal nodes to never be assigned as children, leaving orphan subtrees with uninitialized AABBs. The traversal then missed entire subtrees, returning inflated Hausdorff distances. Fix: start `t` at the largest power of 2 ≤ max_len (e.g. 16, 8, 4, 2, 1 for max_len=19), guaranteeing full coverage.
+
+## hausdorff BVH: Heap Free-List Overlap on Sample Buffers
+
+Four separate `heap_alloc` calls for `s_samples_a`, `s_tri_ids_a`, `s_samples_b`, `s_tri_ids_b` could return overlapping regions when the free-list had recently freed blocks of similar size. Observed: last 64 bytes of `s_samples_a` aliased first 64 bytes of `s_samples_b`, corrupting ~5 sample positions. This silently corrupted Morton codes and BVH leaf placement, causing the B→A traversal to miss correct triangles. Fix: allocate all four arrays as a single contiguous `heap_alloc` block and compute sub-pointers manually.

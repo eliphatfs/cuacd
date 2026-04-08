@@ -48,7 +48,9 @@ tests/                # All tests
   test_hull_mesh.py   #   D&C hull mesh extraction tests + k-DOP hull tests
   test_warp_sort.py   #   Tests for warp_sort_bp32
   test_plane_cut.py   #   Plane cut tests (14 tests)
-  test_hausdorff.py   #   Hausdorff distance tests (5 tests)
+  test_hausdorff.py   #   Hausdorff distance tests (5 tests) + CoACD reference comparison
+  gen_hausdorff_fixtures.py # Generates CoACD reference Hausdorff fixtures (C++ harness + .npz)
+  ref_hausdorff.cpp    #   Standalone C++ CoACD Hausdorff reference harness
   test_decompose.py   #   beam_decompose tests (cube, lshape, octocat, octocat_debug_steps)
   test_edge_tracking.py # Max edge pairs stress test for D&C hull (requires COACD_TRACK_EDGES=1 build)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling

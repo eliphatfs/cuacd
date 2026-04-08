@@ -109,3 +109,47 @@ def test_symmetry():
     # Bidirectional Hausdorff is symmetric by definition.
     assert abs(h1 - h2) < 0.15 * max(h1, h2, 0.01), \
         f"Asymmetric: {h1} vs {h2}"
+
+
+# ---------------------------------------------------------------------------
+# CoACD reference comparison
+# ---------------------------------------------------------------------------
+import os
+
+_FIXTURE_PATH = os.path.join(
+    os.path.dirname(__file__), 'data', 'hausdorff_coacd_ref.npz')
+
+
+@pytest.mark.skipif(
+    not os.path.exists(_FIXTURE_PATH),
+    reason="Run tests/gen_hausdorff_fixtures.py to generate reference data")
+def test_coacd_reference_comparison():
+    """Compare GPU hausdorff against CoACD reference on fixture pairs.
+
+    GPU uses BVH-based exact triangle search; CoACD uses KD-tree with
+    10-NN point lookup.  In most cases results should match closely.
+    When they differ, GPU should be <= CoACD (BVH finds exact nearest
+    triangle, whereas 10-NN may miss it).
+    """
+    data = np.load(_FIXTURE_PATH, allow_pickle=True)
+    n_pairs = int(data['n_pairs'])
+    names = data['names']
+
+    for i in range(n_pairs):
+        va = data[f'verts_a_{i}'].astype(np.float32)
+        ta = data[f'tris_a_{i}'].astype(np.int32)
+        vb = data[f'verts_b_{i}'].astype(np.float32)
+        tb = data[f'tris_b_{i}'].astype(np.int32)
+        ref = float(data[f'ref_{i}'])
+
+        gpu = _hausdorff(va, ta, vb, tb)
+
+        rel_err = abs(gpu - ref) / max(ref, 1e-6)
+        # Either results match within 15%, or GPU <= CoACD (expected when
+        # CoACD's 10-NN misses the nearest triangle).
+        ok = rel_err < 0.15 or gpu <= ref * 1.01
+        print(f"  {names[i]}: gpu={gpu:.6f}  coacd={ref:.6f}  "
+              f"rel_err={rel_err:.4f}  {'OK' if ok else 'FAIL'}")
+        assert ok, (
+            f"{names[i]}: gpu={gpu:.6f} vs coacd={ref:.6f}, "
+            f"rel_err={rel_err:.3f} and gpu > coacd")
