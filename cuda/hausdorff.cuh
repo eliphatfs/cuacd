@@ -332,6 +332,12 @@ __device__ __forceinline__ float hausdorff_block(
     if (a->nt <= 0 || a->nv <= 0 || b->nt <= 0 || b->nv <= 0)
         return 0.0f;
 
+    // Checked wrappers for input mesh data.
+    PC_BUF(float, av, a->verts, a->nv * 3);
+    PC_BUF(int,   at, a->tris,  a->nt * 3);
+    PC_BUF(float, bv, b->verts, b->nv * 3);
+    PC_BUF(int,   bt, b->tris,  b->nt * 3);
+
     // =================================================================
     // Phase 1: Compute triangle areas and sample counts.
     // =================================================================
@@ -340,11 +346,11 @@ __device__ __forceinline__ float hausdorff_block(
     {
         float local_area = 0.0f;
         for (int t = tid; t < a->nt; t += HD_BLOCK) {
-            int ia = a->tris[t * 3 + 0], ib = a->tris[t * 3 + 1], ic = a->tris[t * 3 + 2];
+            int ia = at[t * 3 + 0], ib = at[t * 3 + 1], ic = at[t * 3 + 2];
             local_area += hd_tri_area(
-                a->verts[ia*3], a->verts[ia*3+1], a->verts[ia*3+2],
-                a->verts[ib*3], a->verts[ib*3+1], a->verts[ib*3+2],
-                a->verts[ic*3], a->verts[ic*3+1], a->verts[ic*3+2]);
+                av[ia*3], av[ia*3+1], av[ia*3+2],
+                av[ib*3], av[ib*3+1], av[ib*3+2],
+                av[ic*3], av[ic*3+1], av[ic*3+2]);
         }
         float ta = block_reduce_sum(local_area, s_reduce, tid);
         if (tid == 0) {
@@ -360,11 +366,11 @@ __device__ __forceinline__ float hausdorff_block(
     {
         float local_area = 0.0f;
         for (int t = tid; t < b->nt; t += HD_BLOCK) {
-            int ia = b->tris[t * 3 + 0], ib = b->tris[t * 3 + 1], ic = b->tris[t * 3 + 2];
+            int ia = bt[t * 3 + 0], ib = bt[t * 3 + 1], ic = bt[t * 3 + 2];
             local_area += hd_tri_area(
-                b->verts[ia*3], b->verts[ia*3+1], b->verts[ia*3+2],
-                b->verts[ib*3], b->verts[ib*3+1], b->verts[ib*3+2],
-                b->verts[ic*3], b->verts[ic*3+1], b->verts[ic*3+2]);
+                bv[ia*3], bv[ia*3+1], bv[ia*3+2],
+                bv[ib*3], bv[ib*3+1], bv[ib*3+2],
+                bv[ic*3], bv[ic*3+1], bv[ic*3+2]);
         }
         float tb = block_reduce_sum(local_area, s_reduce, tid);
         if (tid == 0) {
@@ -398,13 +404,16 @@ __device__ __forceinline__ float hausdorff_block(
         return 0.0f;
     }
 
+    PC_BUF(int, counts_a, s_counts_a, a->nt);
+    PC_BUF(int, counts_b, s_counts_b, b->nt);
+
     // Compute per-triangle sample counts for mesh A.
     for (int t = tid; t < a->nt; t += HD_BLOCK) {
-        int ia = a->tris[t * 3 + 0], ib = a->tris[t * 3 + 1], ic = a->tris[t * 3 + 2];
+        int ia = at[t * 3 + 0], ib = at[t * 3 + 1], ic = at[t * 3 + 2];
         float ta = hd_tri_area(
-            a->verts[ia*3], a->verts[ia*3+1], a->verts[ia*3+2],
-            a->verts[ib*3], a->verts[ib*3+1], a->verts[ib*3+2],
-            a->verts[ic*3], a->verts[ic*3+1], a->verts[ic*3+2]);
+            av[ia*3], av[ia*3+1], av[ia*3+2],
+            av[ib*3], av[ib*3+1], av[ib*3+2],
+            av[ic*3], av[ic*3+1], av[ic*3+2]);
         int N;
         int area_count = (area_a > 1e-20f) ? (int)((float)res_a / area_a * ta) : 0;
         if (a->nt > res_a) {
@@ -413,16 +422,16 @@ __device__ __forceinline__ float hausdorff_block(
         } else {
             N = (area_count > 0) ? area_count : ((t % 2 == 0) ? 1 : 0);
         }
-        s_counts_a[t] = N;
+        counts_a[t] = N;
     }
 
     // Compute per-triangle sample counts for mesh B.
     for (int t = tid; t < b->nt; t += HD_BLOCK) {
-        int ia = b->tris[t * 3 + 0], ib = b->tris[t * 3 + 1], ic = b->tris[t * 3 + 2];
+        int ia = bt[t * 3 + 0], ib = bt[t * 3 + 1], ic = bt[t * 3 + 2];
         float tb = hd_tri_area(
-            b->verts[ia*3], b->verts[ia*3+1], b->verts[ia*3+2],
-            b->verts[ib*3], b->verts[ib*3+1], b->verts[ib*3+2],
-            b->verts[ic*3], b->verts[ic*3+1], b->verts[ic*3+2]);
+            bv[ia*3], bv[ia*3+1], bv[ia*3+2],
+            bv[ib*3], bv[ib*3+1], bv[ib*3+2],
+            bv[ic*3], bv[ic*3+1], bv[ic*3+2]);
         int N;
         int area_count = (area_b > 1e-20f) ? (int)((float)res_b / area_b * tb) : 0;
         if (b->nt > res_b) {
@@ -431,7 +440,7 @@ __device__ __forceinline__ float hausdorff_block(
         } else {
             N = (area_count > 0) ? area_count : ((t % 2 == 0) ? 1 : 0);
         }
-        s_counts_b[t] = N;
+        counts_b[t] = N;
     }
     __syncthreads();
 
@@ -483,15 +492,20 @@ __device__ __forceinline__ float hausdorff_block(
         return 0.0f;
     }
 
+    PC_BUF(float, samples_a, s_samples_a, n_sa * 3);
+    PC_BUF(int,   tri_ids_a, s_tri_ids_a, n_sa);
+    PC_BUF(float, samples_b, s_samples_b, n_sb * 3);
+    PC_BUF(int,   tri_ids_b, s_tri_ids_b, n_sb);
+
     // Generate samples for mesh A.
     for (int t = tid; t < a->nt; t += HD_BLOCK) {
-        int off = s_counts_a[t];
-        int next_off = (t + 1 < a->nt) ? s_counts_a[t + 1] : n_sa;
+        int off = counts_a[t];
+        int next_off = (t + 1 < a->nt) ? counts_a[t + 1] : n_sa;
         int N = next_off - off;
-        int ia = a->tris[t * 3], ib = a->tris[t * 3 + 1], ic = a->tris[t * 3 + 2];
-        float p0x = a->verts[ia*3], p0y = a->verts[ia*3+1], p0z = a->verts[ia*3+2];
-        float p1x = a->verts[ib*3], p1y = a->verts[ib*3+1], p1z = a->verts[ib*3+2];
-        float p2x = a->verts[ic*3], p2y = a->verts[ic*3+1], p2z = a->verts[ic*3+2];
+        int ia = at[t * 3], ib = at[t * 3 + 1], ic = at[t * 3 + 2];
+        float p0x = av[ia*3], p0y = av[ia*3+1], p0z = av[ia*3+2];
+        float p1x = av[ib*3], p1y = av[ib*3+1], p1z = av[ib*3+2];
+        float p2x = av[ic*3], p2y = av[ic*3+1], p2z = av[ic*3+2];
         for (int k = 0; k < N; k++) {
             unsigned int ha = hd_wang_hash((unsigned int)t * 65537u + (unsigned int)k);
             unsigned int hb = hd_wang_hash(ha + 0x9e3779b9u);
@@ -499,22 +513,22 @@ __device__ __forceinline__ float hausdorff_block(
             float rb = (float)(hb & 0xFFFFFFu) / (float)0xFFFFFFu;
             float sqa = sqrtf(ra);
             int idx = off + k;
-            s_samples_a[idx * 3 + 0] = (1.0f - sqa) * p0x + sqa * (1.0f - rb) * p1x + sqa * rb * p2x;
-            s_samples_a[idx * 3 + 1] = (1.0f - sqa) * p0y + sqa * (1.0f - rb) * p1y + sqa * rb * p2y;
-            s_samples_a[idx * 3 + 2] = (1.0f - sqa) * p0z + sqa * (1.0f - rb) * p1z + sqa * rb * p2z;
-            s_tri_ids_a[idx] = t;
+            samples_a[idx * 3 + 0] = (1.0f - sqa) * p0x + sqa * (1.0f - rb) * p1x + sqa * rb * p2x;
+            samples_a[idx * 3 + 1] = (1.0f - sqa) * p0y + sqa * (1.0f - rb) * p1y + sqa * rb * p2y;
+            samples_a[idx * 3 + 2] = (1.0f - sqa) * p0z + sqa * (1.0f - rb) * p1z + sqa * rb * p2z;
+            tri_ids_a[idx] = t;
         }
     }
 
     // Generate samples for mesh B.
     for (int t = tid; t < b->nt; t += HD_BLOCK) {
-        int off = s_counts_b[t];
-        int next_off = (t + 1 < b->nt) ? s_counts_b[t + 1] : n_sb;
+        int off = counts_b[t];
+        int next_off = (t + 1 < b->nt) ? counts_b[t + 1] : n_sb;
         int N = next_off - off;
-        int ia = b->tris[t * 3], ib = b->tris[t * 3 + 1], ic = b->tris[t * 3 + 2];
-        float p0x = b->verts[ia*3], p0y = b->verts[ia*3+1], p0z = b->verts[ia*3+2];
-        float p1x = b->verts[ib*3], p1y = b->verts[ib*3+1], p1z = b->verts[ib*3+2];
-        float p2x = b->verts[ic*3], p2y = b->verts[ic*3+1], p2z = b->verts[ic*3+2];
+        int ia = bt[t * 3], ib = bt[t * 3 + 1], ic = bt[t * 3 + 2];
+        float p0x = bv[ia*3], p0y = bv[ia*3+1], p0z = bv[ia*3+2];
+        float p1x = bv[ib*3], p1y = bv[ib*3+1], p1z = bv[ib*3+2];
+        float p2x = bv[ic*3], p2y = bv[ic*3+1], p2z = bv[ic*3+2];
         for (int k = 0; k < N; k++) {
             unsigned int ha = hd_wang_hash((unsigned int)t * 65537u + (unsigned int)k);
             unsigned int hb = hd_wang_hash(ha + 0x9e3779b9u);
@@ -522,10 +536,10 @@ __device__ __forceinline__ float hausdorff_block(
             float rb = (float)(hb & 0xFFFFFFu) / (float)0xFFFFFFu;
             float sqa = sqrtf(ra);
             int idx = off + k;
-            s_samples_b[idx * 3 + 0] = (1.0f - sqa) * p0x + sqa * (1.0f - rb) * p1x + sqa * rb * p2x;
-            s_samples_b[idx * 3 + 1] = (1.0f - sqa) * p0y + sqa * (1.0f - rb) * p1y + sqa * rb * p2y;
-            s_samples_b[idx * 3 + 2] = (1.0f - sqa) * p0z + sqa * (1.0f - rb) * p1z + sqa * rb * p2z;
-            s_tri_ids_b[idx] = t;
+            samples_b[idx * 3 + 0] = (1.0f - sqa) * p0x + sqa * (1.0f - rb) * p1x + sqa * rb * p2x;
+            samples_b[idx * 3 + 1] = (1.0f - sqa) * p0y + sqa * (1.0f - rb) * p1y + sqa * rb * p2y;
+            samples_b[idx * 3 + 2] = (1.0f - sqa) * p0z + sqa * (1.0f - rb) * p1z + sqa * rb * p2z;
+            tri_ids_b[idx] = t;
         }
     }
     __syncthreads();
@@ -546,10 +560,14 @@ __device__ __forceinline__ float hausdorff_block(
         // Brute force.
         float local_max = 0.0f;
         for (int i = tid; i < n_sa; i += HD_BLOCK) {
-            float qx = s_samples_a[i * 3], qy = s_samples_a[i * 3 + 1], qz = s_samples_a[i * 3 + 2];
+            float qx = samples_a[i * 3], qy = samples_a[i * 3 + 1], qz = samples_a[i * 3 + 2];
             float best = 1e30f;
             for (int t = 0; t < b->nt; t++) {
-                float d = hd_pt_mesh_tri_dist_sq(qx, qy, qz, t, b);
+                int i0 = bt[t*3+0], i1 = bt[t*3+1], i2 = bt[t*3+2];
+                float d = hd_dist_pt_tri_sq(qx,qy,qz,
+                    bv[i0*3],bv[i0*3+1],bv[i0*3+2],
+                    bv[i1*3],bv[i1*3+1],bv[i1*3+2],
+                    bv[i2*3],bv[i2*3+1],bv[i2*3+2]);
                 best = fminf(best, d);
             }
             local_max = fmaxf(local_max, best);
@@ -563,10 +581,14 @@ __device__ __forceinline__ float hausdorff_block(
     if (a->nt <= HD_BRUTE_THRESH) {
         float local_max = 0.0f;
         for (int i = tid; i < n_sb; i += HD_BLOCK) {
-            float qx = s_samples_b[i * 3], qy = s_samples_b[i * 3 + 1], qz = s_samples_b[i * 3 + 2];
+            float qx = samples_b[i * 3], qy = samples_b[i * 3 + 1], qz = samples_b[i * 3 + 2];
             float best = 1e30f;
             for (int t = 0; t < a->nt; t++) {
-                float d = hd_pt_mesh_tri_dist_sq(qx, qy, qz, t, a);
+                int i0 = at[t*3+0], i1 = at[t*3+1], i2 = at[t*3+2];
+                float d = hd_dist_pt_tri_sq(qx,qy,qz,
+                    av[i0*3],av[i0*3+1],av[i0*3+2],
+                    av[i1*3],av[i1*3+1],av[i1*3+2],
+                    av[i2*3],av[i2*3+1],av[i2*3+2]);
                 best = fminf(best, d);
             }
             local_max = fmaxf(local_max, best);
@@ -599,14 +621,14 @@ __device__ __forceinline__ float hausdorff_block(
 
         // Samples A.
         for (int i = tid; i < n_sa; i += HD_BLOCK) {
-            float x = s_samples_a[i * 3], y = s_samples_a[i * 3 + 1], z = s_samples_a[i * 3 + 2];
+            float x = samples_a[i * 3], y = samples_a[i * 3 + 1], z = samples_a[i * 3 + 2];
             tlo[0] = fminf(tlo[0], x); thi[0] = fmaxf(thi[0], x);
             tlo[1] = fminf(tlo[1], y); thi[1] = fmaxf(thi[1], y);
             tlo[2] = fminf(tlo[2], z); thi[2] = fmaxf(thi[2], z);
         }
         // Samples B.
         for (int i = tid; i < n_sb; i += HD_BLOCK) {
-            float x = s_samples_b[i * 3], y = s_samples_b[i * 3 + 1], z = s_samples_b[i * 3 + 2];
+            float x = samples_b[i * 3], y = samples_b[i * 3 + 1], z = samples_b[i * 3 + 2];
             tlo[0] = fminf(tlo[0], x); thi[0] = fmaxf(thi[0], x);
             tlo[1] = fminf(tlo[1], y); thi[1] = fmaxf(thi[1], y);
             tlo[2] = fminf(tlo[2], z); thi[2] = fmaxf(thi[2], z);
@@ -661,24 +683,26 @@ __device__ __forceinline__ float hausdorff_block(
     }
 
     // Compute Morton codes.
+    PC_BUF(MortonPoint, morton_b, s_morton_b, need_bvh_b ? n_sb : 0);
+    PC_BUF(MortonPoint, morton_a, s_morton_a, need_bvh_a ? n_sa : 0);
     if (need_bvh_b) {
         for (int i = tid; i < n_sb; i += HD_BLOCK) {
-            float x = s_samples_b[i * 3], y = s_samples_b[i * 3 + 1], z = s_samples_b[i * 3 + 2];
+            float x = samples_b[i * 3], y = samples_b[i * 3 + 1], z = samples_b[i * 3 + 2];
             unsigned int mx = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (x - bb_min[0]) / bb_ext[0] * 1023.0f));
             unsigned int my = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (y - bb_min[1]) / bb_ext[1] * 1023.0f));
             unsigned int mz = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (z - bb_min[2]) / bb_ext[2] * 1023.0f));
-            s_morton_b[i].code = hd_morton3D(mx, my, mz);
-            s_morton_b[i].index = i;
+            morton_b[i].code = hd_morton3D(mx, my, mz);
+            morton_b[i].index = i;
         }
     }
     if (need_bvh_a) {
         for (int i = tid; i < n_sa; i += HD_BLOCK) {
-            float x = s_samples_a[i * 3], y = s_samples_a[i * 3 + 1], z = s_samples_a[i * 3 + 2];
+            float x = samples_a[i * 3], y = samples_a[i * 3 + 1], z = samples_a[i * 3 + 2];
             unsigned int mx = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (x - bb_min[0]) / bb_ext[0] * 1023.0f));
             unsigned int my = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (y - bb_min[1]) / bb_ext[1] * 1023.0f));
             unsigned int mz = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (z - bb_min[2]) / bb_ext[2] * 1023.0f));
-            s_morton_a[i].code = hd_morton3D(mx, my, mz);
-            s_morton_a[i].index = i;
+            morton_a[i].code = hd_morton3D(mx, my, mz);
+            morton_a[i].index = i;
         }
     }
     __syncthreads();
@@ -925,11 +949,11 @@ __device__ __forceinline__ float hausdorff_block(
         // Step A: Initialize leaf AABBs.
         for (int i = tid; i < n; i += HD_BLOCK) {
             int leaf_idx = (n - 1) + i;
-            int tri = s_tri_ids_b[morton[i].index];
-            int ia = b->tris[tri * 3 + 0], ib_t = b->tris[tri * 3 + 1], ic = b->tris[tri * 3 + 2];
-            float ax = b->verts[ia*3], ay = b->verts[ia*3+1], az = b->verts[ia*3+2];
-            float bx = b->verts[ib_t*3], by = b->verts[ib_t*3+1], bz = b->verts[ib_t*3+2];
-            float cx = b->verts[ic*3], cy = b->verts[ic*3+1], cz = b->verts[ic*3+2];
+            int tri = tri_ids_b[morton[i].index];
+            int ia = bt[tri * 3 + 0], ib_t = bt[tri * 3 + 1], ic = bt[tri * 3 + 2];
+            float ax = bv[ia*3], ay = bv[ia*3+1], az = bv[ia*3+2];
+            float bx = bv[ib_t*3], by = bv[ib_t*3+1], bz = bv[ib_t*3+2];
+            float cx = bv[ic*3], cy = bv[ic*3+1], cz = bv[ic*3+2];
             bvh[leaf_idx].bmin[0] = fminf(ax, fminf(bx, cx));
             bvh[leaf_idx].bmin[1] = fminf(ay, fminf(by, cy));
             bvh[leaf_idx].bmin[2] = fminf(az, fminf(bz, cz));
@@ -1051,11 +1075,11 @@ __device__ __forceinline__ float hausdorff_block(
         // Leaf AABBs — from mesh A's triangles.
         for (int i = tid; i < n; i += HD_BLOCK) {
             int leaf_idx = (n - 1) + i;
-            int tri = s_tri_ids_a[morton[i].index];
-            int ia = a->tris[tri * 3 + 0], ib_t = a->tris[tri * 3 + 1], ic = a->tris[tri * 3 + 2];
-            float ax = a->verts[ia*3], ay = a->verts[ia*3+1], az = a->verts[ia*3+2];
-            float bx = a->verts[ib_t*3], by = a->verts[ib_t*3+1], bz = a->verts[ib_t*3+2];
-            float cx = a->verts[ic*3], cy = a->verts[ic*3+1], cz = a->verts[ic*3+2];
+            int tri = tri_ids_a[morton[i].index];
+            int ia = at[tri * 3 + 0], ib_t = at[tri * 3 + 1], ic = at[tri * 3 + 2];
+            float ax = av[ia*3], ay = av[ia*3+1], az = av[ia*3+2];
+            float bx = av[ib_t*3], by = av[ib_t*3+1], bz = av[ib_t*3+2];
+            float cx = av[ic*3], cy = av[ic*3+1], cz = av[ic*3+2];
             bvh[leaf_idx].bmin[0] = fminf(ax, fminf(bx, cx));
             bvh[leaf_idx].bmin[1] = fminf(ay, fminf(by, cy));
             bvh[leaf_idx].bmin[2] = fminf(az, fminf(bz, cz));
@@ -1151,11 +1175,10 @@ __device__ __forceinline__ float hausdorff_block(
     // Direction A->B (query samples_a against BVH built on B's samples).
     if (need_bvh_b && n_sb > 1) {
         BVHNode* bvh = s_bvh_b;
-        int n_leaves = n_sb;
         float local_max = 0.0f;
 
         for (int i = tid; i < n_sa; i += HD_BLOCK) {
-            float qx = s_samples_a[i * 3], qy = s_samples_a[i * 3 + 1], qz = s_samples_a[i * 3 + 2];
+            float qx = samples_a[i * 3], qy = samples_a[i * 3 + 1], qz = samples_a[i * 3 + 2];
             float best_sq = 1e30f;
 
             int stack[HD_BVH_STACK];
@@ -1171,7 +1194,12 @@ __device__ __forceinline__ float hausdorff_block(
 
                 if (nd->left == -1) {
                     // Leaf: exact distance to source triangle.
-                    float d = hd_pt_mesh_tri_dist_sq(qx, qy, qz, nd->tri_idx, b);
+                    int ti = nd->tri_idx;
+                    int i0 = bt[ti*3+0], i1 = bt[ti*3+1], i2 = bt[ti*3+2];
+                    float d = hd_dist_pt_tri_sq(qx,qy,qz,
+                        bv[i0*3],bv[i0*3+1],bv[i0*3+2],
+                        bv[i1*3],bv[i1*3+1],bv[i1*3+2],
+                        bv[i2*3],bv[i2*3+1],bv[i2*3+2]);
                     best_sq = fminf(best_sq, d);
                 } else {
                     // Push children, farther first.
@@ -1196,10 +1224,14 @@ __device__ __forceinline__ float hausdorff_block(
         // Too few samples for BVH — brute force against all target triangles.
         float local_max = 0.0f;
         for (int i = tid; i < n_sa; i += HD_BLOCK) {
-            float qx = s_samples_a[i * 3], qy = s_samples_a[i * 3 + 1], qz = s_samples_a[i * 3 + 2];
+            float qx = samples_a[i * 3], qy = samples_a[i * 3 + 1], qz = samples_a[i * 3 + 2];
             float best = 1e30f;
             for (int t = 0; t < b->nt; t++) {
-                float d = hd_pt_mesh_tri_dist_sq(qx, qy, qz, t, b);
+                int i0 = bt[t*3+0], i1 = bt[t*3+1], i2 = bt[t*3+2];
+                float d = hd_dist_pt_tri_sq(qx,qy,qz,
+                    bv[i0*3],bv[i0*3+1],bv[i0*3+2],
+                    bv[i1*3],bv[i1*3+1],bv[i1*3+2],
+                    bv[i2*3],bv[i2*3+1],bv[i2*3+2]);
                 best = fminf(best, d);
             }
             local_max = fmaxf(local_max, best);
@@ -1212,11 +1244,10 @@ __device__ __forceinline__ float hausdorff_block(
     // Direction B->A (query samples_b against BVH built on A's samples).
     if (need_bvh_a && n_sa > 1) {
         BVHNode* bvh = s_bvh_a;
-        int n_leaves = n_sa;
         float local_max = 0.0f;
 
         for (int i = tid; i < n_sb; i += HD_BLOCK) {
-            float qx = s_samples_b[i * 3], qy = s_samples_b[i * 3 + 1], qz = s_samples_b[i * 3 + 2];
+            float qx = samples_b[i * 3], qy = samples_b[i * 3 + 1], qz = samples_b[i * 3 + 2];
             float best_sq = 1e30f;
 
             int stack[HD_BVH_STACK];
@@ -1231,7 +1262,12 @@ __device__ __forceinline__ float hausdorff_block(
                 if (aabb_d >= best_sq) continue;
 
                 if (nd->left == -1) {
-                    float d = hd_pt_mesh_tri_dist_sq(qx, qy, qz, nd->tri_idx, a);
+                    int ti = nd->tri_idx;
+                    int i0 = at[ti*3+0], i1 = at[ti*3+1], i2 = at[ti*3+2];
+                    float d = hd_dist_pt_tri_sq(qx,qy,qz,
+                        av[i0*3],av[i0*3+1],av[i0*3+2],
+                        av[i1*3],av[i1*3+1],av[i1*3+2],
+                        av[i2*3],av[i2*3+1],av[i2*3+2]);
                     best_sq = fminf(best_sq, d);
                 } else {
                     float dL = hd_pt_aabb_dist_sq(qx, qy, qz, bvh[nd->left].bmin, bvh[nd->left].bmax);
@@ -1255,10 +1291,14 @@ __device__ __forceinline__ float hausdorff_block(
         // Too few samples for BVH — brute force against all target triangles.
         float local_max = 0.0f;
         for (int i = tid; i < n_sb; i += HD_BLOCK) {
-            float qx = s_samples_b[i * 3], qy = s_samples_b[i * 3 + 1], qz = s_samples_b[i * 3 + 2];
+            float qx = samples_b[i * 3], qy = samples_b[i * 3 + 1], qz = samples_b[i * 3 + 2];
             float best = 1e30f;
             for (int t = 0; t < a->nt; t++) {
-                float d = hd_pt_mesh_tri_dist_sq(qx, qy, qz, t, a);
+                int i0 = at[t*3+0], i1 = at[t*3+1], i2 = at[t*3+2];
+                float d = hd_dist_pt_tri_sq(qx,qy,qz,
+                    av[i0*3],av[i0*3+1],av[i0*3+2],
+                    av[i1*3],av[i1*3+1],av[i1*3+2],
+                    av[i2*3],av[i2*3+1],av[i2*3+2]);
                 best = fminf(best, d);
             }
             local_max = fmaxf(local_max, best);

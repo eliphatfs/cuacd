@@ -34,12 +34,20 @@ static __device__ inline float part_cost(const Part& p) {
 }
 
 // Comparator for sorting Parts by part_cost, ascending.
+// Tiebreak on mesh.verts pointer to ensure a total order — warp_partition
+// fills equal-key slots with the pivot value, which would duplicate Part
+// structs (and their refcounted pointers) without incrementing refcounts.
 struct PartKeyCmp {
     static __device__ inline float key(const Part& p) { return part_cost(p); }
     static __device__ inline int cmp(Part a, Part b) {
         float ka = key(a), kb = key(b);
         if (ka < kb) return -1;
         if (ka > kb) return  1;
+        // Tiebreak: compare mesh.verts pointer to get a unique total order.
+        unsigned long long pa = (unsigned long long)a.mesh.verts;
+        unsigned long long pb = (unsigned long long)b.mesh.verts;
+        if (pa < pb) return -1;
+        if (pa > pb) return  1;
         return 0;
     }
     static __device__ inline Part sentinel() {
@@ -132,8 +140,18 @@ extern "C" __global__ void beam_expansion(
     int axis     = cut_idx / cuts_per_axis;
     int slice    = cut_idx % cuts_per_axis;  // 0-based, gives (slice+1)/(cuts_per_axis+1) fraction
 
+    if (item_idx >= current->nitems) return;
+
     WorkItem* wi   = &current->items[item_idx];
     int       np   = wi->nparts;
+
+    if (np <= 0) {
+        if (tid == 0)
+            DPRINTF("[expand] EMPTY ITEM block=%d item=%d np=%d nitems=%d\n",
+                   blockIdx.x, item_idx, np, current->nitems);
+        return;
+    }
+
     Mesh*     mesh = &wi->parts[np - 1].mesh;
 
     // Validate mesh before use — detect freed/corrupted meshes early.
