@@ -184,9 +184,23 @@ int lookahead_decompose(
         void* args[] = { &d_verts, &d_tris, &nv, &nt,
                          &d_hverts, &d_htris, &hull_nv, &hull_nt,
                          &d_decomp };
-        LCHECK(cuLaunchKernel(ctx->fn_la_init, 3, 1, 1, 32, 1, 1, 0, s, args, NULL));
+        LCHECK(cuLaunchKernel(ctx->fn_la_init, 1, 1, 1, 64, 1, 1, 0, s, args, NULL));
     }
     LCHECK(cuStreamSynchronize(s));
+    if (verbose) fprintf(stderr, "[la] init OK\n");
+
+    // Temporary per-kernel sync for debugging octocat crash
+    #define LA_SYNC_CHECK(label) do { \
+        CUresult _sr = cuStreamSynchronize(s); \
+        if (_sr != CUDA_SUCCESS) { \
+            const char* _m = NULL; cuGetErrorString(_sr, &_m); \
+            fprintf(stderr, "[la] CRASH after %s: %s\n", label, _m ? _m : "?"); \
+            result_code = (int)_sr; goto cleanup; \
+        } \
+        int _e = 0; cuMemcpyDtoH(&_e, d_err, sizeof(int)); \
+        if (_e) { fprintf(stderr, "[la] ERR 0x%x after %s\n", _e, label); result_code = _e; goto cleanup; } \
+        if (verbose) fprintf(stderr, "[la] %s OK\n", label); \
+    } while(0)
 
     // Main loop
     for (int iter = 0; iter < max_iters; iter++) {
@@ -197,6 +211,7 @@ int lookahead_decompose(
             void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
             LCHECK(cuLaunchKernel(ctx->fn_la_sort_parts, 1, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
+        LA_SYNC_CHECK("sort_parts1");
 
         // Compute Hausdorff for parts near threshold (lazy — skip if rv >= threshold)
         {
@@ -204,12 +219,14 @@ int lookahead_decompose(
             LCHECK(cuLaunchKernel(ctx->fn_la_hausdorff_parts,
                                    LA_MAX_DECOMP_H, 1, 1, 256, 1, 1, 0, s, args, NULL));
         }
+        LA_SYNC_CHECK("hausdorff_parts");
 
         // Re-sort with full cost (rv + hausdorff)
         {
             void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
             LCHECK(cuLaunchKernel(ctx->fn_la_sort_parts, 1, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
+        LA_SYNC_CHECK("sort_parts2");
 
         // Count cutting parts
         LCHECK(cuMemsetD32Async(d_n_cutting, 0, 1, s));
@@ -252,6 +269,7 @@ int lookahead_decompose(
             LCHECK(cuLaunchKernel(ctx->fn_la_seed_tree,
                                    n_cutting, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
+        LA_SYNC_CHECK("seed_tree");
 
         // Double-buffer expansion
         CUdeviceptr d_cur  = d_items_a;  // seeds already written here by la_seed_tree
@@ -271,6 +289,8 @@ int lookahead_decompose(
                 LCHECK(cuLaunchKernel(ctx->fn_la_expand,
                                        nblocks, 1, 1, 64, 1, 1, 0, s, args, NULL));
             }
+            LA_SYNC_CHECK("expand");
+
             // Read back next_nitems
             int next_n = 0;
             LCHECK(cuMemcpyDtoHAsync(&next_n, d_nitems, sizeof(int), s));
@@ -286,6 +306,7 @@ int lookahead_decompose(
                 LCHECK(cuLaunchKernel(ctx->fn_la_hull_la,
                                        2 * next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
+            LA_SYNC_CHECK("hull");
 
             // Sort parts within items
             {
@@ -293,6 +314,7 @@ int lookahead_decompose(
                 LCHECK(cuLaunchKernel(ctx->fn_la_sort_items,
                                        next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
+            LA_SYNC_CHECK("sort_items");
 
             // Record level cost
             {

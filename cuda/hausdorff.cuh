@@ -23,7 +23,7 @@
 #include "warp_sort.cuh"
 
 #define HD_BLOCK       256
-#define HD_BRUTE_THRESH 99999
+#define HD_BRUTE_THRESH 128
 #define HD_RESOLUTION  2000
 #define HD_MIN_SAMPLES 1000
 #define HD_BVH_STACK    32

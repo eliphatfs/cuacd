@@ -81,45 +81,47 @@ extern "C" __global__ void la_initialize(
 {
     int lane = threadIdx.x;
 
-    if (blockIdx.x == 0) {
-        // Compute mesh volume
+    // Warp 0: mesh volume, warp 1: hull volume, lane 0: metadata
+    float mesh_vol = 0.0f;
+    float hull_vol = 0.0f;
+
+    int warp_id = lane / WARP_SIZE;
+    int wlane   = lane & (WARP_SIZE - 1);
+
+    if (warp_id == 0) {
         Mesh m;
         m.verts    = verts;
         m.tris     = tris;
         m.nv       = nv;
         m.nt       = nt;
         m.refcount = NULL;
-        float vol = mesh_volume_warp(&m, lane);
-        if (lane == 0)
-            decomp->parts[0].mesh_vol = vol;
-    } else if (blockIdx.x == 1) {
-        // Compute hull volume
+        mesh_vol = mesh_volume_warp(&m, wlane);
+    } else if (warp_id == 1) {
         Mesh h;
         h.verts    = hull_verts;
         h.tris     = hull_tris;
         h.nv       = hull_nv;
         h.nt       = hull_nt;
         h.refcount = NULL;
-        float vol = mesh_volume_warp(&h, lane);
-        if (lane == 0)
-            decomp->parts[0].hull_vol = vol;
-    } else {
-        // Set up part 0 metadata
-        if (lane == 0) {
-            Part* p          = &decomp->parts[0];
-            p->mesh.verts    = verts;
-            p->mesh.tris     = tris;
-            p->mesh.nv       = nv;
-            p->mesh.nt       = nt;
-            p->mesh.refcount = NULL;
-            p->hull.verts    = hull_verts;
-            p->hull.tris     = hull_tris;
-            p->hull.nv       = hull_nv;
-            p->hull.nt       = hull_nt;
-            p->hull.refcount = NULL;
-            p->hausdorff     = 0.0f;
-            decomp->nparts   = 1;
-        }
+        hull_vol = mesh_volume_warp(&h, wlane);
+    }
+
+    if (lane == 0) {
+        Part* p          = &decomp->parts[0];
+        p->mesh.verts    = verts;
+        p->mesh.tris     = tris;
+        p->mesh.nv       = nv;
+        p->mesh.nt       = nt;
+        p->mesh.refcount = NULL;
+        p->hull.verts    = hull_verts;
+        p->hull.tris     = hull_tris;
+        p->hull.nv       = hull_nv;
+        p->hull.nt       = hull_nt;
+        p->hull.refcount = NULL;
+        p->hausdorff     = 0.0f;
+        p->mesh_vol      = mesh_vol;
+        p->hull_vol      = hull_vol;
+        decomp->nparts   = 1;
     }
 }
 
