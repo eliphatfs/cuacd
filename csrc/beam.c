@@ -305,7 +305,7 @@ int beam_decompose(
     // Timing helpers (active only when verbose != 0).
 #if defined(_POSIX_C_SOURCE) || defined(__linux__)
 #include <time.h>
-    struct timespec _t0, _t1;
+    struct timespec _t0, _t1, _td0, _td1;
 #define TSTAMP(t) clock_gettime(CLOCK_MONOTONIC, &(t))
 #define TELAPSED_MS(a,b) (((b).tv_sec-(a).tv_sec)*1e3 + ((b).tv_nsec-(a).tv_nsec)*1e-6)
 #else
@@ -431,6 +431,7 @@ int beam_decompose(
             fprintf(stderr, "[beam] iter %d: finalize  pool=%.1f MB\n", iter, (double)_pu0 / (1024*1024));
         }
         TSTAMP(_t_iter);
+        if (debug) TSTAMP(_td0);
 
         if (*h_err_p) {
             snprintf(ctx->last_error, sizeof(ctx->last_error),
@@ -463,6 +464,7 @@ int beam_decompose(
 
         if (debug) {
             CUresult _sr = cuStreamSynchronize(s);
+            TSTAMP(_td1);
             if (_sr != CUDA_SUCCESS) {
                 const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
                 fprintf(stderr, "[beam] iter %d EXPAND CRASH: %s\n", iter, _msg ? _msg : "?");
@@ -476,7 +478,9 @@ int beam_decompose(
             }
             unsigned long long _pu = 0;
             cuMemcpyDtoH(&_pu, ctx->d_pool_off, sizeof(unsigned long long));
-            fprintf(stderr, "[beam] iter %d: expand OK  pool=%.1f MB\n", iter, (double)_pu / (1024*1024));
+            fprintf(stderr, "[beam] iter %d: expand OK  %.1f ms  pool=%.1f MB\n",
+                    iter, TELAPSED_MS(_td0, _td1), (double)_pu / (1024*1024));
+            TSTAMP(_td0);
         }
 
         // Swap: next (d_prev) becomes current; old current becomes prev.
@@ -496,6 +500,7 @@ int beam_decompose(
 
         if (debug) {
             CUresult _sr = cuStreamSynchronize(s);
+            TSTAMP(_td1);
             if (_sr != CUDA_SUCCESS) {
                 const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
                 fprintf(stderr, "[beam] iter %d HULL CRASH: %s\n", iter, _msg ? _msg : "?");
@@ -509,7 +514,9 @@ int beam_decompose(
             }
             unsigned long long _pu2 = 0;
             cuMemcpyDtoH(&_pu2, ctx->d_pool_off, sizeof(unsigned long long));
-            fprintf(stderr, "[beam] iter %d: hull OK  pool=%.1f MB\n", iter, (double)_pu2 / (1024*1024));
+            fprintf(stderr, "[beam] iter %d: hull OK  %.1f ms  pool=%.1f MB\n",
+                    iter, TELAPSED_MS(_td0, _td1), (double)_pu2 / (1024*1024));
+            TSTAMP(_td0);
         }
 
         // ---- beam_hausdorff: same grid as hull, 256 threads/block ----
@@ -523,6 +530,7 @@ int beam_decompose(
 
         if (debug) {
             CUresult _sr = cuStreamSynchronize(s);
+            TSTAMP(_td1);
             if (_sr != CUDA_SUCCESS) {
                 const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
                 fprintf(stderr, "[beam] iter %d HAUSDORFF CRASH: %s\n", iter, _msg ? _msg : "?");
@@ -536,7 +544,9 @@ int beam_decompose(
             }
             unsigned long long _pu2h = 0;
             cuMemcpyDtoH(&_pu2h, ctx->d_pool_off, sizeof(unsigned long long));
-            fprintf(stderr, "[beam] iter %d: hausdorff OK  pool=%.1f MB\n", iter, (double)_pu2h / (1024*1024));
+            fprintf(stderr, "[beam] iter %d: hausdorff OK  %.1f ms  pool=%.1f MB\n",
+                    iter, TELAPSED_MS(_td0, _td1), (double)_pu2h / (1024*1024));
+            TSTAMP(_td0);
         }
 
         // ---- beam_sort: over-provisioned grid, self-checks nitems ----
@@ -550,6 +560,7 @@ int beam_decompose(
 
         if (debug) {
             CUresult _sr = cuStreamSynchronize(s);
+            TSTAMP(_td1);
             if (_sr != CUDA_SUCCESS) {
                 const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
                 fprintf(stderr, "[beam] iter %d SORT CRASH: %s\n", iter, _msg ? _msg : "?");
@@ -563,7 +574,8 @@ int beam_decompose(
             }
             unsigned long long _pu3 = 0;
             cuMemcpyDtoH(&_pu3, ctx->d_pool_off, sizeof(unsigned long long));
-            fprintf(stderr, "[beam] iter %d: sort OK  pool=%.1f MB\n", iter, (double)_pu3 / (1024*1024));
+            fprintf(stderr, "[beam] iter %d: sort OK  %.1f ms  pool=%.1f MB\n",
+                    iter, TELAPSED_MS(_td0, _td1), (double)_pu3 / (1024*1024));
         }
     }
 

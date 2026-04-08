@@ -227,55 +227,25 @@ __device__ inline int hd_delta(const MortonPoint* keys, int n, int i, int j) {
 }
 
 // ============================================================================
-// Block-level inclusive prefix sum on int array in shared memory.
-// Handles n_tris > 256 via chunked approach.
+// Block-level exclusive prefix sum on int array in global memory.
 // counts[] is in global (scratch heap); smem_i is shared [HD_BLOCK].
-// After call, counts[i] contains exclusive prefix sum (offset), and
-// *total is the total count.
+// After call, counts[i] = sum of counts[0..i-1] (sequential exclusive
+// prefix sum), and *total is the sum of all elements.
 // ============================================================================
 
 __device__ inline void hd_block_prefix_sum(
     int* counts, int n, int* smem_i, int tid, int* total)
 {
-    // Phase 1: each thread sums its strided chunk.
-    int local_sum = 0;
-    for (int i = tid; i < n; i += HD_BLOCK)
-        local_sum += counts[i];
-    smem_i[tid] = local_sum;
-    __syncthreads();
-
-    // Phase 2: exclusive scan over the 256 partial sums (Blelloch).
-    // Up-sweep.
-    for (int d = 1; d < HD_BLOCK; d <<= 1) {
-        int ai = (tid + 1) * (d << 1) - 1;
-        if (ai < HD_BLOCK)
-            smem_i[ai] += smem_i[ai - d];
-        __syncthreads();
-    }
+    // Sequential exclusive prefix sum by thread 0.
+    // n is the triangle count (at most a few thousand), so this is fast.
     if (tid == 0) {
-        *total = smem_i[HD_BLOCK - 1];
-        smem_i[HD_BLOCK - 1] = 0;
-    }
-    __syncthreads();
-    // Down-sweep.
-    for (int d = HD_BLOCK >> 1; d >= 1; d >>= 1) {
-        int ai = (tid + 1) * (d << 1) - 1;
-        if (ai < HD_BLOCK) {
-            int tmp = smem_i[ai - d];
-            smem_i[ai - d] = smem_i[ai];
-            smem_i[ai] += tmp;
+        int running = 0;
+        for (int i = 0; i < n; i++) {
+            int c = counts[i];
+            counts[i] = running;
+            running += c;
         }
-        __syncthreads();
-    }
-    // smem_i[tid] now holds the exclusive prefix sum of the chunk sums.
-
-    // Phase 3: each thread converts its chunk's counts to exclusive offsets.
-    int chunk_base = smem_i[tid];
-    int running = 0;
-    for (int i = tid; i < n; i += HD_BLOCK) {
-        int c = counts[i];
-        counts[i] = chunk_base + running;
-        running += c;
+        *total = running;
     }
     __syncthreads();
 }
@@ -1039,6 +1009,7 @@ __device__ __forceinline__ float hausdorff_block(
             heap_free(scratch_heap, (void*)s_bvh_counters); s_bvh_counters = NULL;
         }
         __syncthreads();
+
     }
 
     if (need_bvh_a && n_sa > 1) {
@@ -1162,6 +1133,7 @@ __device__ __forceinline__ float hausdorff_block(
             heap_free(scratch_heap, (void*)s_bvh_counters); s_bvh_counters = NULL;
         }
         __syncthreads();
+
     }
 
     // Free morton arrays and tri_ids — no longer needed.
@@ -1279,7 +1251,6 @@ __device__ __forceinline__ float hausdorff_block(
         float dir_ba = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ba = dir_ba;
         __syncthreads();
-
     } else if (need_bvh_a && n_sa <= 1) {
         // Too few samples for BVH — brute force against all target triangles.
         float local_max = 0.0f;
