@@ -85,6 +85,21 @@ struct beam_ctx {
     CUfunction fn_kdop_hull;
     CUfunction fn_hausdorff;
 
+    // Lookahead decomposition kernels
+    CUfunction fn_la_init;
+    CUfunction fn_la_sort_parts;
+    CUfunction fn_la_hausdorff_parts;
+    CUfunction fn_la_count_cutting;
+    CUfunction fn_la_seed_tree;
+    CUfunction fn_la_expand;
+    CUfunction fn_la_expand_quick;
+    CUfunction fn_la_hull_la;
+    CUfunction fn_la_sort_items;
+    CUfunction fn_la_record_level_cost;
+    CUfunction fn_la_evaluate;
+    CUfunction fn_la_apply_cuts;
+    CUfunction fn_la_cleanup_tree;
+
     // Heaps embedded in d_pool_struct (beam.c update pending).
     // Fields d_heap, d_scratch, d_heap_compact_buf, d_scratch_compact_buf removed.
     CUdeviceptr d_pool_mem;       // pool backing memory (user allocations)

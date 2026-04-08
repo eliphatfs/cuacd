@@ -314,6 +314,94 @@ static PyObject* py_decompose(PyObject* self, PyObject* args, PyObject* kwargs) 
 }
 
 // ---------------------------------------------------------------------------
+// lookahead_decompose(verts_ptr, nv, tris_ptr, nt,
+//                     hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,
+//                     max_iters, width, threshold,
+//                     depth=2, quick_depth=1, max_n_cutting=16,
+//                     verbose=0, debug=0)
+//   -> list of (verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol)
+//      one tuple per output part.
+// ---------------------------------------------------------------------------
+
+static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject* kwargs) {
+    static char* kwlist[] = {
+        "verts_ptr", "nv", "tris_ptr", "nt",
+        "hull_verts_ptr", "hull_nv", "hull_tris_ptr", "hull_nt",
+        "max_iters", "width", "threshold",
+        "depth", "quick_depth", "max_n_cutting",
+        "verbose", "debug", NULL
+    };
+    unsigned long long vp, tp, hvp, htp;
+    int nv, nt, hull_nv, hull_nt;
+    int max_iters, width;
+    float threshold;
+    int depth = 2, quick_depth = 1, max_n_cutting = 16;
+    int verbose = 0, debug = 0;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiifiii|ii", kwlist,
+            &vp, &nv, &tp, &nt,
+            &hvp, &hull_nv, &htp, &hull_nt,
+            &max_iters, &width, &threshold,
+            &depth, &quick_depth, &max_n_cutting,
+            &verbose, &debug))
+        return NULL;
+
+    REQUIRE_CTX();
+
+    struct beam_result result;
+    memset(&result, 0, sizeof(result));
+
+    int rc = lookahead_decompose(g_state.ctx,
+        (const float*)(uintptr_t)vp,  nv,
+        (const int*)  (uintptr_t)tp,  nt,
+        (const float*)(uintptr_t)hvp, hull_nv,
+        (const int*)  (uintptr_t)htp, hull_nt,
+        max_iters, width, threshold,
+        depth, quick_depth, max_n_cutting,
+        verbose, debug,
+        &result);
+    if (rc != 0) {
+        beam_result_free(&result);
+        return raise_error(g_state.ctx, rc);
+    }
+
+    // Build Python list of tuples (same format as py_decompose)
+    PyObject* list = PyList_New(result.nparts);
+    if (!list) { beam_result_free(&result); return NULL; }
+
+    for (int i = 0; i < result.nparts; i++) {
+        struct beam_part_result* p = &result.parts[i];
+        Py_ssize_t vbytes = (Py_ssize_t)p->nv * 3 * sizeof(float);
+        Py_ssize_t tbytes = (Py_ssize_t)p->nt * 3 * sizeof(int);
+
+        PyObject* vbuf = PyBytes_FromStringAndSize((const char*)p->verts, vbytes);
+        PyObject* tbuf = PyBytes_FromStringAndSize((const char*)p->tris,  tbytes);
+        if (!vbuf || !tbuf) {
+            Py_XDECREF(vbuf); Py_XDECREF(tbuf);
+            Py_DECREF(list);
+            beam_result_free(&result);
+            return NULL;
+        }
+
+        PyObject* tup = Py_BuildValue("(OOiiff)",
+            vbuf, tbuf,
+            p->nv, p->nt,
+            p->mesh_vol, p->hull_vol);
+        Py_DECREF(vbuf);
+        Py_DECREF(tbuf);
+        if (!tup) {
+            Py_DECREF(list);
+            beam_result_free(&result);
+            return NULL;
+        }
+        PyList_SetItem(list, i, tup);
+    }
+
+    beam_result_free(&result);
+    return list;
+}
+
+// ---------------------------------------------------------------------------
 // kdop_hull(pts_ptr, total_pts, offsets_ptr, n_hulls, max_hv, max_ht,
 //           verts_ptr, tris_ptr, nv_ptr, nt_ptr, vols_ptr, errors_ptr) -> None
 // ---------------------------------------------------------------------------
@@ -391,6 +479,10 @@ static PyMethodDef gpu_methods[] = {
     { "decompose",          (PyCFunction)py_decompose, METH_VARARGS | METH_KEYWORDS,
       "decompose(verts_ptr, nv, tris_ptr, nt, hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,\n"
       "          max_iters, cuts_per_axis, threshold, max_keep, verbose=0, debug=0)\n"
+      "-> list of (verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol) per part." },
+    { "lookahead_decompose", (PyCFunction)py_lookahead_decompose, METH_VARARGS | METH_KEYWORDS,
+      "lookahead_decompose(verts_ptr, nv, tris_ptr, nt, hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,\n"
+      "                    max_iters, width, threshold, depth=2, quick_depth=1, max_n_cutting=16, verbose=0, debug=0)\n"
       "-> list of (verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol) per part." },
     { NULL, NULL, 0, NULL }
 };

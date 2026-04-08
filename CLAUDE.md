@@ -25,10 +25,11 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   kdop_hull.cuh       #   kdop_hull_block: single-warp (32 threads) exact hull via extreme-point prefilter + D&C
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   hausdorff.cuh       #   hausdorff_block: block-level (256 threads) bidirectional Hausdorff distance via sampling + linear BVH
-  structs.cuh         #   Device-side: Mesh, Part, PartPair, WorkItem, AlgoState
+  structs.cuh         #   Device-side: Mesh, Part, PartPair, WorkItem, AlgoState, LaWorkItem, LaDecompState, LaEvalResult
   mm.cu               #   heap_init_kernel
   kdop_const.cu       #   __constant__ KDOP_AXES[40][3] definition (broadcast-cached icosphere axes)
   beam.cu             #   beam_expansion, beam_hull, beam_hausdorff, beam_sort, beam_finalize kernels
+  lookahead.cu        #   lookahead search kernels: la_initialize, la_expand, la_evaluate, la_apply_cuts, etc.
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel
   test_mesh_volume.cu #   Test kernel: mesh_volume_kernel
@@ -37,12 +38,13 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   test_hausdorff.cu   #   Test kernel: hausdorff_kernel
 csrc/                 # C host code
   structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, beam_ctx
-  beam.h              #   Public C API (beam_ctx_t, beam_init/destroy/compact/pool_usage, batch ops)
-  beam.c              #   Host implementation: beam_init/destroy, beam_heap_compact, beam_pool_usage
-  test_beam.c         #   Test host launchers
-  beam_module.c       #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
+  beam.h              #   Public C API (beam_ctx_t, beam_init/destroy/compact/pool_usage, batch ops) + Mesh_h/Part_h host mirrors
+  beam.c              #   Host implementation: beam_init/destroy, beam_decompose (rv-only cost after Hausdorff removal)
+  lookahead.c         #   Host implementation: lookahead_decompose (full lookahead tree search with Hausdorff)
+  test.c              #   Test host launchers
+  module.c            #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
-  __init__.py         #   Context class (batch_hull_volume, batch_mesh_volume, batch_hull_dandc_mesh, batch_kdop_hull_mesh)
+  __init__.py         #   Context class (batch_hull_volume, batch_mesh_volume, batch_hull_dandc_mesh, batch_kdop_hull_mesh, lookahead_decompose)
 tests/                # All tests
   test_hull.py        #   Hull volume + mesh volume tests
   test_hull_mesh.py   #   D&C hull mesh extraction tests + k-DOP hull tests
@@ -52,6 +54,7 @@ tests/                # All tests
   gen_hausdorff_fixtures.py # Generates CoACD reference Hausdorff fixtures (C++ harness + .npz)
   ref_hausdorff.cpp    #   Standalone C++ CoACD Hausdorff reference harness
   test_decompose.py   #   beam_decompose tests (cube, lshape, octocat, octocat_debug_steps)
+  test_lookahead.py   #   lookahead_decompose tests (cube, lshape, octocat, convergence)
   test_edge_tracking.py # Max edge pairs stress test for D&C hull (requires COACD_TRACK_EDGES=1 build)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling
   bench_mm.py         #   Memory management benchmark
@@ -135,6 +138,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto 
     volumes = ctx.batch_mesh_volume(verts_list, tris_list)
     results = ctx.batch_hull_dandc_mesh(pts_list)   # list of (verts, tris, volume) — exact D&C hull
     results = ctx.batch_kdop_hull_mesh(pts_list)    # list of (verts, tris, volume) — approximate k-DOP hull
+    parts = ctx.lookahead_decompose(verts, tris, max_iters=100, width=30, threshold=0.05)
     used = ctx.pool_usage()     # bytes consumed from pool (monotonic high-water mark)
     ctx.heap_compact()          # no-op (coalescing handled by heap_free)
 ```
@@ -159,7 +163,9 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 **Hausdorff Distance** (`hausdorff.cuh`): Block-level (256 threads, 8 warps). Computes bidirectional Hausdorff distance between two meshes via sampling + linear BVH. CoACD-matching area-proportional sampling with Wang hash pseudo-random barycentric coordinates. Brute-force path for ≤64 target triangles; linear BVH (Karras 2012 radix tree) for larger meshes with cooperative 4-warp Morton code sort. Used by `beam_hausdorff` kernel to fill `Part.hausdorff`.
 
-**Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → hausdorff → sort`. Pipelined in stream order, sync only after finalize. `beam_hull` uses `kdop_hull_block` (32 threads/block). `beam_hausdorff` uses `hausdorff_block` (256 threads/block). See `docs/api_beam.md`.
+**Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → sort`. Uses rv-only cost (no Hausdorff — it was removed because Hausdorff is non-monotonic over a single cut, preventing convergence). Pipelined in stream order, sync only after finalize. `beam_hull` uses `kdop_hull_block` (32 threads/block). See `docs/api_beam.md`.
+
+**Lookahead Search Decomposition** (`lookahead.cu` + `csrc/lookahead.c`): Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (width cuts each), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses full cost (rv + Hausdorff) in the decomposition loop — lookahead handles Hausdorff non-monotonicity well. Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_cleanup_tree.
 
 ### Utility Functions
 
@@ -188,12 +194,14 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 ## Current Status
 
 ### Working
-- D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all 120 tests pass.
+- D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
 - `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Used by `beam_hull`. Produces exact hull via extreme-point prefilter + D&C.
 - `hausdorff_block` — 5 tests pass. Used by `beam_hausdorff`. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
+- `lookahead_decompose` — cube, lshape, 49160 tests pass. Octocat test fails with CUDA error 700 (illegal memory access) during `la_expand` — under investigation.
 
 ### Known Limitations
-- **Beam search item starvation**: `beam_decompose` can sometimes reduce to 0 work items before convergence. This happens when the last (worst-cost) part of every surviving WorkItem cannot be meaningfully split by any axis-aligned plane (all cuts produce an empty half), yet its cost remains above the threshold. Once nitems reaches 0, the algorithm spins uselessly until max_iters. This is a fundamental weakness of greedy beam search — it can prune all productive paths too early. Will be addressed by switching to MCTS (CoACD-style) which maintains broader exploration.
+- **Beam search item starvation**: `beam_decompose` can sometimes reduce to 0 work items before convergence. This happens when the last (worst-cost) part of every surviving WorkItem cannot be meaningfully split by any axis-aligned plane (all cuts produce an empty half), yet its cost remains above the threshold. Once nitems reaches 0, the algorithm spins uselessly until max_iters. This is a fundamental weakness of greedy beam search — it can prune all productive paths too early. The lookahead algorithm avoids this by maintaining a flat decomposition and applying cuts one at a time.
+- **Lookahead octocat crash**: `lookahead_decompose` crashes on large meshes (octocat ~10k verts) with CUDA error 700. Small meshes (cube, lshape, 49160 ~300 verts) work fine. Likely a host/device struct size mismatch or pool overflow in `la_expand`.
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input

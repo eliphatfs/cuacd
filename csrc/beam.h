@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <cuda.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -109,6 +110,24 @@ int beam_batch_mesh_volume(
 //   All verts/tris in beam_part_result are malloc'd; call beam_result_free to release.
 //   Returns 0 on success, non-zero on error (see beam_last_error).
 
+// Host-side mirrors of CUDA device structs.
+// Pointer fields use CUdeviceptr (uint64) to match 64-bit device pointers.
+struct Mesh_h {
+    CUdeviceptr verts;     // float* on device
+    CUdeviceptr tris;      // int*   on device
+    int         nv;
+    int         nt;
+    CUdeviceptr refcount;  // int*   on device
+};
+
+struct Part_h {
+    struct Mesh_h mesh;
+    struct Mesh_h hull;
+    float mesh_vol;
+    float hull_vol;
+    float hausdorff;
+};
+
 struct beam_part_result {
     float* verts;     // malloc'd, nv*3 floats
     int*   tris;      // malloc'd, nt*3 ints
@@ -185,6 +204,32 @@ int beam_test_plane_cut(
     int*   out_neg_tris,  int out_neg_tris_cap,
     int* out_n_pv, int* out_n_pt,
     int* out_n_nv, int* out_n_nt);
+
+// ---------------------------------------------------------------------------
+// lookahead_decompose — lookahead tree search convex decomposition
+// ---------------------------------------------------------------------------
+// Inputs: mesh (verts/tris) and its precomputed convex hull (hull_verts/hull_tris).
+// Hyperparams:
+//   max_iters:      outer iteration cap
+//   width:          number of candidate cuts per expansion level (per axis: width/3)
+//   threshold:      stop when all part costs fall below this value
+//   depth:          number of full expansion levels
+//   quick_depth:    number of quick expansion levels (1 child per item, best-axis midpoint)
+//   max_n_cutting:  max parts processed in parallel per iteration
+//
+// Output: beam_result (reused) filled with the parts of the final decomposition.
+//   Returns 0 on success, non-zero on error (see beam_last_error).
+
+int lookahead_decompose(
+    beam_ctx_t   ctx,
+    const float* verts,      int nv,
+    const int*   tris,       int nt,
+    const float* hull_verts, int hull_nv,
+    const int*   hull_tris,  int hull_nt,
+    int max_iters, int width, float threshold,
+    int depth, int quick_depth, int max_n_cutting,
+    int verbose, int debug,
+    struct beam_result* out);
 
 #ifdef __cplusplus
 }

@@ -260,3 +260,66 @@ class Context:
             vol = _mesh_volume_cpu(hv, ht) if nt > 0 else 0.0
             results.append((hv, ht, float(vol)))
         return results
+
+    # ------------------------------------------------------------------
+    # lookahead_decompose
+    # ------------------------------------------------------------------
+
+    def lookahead_decompose(self, verts, tris, *,
+                            max_iters=100, width=30, threshold=0.05,
+                            depth=2, quick_depth=1, max_n_cutting=16,
+                            verbose=0, debug=0):
+        """Decompose a mesh into convex parts using lookahead tree search.
+
+        Parameters
+        ----------
+        verts : array_like, shape (N, 3), float32
+            Mesh vertices.
+        tris : array_like, shape (M, 3), int32
+            Triangle indices.
+        max_iters : int
+            Maximum outer iterations.
+        width : int
+            Number of candidate cuts per expansion level.
+        threshold : float
+            Stop when all parts have cost below this value.
+        depth : int
+            Number of full expansion levels in the lookahead tree.
+        quick_depth : int
+            Number of quick expansion levels (1 child per item, best-axis midpoint).
+        max_n_cutting : int
+            Maximum parts processed in parallel per iteration.
+        verbose : int
+            Print timing info if nonzero.
+
+        Returns
+        -------
+        list of (verts, tris) tuples, one per output part.
+        """
+        import scipy.spatial
+
+        verts = _as_f32(verts).reshape(-1, 3)
+        tris = _as_i32(tris).reshape(-1, 3)
+
+        # Compute convex hull for the input mesh
+        # Use hull.points (all vertices) and hull.simplices (indices into .points)
+        # so the triangle indices are valid for the vertex array we pass.
+        hull = scipy.spatial.ConvexHull(verts)
+        hull_verts = _as_f32(hull.points)
+        hull_tris = _as_i32(hull.simplices)
+
+        raw = _gpu.lookahead_decompose(
+            verts.ctypes.data, len(verts),
+            tris.ctypes.data, len(tris),
+            hull_verts.ctypes.data, len(hull_verts),
+            hull_tris.ctypes.data, len(hull_tris),
+            max_iters, width, threshold,
+            depth, quick_depth, max_n_cutting,
+            verbose, debug)
+
+        results = []
+        for vb, tb, nv, nt, mv, hv in raw:
+            v = np.frombuffer(vb, dtype=np.float32).reshape(nv, 3).copy()
+            t = np.frombuffer(tb, dtype=np.int32).reshape(nt, 3).copy()
+            results.append((v, t))
+        return results

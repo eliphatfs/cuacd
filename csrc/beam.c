@@ -10,6 +10,17 @@
 #include <stddef.h>
 #include <math.h>
 
+// Timing helpers — defined once at file scope for use in both beam_decompose
+// and lookahead_decompose.
+#if defined(_POSIX_C_SOURCE) || defined(__linux__)
+#include <time.h>
+#define TSTAMP(t) clock_gettime(CLOCK_MONOTONIC, &(t))
+#define TELAPSED_MS(a,b) (((b).tv_sec-(a).tv_sec)*1e3 + ((b).tv_nsec-(a).tv_nsec)*1e-6)
+#else
+#define TSTAMP(t)        ((void)0)
+#define TELAPSED_MS(a,b) 0.0
+#endif
+
 // Embedded fatbin — generated at build time by setup.py
 #include "kernels_fatbin.h"
 
@@ -71,6 +82,21 @@ int beam_init(beam_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     cuModuleGetFunction(&ctx->fn_heap_init,           ctx->module, "heap_init_kernel");
     cuModuleGetFunction(&ctx->fn_kdop_hull,           ctx->module, "kdop_hull_kernel");
     cuModuleGetFunction(&ctx->fn_hausdorff,           ctx->module, "hausdorff_kernel");
+
+    // Resolve lookahead kernels
+    cuModuleGetFunction(&ctx->fn_la_init,              ctx->module, "la_initialize");
+    cuModuleGetFunction(&ctx->fn_la_sort_parts,        ctx->module, "la_sort_parts");
+    cuModuleGetFunction(&ctx->fn_la_hausdorff_parts,   ctx->module, "la_hausdorff_parts");
+    cuModuleGetFunction(&ctx->fn_la_count_cutting,     ctx->module, "la_count_cutting");
+    cuModuleGetFunction(&ctx->fn_la_seed_tree,         ctx->module, "la_seed_tree");
+    cuModuleGetFunction(&ctx->fn_la_expand,            ctx->module, "la_expand");
+    cuModuleGetFunction(&ctx->fn_la_expand_quick,      ctx->module, "la_expand_quick");
+    cuModuleGetFunction(&ctx->fn_la_hull_la,           ctx->module, "la_hull");
+    cuModuleGetFunction(&ctx->fn_la_sort_items,        ctx->module, "la_sort_items");
+    cuModuleGetFunction(&ctx->fn_la_record_level_cost, ctx->module, "la_record_level_cost");
+    cuModuleGetFunction(&ctx->fn_la_evaluate,          ctx->module, "la_evaluate");
+    cuModuleGetFunction(&ctx->fn_la_apply_cuts,        ctx->module, "la_apply_cuts");
+    cuModuleGetFunction(&ctx->fn_la_cleanup_tree,      ctx->module, "la_cleanup_tree");
 
     // Determine pool size: default to 80% of free device memory
     if (pool_bytes == 0) {
@@ -171,26 +197,9 @@ int beam_heap_compact(beam_ctx_t ctx) {
 // ---------------------------------------------------------------------------
 
 // Host-side mirrors of CUDA device structs from cuda/structs.cuh.
-// Pointer fields use CUdeviceptr (uint64) to match 64-bit device pointers.
+// Mesh_h and Part_h are defined in beam.h (shared with lookahead.c).
 // Padding matches the device struct layout automatically via C alignment rules.
 #define WORK_ITEM_MAX_PARTS 512
-
-struct Mesh_h {
-    CUdeviceptr verts;     // float* on device
-    CUdeviceptr tris;      // int*   on device
-    int         nv;
-    int         nt;
-    CUdeviceptr refcount;  // int*   on device
-};
-
-struct Part_h {
-    struct Mesh_h mesh;
-    struct Mesh_h hull;
-    float mesh_vol;
-    float hull_vol;
-    float hausdorff;
-    // 4 bytes trailing padding added by compiler to reach alignment of 8
-};
 
 struct WorkItem_h {
     struct Part_h parts[WORK_ITEM_MAX_PARTS];
@@ -302,16 +311,7 @@ int beam_decompose(
     int result_code = 0;
     LCHECK(cuStreamCreate(&s, CU_STREAM_DEFAULT));
 
-    // Timing helpers (active only when verbose != 0).
-#if defined(_POSIX_C_SOURCE) || defined(__linux__)
-#include <time.h>
     struct timespec _t0, _t1, _td0, _td1;
-#define TSTAMP(t) clock_gettime(CLOCK_MONOTONIC, &(t))
-#define TELAPSED_MS(a,b) (((b).tv_sec-(a).tv_sec)*1e3 + ((b).tv_nsec-(a).tv_nsec)*1e-6)
-#else
-#define TSTAMP(t)        ((void)0)
-#define TELAPSED_MS(a,b) 0.0
-#endif
 
     CUdeviceptr d_verts      = 0, d_tris       = 0;
     CUdeviceptr d_hverts     = 0, d_htris       = 0;
@@ -519,35 +519,9 @@ int beam_decompose(
             TSTAMP(_td0);
         }
 
-        // ---- beam_hausdorff: same grid as hull, 256 threads/block ----
-        {
-            void* args[] = { &d_current, &ctx->d_pool_struct, &d_err };
-            int nblocks = 2 * 3 * cuts_per_axis * cur_nitems;
-            if (nblocks < 1) nblocks = 1;
-            LCHECK(cuLaunchKernel(fn_hausdorff, nblocks, 1, 1, 256, 1, 1,
-                                  0, s, args, NULL));
-        }
-
-        if (debug) {
-            CUresult _sr = cuStreamSynchronize(s);
-            TSTAMP(_td1);
-            if (_sr != CUDA_SUCCESS) {
-                const char* _msg = NULL; cuGetErrorString(_sr, &_msg);
-                fprintf(stderr, "[beam] iter %d HAUSDORFF CRASH: %s\n", iter, _msg ? _msg : "?");
-                result_code = (int)_sr; goto cleanup;
-            }
-            int _he = 0;
-            cuMemcpyDtoH(&_he, d_err, sizeof(int));
-            if (_he) {
-                fprintf(stderr, "[beam] iter %d HAUSDORFF err=0x%x\n", iter, _he);
-                result_code = _he; goto cleanup;
-            }
-            unsigned long long _pu2h = 0;
-            cuMemcpyDtoH(&_pu2h, ctx->d_pool_off, sizeof(unsigned long long));
-            fprintf(stderr, "[beam] iter %d: hausdorff OK  %.1f ms  pool=%.1f MB\n",
-                    iter, TELAPSED_MS(_td0, _td1), (double)_pu2h / (1024*1024));
-            TSTAMP(_td0);
-        }
+        // NOTE: beam_hausdorff removed — Hausdorff distance is non-monotonic
+        // over a single cut, causing the beam search to fail to converge.
+        // The sort below uses rv-only cost: k_rv * cbrt(3/(4pi)*(hull_vol - mesh_vol)).
 
         // ---- beam_sort: over-provisioned grid, self-checks nitems ----
         {

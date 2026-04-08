@@ -91,6 +91,7 @@ _CUDA_MODULES = [
     "test_mesh_volume.cu",
     "test_plane_cut.cu",
     "beam.cu",
+    "lookahead.cu",
     "test_kdop_hull.cu",
     "test_hausdorff.cu",
 ]
@@ -201,9 +202,10 @@ class CoacdBuildExt(build_ext):
 _gpu_ext = Extension(
     name="coacd_gpu._gpu",
     sources=[
-        os.path.join("csrc", "beam_module.c"),
+        os.path.join("csrc", "module.c"),
         os.path.join("csrc", "beam.c"),
-        os.path.join("csrc", "test_beam.c"),
+        os.path.join("csrc", "lookahead.c"),
+        os.path.join("csrc", "test.c"),
     ],
     py_limited_api=True,
 )
