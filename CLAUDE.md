@@ -197,11 +197,10 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 - D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
 - `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Used by `beam_hull`. Produces exact hull via extreme-point prefilter + D&C.
 - `hausdorff_block` — 5 tests pass. Used by `beam_hausdorff`. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
-- `lookahead_decompose` — cube, lshape, 49160 tests pass. Octocat test fails with CUDA error 700 (illegal memory access) during `la_expand` — under investigation.
+- `lookahead_decompose` — all tests pass (cube, lshape, octocat, 49160).
 
 ### Known Limitations
 - **Beam search item starvation**: `beam_decompose` can sometimes reduce to 0 work items before convergence. This happens when the last (worst-cost) part of every surviving WorkItem cannot be meaningfully split by any axis-aligned plane (all cuts produce an empty half), yet its cost remains above the threshold. Once nitems reaches 0, the algorithm spins uselessly until max_iters. This is a fundamental weakness of greedy beam search — it can prune all productive paths too early. The lookahead algorithm avoids this by maintaining a flat decomposition and applying cuts one at a time.
-- **Lookahead octocat crash**: `lookahead_decompose` crashes on large meshes (octocat ~10k verts) with CUDA error 700. Small meshes (cube, lshape, 49160 ~300 verts) work fine. Likely a host/device struct size mismatch or pool overflow in `la_expand`.
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input

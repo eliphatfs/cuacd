@@ -487,12 +487,20 @@ extern "C" __global__ void la_expand_quick(
     __syncthreads();
 
     // Try all 3 axes at midpoint, keep the best cut
-    __shared__ PartPair s_best_pp;
-    __shared__ float    s_best_cost;
-    __shared__ int      s_best_axis;
-    __shared__ int      s_valid_cut;
+    // NOTE: We cannot store the best PartPair in __shared__ memory because
+    // plane_cut_block's __shared__ PartPair s_result may be aliased to the same
+    // shared memory by the compiler (they are never simultaneously live).
+    // Instead, we claim output slots immediately and free non-best ones after.
+    __shared__ float s_costs[3];        // cost per axis (1e30 = invalid/empty)
+    __shared__ float s_vols[3][2];      // [axis][pos/neg] mesh volumes
+    __shared__ int   s_nvs[3][2];       // [axis][pos/neg] nv
+    __shared__ int   s_nts[3][2];       // [axis][pos/neg] nt
+    __shared__ void* s_vptrs[3][2];     // [axis][pos/neg] verts heap ptr
+    __shared__ void* s_tptrs[3][2];     // [axis][pos/neg] tris heap ptr
+    __shared__ int*  s_rcptrs[3][2];    // [axis][pos/neg] refcount ptr
+    __shared__ int   s_valid[3];        // 1 if cut produced two non-empty halves
 
-    if (tid == 0) { s_best_cost = 1e30f; s_valid_cut = 0; }
+    if (tid < 3) { s_costs[tid] = 1e30f; s_valid[tid] = 0; }
     __syncthreads();
 
     for (int axis = 0; axis < 3; axis++) {
@@ -511,65 +519,89 @@ extern "C" __global__ void la_expand_quick(
             if (tid == 0) {
                 if (pp.pos.mesh.verts) heap_free(&pool->heap, (void*)pp.pos.mesh.verts);
                 if (pp.neg.mesh.verts) heap_free(&pool->heap, (void*)pp.neg.mesh.verts);
+                s_costs[axis] = 1e30f;
+                s_valid[axis] = 0;
             }
             __syncthreads();
             continue;
         }
 
         // Compute mesh volumes for both halves
-        float pos_vol = 0.0f, neg_vol = 0.0f;
-        int warp_id = tid / WARP_SIZE;
-        int wlane   = tid & (WARP_SIZE - 1);
-        if (warp_id == 0)
-            pos_vol = mesh_volume_warp(&pp.pos.mesh, wlane);
-        else if (warp_id == 1)
-            neg_vol = mesh_volume_warp(&pp.neg.mesh, wlane);
+        {
+            __shared__ Mesh s_pos_mesh, s_neg_mesh;
+            if (tid == 0) {
+                s_pos_mesh = pp.pos.mesh;
+                s_neg_mesh = pp.neg.mesh;
+            }
+            __syncthreads();
 
-        // Compute rv-only cost of this cut = max(rv_cost(pos), rv_cost(neg))
-        // rv = k_rv * cbrt(3/(4pi) * max(hull_vol - mesh_vol, 0))
-        // Since hull not computed yet, approximate hull_vol ≈ mesh_vol (rv ≈ 0).
-        // This means rv-only cost is 0 for both halves. We need hull for a
-        // meaningful comparison. Use volume ratio as a simple proxy instead:
-        //   cut_cost = max(pos_vol, neg_vol) / (pos_vol + neg_vol + eps)
-        // Better: just use the volume of the larger half as cost proxy.
-        // For now: store the pair and let hull computation fill in the real cost.
+            float pos_vol = 0.0f, neg_vol = 0.0f;
+            int warp_id = tid / WARP_SIZE;
+            int wlane   = tid & (WARP_SIZE - 1);
+            if (warp_id == 0)
+                pos_vol = mesh_volume_warp(&s_pos_mesh, wlane);
+            else if (warp_id == 1)
+                neg_vol = mesh_volume_warp(&s_neg_mesh, wlane);
 
-        // Check if this is the best cut so far (using mesh volume as proxy)
-        float max_vol = fmaxf(pos_vol, neg_vol);
-        float total_vol = pos_vol + neg_vol + 1e-10f;
-        float cost = max_vol / total_vol;  // range (0.5, 1.0]; lower is more balanced
+            // Compute cost using mesh volume as proxy
+            float max_vol = fmaxf(pos_vol, neg_vol);
+            float total_vol = pos_vol + neg_vol + 1e-10f;
+            float cost = max_vol / total_vol;  // range (0.5, 1.0]; lower is more balanced
 
-        if (tid == 0) {
-            if (cost < s_best_cost) {
-                // Free previous best
-                if (s_valid_cut) {
-                    heap_free(&pool->heap, (void*)s_best_pp.pos.mesh.verts);
-                    heap_free(&pool->heap, (void*)s_best_pp.neg.mesh.verts);
-                }
-                s_best_pp   = pp;
-                s_best_cost = cost;
-                s_best_axis = axis;
-                s_valid_cut = 1;
-                // Store volumes in the PartPair's mesh_vol fields
-                s_best_pp.pos.mesh_vol = pos_vol;
-                s_best_pp.neg.mesh_vol = neg_vol;
-            } else {
-                // Free this cut's meshes
-                heap_free(&pool->heap, (void*)pp.pos.mesh.verts);
-                heap_free(&pool->heap, (void*)pp.neg.mesh.verts);
+            if (tid == 0) {
+                s_costs[axis] = cost;
+                s_vols[axis][0] = pos_vol;
+                s_vols[axis][1] = neg_vol;
+                s_nvs[axis][0] = pp.pos.mesh.nv;
+                s_nvs[axis][1] = pp.neg.mesh.nv;
+                s_nts[axis][0] = pp.pos.mesh.nt;
+                s_nts[axis][1] = pp.neg.mesh.nt;
+                s_vptrs[axis][0] = (void*)pp.pos.mesh.verts;
+                s_vptrs[axis][1] = (void*)pp.neg.mesh.verts;
+                s_tptrs[axis][0] = (void*)pp.pos.mesh.tris;
+                s_tptrs[axis][1] = (void*)pp.neg.mesh.tris;
+                s_rcptrs[axis][0] = pp.pos.mesh.refcount;
+                s_rcptrs[axis][1] = pp.neg.mesh.refcount;
+                s_valid[axis] = 1;
             }
         }
         __syncthreads();
     }
 
-    if (!s_valid_cut) return;  // no valid cut found for this item
+    // Find the best axis
+    __shared__ int s_best_axis;
+    __shared__ float s_best_cost;
+    if (tid == 0) {
+        s_best_cost = 1e30f;
+        s_best_axis = 0;
+        for (int a = 0; a < 3; a++) {
+            if (s_valid[a] && s_costs[a] < s_best_cost) {
+                s_best_cost = s_costs[a];
+                s_best_axis = a;
+            }
+        }
+    }
+    __syncthreads();
+
+    // Free non-best cuts
+    if (tid == 0) {
+        for (int a = 0; a < 3; a++) {
+            if (s_valid[a] && a != s_best_axis) {
+                heap_free(&pool->heap, s_vptrs[a][0]);
+                heap_free(&pool->heap, s_vptrs[a][1]);
+            }
+        }
+    }
+    __syncthreads();
+
+    if (s_best_cost >= 1e30f) return;  // no valid cut found
 
     // Guard against exceeding part capacity
     if (np + 1 > LA_MAX_PARTS) {
         if (tid == 0) {
             atomicOr(err, LA_ERR_OVERFLOW);
-            heap_free(&pool->heap, (void*)s_best_pp.pos.mesh.verts);
-            heap_free(&pool->heap, (void*)s_best_pp.neg.mesh.verts);
+            heap_free(&pool->heap, s_vptrs[s_best_axis][0]);
+            heap_free(&pool->heap, s_vptrs[s_best_axis][1]);
         }
         return;
     }
@@ -594,11 +626,39 @@ extern "C" __global__ void la_expand_quick(
         if (wo->parts[i].hull.refcount) atomicAdd(wo->parts[i].hull.refcount, 1);
     }
 
-    // Write the two new parts and metadata
+    // Reconstruct best PartPair from saved per-axis data
+    int ba = s_best_axis;  // shorthand
     if (tid == 0) {
-        wo->parts[np - 1] = s_best_pp.pos;
-        wo->parts[np]     = s_best_pp.neg;
-        wo->nparts        = np + 1;
+        // Pos part
+        wo->parts[np - 1].mesh.verts    = (float*)s_vptrs[ba][0];
+        wo->parts[np - 1].mesh.tris     = (int*)s_tptrs[ba][0];
+        wo->parts[np - 1].mesh.nv       = s_nvs[ba][0];
+        wo->parts[np - 1].mesh.nt       = s_nts[ba][0];
+        wo->parts[np - 1].mesh.refcount = s_rcptrs[ba][0];
+        wo->parts[np - 1].hull.verts    = NULL;
+        wo->parts[np - 1].hull.tris     = NULL;
+        wo->parts[np - 1].hull.nv       = 0;
+        wo->parts[np - 1].hull.nt       = 0;
+        wo->parts[np - 1].hull.refcount = NULL;
+        wo->parts[np - 1].mesh_vol      = s_vols[ba][0];
+        wo->parts[np - 1].hull_vol      = 0.0f;
+        wo->parts[np - 1].hausdorff     = 0.0f;
+        // Neg part
+        wo->parts[np].mesh.verts    = (float*)s_vptrs[ba][1];
+        wo->parts[np].mesh.tris     = (int*)s_tptrs[ba][1];
+        wo->parts[np].mesh.nv       = s_nvs[ba][1];
+        wo->parts[np].mesh.nt       = s_nts[ba][1];
+        wo->parts[np].mesh.refcount = s_rcptrs[ba][1];
+        wo->parts[np].hull.verts    = NULL;
+        wo->parts[np].hull.tris     = NULL;
+        wo->parts[np].hull.nv       = 0;
+        wo->parts[np].hull.nt       = 0;
+        wo->parts[np].hull.refcount = NULL;
+        wo->parts[np].mesh_vol      = s_vols[ba][1];
+        wo->parts[np].hull_vol      = 0.0f;
+        wo->parts[np].hausdorff     = 0.0f;
+
+        wo->nparts = np + 1;
 
         // Inherit tracking from parent
         wo->src_part_idx    = wi->src_part_idx;
