@@ -58,3 +58,17 @@ Four separate `heap_alloc` calls for `s_samples_a`, `s_tri_ids_a`, `s_samples_b`
 Fix: replaced `s_best_pp` with per-axis arrays (`s_costs[3]`, `s_vptrs[3][2]`, etc.) that store each axis's result immediately after `plane_cut_block` returns, before the next iteration can overwrite shared memory. After the loop, non-best cuts are freed and the best is reconstructed from the per-axis arrays. This avoids any `__shared__` variable persisting across `plane_cut_block` calls.
 
 **General rule**: Never store data in `__shared__` variables that must survive across calls to inlined `__device__` functions that also use `__shared__` memory. The compiler is free to alias `__shared__` variables with non-overlapping liveness.
+
+## la_expand: Level-0 Items Share Mesh Memory with Leaf Items (Double-Decrement Bug)
+
+`la_expand` copies the output work item (`wo`) to the level-0 buffer (`l0`), creating two references to the same `mesh.verts` device memory (from `plane_cut_block`) but without incrementing the refcount. During cleanup, both `la_cleanup_tree` on `d_cur` (leaf items) and on `d_level0` decrement the same refcount. With initial refcount=1, the first decrement frees the memory, and the second is a double-free. Worse, when `la_apply_cuts` adopts the level-0 item's parts into the decomp and increments the refcount to 2, both cleanup passes decrement it to 0 and free it — leaving the decomp with a dangling pointer. The next `la_hull_decomp` call allocates new hull memory over the freed mesh, corrupting vertex data. Observed as mesh_vol changing from 0.566 to 0.352 between kernel launches.
+
+Fix: (1) In `la_expand`, increment the mesh refcount when writing to the level-0 item (`atomicAdd(l0->parts[np-1].mesh.refcount, 1)` and same for `np`). This accounts for the second reference. (2) In `la_apply_cuts`, null out both hull AND mesh pointers in the adopted level-0 item so that `la_cleanup_tree` doesn't decrement the refcounts for the decomp-owned copies.
+
+## warp_sort_t Corrupts Large Structs (Part)
+
+`warp_sort_t<Part, LAPartKeyCmpRV>` corrupted Part data during sorting. The `warp_partition` step writes the pivot value into all "equal-key" slots, but for large structs like Part (80 bytes), this overwrites the entire struct — including `mesh.verts` and `refcount` pointers — with the pivot's values. This causes duplicate mesh references, double-frees, and NULL pointer dereferences at depth>1 expansion. Fix: replaced `warp_sort_t<Part>` with single-thread insertion sort (adequate for `LA_MAX_PARTS=16` and `LA_MAX_DECOMP=1024`).
+
+## L-shape Test Fixture Must Be Watertight
+
+The `_make_lshape()` fixture in `test_lookahead.py` was changed from the original `_merge_meshes([box_a, box_b])` approach to a hand-coded vertex/index list that was NOT watertight (euler_number=-1, is_watertight=False). Non-watertight input causes `mesh_volume_warp` to return incorrect volumes, making rv cost unreliable and preventing convergence. Fix: restored the original `_box()` + `_merge_meshes()` approach which produces a watertight L-shape (two overlapping boxes with outward-facing triangles). The merged mesh is watertight with volume=4 (unnormalized).

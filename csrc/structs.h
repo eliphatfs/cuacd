@@ -98,6 +98,7 @@ struct beam_ctx {
     CUfunction fn_la_record_level_cost;
     CUfunction fn_la_evaluate;
     CUfunction fn_la_apply_cuts;
+    CUfunction fn_la_hull_decomp;
     CUfunction fn_la_cleanup_tree;
 
     // Heaps embedded in d_pool_struct (beam.c update pending).

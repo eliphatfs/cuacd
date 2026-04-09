@@ -54,7 +54,7 @@ struct AlgoState {
 // ============================================================================
 #define LA_MAX_PARTS     16
 #define LA_MAX_CUTTING   16
-#define LA_MAX_DECOMP    256
+#define LA_MAX_DECOMP    1024
 #define LA_MAX_LEVELS    4
 
 struct LaWorkItem {

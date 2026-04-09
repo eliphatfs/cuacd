@@ -267,7 +267,7 @@ class Context:
 
     def lookahead_decompose(self, verts, tris, *,
                             max_iters=100, width=30, threshold=0.05,
-                            depth=2, quick_depth=1, max_n_cutting=16,
+                            depth=1, quick_depth=1, max_n_cutting=16,
                             verbose=0, debug=0):
         """Decompose a mesh into convex parts using lookahead tree search.
 
@@ -302,11 +302,19 @@ class Context:
         tris = _as_i32(tris).reshape(-1, 3)
 
         # Compute convex hull for the input mesh
-        # Use hull.points (all vertices) and hull.simplices (indices into .points)
-        # so the triangle indices are valid for the vertex array we pass.
         hull = scipy.spatial.ConvexHull(verts)
         hull_verts = _as_f32(hull.points)
         hull_tris = _as_i32(hull.simplices)
+
+        # Reorient hull triangles so normals point outward (away from centroid).
+        # scipy's ConvexHull does not guarantee consistent winding.
+        centroid = hull_verts.mean(axis=0)
+        v0 = hull_verts[hull_tris[:, 0]]
+        v1 = hull_verts[hull_tris[:, 1]]
+        v2 = hull_verts[hull_tris[:, 2]]
+        normals = np.cross(v1 - v0, v2 - v0)
+        inward = (normals * (v0 - centroid)).sum(axis=1) < 0
+        hull_tris[inward] = hull_tris[inward][:, [0, 2, 1]]
 
         raw = _gpu.lookahead_decompose(
             verts.ctypes.data, len(verts),

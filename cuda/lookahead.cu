@@ -17,6 +17,11 @@
 #include "warp_sort.cuh"
 #include "hausdorff.cuh"
 
+// Sentinel refcount value: marks hull as heap-allocated by kdop_hull_block
+// (should be freed with heap_free, not refcount-decremented).
+// Valid refcounts are always aligned pointers; (int*)1 is never a valid address.
+#define LA_REFCOUNT_HEAP ((int*)1)
+
 // Error codes (distinct from beam search and plane_cut codes).
 #define LA_ERR_OVERFLOW     0x100000  // LaWorkItem exceeded LA_MAX_PARTS
 #define LA_ERR_SORT_OOM     0x200000  // scratch heap allocation failed in sort
@@ -34,15 +39,16 @@ static __device__ inline float la_part_cost(const Part& p) {
     return fmaxf(LA_PART_COST_K_RV * rv, p.hausdorff);
 }
 
-// rv-only cost (no Hausdorff) — used during tree exploration where Hausdorff
-// is too expensive and not needed for cut selection.
+// rv-only cost (no Hausdorff) — used during tree exploration.
+// rv = cbrt(3/(4pi)*(hull_vol - mesh_vol)) — equivalent sphere radius of
+// the volume difference. Monotonically decreases with each good cut.
 static __device__ inline float la_part_cost_rv(const Part& p) {
     const float pi = 3.14159265358979f;
     float rv = cbrtf((3.0f / (4.0f * pi)) * fmaxf(p.hull_vol - p.mesh_vol, 0.0f));
     return LA_PART_COST_K_RV * rv;
 }
 
-// Part comparator for sorting — full cost (rv + hausdorff).
+// Part comparator for sorting decomposition — full cost (rv + hausdorff).
 struct LAPartKeyCmp {
     static __device__ inline float key(const Part& p) { return la_part_cost(p); }
     static __device__ inline int cmp(Part a, Part b) {
@@ -60,6 +66,28 @@ struct LAPartKeyCmp {
         s.hausdorff = 1e30f;
         s.mesh_vol  = 1e30f;
         s.hull_vol  = 0.0f;
+        return s;
+    }
+};
+
+// Part comparator for sorting tree items — rv-only cost.
+// Tree search should use rv-only for cut selection, not Hausdorff.
+struct LAPartKeyCmpRV {
+    static __device__ inline float key(const Part& p) { return la_part_cost_rv(p); }
+    static __device__ inline int cmp(Part a, Part b) {
+        float ka = key(a), kb = key(b);
+        if (ka < kb) return -1;
+        if (ka > kb) return  1;
+        unsigned long long pa = (unsigned long long)a.mesh.verts;
+        unsigned long long pb = (unsigned long long)b.mesh.verts;
+        if (pa < pb) return -1;
+        if (pa > pb) return  1;
+        return 0;
+    }
+    static __device__ inline Part sentinel() {
+        Part s = {};
+        s.hull_vol  = 1e30f;
+        s.mesh_vol  = 0.0f;
         return s;
     }
 };
@@ -106,6 +134,12 @@ extern "C" __global__ void la_initialize(
         hull_vol = mesh_volume_warp(&h, wlane);
     }
 
+    // Broadcast hull_vol from warp 1 to warp 0 so lane 0 can write both
+    __shared__ float s_hull_vol;
+    if (warp_id == 1 && wlane == 0)
+        s_hull_vol = hull_vol;
+    __syncthreads();
+
     if (lane == 0) {
         Part* p          = &decomp->parts[0];
         p->mesh.verts    = verts;
@@ -120,7 +154,7 @@ extern "C" __global__ void la_initialize(
         p->hull.refcount = NULL;
         p->hausdorff     = 0.0f;
         p->mesh_vol      = mesh_vol;
-        p->hull_vol      = hull_vol;
+        p->hull_vol      = s_hull_vol;
         decomp->nparts   = 1;
     }
 }
@@ -141,24 +175,20 @@ extern "C" __global__ void la_sort_parts(
     int np   = decomp->nparts;
     if (np <= 1) return;
 
-    // Allocate sort scratch
-    __shared__ char* s_scratch;
+    // Insertion sort by rv cost ascending.
+    // Single-threaded (lane 0) — fine for LA_MAX_DECOMP <= 1024.
     if (lane == 0) {
-        int nb = np * (int)sizeof(Part) + WS_MAX_STACK * 2 * (int)sizeof(int);
-        if (heap_alloc(&pool->scratch, nb, (void**)&s_scratch) != 0) {
-            s_scratch = NULL;
-            atomicOr(err, LA_ERR_SORT_OOM);
+        for (int i = 1; i < np; i++) {
+            Part key = decomp->parts[i];
+            float kcost = la_part_cost_rv(key);
+            int j = i - 1;
+            while (j >= 0 && la_part_cost_rv(decomp->parts[j]) > kcost) {
+                decomp->parts[j + 1] = decomp->parts[j];
+                j--;
+            }
+            decomp->parts[j + 1] = key;
         }
     }
-    __syncwarp();
-    if (s_scratch == NULL) return;
-
-    int rc = warp_sort_t<Part, LAPartKeyCmp>(decomp->parts, s_scratch, np, lane);
-    if (rc != 0 && lane == 0)
-        atomicOr(err, LA_ERR_SORT_STACK);
-
-    if (lane == 0)
-        heap_free(&pool->scratch, s_scratch);
 }
 
 // ============================================================================
@@ -207,7 +237,15 @@ extern "C" __global__ void la_count_cutting(
     int np   = decomp->nparts;
 
     for (int i = lane; i < np; i += WARP_SIZE) {
-        float cost = la_part_cost(decomp->parts[i]);
+        // Use rv-only cost for the stopping criterion.
+        // Hausdorff can remain large for small parts due to surface
+        // deviation even when the part is essentially convex (rv ≈ 0).
+        // Over-decomposition with Hausdorff produces hundreds of tiny parts.
+        // Use rv-only cost for the stopping criterion.
+        // Hausdorff can remain large for small parts due to surface
+        // deviation even when the part is essentially convex (rv ≈ 0).
+        // Over-decomposition with Hausdorff produces hundreds of tiny parts.
+        float cost = la_part_cost_rv(decomp->parts[i]);
         if (cost >= threshold) {
             int idx = atomicAdd(n_cutting, 1);
             if (idx < max_cutting)
@@ -238,9 +276,19 @@ extern "C" __global__ void la_seed_tree(
     // Copy the part
     wi->parts[0] = *src;
 
-    // Increment refcounts (the source part is still in the decomposition)
+    // Increment mesh refcount (the source part is still in the decomposition)
     if (src->mesh.refcount) atomicAdd(src->mesh.refcount, 1);
-    if (src->hull.refcount) atomicAdd(src->hull.refcount, 1);
+
+    // Null out hull in the copy — tree search uses rv-only cost, so hulls
+    // are not needed in tree items. The decomp part still owns its hull.
+    // Without this, both decomp and level-0 item share hull.verts with
+    // refcount=NULL → double-free.
+    wi->parts[0].hull.verts    = NULL;
+    wi->parts[0].hull.tris     = NULL;
+    wi->parts[0].hull.nv       = 0;
+    wi->parts[0].hull.nt       = 0;
+    wi->parts[0].hull.refcount = NULL;
+    wi->parts[0].hull_vol      = 0.0f;
 
     if (threadIdx.x == 0) {
         wi->nparts         = 1;
@@ -286,13 +334,16 @@ extern "C" __global__ void la_expand(
 
     Mesh* mesh = &wi->parts[np - 1].mesh;
 
-    // Validate mesh
-    if (tid == 0 && (mesh->nv <= 0 || mesh->nt <= 0 ||
-                     mesh->nv > 1000000 || mesh->nt > 1000000 ||
-                     mesh->verts == NULL || mesh->tris == NULL)) {
-        atomicOr(err, 0x100000);
-        return;
+    // Validate mesh — all threads must see the result
+    __shared__ int s_mesh_bad;
+    if (tid == 0) {
+        s_mesh_bad = (mesh->nv <= 0 || mesh->nt <= 0 ||
+                      mesh->nv > 1000000 || mesh->nt > 1000000 ||
+                      mesh->verts == NULL || mesh->tris == NULL) ? 1 : 0;
+        if (s_mesh_bad) atomicOr(err, 0x100000);
     }
+    __syncthreads();
+    if (s_mesh_bad) return;
 
     // Compute bounding box
     __shared__ float s_lo[3], s_hi[3];
@@ -364,10 +415,16 @@ extern "C" __global__ void la_expand(
         dst_i[i] = src_i[i];
     __syncthreads();
 
-    // Increment refcounts for copied parts
+    // Increment refcounts for copied parts; null out hulls (rv-only tree search
+    // doesn't need them, and they have refcount=NULL → sharing = double-free)
     for (int i = tid; i < np - 1; i += blockDim.x) {
         if (wo->parts[i].mesh.refcount) atomicAdd(wo->parts[i].mesh.refcount, 1);
-        if (wo->parts[i].hull.refcount) atomicAdd(wo->parts[i].hull.refcount, 1);
+        wo->parts[i].hull.verts    = NULL;
+        wo->parts[i].hull.tris     = NULL;
+        wo->parts[i].hull.nv       = 0;
+        wo->parts[i].hull.nt       = 0;
+        wo->parts[i].hull.refcount = NULL;
+        wo->parts[i].hull_vol      = 0.0f;
     }
 
     // Write the two new parts and metadata
@@ -422,6 +479,15 @@ extern "C" __global__ void la_expand(
             l0->n_levels       = wo->n_levels;
             for (int l = 0; l < wo->n_levels; l++)
                 l0->level_costs[l] = wo->level_costs[l];
+
+            // Increment refcounts for the two new parts (pos/neg from plane_cut).
+            // The level-0 items share mesh memory with the leaf items (d_cur).
+            // Without this increment, cleanup would double-decrement and free
+            // memory that the decomp (via la_apply_cuts) still references.
+            if (l0->parts[np - 1].mesh.refcount)
+                atomicAdd(l0->parts[np - 1].mesh.refcount, 1);
+            if (l0->parts[np].mesh.refcount)
+                atomicAdd(l0->parts[np].mesh.refcount, 1);
         }
     }
 }
@@ -451,13 +517,16 @@ extern "C" __global__ void la_expand_quick(
 
     Mesh* mesh = &wi->parts[np - 1].mesh;
 
-    // Validate mesh
-    if (tid == 0 && (mesh->nv <= 0 || mesh->nt <= 0 ||
-                     mesh->nv > 1000000 || mesh->nt > 1000000 ||
-                     mesh->verts == NULL || mesh->tris == NULL)) {
-        atomicOr(err, 0x100000);
-        return;
+    // Validate mesh — all threads must see the result
+    __shared__ int s_mesh_bad;
+    if (tid == 0) {
+        s_mesh_bad = (mesh->nv <= 0 || mesh->nt <= 0 ||
+                      mesh->nv > 1000000 || mesh->nt > 1000000 ||
+                      mesh->verts == NULL || mesh->tris == NULL) ? 1 : 0;
+        if (s_mesh_bad) atomicOr(err, 0x100000);
     }
+    __syncthreads();
+    if (s_mesh_bad) return;
 
     // Compute bounding box
     __shared__ float s_lo[3], s_hi[3];
@@ -620,10 +689,15 @@ extern "C" __global__ void la_expand_quick(
         dst_i[i] = src_i[i];
     __syncthreads();
 
-    // Increment refcounts for copied parts
+    // Increment refcounts for copied parts; null out hulls (rv-only tree search)
     for (int i = tid; i < np - 1; i += blockDim.x) {
         if (wo->parts[i].mesh.refcount) atomicAdd(wo->parts[i].mesh.refcount, 1);
-        if (wo->parts[i].hull.refcount) atomicAdd(wo->parts[i].hull.refcount, 1);
+        wo->parts[i].hull.verts    = NULL;
+        wo->parts[i].hull.tris     = NULL;
+        wo->parts[i].hull.nv       = 0;
+        wo->parts[i].hull.nt       = 0;
+        wo->parts[i].hull.refcount = NULL;
+        wo->parts[i].hull_vol      = 0.0f;
     }
 
     // Reconstruct best PartPair from saved per-axis data
@@ -708,6 +782,7 @@ extern "C" __global__ void la_hull(
     if (tid == 0) {
         p->hull     = hull;
         p->hull_vol = hvol;
+        p->hull.refcount = LA_REFCOUNT_HEAP;
     }
 }
 
@@ -731,23 +806,19 @@ extern "C" __global__ void la_sort_items(
     int np = wi->nparts;
     if (np <= 1) return;
 
-    __shared__ char* s_scratch;
+    // Simple insertion sort by rv cost ascending.
     if (lane == 0) {
-        int nb = np * (int)sizeof(Part) + WS_MAX_STACK * 2 * (int)sizeof(int);
-        if (heap_alloc(&pool->scratch, nb, (void**)&s_scratch) != 0) {
-            s_scratch = NULL;
-            atomicOr(err, LA_ERR_SORT_OOM);
+        for (int i = 1; i < np; i++) {
+            Part key = wi->parts[i];
+            float kcost = la_part_cost_rv(key);
+            int j = i - 1;
+            while (j >= 0 && la_part_cost_rv(wi->parts[j]) > kcost) {
+                wi->parts[j + 1] = wi->parts[j];
+                j--;
+            }
+            wi->parts[j + 1] = key;
         }
     }
-    __syncwarp();
-    if (s_scratch == NULL) return;
-
-    int rc = warp_sort_t<Part, LAPartKeyCmp>(wi->parts, s_scratch, np, lane);
-    if (rc != 0 && lane == 0)
-        atomicOr(err, LA_ERR_SORT_STACK);
-
-    if (lane == 0)
-        heap_free(&pool->scratch, s_scratch);
 }
 
 // ============================================================================
@@ -764,7 +835,7 @@ extern "C" __global__ void la_record_level_cost(
 
     LaWorkItem* wi = &items[i];
     if (threadIdx.x == 0 && wi->nparts > 0 && wi->n_levels < LA_MAX_LEVELS) {
-        float worst_cost = la_part_cost(wi->parts[wi->nparts - 1]);
+        float worst_cost = la_part_cost_rv(wi->parts[wi->nparts - 1]);
         wi->level_costs[wi->n_levels] = worst_cost;
         wi->n_levels++;
     }
@@ -859,6 +930,7 @@ extern "C" __global__ void la_apply_cuts(
     LaWorkItem*    level0_items,
     LaEvalResult*  results,
     int            width,
+    DevicePool*    pool,
     int*           err)
 {
     if (*err) return;
@@ -888,6 +960,22 @@ extern "C" __global__ void la_apply_cuts(
     // Replace the cutting part with the first half
     // Add the second half at the new slot
     if (tid == 0) {
+        // Free the old part's mesh and hull (being replaced)
+        Part* old = &decomp->parts[part_idx];
+        if (old->mesh.refcount) {
+            int om = atomicAdd(old->mesh.refcount, -1);
+            if (om == 1) heap_free(&pool->heap, (void*)old->mesh.verts);
+        }
+        // Mesh with refcount=NULL is owned externally (original input) — do not free.
+        if (old->hull.refcount == LA_REFCOUNT_HEAP) {
+            // Heap-allocated hull from la_hull_decomp — free directly
+            heap_free(&pool->heap, (void*)old->hull.verts);
+        } else if (old->hull.refcount) {
+            int oh = atomicAdd(old->hull.refcount, -1);
+            if (oh == 1) heap_free(&pool->heap, (void*)old->hull.verts);
+        }
+        // Hull with refcount=NULL is owned externally (initial input) — do not free.
+
         // Increment refcounts for the two adopted halves
         if (best_wi->parts[0].mesh.refcount)
             atomicAdd(best_wi->parts[0].mesh.refcount, 1);
@@ -903,6 +991,60 @@ extern "C" __global__ void la_apply_cuts(
 
         // Write second half into the new slot
         decomp->parts[s_new_idx] = best_wi->parts[1];
+
+        // Null out hulls and meshes in level-0 item so la_cleanup_tree won't
+        // double-decrement refcounts or free memory the decomp now owns.
+        // The level-0 items and the leaf items (d_cur) share mesh memory from
+        // plane_cut_block. The refcount was incremented in la_expand for the
+        // level-0 copy and again here for the decomp copy. Nulling out the
+        // level-0 item prevents cleanup from decrementing those refcounts.
+        best_wi->parts[0].hull.verts = NULL;
+        best_wi->parts[0].hull.nv    = 0;
+        best_wi->parts[1].hull.verts = NULL;
+        best_wi->parts[1].hull.nv    = 0;
+        best_wi->parts[0].mesh.verts = NULL;
+        best_wi->parts[0].mesh.nv    = 0;
+        best_wi->parts[1].mesh.verts = NULL;
+        best_wi->parts[1].mesh.nv    = 0;
+    }
+}
+
+// ============================================================================
+// la_hull_decomp: <<<LA_MAX_DECOMP, KDOP_BLOCK=32>>>
+// Compute k-DOP hull for decomposition parts that lack hull_vol.
+// Called after la_apply_cuts to ensure all parts have valid hull_vol.
+// ============================================================================
+extern "C" __global__ void la_hull_decomp(
+    LaDecompState* decomp,
+    DevicePool*    pool,
+    int*           err)
+{
+    if (*err) return;
+
+    int i = blockIdx.x;
+    if (i >= decomp->nparts) return;
+
+    Part* p = &decomp->parts[i];
+    if (p->hull_vol > 0.0f) return;  // already computed
+    if (p->mesh.nv == 0) return;     // empty part
+
+    float hvol = 0.0f;
+    Mesh hull = kdop_hull_block(
+        p->mesh.verts, p->mesh.nv,
+        &pool->heap, &pool->scratch,
+        &hvol, err);
+
+    if (threadIdx.x == 0) {
+        p->hull     = hull;
+        p->hull_vol = hvol;
+        // Mark hull as heap-allocated (vs initial input hull from la_initialize)
+        p->hull.refcount = LA_REFCOUNT_HEAP;
+
+        // Clamp mesh_vol to at most hull_vol — if mesh_volume_warp overestimated
+        // due to non-watertight mesh, the part is essentially convex and
+        // hull_vol - mesh_vol should be 0.
+        if (p->mesh_vol > p->hull_vol)
+            p->mesh_vol = p->hull_vol;
     }
 }
 
@@ -929,7 +1071,11 @@ extern "C" __global__ void la_cleanup_tree(
             int old = atomicAdd(pp->mesh.refcount, -1);
             if (old == 1) heap_free(&pool->heap, (void*)pp->mesh.verts);
         }
-        if (pp->hull.refcount) {
+        // Mesh with refcount=NULL is owned externally (original input) — do not free.
+        if (pp->hull.refcount == LA_REFCOUNT_HEAP) {
+            // Heap-allocated hull from la_hull — free directly
+            heap_free(&pool->heap, (void*)pp->hull.verts);
+        } else if (pp->hull.refcount) {
             int old = atomicAdd(pp->hull.refcount, -1);
             if (old == 1) heap_free(&pool->heap, (void*)pp->hull.verts);
         }

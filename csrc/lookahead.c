@@ -22,7 +22,7 @@
 
 #define LA_MAX_PARTS_H     16
 #define LA_MAX_CUTTING_H   16
-#define LA_MAX_DECOMP_H    256
+#define LA_MAX_DECOMP_H    1024
 #define LA_MAX_LEVELS_H    4
 
 struct LaWorkItem_h {
@@ -213,20 +213,8 @@ int lookahead_decompose(
         }
         LA_SYNC_CHECK("sort_parts1");
 
-        // Compute Hausdorff for parts near threshold (lazy — skip if rv >= threshold)
-        {
-            void* args[] = { &d_decomp, &ctx->d_pool_struct, &threshold, &d_err };
-            LCHECK(cuLaunchKernel(ctx->fn_la_hausdorff_parts,
-                                   LA_MAX_DECOMP_H, 1, 1, 256, 1, 1, 0, s, args, NULL));
-        }
-        LA_SYNC_CHECK("hausdorff_parts");
-
-        // Re-sort with full cost (rv + hausdorff)
-        {
-            void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
-            LCHECK(cuLaunchKernel(ctx->fn_la_sort_parts, 1, 1, 1, 32, 1, 1, 0, s, args, NULL));
-        }
-        LA_SYNC_CHECK("sort_parts2");
+        // Hausdorff + second sort skipped: convergence uses rv-only cost
+        // (Hausdorff can remain large for small essentially-convex parts)
 
         // Count cutting parts
         LCHECK(cuMemsetD32Async(d_n_cutting, 0, 1, s));
@@ -400,9 +388,17 @@ int lookahead_decompose(
         // Apply best cuts to the persistent decomposition
         {
             void* args[] = { &d_decomp, &d_cutting_idx, &n_cutting,
-                             &d_level0, &d_results, &width, &d_err };
+                             &d_level0, &d_results, &width,
+                             &ctx->d_pool_struct, &d_err };
             LCHECK(cuLaunchKernel(ctx->fn_la_apply_cuts,
                                    n_cutting, 1, 1, 64, 1, 1, 0, s, args, NULL));
+        }
+
+        // Compute hulls for new parts (la_apply_cuts sets hull_vol=0)
+        {
+            void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
+            LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
+                                   LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
 
         // Cleanup tree: free meshes from level-0 items

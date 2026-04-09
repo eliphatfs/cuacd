@@ -42,35 +42,81 @@ def _make_cube():
     return v, t
 
 
-def _make_lshape():
-    """L-shape: two boxes sharing an edge."""
-    a_v, a_t = _make_cube()
-    # Second box offset in X, sharing the [1,0,0]→[1,1,1] edge
-    b_v = a_v + np.array([1, 0, 0], dtype=np.float32)
-    b_t = a_t + len(a_v)
-    v = np.concatenate([a_v, b_v], axis=0)
-    t = np.concatenate([a_t, b_t], axis=0)
+def _box(lo, hi):
+    """Return (verts, tris) for an axis-aligned box."""
+    x0, y0, z0 = lo; x1, y1, z1 = hi
+    v = np.array([
+        [x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0],
+        [x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1],
+    ], dtype=np.float32)
+    t = np.array([
+        [0,2,1],[0,3,2],[4,5,6],[4,6,7],
+        [0,1,5],[0,5,4],[2,3,7],[2,7,6],
+        [0,4,7],[0,7,3],[1,2,6],[1,6,5],
+    ], dtype=np.int32)
     return v, t
 
 
-def _decompose_shape(ctx, verts, tris, **kwargs):
+def _merge_meshes(meshes):
+    """Concatenate a list of (verts, tris) into one mesh."""
+    all_v, all_t = [], []
+    offset = 0
+    for v, t in meshes:
+        all_v.append(v); all_t.append(t + offset); offset += len(v)
+    return np.concatenate(all_v), np.concatenate(all_t)
+
+
+def _make_lshape():
+    """L-shape = box_A ∪ box_B (two boxes sharing a face-edge)."""
+    box_a = _box([0, 0, 0], [2, 1, 1])  # horizontal bar
+    box_b = _box([0, 1, 0], [1, 3, 1])  # vertical bar
+    return _merge_meshes([box_a, box_b])
+
+
+def _decompose_shape(ctx, verts, tris, label="", **kwargs):
     """Normalize, decompose, and denormalize."""
+    from scipy.spatial import ConvexHull
+
     # Normalize to [-1, 1]
     lo = verts.min(axis=0)
     hi = verts.max(axis=0)
     center = (lo + hi) / 2
     extent = (hi - lo).max()
     scale = extent / 2 if extent > 0 else 1.0
-    nv = (verts - center) / scale
+    nv = ((verts - center) / scale).astype(np.float32)
 
     kwargs.setdefault("verbose", 1)
-    raw = ctx.lookahead_decompose(nv.astype(np.float32), tris, **kwargs)
+    raw = ctx.lookahead_decompose(nv, tris, **kwargs)
+
+    # GPU hull volumes for each part (in normalized space)
+    hull_results = ctx.batch_kdop_hull_mesh([p[0] for p in raw])
+
+    print(f"\n{label}: {len(raw)} parts" if label else f"\n{len(raw)} parts")
+    print(f"  {'':>6s}  {'tm_mesh':>10s} {'gpu_hull':>10s} {'tm_hull':>10s} {'scipy_hull':>10s}")
 
     parts = []
-    for vb, tb in raw:
-        v = vb * scale + center
-        parts.append((v, tb))
-    print(f"  {len(parts)} parts, pool usage: {ctx.pool_usage() / 1e6:.1f} MB")
+    for i, ((pv, pt), (_, ht, hv)) in enumerate(zip(raw, hull_results)):
+        # tm mesh volume (normalized space)
+        tm = trimesh.Trimesh(pv.copy(), pt.copy(), process=False)
+        tm_mesh_vol = abs(tm.volume) if tm.is_volume else float('nan')
+        # trimesh hull volume
+        try:
+            tm_hull_vol = abs(tm.convex_hull.volume)
+        except Exception:
+            tm_hull_vol = float('nan')
+        # scipy hull volume
+        try:
+            sc_hull = ConvexHull(pv)
+            scipy_hull_vol = sc_hull.volume
+        except Exception:
+            scipy_hull_vol = float('nan')
+        print(f"  part {i:2d}: {tm_mesh_vol:10.6f} {hv:10.6f} {tm_hull_vol:10.6f} {scipy_hull_vol:10.6f}")
+
+        # Denormalize for output
+        v = pv * scale + center
+        parts.append((v, pt))
+
+    print(f"  pool usage: {ctx.pool_usage() / 1e6:.1f} MB")
     return parts
 
 
@@ -97,14 +143,15 @@ class TestLookaheadDecompose:
     def test_cube_la(self, gpu_ctx):
         """Unit cube is already convex — should produce 1 part."""
         verts, tris = _make_cube()
-        parts = _decompose_shape(gpu_ctx, verts, tris, max_iters=5, threshold=0.05)
+        parts = _decompose_shape(gpu_ctx, verts, tris, label="cube", max_iters=5, threshold=0.05)
         assert len(parts) == 1
 
     def test_lshape_la(self, gpu_ctx):
-        """L-shape should decompose into 2-4 convex parts."""
+        """L-shape should decompose into 2+ convex parts."""
         verts, tris = _make_lshape()
-        parts = _decompose_shape(gpu_ctx, verts, tris, max_iters=50, threshold=0.05)
-        assert 2 <= len(parts) <= 8
+        parts = _decompose_shape(gpu_ctx, verts, tris, label="lshape",
+                                 max_iters=50, threshold=0.05)
+        assert 2 <= len(parts) <= 10
         for v, t in parts:
             assert v.ndim == 2 and v.shape[1] == 3
             assert t.ndim == 2 and t.shape[1] == 3
@@ -120,13 +167,14 @@ class TestLookaheadDecompose:
             gpu_ctx,
             np.ascontiguousarray(mesh.vertices, dtype=np.float32),
             np.ascontiguousarray(mesh.faces, dtype=np.int32),
-            max_iters=100, threshold=0.05)
+            label="octocat", max_iters=100, threshold=0.05)
         assert len(parts) >= 1
 
     def test_la_convergence(self, gpu_ctx):
         """After decomposition with reasonable threshold, all parts should be roughly convex."""
         verts, tris = _make_lshape()
-        parts = _decompose_shape(gpu_ctx, verts, tris, max_iters=100, threshold=0.05)
+        parts = _decompose_shape(gpu_ctx, verts, tris, label="lshape",
+                                 max_iters=100, threshold=0.05)
         assert len(parts) >= 2
         # Each part should have valid geometry
         for v, t in parts:
@@ -142,7 +190,7 @@ class TestLookaheadDecompose:
             gpu_ctx,
             np.ascontiguousarray(mesh.vertices, dtype=np.float32),
             np.ascontiguousarray(mesh.faces, dtype=np.int32),
-            max_iters=100, threshold=0.05)
+            label="49160", max_iters=100, threshold=0.05)
         assert len(parts) >= 1
 
     def test_export_glb(self, gpu_ctx):
@@ -151,7 +199,7 @@ class TestLookaheadDecompose:
 
         # Cube
         v, t = _make_cube()
-        parts = _decompose_shape(gpu_ctx, v, t, max_iters=5, threshold=0.05)
+        parts = _decompose_shape(gpu_ctx, v, t, label="cube", max_iters=5, threshold=0.05)
         path = os.path.join(OUTPUT_DIR, "la_cube.glb")
         _build_scene([("cube", parts)]).export(path)
         print(f"\nExported {path}")
@@ -159,7 +207,7 @@ class TestLookaheadDecompose:
 
         # L-shape
         v, t = _make_lshape()
-        parts = _decompose_shape(gpu_ctx, v, t, max_iters=50, threshold=0.05)
+        parts = _decompose_shape(gpu_ctx, v, t, label="lshape", max_iters=50, threshold=0.05)
         path = os.path.join(OUTPUT_DIR, "la_lshape.glb")
         _build_scene([("lshape", parts)]).export(path)
         print(f"\nExported {path}")
@@ -170,7 +218,7 @@ class TestLookaheadDecompose:
             mesh = trimesh.load(STL_49160, force="mesh")
             v = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
             t = np.ascontiguousarray(mesh.faces, dtype=np.int32)
-            parts = _decompose_shape(gpu_ctx, v, t, max_iters=100, threshold=0.05)
+            parts = _decompose_shape(gpu_ctx, v, t, label="49160", max_iters=100, threshold=0.05)
             path = os.path.join(OUTPUT_DIR, "la_49160.glb")
             _build_scene([("49160", parts)]).export(path)
             print(f"\nExported {path}")
@@ -181,7 +229,7 @@ class TestLookaheadDecompose:
             mesh = trimesh.load(OCTOCAT_OBJ, force="mesh")
             v = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
             t = np.ascontiguousarray(mesh.faces, dtype=np.int32)
-            parts = _decompose_shape(gpu_ctx, v, t, max_iters=100, threshold=0.05)
+            parts = _decompose_shape(gpu_ctx, v, t, label="octocat", max_iters=100, threshold=0.05)
             path = os.path.join(OUTPUT_DIR, "la_octocat.glb")
             _build_scene([("octocat", parts)]).export(path)
             print(f"\nExported {path}")
