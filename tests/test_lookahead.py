@@ -3,6 +3,7 @@
 import os
 import numpy as np
 import pytest
+import trimesh
 
 import coacd_gpu
 
@@ -15,6 +16,14 @@ import coacd_gpu
 def gpu_ctx():
     with coacd_gpu.Context(device=0, pool_bytes=10 * 1024**3) as ctx:
         yield ctx
+
+
+OCTOCAT_OBJ = os.path.join(os.path.dirname(__file__),
+                            "../CoACD/examples/Octocat-v2.obj")
+STL_49160   = os.path.join(os.path.dirname(__file__),
+                            "data/49160.stl")
+OUTPUT_DIR  = os.path.join(os.path.dirname(__file__),
+                            "../decomp_output")
 
 
 def _make_cube():
@@ -44,33 +53,7 @@ def _make_lshape():
     return v, t
 
 
-def _call_lookahead_decompose(verts, tris, **kwargs):
-    """Call lookahead_decompose with raw C pointers."""
-    verts = np.ascontiguousarray(verts, dtype=np.float32)
-    tris = np.ascontiguousarray(tris, dtype=np.int32)
-
-    import scipy.spatial
-    hull = scipy.spatial.ConvexHull(verts)
-    hull_verts = np.ascontiguousarray(hull.points, dtype=np.float32)
-    hull_tris = np.ascontiguousarray(hull.simplices, dtype=np.int32)
-
-    defaults = dict(
-        max_iters=100, width=30, threshold=0.05,
-        depth=2, quick_depth=1, max_n_cutting=16,
-        verbose=0, debug=0,
-    )
-    defaults.update(kwargs)
-
-    from coacd_gpu import _gpu
-    return _gpu.lookahead_decompose(
-        verts.ctypes.data, len(verts),
-        tris.ctypes.data, len(tris),
-        hull_verts.ctypes.data, len(hull_verts),
-        hull_tris.ctypes.data, len(hull_tris),
-        **defaults)
-
-
-def _decompose_shape(verts, tris, **kwargs):
+def _decompose_shape(ctx, verts, tris, **kwargs):
     """Normalize, decompose, and denormalize."""
     # Normalize to [-1, 1]
     lo = verts.min(axis=0)
@@ -80,16 +63,29 @@ def _decompose_shape(verts, tris, **kwargs):
     scale = extent / 2 if extent > 0 else 1.0
     nv = (verts - center) / scale
 
-    raw = _call_lookahead_decompose(nv, tris, **kwargs)
+    kwargs.setdefault("verbose", 1)
+    raw = ctx.lookahead_decompose(nv.astype(np.float32), tris, **kwargs)
 
     parts = []
-    for vb, tb, nv_count, nt_count, mv, hv in raw:
-        v = np.frombuffer(vb, dtype=np.float32).reshape(nv_count, 3).copy()
-        t = np.frombuffer(tb, dtype=np.int32).reshape(nt_count, 3).copy()
-        # Denormalize
-        v = v * scale + center
-        parts.append((v, t))
+    for vb, tb in raw:
+        v = vb * scale + center
+        parts.append((v, tb))
+    print(f"  {len(parts)} parts, pool usage: {ctx.pool_usage() / 1e6:.1f} MB")
     return parts
+
+
+def _build_scene(all_parts_by_shape):
+    """Build a trimesh.Scene with random per-part colors."""
+    scene = trimesh.Scene()
+    rng = np.random.default_rng(0)
+    for label, parts in all_parts_by_shape:
+        for i, (v, t) in enumerate(parts):
+            mesh = trimesh.Trimesh(v, t)
+            color = (rng.random(3) * 255).astype(np.uint8)
+            mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh)
+            mesh.visual.vertex_colors[:, :3] = color
+            scene.add_geometry(mesh, node_name=f"{label}_{i}")
+    return scene
 
 
 # ---------------------------------------------------------------------------
@@ -101,13 +97,13 @@ class TestLookaheadDecompose:
     def test_cube_la(self, gpu_ctx):
         """Unit cube is already convex — should produce 1 part."""
         verts, tris = _make_cube()
-        parts = _decompose_shape(verts, tris, max_iters=5, threshold=0.05)
+        parts = _decompose_shape(gpu_ctx, verts, tris, max_iters=5, threshold=0.05)
         assert len(parts) == 1
 
     def test_lshape_la(self, gpu_ctx):
         """L-shape should decompose into 2-4 convex parts."""
         verts, tris = _make_lshape()
-        parts = _decompose_shape(verts, tris, max_iters=50, threshold=0.05)
+        parts = _decompose_shape(gpu_ctx, verts, tris, max_iters=50, threshold=0.05)
         assert 2 <= len(parts) <= 8
         for v, t in parts:
             assert v.ndim == 2 and v.shape[1] == 3
@@ -115,13 +111,13 @@ class TestLookaheadDecompose:
             assert len(v) >= 4  # minimum tetrahedron
             assert len(t) >= 4
 
-    @pytest.mark.skipif(not os.path.exists("CoACD/examples/Octocat-v2.obj"),
+    @pytest.mark.skipif(not os.path.exists(OCTOCAT_OBJ),
                         reason="Octocat model not found")
     def test_octocat_la(self, gpu_ctx):
         """Octocat decomposition should produce >= 1 part."""
-        import trimesh
-        mesh = trimesh.load("CoACD/examples/Octocat-v2.obj")
+        mesh = trimesh.load(OCTOCAT_OBJ, force="mesh")
         parts = _decompose_shape(
+            gpu_ctx,
             np.ascontiguousarray(mesh.vertices, dtype=np.float32),
             np.ascontiguousarray(mesh.faces, dtype=np.int32),
             max_iters=100, threshold=0.05)
@@ -130,21 +126,63 @@ class TestLookaheadDecompose:
     def test_la_convergence(self, gpu_ctx):
         """After decomposition with reasonable threshold, all parts should be roughly convex."""
         verts, tris = _make_lshape()
-        parts = _decompose_shape(verts, tris, max_iters=100, threshold=0.05)
+        parts = _decompose_shape(gpu_ctx, verts, tris, max_iters=100, threshold=0.05)
         assert len(parts) >= 2
         # Each part should have valid geometry
         for v, t in parts:
             assert len(v) > 0
             assert len(t) > 0
 
-    @pytest.mark.skipif(not os.path.exists("49160.stl"),
+    @pytest.mark.skipif(not os.path.exists(STL_49160),
                         reason="49160.stl not found")
     def test_49160_la(self, gpu_ctx):
         """Decompose 49160.stl — should produce >= 1 part."""
-        import trimesh
-        mesh = trimesh.load("49160.stl")
+        mesh = trimesh.load(STL_49160, force="mesh")
         parts = _decompose_shape(
+            gpu_ctx,
             np.ascontiguousarray(mesh.vertices, dtype=np.float32),
             np.ascontiguousarray(mesh.faces, dtype=np.int32),
             max_iters=100, threshold=0.05)
         assert len(parts) >= 1
+
+    def test_export_glb(self, gpu_ctx):
+        """Decompose shapes with lookahead and export GLB files."""
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+        # Cube
+        v, t = _make_cube()
+        parts = _decompose_shape(gpu_ctx, v, t, max_iters=5, threshold=0.05)
+        path = os.path.join(OUTPUT_DIR, "la_cube.glb")
+        _build_scene([("cube", parts)]).export(path)
+        print(f"\nExported {path}")
+        assert os.path.exists(path)
+
+        # L-shape
+        v, t = _make_lshape()
+        parts = _decompose_shape(gpu_ctx, v, t, max_iters=50, threshold=0.05)
+        path = os.path.join(OUTPUT_DIR, "la_lshape.glb")
+        _build_scene([("lshape", parts)]).export(path)
+        print(f"\nExported {path}")
+        assert os.path.exists(path)
+
+        # 49160.stl (skip quietly if missing)
+        if os.path.exists(STL_49160):
+            mesh = trimesh.load(STL_49160, force="mesh")
+            v = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
+            t = np.ascontiguousarray(mesh.faces, dtype=np.int32)
+            parts = _decompose_shape(gpu_ctx, v, t, max_iters=100, threshold=0.05)
+            path = os.path.join(OUTPUT_DIR, "la_49160.glb")
+            _build_scene([("49160", parts)]).export(path)
+            print(f"\nExported {path}")
+            assert os.path.exists(path)
+
+        # Octocat (skip quietly if missing)
+        if os.path.exists(OCTOCAT_OBJ):
+            mesh = trimesh.load(OCTOCAT_OBJ, force="mesh")
+            v = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
+            t = np.ascontiguousarray(mesh.faces, dtype=np.int32)
+            parts = _decompose_shape(gpu_ctx, v, t, max_iters=100, threshold=0.05)
+            path = os.path.join(OUTPUT_DIR, "la_octocat.glb")
+            _build_scene([("octocat", parts)]).export(path)
+            print(f"\nExported {path}")
+            assert os.path.exists(path)

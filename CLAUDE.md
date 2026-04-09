@@ -53,8 +53,8 @@ tests/                # All tests
   test_hausdorff.py   #   Hausdorff distance tests (5 tests) + CoACD reference comparison
   gen_hausdorff_fixtures.py # Generates CoACD reference Hausdorff fixtures (C++ harness + .npz)
   ref_hausdorff.cpp    #   Standalone C++ CoACD Hausdorff reference harness
-  test_decompose.py   #   beam_decompose tests (cube, lshape, octocat, octocat_debug_steps)
-  test_lookahead.py   #   lookahead_decompose tests (cube, lshape, octocat, convergence)
+  test_beam.py        #   beam_decompose tests (cube, lshape, octocat, octocat_debug_steps)
+  test_lookahead.py   #   lookahead_decompose tests (cube, lshape, octocat, convergence, export_glb)
   test_edge_tracking.py # Max edge pairs stress test for D&C hull (requires COACD_TRACK_EDGES=1 build)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling
   bench_mm.py         #   Memory management benchmark

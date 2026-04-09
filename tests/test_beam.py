@@ -6,8 +6,7 @@ Shapes:
   - Octocat-v2.obj: complex organic shape → several parts
 
 Each shape is normalized to bbox [-1, 1] before decomposition, then
-rescaled back.  All three results are exported as a single GLB with
-random per-part colors, mirroring the CoACD reference visualizer.
+rescaled back.
 """
 import os
 import numpy as np
@@ -21,8 +20,6 @@ OCTOCAT_OBJ  = os.path.join(os.path.dirname(__file__),
                             "../CoACD/examples/Octocat-v2.obj")
 STL_49160    = os.path.join(os.path.dirname(__file__),
                             "data/49160.stl")
-OUTPUT_GLB   = os.path.join(os.path.dirname(__file__),
-                            "../decomp_output/decompose_all.glb")
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -170,19 +167,6 @@ def _decompose_shape(verts, tris, label, **kwargs):
     return meshes
 
 
-def _build_scene(all_parts_by_shape):
-    """Build a trimesh.Scene with random per-part colors, one section per shape."""
-    scene = trimesh.Scene()
-    rng = np.random.default_rng(0)
-    for label, parts in all_parts_by_shape:
-        for p in parts:
-            color = (rng.random(3) * 255).astype(np.uint8)
-            p.visual = trimesh.visual.ColorVisuals(mesh=p)
-            p.visual.vertex_colors[:, :3] = color
-            scene.add_geometry(p, node_name=f"{label}_{id(p)}")
-    return scene
-
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -239,55 +223,3 @@ def test_49160_decompose():
                              threshold=0.05, max_keep=32,
                              verbose=1)
     assert len(parts) >= 1
-
-
-def test_export_glb():
-    """Decompose all three shapes and export one GLB each."""
-    outdir = os.path.dirname(OUTPUT_GLB)
-    os.makedirs(outdir, exist_ok=True)
-
-    # Cube
-    v, t = _make_cube()
-    parts = _decompose_shape(v, t, "cube")
-    path = os.path.join(outdir, "cube.glb")
-    _build_scene([("cube", parts)]).export(path)
-    print(f"\nExported {path}")
-    assert os.path.exists(path)
-
-    # L-shape
-    v, t = _make_lshape()
-    parts = _decompose_shape(v, t, "lshape")
-    path = os.path.join(outdir, "lshape.glb")
-    _build_scene([("lshape", parts)]).export(path)
-    print(f"\nExported {path}")
-    assert os.path.exists(path)
-
-    # 49160.stl (skip quietly if missing)
-    if os.path.exists(STL_49160):
-        mesh = trimesh.load(STL_49160, force="mesh")
-        v = np.array(mesh.vertices, dtype=np.float32)
-        t = np.array(mesh.faces,    dtype=np.int32)
-        parts = _decompose_shape(v, t, "49160",
-                                 max_iters=100,
-                                 cuts_per_axis=10,
-                                 threshold=0.05,
-                                 max_keep=32)
-        path = os.path.join(outdir, "49160.glb")
-        _build_scene([("49160", parts)]).export(path)
-        print(f"\nExported {path}")
-        assert os.path.exists(path)
-
-    # Octocat (skip quietly if missing)
-    if os.path.exists(OCTOCAT_OBJ):
-        mesh = trimesh.load(OCTOCAT_OBJ, force="mesh")
-        v = np.array(mesh.vertices, dtype=np.float32)
-        t = np.array(mesh.faces,    dtype=np.int32)
-        parts = _decompose_shape(v, t, "octocat",
-                                 max_iters=100,
-                                 cuts_per_axis=10,
-                                 threshold=0.05,
-                                 max_keep=32)
-        path = os.path.join(outdir, "octocat.glb")
-        _build_scene([("octocat", parts)]).export(path)
-        print(f"\nExported {path}")
-        assert os.path.exists(path)
