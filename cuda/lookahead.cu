@@ -234,19 +234,39 @@ extern "C" __global__ void la_count_cutting(
     int            max_cutting,
     int*           err)
 {
-    int lane = threadIdx.x;
-    int np   = decomp->nparts;
+    // Parts are sorted by cost ascending (la_sort_parts runs before this).
+    // Above-threshold parts form a contiguous suffix.  We want the LAST
+    // max_cutting of them (highest cost = most in need of cutting).
+    //
+    // Lane 0 does a sequential scan to find the first above-threshold index,
+    // then fills cutting_indices deterministically.
+    if (threadIdx.x != 0) return;
 
-    for (int i = lane; i < np; i += WARP_SIZE) {
-        // Use full cost (rv + hausdorff) for the stopping criterion,
-        // matching CoACD: a part needs cutting when max(rv, hausdorff) >= threshold.
-        float cost = la_part_cost(decomp->parts[i]);
-        if (cost >= threshold) {
-            int idx = atomicAdd(n_cutting, 1);
-            if (idx < max_cutting)
-                cutting_indices[idx] = i;
+    int np = decomp->nparts;
+
+    // Find first part above threshold (binary-search-like, but np ≤ 1024)
+    int first_above = np;  // default: none above
+    for (int i = 0; i < np; i++) {
+        if (la_part_cost(decomp->parts[i]) >= threshold) {
+            first_above = i;
+            break;
         }
     }
+
+    int n_above = np - first_above;
+    // Skip the lowest-cost above-threshold parts if there are too many
+    int start = first_above;
+    if (n_above > max_cutting)
+        start = np - max_cutting;
+
+    int count = 0;
+    for (int i = start; i < np && count < max_cutting; i++) {
+        if (la_part_cost(decomp->parts[i]) >= threshold) {
+            cutting_indices[count] = i;
+            count++;
+        }
+    }
+    *n_cutting = count;
 }
 
 // ============================================================================
@@ -308,6 +328,7 @@ extern "C" __global__ void la_expand(
     DevicePool* pool,
     int         width,
     LaWorkItem* level0_out,  // if non-NULL, also write output here at [item_idx*width + cut_idx]
+    float       min_edge_dist,
     int*        err)
 {
     if (*err) return;
@@ -367,10 +388,18 @@ extern "C" __global__ void la_expand(
     __syncthreads();
 
     // Axis-aligned plane at (slice+1)/(cpa+1) fraction of bbox extent
+    float frac = (slice + 1.f) / (cpa + 1.f);
+    float cut_pos = s_lo[axis] + frac * (s_hi[axis] - s_lo[axis]);
+
+    // Skip cuts too close to the bbox edge (prevents degenerate thin slivers)
+    float dist_lo = cut_pos - s_lo[axis];
+    float dist_hi = s_hi[axis] - cut_pos;
+    if (dist_lo < min_edge_dist || dist_hi < min_edge_dist) return;
+
     float pa = (axis == 0) ? 1.f : 0.f;
     float pb = (axis == 1) ? 1.f : 0.f;
     float pc = (axis == 2) ? 1.f : 0.f;
-    float pd = -(s_lo[axis] + (slice + 1.f) / (cpa + 1.f) * (s_hi[axis] - s_lo[axis]));
+    float pd = -cut_pos;
 
     PartPair pp = plane_cut_block(mesh, pa, pb, pc, pd,
                                   &pool->heap, &pool->scratch, err);
@@ -518,6 +547,7 @@ extern "C" __global__ void la_expand_quick(
     LaWorkItem* next_items,
     int*        next_nitems,
     DevicePool* pool,
+    float       min_edge_dist,
     int*        err)
 {
     if (*err) return;
@@ -588,6 +618,9 @@ extern "C" __global__ void la_expand_quick(
     __syncthreads();
 
     for (int axis = 0; axis < 3; axis++) {
+        // Skip axes where the extent is too small for a valid midpoint cut
+        if (s_hi[axis] - s_lo[axis] < 2.0f * min_edge_dist) continue;
+
         float pa = (axis == 0) ? 1.f : 0.f;
         float pb = (axis == 1) ? 1.f : 0.f;
         float pc = (axis == 2) ? 1.f : 0.f;

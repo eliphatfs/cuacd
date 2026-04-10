@@ -264,8 +264,27 @@ int lookahead_decompose(
         int n_cutting = *h_ncutting_p;
         if (n_cutting > max_n_cutting) n_cutting = max_n_cutting;
 
-        if (verbose)
-            fprintf(stderr, "[la] iter %d: n_cutting=%d\n", iter, n_cutting);
+        if (verbose) {
+            fprintf(stderr, "[la] iter %d: n_cutting=%d", iter, n_cutting);
+            if (verbose >= 2) {
+                // Print cutting_indices
+                int* h_cidx = (int*)malloc((size_t)n_cutting * sizeof(int));
+                if (h_cidx) {
+                    CUresult _rc = cuMemcpyDtoH(h_cidx, d_cutting_idx,
+                                                (size_t)n_cutting * sizeof(int));
+                    if (_rc == CUDA_SUCCESS) {
+                        fprintf(stderr, " cutting_indices=[");
+                        for (int _ci = 0; _ci < n_cutting; _ci++) {
+                            if (_ci > 0) fprintf(stderr, " ");
+                            fprintf(stderr, "%d", h_cidx[_ci]);
+                        }
+                        fprintf(stderr, "]");
+                    }
+                    free(h_cidx);
+                }
+            }
+            fprintf(stderr, "\n");
+        }
 
         if (n_cutting == 0) {
             // All parts converged
@@ -297,6 +316,9 @@ int lookahead_decompose(
         CUdeviceptr d_next = d_items_b;
         int cur_n = n_cutting;
 
+        // Minimum distance from bbox edge for cuts (prevents degenerate slivers)
+        float min_edge_dist = threshold * 0.25f;
+
         // Full expansion levels
         for (int d = 0; d < depth; d++) {
             LCHECK(cuMemsetD32Async(d_nitems, 0, 1, s));
@@ -306,7 +328,8 @@ int lookahead_decompose(
                 // First expansion level writes to d_level0; deeper levels pass NULL
                 CUdeviceptr l0_ptr = (d == 0) ? d_level0 : (CUdeviceptr)0;
                 void* args[] = { &d_cur, &cur_n, &d_next, &d_nitems,
-                                 &ctx->d_pool_struct, &width, &l0_ptr, &d_err };
+                                 &ctx->d_pool_struct, &width, &l0_ptr,
+                                 &min_edge_dist, &d_err };
                 LCHECK(cuLaunchKernel(ctx->fn_la_expand,
                                        nblocks, 1, 1, 64, 1, 1, 0, s, args, NULL));
             }
@@ -371,7 +394,7 @@ int lookahead_decompose(
 
             {
                 void* args[] = { &d_cur, &cur_n, &d_next, &d_nitems,
-                                 &ctx->d_pool_struct, &d_err };
+                                 &ctx->d_pool_struct, &min_edge_dist, &d_err };
                 LCHECK(cuLaunchKernel(ctx->fn_la_expand_quick,
                                        cur_n, 1, 1, 64, 1, 1, 0, s, args, NULL));
             }
