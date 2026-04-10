@@ -197,11 +197,12 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 - D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
 - `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Used by `beam_hull`. Produces exact hull via extreme-point prefilter + D&C.
 - `hausdorff_block` — 5 tests pass. Used by `beam_hausdorff`. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
-- `lookahead_decompose` — cube test passes. L-shape and harder cases fail (see Known Limitations). Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=1.
+- `lookahead_decompose` — cube, L-shape, octocat, convergence tests pass. Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=1. 49160 hits pool OOM on complex meshes at high iteration counts.
 
 ### Known Limitations
 - **Beam search item starvation**: `beam_decompose` can sometimes reduce to 0 work items before convergence. This happens when the last (worst-cost) part of every surviving WorkItem cannot be meaningfully split by any axis-aligned plane (all cuts produce an empty half), yet its cost remains above the threshold. Once nitems reaches 0, the algorithm spins uselessly until max_iters. This is a fundamental weakness of greedy beam search — it can prune all productive paths too early. The lookahead algorithm avoids this by maintaining a flat decomposition and applying cuts one at a time.
-- **Lookahead L-shape non-convergence**: Hausdorff distance has a persistent floor (~0.057) for sub-parts of the L-shape, keeping them above threshold=0.05 even when they are essentially convex (rv≈0). This causes indefinite over-decomposition until pool OOM (error 0x2 = `PC_KERR_POOL_OOM`) at iter 13. Root cause under investigation — the Hausdorff values are genuine (confirmed with standalone test kernel), not a calling-code bug.
+- **Lookahead pool OOM on complex meshes**: 49160.stl hits pool OOM (`PC_KERR_POOL_OOM = 0x2`) at iter 34 when n_cutting grows large (many parts × width × width leaf items exhaust the 10GB pool).
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input
+- **Ternary search refinement** for lookahead cut selection: CoACD refines the MCTS-selected cut position via ternary search (`TernaryMCTS`, up to 10 iterations, epsilon=0.0001) to find the optimal cut within ±interval of the grid point. Our implementation uses only the fixed grid (width/3 cuts per axis). Adding refinement would let the algorithm find exact structural corners (e.g. the L-shape junction) instead of relying on the nearest grid point.

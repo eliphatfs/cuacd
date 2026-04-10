@@ -428,14 +428,17 @@ extern "C" __global__ void la_expand(
         wo->parts[np]     = pp.neg;
         wo->nparts        = np + 1;
 
-        // Track which input part and which initial cut produced this item
-        if (wi->src_part_idx >= 0) {
+        // Track which input part and which initial cut produced this item.
+        // n_levels == 0 means this is the first expansion (seeds from
+        // la_seed_tree have n_levels=0; after la_record_level_cost at
+        // depth 0, items have n_levels>=1).
+        if (wi->n_levels == 0) {
             // Level 0: this is the first expansion
-            wo->src_part_idx   = wi->src_part_idx;
+            wo->src_part_idx    = wi->src_part_idx;
             wo->initial_cut_idx = cut_idx;
         } else {
             // Deeper level: inherit from parent
-            wo->src_part_idx   = wi->src_part_idx;
+            wo->src_part_idx    = wi->src_part_idx;
             wo->initial_cut_idx = wi->initial_cut_idx;
         }
 
@@ -458,7 +461,7 @@ extern "C" __global__ void la_expand(
     }
 
     // Also write to level0_out if provided (first expansion level only)
-    if (level0_out != NULL && wi->src_part_idx >= 0) {
+    if (level0_out != NULL && wi->n_levels == 0) {
         LaWorkItem* l0 = &level0_out[item_idx * width + cut_idx];
         // Copy the output item to level0
         int out_ints = (np + 1) * (int)(sizeof(Part) / sizeof(int));
