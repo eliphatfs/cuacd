@@ -197,8 +197,7 @@ int lookahead_decompose(
     LCHECK(cuStreamSynchronize(s));
     if (verbose) fprintf(stderr, "[la] init OK\n");
 
-    // Temporary per-kernel sync for debugging octocat crash
-    #define LA_SYNC_CHECK(label) do { \
+    #define LA_SYNC_CHECK(label) do { if (debug) { \
         CUresult _sr = cuStreamSynchronize(s); \
         if (_sr != CUDA_SUCCESS) { \
             const char* _m = NULL; cuGetErrorString(_sr, &_m); \
@@ -208,7 +207,7 @@ int lookahead_decompose(
         int _e = 0; cuMemcpyDtoH(&_e, d_err, sizeof(int)); \
         if (_e) { fprintf(stderr, "[la] ERR 0x%x after %s\n", _e, label); result_code = _e; goto cleanup; } \
         if (verbose) fprintf(stderr, "[la] %s OK\n", label); \
-    } while(0)
+    } } while(0)
 
     // Main loop
     for (int iter = 0; iter < max_iters; iter++) {
