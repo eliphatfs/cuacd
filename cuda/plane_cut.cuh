@@ -319,35 +319,143 @@ __device__ inline PartPair plane_cut_block(
     int max_out_tris = min(n_tris + n_cross * 2, n_tris * 3);
 
     if (n_cross == 0) {
-        // No crossing — entire mesh on one side.
+        // No crossing edges.  Check whether vertices exist on both sides
+        // (disjoint components separated by the plane).
         if (tid == 0) {
             int any_pos = 0, any_neg = 0;
             for (int v = 0; v < n_verts; v++) {
                 if (signs[v] > 0) any_pos = 1;
                 if (signs[v] < 0) any_neg = 1;
             }
-            int is_neg = (any_neg && !any_pos);
-            unsigned int vb = (unsigned int)PC_ALIGN16(n_verts * 3 * (int)sizeof(float));
-            unsigned int tb = (unsigned int)PC_ALIGN16(n_tris  * 3 * (int)sizeof(int));
-            unsigned int rb = (unsigned int)PC_ALIGN16((int)sizeof(int));
-            unsigned int sz = vb + tb + rb; if (!sz) sz = 1;
-            void* chunk = NULL;
-            if (heap_alloc(heap, sz, &chunk) != HEAP_OK) {
-                atomicOr(kernel_error, PC_KERR_POOL_OOM);
+            if (!any_pos || !any_neg) {
+                // All on one side — copy entire mesh.
+                int is_neg = (any_neg && !any_pos);
+                unsigned int vb = (unsigned int)PC_ALIGN16(n_verts * 3 * (int)sizeof(float));
+                unsigned int tb = (unsigned int)PC_ALIGN16(n_tris  * 3 * (int)sizeof(int));
+                unsigned int rb = (unsigned int)PC_ALIGN16((int)sizeof(int));
+                unsigned int sz = vb + tb + rb; if (!sz) sz = 1;
+                void* chunk = NULL;
+                if (heap_alloc(heap, sz, &chunk) != HEAP_OK) {
+                    atomicOr(kernel_error, PC_KERR_POOL_OOM);
+                } else {
+                    float* pv = (float*)chunk;
+                    int*   pt = (int*)((char*)chunk + vb);
+                    int*   rc = (int*)((char*)chunk + vb + tb);
+                    *rc = 1;
+                    for (int i = 0; i < n_verts * 3; i++) pv[i] = vertices[i];
+                    for (int i = 0; i < n_tris  * 3; i++) pt[i] = triangles[i];
+                    Part* side  = is_neg ? &s_result.neg : &s_result.pos;
+                    Part* empty = is_neg ? &s_result.pos : &s_result.neg;
+                    pc_zero_part(side);
+                    side->mesh.verts = pv; side->mesh.tris = pt;
+                    side->mesh.nv = n_verts; side->mesh.nt = n_tris;
+                    side->mesh.refcount = rc;
+                    pc_zero_part(empty);
+                }
             } else {
-                float* pv = (float*)chunk;
-                int*   pt = (int*)((char*)chunk + vb);
-                int*   rc = (int*)((char*)chunk + vb + tb);
-                *rc = 1;
-                for (int i = 0; i < n_verts * 3; i++) pv[i] = vertices[i];
-                for (int i = 0; i < n_tris  * 3; i++) pt[i] = triangles[i];
-                Part* side  = is_neg ? &s_result.neg : &s_result.pos;
-                Part* empty = is_neg ? &s_result.pos : &s_result.neg;
-                pc_zero_part(side);
-                side->mesh.verts = pv; side->mesh.tris = pt;
-                side->mesh.nv = n_verts; side->mesh.nt = n_tris;
-                side->mesh.refcount = rc;
-                pc_zero_part(empty);
+                // Disjoint components on both sides — separate triangles.
+                // Classify each triangle by its vertices' signs.
+                // On-plane vertices (sign=0): triangle goes to whichever side
+                // it has a non-zero vertex on; all-zero triangles go to pos.
+
+                // Count triangles per side.
+                int n_pos_t = 0, n_neg_t = 0;
+                for (int t = 0; t < n_tris; t++) {
+                    int s0 = signs[triangles[t*3]], s1 = signs[triangles[t*3+1]], s2 = signs[triangles[t*3+2]];
+                    if (s0 < 0 || s1 < 0 || s2 < 0) n_neg_t++;
+                    else n_pos_t++;
+                }
+
+                // Build vertex remap: vertex → new index per side.
+                // Use scratch heap for the remap array (-1 = not used on this side).
+                int* vmap = NULL;
+                void* vmap_p;
+                if (heap_alloc(scratch_heap, (unsigned int)(n_verts * (int)sizeof(int)), &vmap_p) != HEAP_OK) {
+                    atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);
+                    PC_FREE_ALL_SHARED_SCRATCH();
+                } else {
+                    vmap = (int*)vmap_p;
+
+                    // --- Positive side ---
+                    for (int v = 0; v < n_verts; v++) vmap[v] = -1;
+                    int pnv = 0;
+                    for (int t = 0; t < n_tris; t++) {
+                        int i0=triangles[t*3], i1=triangles[t*3+1], i2=triangles[t*3+2];
+                        int s0=signs[i0], s1=signs[i1], s2=signs[i2];
+                        if (s0 < 0 || s1 < 0 || s2 < 0) continue;
+                        if (vmap[i0]<0) vmap[i0]=pnv++;
+                        if (vmap[i1]<0) vmap[i1]=pnv++;
+                        if (vmap[i2]<0) vmap[i2]=pnv++;
+                    }
+                    unsigned int pvb=(unsigned int)PC_ALIGN16(pnv*3*(int)sizeof(float));
+                    unsigned int ptb=(unsigned int)PC_ALIGN16(n_pos_t*3*(int)sizeof(int));
+                    unsigned int prc=(unsigned int)PC_ALIGN16((int)sizeof(int));
+                    unsigned int psz=pvb+ptb+prc; if (!psz) psz=1;
+                    void* pchunk=NULL;
+                    if (heap_alloc(heap, psz, &pchunk) != HEAP_OK) {
+                        atomicOr(kernel_error, PC_KERR_POOL_OOM);
+                    } else {
+                        float* opv=(float*)pchunk;
+                        int*   opt=(int*)((char*)pchunk+pvb);
+                        int*   orc=(int*)((char*)pchunk+pvb+ptb);
+                        *orc=1;
+                        for (int v=0; v<n_verts; v++) {
+                            if (vmap[v]>=0) { int j=vmap[v]; opv[j*3]=vertices[v*3]; opv[j*3+1]=vertices[v*3+1]; opv[j*3+2]=vertices[v*3+2]; }
+                        }
+                        int ti=0;
+                        for (int t=0; t<n_tris; t++) {
+                            int i0=triangles[t*3], i1=triangles[t*3+1], i2=triangles[t*3+2];
+                            int s0=signs[i0], s1=signs[i1], s2=signs[i2];
+                            if (s0 < 0 || s1 < 0 || s2 < 0) continue;
+                            opt[ti*3]=vmap[i0]; opt[ti*3+1]=vmap[i1]; opt[ti*3+2]=vmap[i2]; ti++;
+                        }
+                        pc_zero_part(&s_result.pos);
+                        s_result.pos.mesh.verts=opv; s_result.pos.mesh.tris=opt;
+                        s_result.pos.mesh.nv=pnv; s_result.pos.mesh.nt=n_pos_t;
+                        s_result.pos.mesh.refcount=orc;
+                    }
+
+                    // --- Negative side ---
+                    for (int v = 0; v < n_verts; v++) vmap[v] = -1;
+                    int nnv = 0;
+                    for (int t = 0; t < n_tris; t++) {
+                        int i0=triangles[t*3], i1=triangles[t*3+1], i2=triangles[t*3+2];
+                        int s0=signs[i0], s1=signs[i1], s2=signs[i2];
+                        if (!(s0 < 0 || s1 < 0 || s2 < 0)) continue;
+                        if (vmap[i0]<0) vmap[i0]=nnv++;
+                        if (vmap[i1]<0) vmap[i1]=nnv++;
+                        if (vmap[i2]<0) vmap[i2]=nnv++;
+                    }
+                    unsigned int nvb=(unsigned int)PC_ALIGN16(nnv*3*(int)sizeof(float));
+                    unsigned int ntb=(unsigned int)PC_ALIGN16(n_neg_t*3*(int)sizeof(int));
+                    unsigned int nrc=(unsigned int)PC_ALIGN16((int)sizeof(int));
+                    unsigned int nsz=nvb+ntb+nrc; if (!nsz) nsz=1;
+                    void* nchunk=NULL;
+                    if (heap_alloc(heap, nsz, &nchunk) != HEAP_OK) {
+                        atomicOr(kernel_error, PC_KERR_POOL_OOM);
+                    } else {
+                        float* onv=(float*)nchunk;
+                        int*   ont=(int*)((char*)nchunk+nvb);
+                        int*   orc=(int*)((char*)nchunk+nvb+ntb);
+                        *orc=1;
+                        for (int v=0; v<n_verts; v++) {
+                            if (vmap[v]>=0) { int j=vmap[v]; onv[j*3]=vertices[v*3]; onv[j*3+1]=vertices[v*3+1]; onv[j*3+2]=vertices[v*3+2]; }
+                        }
+                        int ti=0;
+                        for (int t=0; t<n_tris; t++) {
+                            int i0=triangles[t*3], i1=triangles[t*3+1], i2=triangles[t*3+2];
+                            int s0=signs[i0], s1=signs[i1], s2=signs[i2];
+                            if (!(s0 < 0 || s1 < 0 || s2 < 0)) continue;
+                            ont[ti*3]=vmap[i0]; ont[ti*3+1]=vmap[i1]; ont[ti*3+2]=vmap[i2]; ti++;
+                        }
+                        pc_zero_part(&s_result.neg);
+                        s_result.neg.mesh.verts=onv; s_result.neg.mesh.tris=ont;
+                        s_result.neg.mesh.nv=nnv; s_result.neg.mesh.nt=n_neg_t;
+                        s_result.neg.mesh.refcount=orc;
+                    }
+
+                    heap_free(scratch_heap, vmap_p);
+                }
             }
             PC_FREE_ALL_SHARED_SCRATCH();
         }

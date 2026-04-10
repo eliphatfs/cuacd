@@ -49,7 +49,7 @@ tests/                # All tests
   test_hull.py        #   Hull volume + mesh volume tests
   test_hull_mesh.py   #   D&C hull mesh extraction tests + k-DOP hull tests
   test_warp_sort.py   #   Tests for warp_sort_bp32
-  test_plane_cut.py   #   Plane cut tests (14 tests)
+  test_plane_cut.py   #   Plane cut tests (16 tests)
   test_hausdorff.py   #   Hausdorff distance tests (5 tests) + CoACD reference comparison
   gen_hausdorff_fixtures.py # Generates CoACD reference Hausdorff fixtures (C++ harness + .npz)
   ref_hausdorff.cpp    #   Standalone C++ CoACD Hausdorff reference harness
@@ -157,7 +157,7 @@ One `DevicePool` with bump allocator backs two embedded `DeviceHeap` instances (
 
 Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-allocated from `scratch_heap` (not WarpPool) and freed immediately after the vertex-init copy in postsort, before the D&C phase. Edge pools (BtPool + initial slabs) exist only for BT_HULL_GROUPS=16 primaries — secondaries never allocate edges, so `edgePool.blocks` is indexed by `group` (not `lane`). WarpPool backing covers only sort scratch + postsort persistent data + D&C stacks/BFS queues. See `docs/api_hull_dandc.md`.
 
-**Plane Cut** (`plane_cut.cuh`): Block-level (64 threads) mesh splitting along an arbitrary plane. Produces `PartPair` with pos/neg meshes. See `docs/api_plane_cut.md`.
+**Plane Cut** (`plane_cut.cuh`): Block-level (64 threads) mesh splitting along an arbitrary plane. Produces `PartPair` with pos/neg meshes. Handles disjoint components: when the plane doesn't intersect any edge but vertices exist on both sides, triangles are separated by vertex sign with per-side vertex compaction. See `docs/api_plane_cut.md`.
 
 **Hull with Extreme-Point Prefilter** (`kdop_hull.cuh`): Single-warp (32 threads). Fast path: direct D&C hull for nv ≤ 1024. Main path: warp argmax/argmin over 40 icosphere axes finds up to 80 extreme vertices → D&C rough inner hull → ballot/popcount half-space filter discards interior points → D&C final hull of survivors. Result is the exact convex hull. Exposed as `ctx.batch_kdop_hull_mesh()`. Used by `beam_hull` kernel. See `docs/api_kdop_hull.md`.
 

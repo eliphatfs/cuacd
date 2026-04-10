@@ -333,6 +333,27 @@ class TestEdgeCases:
         _check_watertight(nv, nt, "neg")
         _check_volume_conservation(pv, pt, nv, nt, total_vol, tol=0.02)
 
+    def test_two_disjoint_cubes_separate_x(self):
+        """Two disjoint cubes cut by x=0 — separates them into one per side."""
+        c = trimesh.creation.box(extents=(0.5, 0.5, 0.5))
+        cv = np.array(c.vertices, dtype=np.float32)
+        ct = np.array(c.faces, dtype=np.int32)
+        # Cube A centered at (-1, 0, 0), Cube B at (+1, 0, 0)
+        va = cv.copy(); va[:, 0] -= 1.0
+        vb = cv.copy(); vb[:, 0] += 1.0
+        v = np.vstack([va, vb])
+        t = np.vstack([ct, ct + len(va)])
+        cube_vol = 0.5 ** 3  # each cube is 0.125
+        total_vol = cube_vol * 2
+        # Cut with x=0 — should separate the two cubes entirely
+        pv, pt, nv, nt = _plane_cut(v, t, 1, 0, 0, 0)
+        assert len(pt) > 0 and len(nt) > 0, "Expected one cube on each side"
+        _check_watertight(pv, pt, "pos")
+        _check_watertight(nv, nt, "neg")
+        pos_vol, neg_vol = _check_volume_conservation(pv, pt, nv, nt, total_vol, tol=0.02)
+        assert abs(pos_vol - cube_vol) < 0.02, f"pos vol {pos_vol} != {cube_vol}"
+        assert abs(neg_vol - cube_vol) < 0.02, f"neg vol {neg_vol} != {cube_vol}"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
