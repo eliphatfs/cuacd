@@ -213,8 +213,41 @@ int lookahead_decompose(
         }
         LA_SYNC_CHECK("sort_parts1");
 
-        // Hausdorff + second sort skipped: convergence uses rv-only cost
-        // (Hausdorff can remain large for small essentially-convex parts)
+        // Compute Hausdorff for parts with rv-cost below threshold
+        {
+            void* args[] = { &d_decomp, &ctx->d_pool_struct, &threshold, &d_err };
+            LCHECK(cuLaunchKernel(ctx->fn_la_hausdorff_parts,
+                                   LA_MAX_DECOMP_H, 1, 1, 256, 1, 1, 0, s, args, NULL));
+        }
+        LA_SYNC_CHECK("hausdorff_parts");
+
+        // Sort again by full cost (rv + hausdorff)
+        {
+            void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
+            LCHECK(cuLaunchKernel(ctx->fn_la_sort_parts, 1, 1, 1, 32, 1, 1, 0, s, args, NULL));
+        }
+        LA_SYNC_CHECK("sort_parts2");
+
+        // Diagnostic: print per-part cost breakdown
+        if (verbose) {
+            struct LaDecompState_h h_diag;
+            CUresult _dr = cuMemcpyDtoH(&h_diag, d_decomp, sizeof(h_diag));
+            if (_dr == CUDA_SUCCESS) {
+                const float pi = 3.14159265358979f;
+                fprintf(stderr, "[la]   part   nv   nt  mesh_vol  hull_vol    rv_cost  hausdorff  full_cost\n");
+                for (int _i = 0; _i < h_diag.nparts; _i++) {
+                    struct Part_h* _p = &h_diag.parts[_i];
+                    float rv = cbrtf((3.0f/(4.0f*pi)) * fmaxf(_p->hull_vol - _p->mesh_vol, 0.0f));
+                    float rv_cost = 0.3f * rv;
+                    float full_cost = fmaxf(rv_cost, _p->hausdorff);
+                    fprintf(stderr, "[la]   %3d  %4d %4d  %9.6f %9.6f  %9.6f %10.6f %10.6f%s\n",
+                            _i, _p->mesh.nv, _p->mesh.nt,
+                            _p->mesh_vol, _p->hull_vol,
+                            rv_cost, _p->hausdorff, full_cost,
+                            full_cost >= threshold ? " *" : "");
+                }
+            }
+        }
 
         // Count cutting parts
         LCHECK(cuMemsetD32Async(d_n_cutting, 0, 1, s));
@@ -342,6 +375,19 @@ int lookahead_decompose(
                 LCHECK(cuLaunchKernel(ctx->fn_la_expand_quick,
                                        cur_n, 1, 1, 64, 1, 1, 0, s, args, NULL));
             }
+            {
+                LCHECK(cuStreamSynchronize(s));
+                int _he = 0;
+                cuMemcpyDtoH(&_he, d_err, sizeof(int));
+                if (_he) {
+                    unsigned long long _pu = 0;
+                    cuMemcpyDtoH(&_pu, ctx->d_pool_off, sizeof(unsigned long long));
+                    fprintf(stderr, "[la] ERR 0x%x after expand_quick (iter %d, q=%d, cur_n=%d, pool=%.1f MB)\n",
+                            _he, iter, q, cur_n, (double)_pu / (1024*1024));
+                    result_code = _he; goto cleanup;
+                }
+                if (verbose) fprintf(stderr, "[la] expand_quick OK\n");
+            }
 
             int next_n = 0;
             LCHECK(cuMemcpyDtoHAsync(&next_n, d_nitems, sizeof(int), s));
@@ -356,12 +402,14 @@ int lookahead_decompose(
                 LCHECK(cuLaunchKernel(ctx->fn_la_hull_la,
                                        2 * next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
+            LA_SYNC_CHECK("hull_quick");
 
             {
                 void* args[] = { &d_next, &next_n, &ctx->d_pool_struct, &d_err };
                 LCHECK(cuLaunchKernel(ctx->fn_la_sort_items,
                                        next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
+            LA_SYNC_CHECK("sort_items_quick");
 
             {
                 void* args[] = { &d_next, &next_n };
@@ -384,6 +432,157 @@ int lookahead_decompose(
             LCHECK(cuLaunchKernel(ctx->fn_la_evaluate,
                                    n_cutting, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
+        LA_SYNC_CHECK("evaluate");
+
+        // Diagnostic: dump tree exploration info when verbose >= 2
+        if (verbose >= 2) {
+            LCHECK(cuStreamSynchronize(s));
+
+            // Read back eval results
+            struct LaEvalResult_h* h_results =
+                (struct LaEvalResult_h*)malloc((size_t)n_cutting * sizeof(struct LaEvalResult_h));
+            if (h_results) {
+                CUresult _rr = cuMemcpyDtoH(h_results, d_results,
+                                            (size_t)n_cutting * sizeof(struct LaEvalResult_h));
+                if (_rr == CUDA_SUCCESS) {
+                    for (int _ci = 0; _ci < n_cutting; _ci++) {
+                        fprintf(stderr, "[la]   eval: src_part=%d  best_cut=%d  best_cost=%.6f\n",
+                                _ci, h_results[_ci].best_cut_idx, h_results[_ci].best_cost);
+                    }
+                }
+                free(h_results);
+            }
+
+            // Read back leaf items (kept alive for per-cut summary below)
+            struct LaWorkItem_h* h_leaves =
+                (struct LaWorkItem_h*)malloc((size_t)cur_n * sizeof(struct LaWorkItem_h));
+            int h_leaves_valid = 0;
+            if (h_leaves) {
+                CUresult _rl = cuMemcpyDtoH(h_leaves, d_cur,
+                                            (size_t)cur_n * sizeof(struct LaWorkItem_h));
+                h_leaves_valid = (_rl == CUDA_SUCCESS);
+            }
+            if (h_leaves_valid) {
+                const float pi = 3.14159265358979f;
+                fprintf(stderr, "[la]   leaf_items: %d items\n", cur_n);
+                for (int _li = 0; _li < cur_n; _li++) {
+                    struct LaWorkItem_h* _wi = &h_leaves[_li];
+                    if (_wi->nparts <= 0 || _wi->n_levels == 0) continue;
+                    // Compute worst rv cost in this item
+                    float worst_rv = 0.0f;
+                    for (int _p = 0; _p < _wi->nparts; _p++) {
+                        struct Part_h* _pp = &_wi->parts[_p];
+                        float rv = cbrtf((3.0f/(4.0f*pi)) *
+                                         fmaxf(_pp->hull_vol - _pp->mesh_vol, 0.0f));
+                        float rv_cost = 0.3f * rv;
+                        if (rv_cost > worst_rv) worst_rv = rv_cost;
+                    }
+                    // Compute path cost = average of level_costs
+                    float path_cost = 0.0f;
+                    for (int _l = 0; _l < _wi->n_levels; _l++)
+                        path_cost += _wi->level_costs[_l];
+                    if (_wi->n_levels > 0) path_cost /= (float)_wi->n_levels;
+
+                    fprintf(stderr, "[la]     leaf[%d]: src=%d cut=%d nparts=%d "
+                            "n_levels=%d worst_rv=%.6f path_cost=%.6f levels=[",
+                            _li, _wi->src_part_idx, _wi->initial_cut_idx,
+                            _wi->nparts, _wi->n_levels, worst_rv, path_cost);
+                    for (int _l = 0; _l < _wi->n_levels; _l++) {
+                        if (_l > 0) fprintf(stderr, " ");
+                        fprintf(stderr, "%.6f", _wi->level_costs[_l]);
+                    }
+                    fprintf(stderr, "]\n");
+                }
+            }
+
+            // Read back level-0 items for per-cut detail
+            {
+                int n_l0 = n_cutting * width;
+                struct LaWorkItem_h* h_l0 =
+                    (struct LaWorkItem_h*)malloc((size_t)n_l0 * sizeof(struct LaWorkItem_h));
+                if (h_l0) {
+                    CUresult _rl0 = cuMemcpyDtoH(h_l0, d_level0,
+                                                  (size_t)n_l0 * sizeof(struct LaWorkItem_h));
+                    if (_rl0 == CUDA_SUCCESS) {
+                        const float pi = 3.14159265358979f;
+                        fprintf(stderr, "[la]   level0_items: %d items\n", n_l0);
+                        for (int _src = 0; _src < n_cutting; _src++) {
+                            fprintf(stderr, "[la]     src_part=%d:\n", _src);
+                            for (int _c = 0; _c < width; _c++) {
+                                struct LaWorkItem_h* _wi = &h_l0[_src * width + _c];
+                                if (_wi->nparts <= 0) {
+                                    fprintf(stderr, "[la]       cut[%d]: EMPTY (no valid split)\n", _c);
+                                    continue;
+                                }
+                                // Per-part rv cost
+                                fprintf(stderr, "[la]       cut[%d]: nparts=%d n_levels=%d",
+                                        _c, _wi->nparts, _wi->n_levels);
+                                // Print level costs
+                                fprintf(stderr, " levels=[");
+                                for (int _l = 0; _l < _wi->n_levels; _l++) {
+                                    if (_l > 0) fprintf(stderr, " ");
+                                    fprintf(stderr, "%.6f", _wi->level_costs[_l]);
+                                }
+                                fprintf(stderr, "]");
+                                // Print per-part costs
+                                fprintf(stderr, " parts=[");
+                                for (int _p = 0; _p < _wi->nparts && _p < 4; _p++) {
+                                    struct Part_h* _pp = &_wi->parts[_p];
+                                    float rv = cbrtf((3.0f/(4.0f*pi)) *
+                                                     fmaxf(_pp->hull_vol - _pp->mesh_vol, 0.0f));
+                                    float rv_cost = 0.3f * rv;
+                                    if (_p > 0) fprintf(stderr, " ");
+                                    fprintf(stderr, "{rv=%.6f hv=%.6f mv=%.6f nv=%d}",
+                                            rv_cost, _pp->hull_vol, _pp->mesh_vol, _pp->mesh.nv);
+                                }
+                                if (_wi->nparts > 4) fprintf(stderr, " ...(%d more)", _wi->nparts - 4);
+                                fprintf(stderr, "]\n");
+                            }
+                        }
+                    }
+                    free(h_l0);
+                }
+            }
+
+            // Per-cut summary from leaf items: best path cost per initial_cut_idx
+            // (This mirrors what la_evaluate computes on the GPU, but visible on host.)
+            if (h_leaves_valid && n_cutting > 0) {
+                float* cut_best = (float*)malloc((size_t)n_cutting * (size_t)width * sizeof(float));
+                if (cut_best) {
+                    for (int _i = 0; _i < n_cutting * width; _i++)
+                        cut_best[_i] = 1e30f;
+
+                    for (int _li = 0; _li < cur_n; _li++) {
+                        struct LaWorkItem_h* _wi = &h_leaves[_li];
+                        if (_wi->nparts <= 0 || _wi->n_levels == 0) continue;
+                        if (_wi->src_part_idx < 0 || _wi->src_part_idx >= n_cutting) continue;
+                        if (_wi->initial_cut_idx < 0 || _wi->initial_cut_idx >= width) continue;
+
+                        float path_cost = 0.0f;
+                        for (int _l = 0; _l < _wi->n_levels; _l++)
+                            path_cost += _wi->level_costs[_l];
+                        if (_wi->n_levels > 0) path_cost /= (float)_wi->n_levels;
+
+                        int idx = _wi->src_part_idx * width + _wi->initial_cut_idx;
+                        if (path_cost < cut_best[idx])
+                            cut_best[idx] = path_cost;
+                    }
+
+                    for (int _src = 0; _src < n_cutting; _src++) {
+                        fprintf(stderr, "[la]   per_cut_best: src_part=%d:", _src);
+                        for (int _c = 0; _c < width; _c++) {
+                            float v = cut_best[_src * width + _c];
+                            if (v < 1e29f)
+                                fprintf(stderr, " %d:%.6f", _c, v);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                    free(cut_best);
+                }
+            }
+
+            free(h_leaves);
+        }
 
         // Apply best cuts to the persistent decomposition
         {
@@ -393,6 +592,7 @@ int lookahead_decompose(
             LCHECK(cuLaunchKernel(ctx->fn_la_apply_cuts,
                                    n_cutting, 1, 1, 64, 1, 1, 0, s, args, NULL));
         }
+        LA_SYNC_CHECK("apply_cuts");
 
         // Compute hulls for new parts (la_apply_cuts sets hull_vol=0)
         {
@@ -400,6 +600,7 @@ int lookahead_decompose(
             LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
                                    LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
+        LA_SYNC_CHECK("hull_decomp");
 
         // Cleanup tree: free meshes from level-0 items
         {
@@ -408,6 +609,7 @@ int lookahead_decompose(
             LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree,
                                    n_l0, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
+        LA_SYNC_CHECK("cleanup_level0");
 
         // Cleanup tree: free meshes from leaf items (d_cur)
         {
@@ -415,6 +617,7 @@ int lookahead_decompose(
             LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree,
                                    cur_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
+        LA_SYNC_CHECK("cleanup_leaves");
 
         // Also cleanup the other buffer (may have intermediate level items)
         {
@@ -424,10 +627,8 @@ int lookahead_decompose(
                                    other_n > 1024 ? 1024 : other_n, 1, 1, 32, 1, 1,
                                    0, s, args, NULL));
         }
+        LA_SYNC_CHECK("cleanup_other");
 
-        LCHECK(cuStreamSynchronize(s));
-
-        // Check error
         *h_err_p = 0;
         LCHECK(cuMemcpyDtoHAsync(h_err_p, d_err, sizeof(int), s));
         LCHECK(cuStreamSynchronize(s));

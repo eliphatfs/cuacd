@@ -165,7 +165,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 **Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → sort`. Uses rv-only cost (no Hausdorff — it was removed because Hausdorff is non-monotonic over a single cut, preventing convergence). Pipelined in stream order, sync only after finalize. `beam_hull` uses `kdop_hull_block` (32 threads/block). See `docs/api_beam.md`.
 
-**Lookahead Search Decomposition** (`lookahead.cu` + `csrc/lookahead.c`): Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (width cuts each), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses rv-only cost (no Hausdorff) for tree exploration and convergence check — Hausdorff is non-monotonic and causes over-decomposition. Default depth=1 (depth≥2 causes over-decomposition with the current path-cost metric). Kernels: la_initialize, la_sort_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree.
+**Lookahead Search Decomposition** (`lookahead.cu` + `csrc/lookahead.c`): Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (width cuts each), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses rv-only cost for tree exploration (matching CoACD), but full cost `max(rv, hausdorff)` for the stopping criterion. Default depth=2, quick_depth=1. Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree.
 
 ### Utility Functions
 
@@ -197,11 +197,11 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 - D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
 - `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Used by `beam_hull`. Produces exact hull via extreme-point prefilter + D&C.
 - `hausdorff_block` — 5 tests pass. Used by `beam_hausdorff`. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
-- `lookahead_decompose` — all tests pass (cube, lshape, octocat, 49160). L-shape converges to 2 parts, octocat to ~12 parts with rv-only cost.
+- `lookahead_decompose` — cube test passes. L-shape and harder cases fail (see Known Limitations). Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=1.
 
 ### Known Limitations
 - **Beam search item starvation**: `beam_decompose` can sometimes reduce to 0 work items before convergence. This happens when the last (worst-cost) part of every surviving WorkItem cannot be meaningfully split by any axis-aligned plane (all cuts produce an empty half), yet its cost remains above the threshold. Once nitems reaches 0, the algorithm spins uselessly until max_iters. This is a fundamental weakness of greedy beam search — it can prune all productive paths too early. The lookahead algorithm avoids this by maintaining a flat decomposition and applying cuts one at a time.
-- **Lookahead depth≥2 over-decomposition**: With depth≥2, the path-cost metric (average worst-part cost across levels) selects cuts that peel off tiny slivers rather than making the best first cut. Use depth=1 for reliable convergence.
+- **Lookahead L-shape non-convergence**: Hausdorff distance has a persistent floor (~0.057) for sub-parts of the L-shape, keeping them above threshold=0.05 even when they are essentially convex (rv≈0). This causes indefinite over-decomposition until pool OOM (error 0x2 = `PC_KERR_POOL_OOM`) at iter 13. Root cause under investigation — the Hausdorff values are genuine (confirmed with standalone test kernel), not a calling-code bug.
 
 ### Not Yet Implemented
 - `__cuda_array_interface__` support for GPU tensor input

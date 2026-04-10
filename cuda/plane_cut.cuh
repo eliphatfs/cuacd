@@ -284,6 +284,10 @@ __device__ inline PartPair plane_cut_block(
     PC_BUF(Edge2i, cross_edges, s_cross_edges, max_cross_edges);
 
     // === Phase 3: Collect crossing edges ===
+    // An edge crosses the plane if its effective signs differ.
+    // Sign=0 (on-plane) is treated as positive for crossing detection,
+    // matching CoACD's convention: edges (0,-1) and (-1,0) are crossing
+    // but (0,+1) and (+1,0) are not.
     for (int t = tid; t < n_tris; t += PC_BLOCK) {
         int i0 = triangles[t*3], i1 = triangles[t*3+1], i2 = triangles[t*3+2];
         int s0 = signs[i0], s1 = signs[i1], s2 = signs[i2];
@@ -291,7 +295,9 @@ __device__ inline PartPair plane_cut_block(
         int esigns[3][2] = {{s0,s1},{s1,s2},{s2,s0}};
         for (int e = 0; e < 3; e++) {
             int sa = esigns[e][0], sb = esigns[e][1];
-            if ((sa > 0 && sb < 0) || (sa < 0 && sb > 0)) {
+            int ea = (sa >= 0) ? 1 : -1;
+            int eb = (sb >= 0) ? 1 : -1;
+            if (ea != eb) {
                 int va = edges[e][0], vb = edges[e][1];
                 int mn = (va < vb) ? va : vb, mx = (va < vb) ? vb : va;
                 int ci = atomicAdd(&s_counters[0], 1);
@@ -424,8 +430,19 @@ __device__ inline PartPair plane_cut_block(
         for (int i = 0; i < n_cross; i++) {
             if (i == 0 || cross_edges[i].a != cross_edges[i-1].a || cross_edges[i].b != cross_edges[i-1].b) {
                 int va = cross_edges[i].a, vb = cross_edges[i].b;
-                pc_intersect(all_verts.raw(), va, vb, pa, pb, pc_n, pd, &all_verts[cur_isect * 3]);
-                isect_idx[i] = cur_isect++;
+                // For edges where one endpoint is on the plane (sign=0),
+                // the intersection is that vertex itself — reuse its index
+                // to avoid creating a duplicate that would break topology.
+                float d0 = pa*all_verts[va*3]+pb*all_verts[va*3+1]+pc_n*all_verts[va*3+2]+pd;
+                float d1 = pa*all_verts[vb*3]+pb*all_verts[vb*3+1]+pc_n*all_verts[vb*3+2]+pd;
+                if (fabsf(d0) <= PC_EPS && fabsf(d1) > PC_EPS) {
+                    isect_idx[i] = va;  // va is on-plane → intersection is va
+                } else if (fabsf(d1) <= PC_EPS && fabsf(d0) > PC_EPS) {
+                    isect_idx[i] = vb;  // vb is on-plane → intersection is vb
+                } else {
+                    pc_intersect(all_verts.raw(), va, vb, pa, pb, pc_n, pd, &all_verts[cur_isect * 3]);
+                    isect_idx[i] = cur_isect++;
+                }
             } else {
                 isect_idx[i] = isect_idx[i - 1];
             }
@@ -477,14 +494,27 @@ __device__ inline PartPair plane_cut_block(
         int on = -1;
         for (int k = 0; k < 3; k++) if (si[k] == 0) { on = k; break; }
         if (on >= 0) {
-            int ov=vi[on], a_i=vi[(on+1)%3], b_i=vi[(on+2)%3], sa=si[(on+1)%3];
-            int nvi = FIND_ISECT(a_i, b_i); if (nvi < 0) continue;
-            if (sa > 0) {
-                int pi=atomicAdd(&s_counters[2],1); pos_tris[pi*3]=ov;pos_tris[pi*3+1]=a_i;pos_tris[pi*3+2]=nvi;
-                int ni=atomicAdd(&s_counters[3],1); neg_tris[ni*3]=ov;neg_tris[ni*3+1]=nvi;neg_tris[ni*3+2]=b_i;
+            int ov=vi[on], a_i=vi[(on+1)%3], b_i=vi[(on+2)%3], sa=si[(on+1)%3], sb=si[(on+2)%3];
+            if (sa == sb) {
+                // Both non-on-plane vertices on same side → triangle stays whole on that side.
+                // The on-plane vertex is part of the boundary but contributes zero area
+                // on the other side (CoACD convention: on-plane goes with the off-plane side).
+                if (sa > 0) {
+                    int pi=atomicAdd(&s_counters[2],1); pos_tris[pi*3]=i0;pos_tris[pi*3+1]=i1;pos_tris[pi*3+2]=i2;
+                } else {
+                    int ni=atomicAdd(&s_counters[3],1); neg_tris[ni*3]=i0;neg_tris[ni*3+1]=i1;neg_tris[ni*3+2]=i2;
+                }
             } else {
-                int ni=atomicAdd(&s_counters[3],1); neg_tris[ni*3]=ov;neg_tris[ni*3+1]=a_i;neg_tris[ni*3+2]=nvi;
-                int pi=atomicAdd(&s_counters[2],1); pos_tris[pi*3]=ov;pos_tris[pi*3+1]=nvi;pos_tris[pi*3+2]=b_i;
+                // Non-on-plane vertices have opposite signs — split at on-plane vertex.
+                // The intersection of the a_i-b_i edge with the plane divides the triangle.
+                int nvi = FIND_ISECT(a_i, b_i); if (nvi < 0) continue;
+                if (sa > 0) {
+                    int pi=atomicAdd(&s_counters[2],1); pos_tris[pi*3]=ov;pos_tris[pi*3+1]=a_i;pos_tris[pi*3+2]=nvi;
+                    int ni=atomicAdd(&s_counters[3],1); neg_tris[ni*3]=ov;neg_tris[ni*3+1]=nvi;neg_tris[ni*3+2]=b_i;
+                } else {
+                    int ni=atomicAdd(&s_counters[3],1); neg_tris[ni*3]=ov;neg_tris[ni*3+1]=a_i;neg_tris[ni*3+2]=nvi;
+                    int pi=atomicAdd(&s_counters[2],1); pos_tris[pi*3]=ov;pos_tris[pi*3+1]=nvi;pos_tris[pi*3+2]=b_i;
+                }
             }
         } else {
             int lone = -1;

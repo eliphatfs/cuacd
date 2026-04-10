@@ -33,45 +33,27 @@ def gpu_ctx():
 # Mesh helpers
 # ---------------------------------------------------------------------------
 
-def _box(lo, hi):
-    """Return (verts float32[N,3], tris int32[M,3]) for an axis-aligned box."""
-    x0, y0, z0 = lo
-    x1, y1, z1 = hi
-    verts = np.array([
-        [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
-        [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
-    ], dtype=np.float32)
-    tris = np.array([
-        [0,2,1],[0,3,2],  # -Z
-        [4,5,6],[4,6,7],  # +Z
-        [0,1,5],[0,5,4],  # -Y
-        [2,3,7],[2,7,6],  # +Y
-        [0,4,7],[0,7,3],  # -X
-        [1,2,6],[1,6,5],  # +X
-    ], dtype=np.int32)
-    return verts, tris
-
-
-def _merge_meshes(meshes):
-    """Concatenate a list of (verts, tris) into one mesh (no deduplication)."""
-    all_v, all_t = [], []
-    offset = 0
-    for v, t in meshes:
-        all_v.append(v)
-        all_t.append(t + offset)
-        offset += len(v)
-    return np.concatenate(all_v), np.concatenate(all_t)
-
-
 def _make_cube():
-    return _box([0, 0, 0], [1, 1, 1])
+    v = np.array([
+        [0,0,0],[1,0,0],[1,1,0],[0,1,0],
+        [0,0,1],[1,0,1],[1,1,1],[0,1,1]], dtype=np.float32)
+    t = np.array([
+        [0,2,1],[0,3,2],[4,5,6],[4,6,7],
+        [0,1,5],[0,5,4],[2,3,7],[2,7,6],
+        [0,4,7],[0,7,3],[1,2,6],[1,6,5],
+    ], dtype=np.int32)
+    return v, t
 
 
 def _make_lshape():
-    """L-shape = box_A ∪ box_B (two boxes sharing a face-edge)."""
-    box_a = _box([0, 0, 0], [2, 1, 1])  # horizontal bar
-    box_b = _box([0, 1, 0], [1, 3, 1])  # vertical bar
-    return _merge_meshes([box_a, box_b])
+    """Manifold L-shape = boolean union of two boxes (watertight, no internal faces)."""
+    box_a = trimesh.creation.box(extents=[2, 1, 1],
+        transform=trimesh.transformations.translation_matrix([1, 0.5, 0.5]))
+    box_b = trimesh.creation.box(extents=[1, 2, 1],
+        transform=trimesh.transformations.translation_matrix([0.5, 2, 0.5]))
+    l_shape = box_a.union(box_b)
+    return (np.ascontiguousarray(l_shape.vertices, dtype=np.float32),
+            np.ascontiguousarray(l_shape.faces, dtype=np.int32))
 
 
 def _scipy_hull(verts):

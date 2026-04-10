@@ -9,6 +9,7 @@
 // Hausdorff is computed lazily on the persistent decomposition for the
 // stopping criterion.
 
+#include <cstdio>
 #include "plane_cut.cuh"
 #include "warp_common.cuh"
 #include "hull_dandc.cuh"
@@ -175,14 +176,14 @@ extern "C" __global__ void la_sort_parts(
     int np   = decomp->nparts;
     if (np <= 1) return;
 
-    // Insertion sort by rv cost ascending.
+    // Insertion sort by full cost (rv + hausdorff) ascending.
     // Single-threaded (lane 0) — fine for LA_MAX_DECOMP <= 1024.
     if (lane == 0) {
         for (int i = 1; i < np; i++) {
             Part key = decomp->parts[i];
-            float kcost = la_part_cost_rv(key);
+            float kcost = la_part_cost(key);
             int j = i - 1;
-            while (j >= 0 && la_part_cost_rv(decomp->parts[j]) > kcost) {
+            while (j >= 0 && la_part_cost(decomp->parts[j]) > kcost) {
                 decomp->parts[j + 1] = decomp->parts[j];
                 j--;
             }
@@ -237,15 +238,9 @@ extern "C" __global__ void la_count_cutting(
     int np   = decomp->nparts;
 
     for (int i = lane; i < np; i += WARP_SIZE) {
-        // Use rv-only cost for the stopping criterion.
-        // Hausdorff can remain large for small parts due to surface
-        // deviation even when the part is essentially convex (rv ≈ 0).
-        // Over-decomposition with Hausdorff produces hundreds of tiny parts.
-        // Use rv-only cost for the stopping criterion.
-        // Hausdorff can remain large for small parts due to surface
-        // deviation even when the part is essentially convex (rv ≈ 0).
-        // Over-decomposition with Hausdorff produces hundreds of tiny parts.
-        float cost = la_part_cost_rv(decomp->parts[i]);
+        // Use full cost (rv + hausdorff) for the stopping criterion,
+        // matching CoACD: a part needs cutting when max(rv, hausdorff) >= threshold.
+        float cost = la_part_cost(decomp->parts[i]);
         if (cost >= threshold) {
             int idx = atomicAdd(n_cutting, 1);
             if (idx < max_cutting)
@@ -279,16 +274,15 @@ extern "C" __global__ void la_seed_tree(
     // Increment mesh refcount (the source part is still in the decomposition)
     if (src->mesh.refcount) atomicAdd(src->mesh.refcount, 1);
 
-    // Null out hull in the copy — tree search uses rv-only cost, so hulls
-    // are not needed in tree items. The decomp part still owns its hull.
-    // Without this, both decomp and level-0 item share hull.verts with
-    // refcount=NULL → double-free.
+    // Null out hull mesh pointers in the copy — the decomp part still owns
+    // its hull, and sharing hull.verts with refcount=NULL → double-free.
+    // But preserve hull_vol so the seed item's rv cost is accurate.
     wi->parts[0].hull.verts    = NULL;
     wi->parts[0].hull.tris     = NULL;
     wi->parts[0].hull.nv       = 0;
     wi->parts[0].hull.nt       = 0;
     wi->parts[0].hull.refcount = NULL;
-    wi->parts[0].hull_vol      = 0.0f;
+    // hull_vol preserved — inherited from decomp part
 
     if (threadIdx.x == 0) {
         wi->nparts         = 1;
@@ -415,8 +409,9 @@ extern "C" __global__ void la_expand(
         dst_i[i] = src_i[i];
     __syncthreads();
 
-    // Increment refcounts for copied parts; null out hulls (rv-only tree search
-    // doesn't need them, and they have refcount=NULL → sharing = double-free)
+    // Increment refcounts for copied parts; null out hull mesh pointers
+    // (they have refcount=NULL → sharing = double-free), but keep hull_vol
+    // so the rv cost is accurate for inherited parts during tree search.
     for (int i = tid; i < np - 1; i += blockDim.x) {
         if (wo->parts[i].mesh.refcount) atomicAdd(wo->parts[i].mesh.refcount, 1);
         wo->parts[i].hull.verts    = NULL;
@@ -424,7 +419,7 @@ extern "C" __global__ void la_expand(
         wo->parts[i].hull.nv       = 0;
         wo->parts[i].hull.nt       = 0;
         wo->parts[i].hull.refcount = NULL;
-        wo->parts[i].hull_vol      = 0.0f;
+        // hull_vol preserved — inherited from parent item
     }
 
     // Write the two new parts and metadata
@@ -471,6 +466,23 @@ extern "C" __global__ void la_expand(
         int* dst_i2 = (int*)l0->parts;
         for (int i = tid; i < out_ints; i += blockDim.x)
             dst_i2[i] = src_i2[i];
+        __syncthreads();
+
+        // Null out inherited parts' mesh/hull pointers in the level-0 copy.
+        // These parts are copies of the leaf items' inherited parts — their
+        // refcounts were already incremented for the leaf copy (line 415).
+        // The level-0 copy does NOT get its own refcount increment for inherited
+        // parts, so cleanup must not decrement them.  Only the two new parts
+        // (at positions np-1 and np) need refcount management here.
+        for (int i = tid; i < np - 1; i += blockDim.x) {
+            l0->parts[i].mesh.refcount = NULL;
+            l0->parts[i].mesh.verts    = NULL;
+            l0->parts[i].mesh.nv       = 0;
+            l0->parts[i].hull.refcount = NULL;
+            l0->parts[i].hull.verts    = NULL;
+            l0->parts[i].hull.nv       = 0;
+        }
+
         // Copy metadata
         if (tid == 0) {
             l0->nparts         = wo->nparts;
@@ -586,8 +598,16 @@ extern "C" __global__ void la_expand_quick(
         // If either side empty, free and skip
         if (pp.pos.mesh.nv == 0 || pp.neg.mesh.nv == 0) {
             if (tid == 0) {
-                if (pp.pos.mesh.verts) heap_free(&pool->heap, (void*)pp.pos.mesh.verts);
-                if (pp.neg.mesh.verts) heap_free(&pool->heap, (void*)pp.neg.mesh.verts);
+                if (pp.pos.mesh.verts) {
+                    int r = heap_free(&pool->heap, (void*)pp.pos.mesh.verts);
+                    if (r) { printf("expand_quick[%d]: empty-free pos err=%d axis=%d ptr=%p\n",
+                                    item_idx, r, axis, pp.pos.mesh.verts); atomicOr(err, r); }
+                }
+                if (pp.neg.mesh.verts) {
+                    int r = heap_free(&pool->heap, (void*)pp.neg.mesh.verts);
+                    if (r) { printf("expand_quick[%d]: empty-free neg err=%d axis=%d ptr=%p\n",
+                                    item_idx, r, axis, pp.neg.mesh.verts); atomicOr(err, r); }
+                }
                 s_costs[axis] = 1e30f;
                 s_valid[axis] = 0;
             }
@@ -598,6 +618,7 @@ extern "C" __global__ void la_expand_quick(
         // Compute mesh volumes for both halves
         {
             __shared__ Mesh s_pos_mesh, s_neg_mesh;
+            __shared__ float s_neg_vol;
             if (tid == 0) {
                 s_pos_mesh = pp.pos.mesh;
                 s_neg_mesh = pp.neg.mesh;
@@ -612,7 +633,13 @@ extern "C" __global__ void la_expand_quick(
             else if (warp_id == 1)
                 neg_vol = mesh_volume_warp(&s_neg_mesh, wlane);
 
+            // Broadcast neg_vol from warp 1 lane 0 to shared memory
+            if (warp_id == 1 && wlane == 0)
+                s_neg_vol = neg_vol;
+            __syncthreads();
+
             // Compute cost using mesh volume as proxy
+            if (tid == 0) neg_vol = s_neg_vol;
             float max_vol = fmaxf(pos_vol, neg_vol);
             float total_vol = pos_vol + neg_vol + 1e-10f;
             float cost = max_vol / total_vol;  // range (0.5, 1.0]; lower is more balanced
@@ -656,8 +683,13 @@ extern "C" __global__ void la_expand_quick(
     if (tid == 0) {
         for (int a = 0; a < 3; a++) {
             if (s_valid[a] && a != s_best_axis) {
-                heap_free(&pool->heap, s_vptrs[a][0]);
-                heap_free(&pool->heap, s_vptrs[a][1]);
+                int r0 = heap_free(&pool->heap, s_vptrs[a][0]);
+                int r1 = heap_free(&pool->heap, s_vptrs[a][1]);
+                if (r0 || r1) {
+                    printf("expand_quick[%d]: free axis=%d pos_err=%d neg_err=%d ptrs=%p %p\n",
+                           item_idx, a, r0, r1, s_vptrs[a][0], s_vptrs[a][1]);
+                    atomicOr(err, r0 ? r0 : r1);
+                }
             }
         }
     }
@@ -689,7 +721,9 @@ extern "C" __global__ void la_expand_quick(
         dst_i[i] = src_i[i];
     __syncthreads();
 
-    // Increment refcounts for copied parts; null out hulls (rv-only tree search)
+    // Increment refcounts for copied parts; null out hull mesh pointers
+    // (avoid double-free from shared refcount=NULL hulls), but keep hull_vol
+    // so rv cost is accurate for inherited parts.
     for (int i = tid; i < np - 1; i += blockDim.x) {
         if (wo->parts[i].mesh.refcount) atomicAdd(wo->parts[i].mesh.refcount, 1);
         wo->parts[i].hull.verts    = NULL;
@@ -697,7 +731,7 @@ extern "C" __global__ void la_expand_quick(
         wo->parts[i].hull.nv       = 0;
         wo->parts[i].hull.nt       = 0;
         wo->parts[i].hull.refcount = NULL;
-        wo->parts[i].hull_vol      = 0.0f;
+        // hull_vol preserved — inherited from parent item
     }
 
     // Reconstruct best PartPair from saved per-axis data
@@ -962,28 +996,44 @@ extern "C" __global__ void la_apply_cuts(
     if (tid == 0) {
         // Free the old part's mesh and hull (being replaced)
         Part* old = &decomp->parts[part_idx];
+        int free_err = 0;
         if (old->mesh.refcount) {
             int om = atomicAdd(old->mesh.refcount, -1);
-            if (om == 1) heap_free(&pool->heap, (void*)old->mesh.verts);
+            if (om == 1) {
+                free_err = heap_free(&pool->heap, (void*)old->mesh.verts);
+                if (free_err) printf("apply_cuts[%d]: mesh free err=%d ptr=%p rc_was=%d\n",
+                                     i, free_err, old->mesh.verts, om);
+            }
         }
         // Mesh with refcount=NULL is owned externally (original input) — do not free.
         if (old->hull.refcount == LA_REFCOUNT_HEAP) {
             // Heap-allocated hull from la_hull_decomp — free directly
-            heap_free(&pool->heap, (void*)old->hull.verts);
+            free_err = heap_free(&pool->heap, (void*)old->hull.verts);
+            if (free_err) printf("apply_cuts[%d]: hull(HEAP) free err=%d ptr=%p\n",
+                                 i, free_err, old->hull.verts);
         } else if (old->hull.refcount) {
             int oh = atomicAdd(old->hull.refcount, -1);
-            if (oh == 1) heap_free(&pool->heap, (void*)old->hull.verts);
+            if (oh == 1) {
+                free_err = heap_free(&pool->heap, (void*)old->hull.verts);
+                if (free_err) printf("apply_cuts[%d]: hull(rc) free err=%d ptr=%p rc_was=%d\n",
+                                     i, free_err, old->hull.verts, oh);
+            }
         }
         // Hull with refcount=NULL is owned externally (initial input) — do not free.
 
-        // Increment refcounts for the two adopted halves
+        // Increment refcounts for the two adopted halves.
+        // Skip LA_REFCOUNT_HEAP sentinel — those hulls are owned directly
+        // (not refcounted) and will be freed via the sentinel check when
+        // this decomp part is eventually replaced.
         if (best_wi->parts[0].mesh.refcount)
             atomicAdd(best_wi->parts[0].mesh.refcount, 1);
-        if (best_wi->parts[0].hull.refcount)
+        if (best_wi->parts[0].hull.refcount &&
+            best_wi->parts[0].hull.refcount != LA_REFCOUNT_HEAP)
             atomicAdd(best_wi->parts[0].hull.refcount, 1);
         if (best_wi->parts[1].mesh.refcount)
             atomicAdd(best_wi->parts[1].mesh.refcount, 1);
-        if (best_wi->parts[1].hull.refcount)
+        if (best_wi->parts[1].hull.refcount &&
+            best_wi->parts[1].hull.refcount != LA_REFCOUNT_HEAP)
             atomicAdd(best_wi->parts[1].hull.refcount, 1);
 
         // Write first half into the original slot
@@ -998,14 +1048,20 @@ extern "C" __global__ void la_apply_cuts(
         // plane_cut_block. The refcount was incremented in la_expand for the
         // level-0 copy and again here for the decomp copy. Nulling out the
         // level-0 item prevents cleanup from decrementing those refcounts.
-        best_wi->parts[0].hull.verts = NULL;
-        best_wi->parts[0].hull.nv    = 0;
-        best_wi->parts[1].hull.verts = NULL;
-        best_wi->parts[1].hull.nv    = 0;
-        best_wi->parts[0].mesh.verts = NULL;
-        best_wi->parts[0].mesh.nv    = 0;
-        best_wi->parts[1].mesh.verts = NULL;
-        best_wi->parts[1].mesh.nv    = 0;
+        best_wi->parts[0].hull.verts    = NULL;
+        best_wi->parts[0].hull.nv       = 0;
+        best_wi->parts[0].hull.refcount = NULL;
+        best_wi->parts[1].hull.verts    = NULL;
+        best_wi->parts[1].hull.nv       = 0;
+        best_wi->parts[1].hull.refcount = NULL;
+        best_wi->parts[0].mesh.verts    = NULL;
+        best_wi->parts[0].mesh.nv       = 0;
+        best_wi->parts[0].mesh.refcount = NULL;
+        best_wi->parts[1].mesh.verts    = NULL;
+        best_wi->parts[1].mesh.nv       = 0;
+        best_wi->parts[1].mesh.refcount = NULL;
+        // Clear nparts so la_cleanup_tree skips this item entirely
+        best_wi->nparts = 0;
     }
 }
 

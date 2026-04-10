@@ -267,7 +267,7 @@ class Context:
 
     def lookahead_decompose(self, verts, tris, *,
                             max_iters=100, width=30, threshold=0.05,
-                            depth=1, quick_depth=1, max_n_cutting=16,
+                            depth=2, quick_depth=1, max_n_cutting=16,
                             verbose=0, debug=0):
         """Decompose a mesh into convex parts using lookahead tree search.
 
