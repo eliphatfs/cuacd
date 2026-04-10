@@ -233,6 +233,7 @@ __device__ inline PartPair plane_cut_block(
         s_dir_edges = NULL; s_dir_sort = NULL; s_boundary_flags = NULL; s_be_a = NULL; s_cap_tris = NULL;
         s_counters[0] = 0; s_counters[1] = n_verts;
         s_counters[2] = 0; s_counters[3] = 0;
+        s_n_cap = 0;
         pc_zero_part(&s_result.pos);
         pc_zero_part(&s_result.neg);
     }
@@ -826,6 +827,7 @@ __device__ inline PartPair plane_cut_block(
     if (warp_id == 0) {
         int kern_ok    = 1;
         int n_cap      = 0;
+        int n_cap_expected = 0;
         int n_boundary = s_n_boundary;
         if (lane == 0) s_w_n_loops = 0;
         void* lv_ptr   = (void*)s_be_a;  // boundary edge pairs (be_a), freed after loop recon
@@ -1097,6 +1099,7 @@ __device__ inline PartPair plane_cut_block(
                         __syncwarp();
 
                         // Ear-clip this polygon (warp-cooperative)
+                        if (lane == 0) n_cap_expected += poly_n - 2;
                         if (poly_n >= 3) {
                             int* prev_a = ear_prevnext.raw();
                             int* next_a = ear_prevnext.raw() + poly_n;
@@ -1154,6 +1157,17 @@ __device__ inline PartPair plane_cut_block(
                         }
                     } // end for each outer loop
 
+                    // Check if cap triangulation is complete.  If ear-clipping
+                    // gave up on any polygon, treat as a failed cut: signal via
+                    // s_n_cap = -1 so all threads see it after __syncthreads.
+                    // Don't free anything here — let the normal cleanup path run.
+                    n_cap_expected = __shfl_sync(0xFFFFFFFF, n_cap_expected, 0);
+                    n_cap          = __shfl_sync(0xFFFFFFFF, n_cap, 0);
+                    if (n_cap < n_cap_expected) {
+                        DPRINTF("[pc-diag] CAP_INCOMPLETE blk=%d n_cap=%d expected=%d\n", blockIdx.x, n_cap, n_cap_expected);
+                        if (lane == 0) s_n_cap = -1;
+                    }
+
                     // Merged loop block no longer needed
                     if (lane == 0) {
                         heap_free(scratch_heap, loop_blk); loop_blk = NULL;
@@ -1174,7 +1188,7 @@ __device__ inline PartPair plane_cut_block(
         // Broadcast phase-13 state.  Local scratch lv_ptr..sb_ptr are all NULL
         // at this point (freed inline above); heap_free is NULL-safe.
         if (lane == 0) {
-            s_n_cap     = n_cap;
+            if (s_n_cap >= 0) s_n_cap = n_cap;  // preserve -1 signal from cap failure
             s_total_pos = n_pos;
             s_total_neg = n_neg;
             s_alloc_ok  = kern_ok;   // repurpose flag for phase-13 gate
@@ -1196,6 +1210,37 @@ __device__ inline PartPair plane_cut_block(
         }
     } // end if (warp_id == 0) phases 10-12
     __syncthreads();
+
+    // Cap triangulation failed — treat as no-cut: copy entire original mesh
+    // to positive side, return empty negative.  All 64 threads participate.
+    if (s_n_cap < 0) {
+        if (tid == 0) {
+            heap_free(scratch_heap, (void*)s_pr_ptr); s_pr_ptr = NULL;
+            heap_free(scratch_heap, (void*)s_nr_ptr); s_nr_ptr = NULL;
+            PC_FREE_ALL_SHARED_SCRATCH();
+            unsigned int vb = (unsigned int)PC_ALIGN16(n_verts * 3 * (int)sizeof(float));
+            unsigned int tb = (unsigned int)PC_ALIGN16(n_tris  * 3 * (int)sizeof(int));
+            unsigned int rb = (unsigned int)PC_ALIGN16((int)sizeof(int));
+            unsigned int sz = vb + tb + rb; if (!sz) sz = 1;
+            void* chunk = NULL;
+            if (heap_alloc(heap, sz, &chunk) != HEAP_OK) {
+                atomicOr(kernel_error, PC_KERR_POOL_OOM);
+            } else {
+                float* ov = (float*)chunk;
+                int*   ot = (int*)((char*)chunk + vb);
+                int*   rc = (int*)((char*)chunk + vb + tb);
+                *rc = 1;
+                for (int i = 0; i < n_verts * 3; i++) ov[i] = vertices[i];
+                for (int i = 0; i < n_tris  * 3; i++) ot[i] = triangles[i];
+                pc_zero_part(&s_result.pos);
+                s_result.pos.mesh.verts = ov; s_result.pos.mesh.tris = ot;
+                s_result.pos.mesh.nv = n_verts; s_result.pos.mesh.nt = n_tris;
+                s_result.pos.mesh.refcount = rc;
+                pc_zero_part(&s_result.neg);
+            }
+        }
+        return s_result;
+    }
 
     // =========================================================================
     // Phase 13: compact verts per side, heap-alloc output, fill PartPair.

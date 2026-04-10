@@ -329,7 +329,10 @@ extern "C" __global__ void la_expand(
     int         width,
     LaWorkItem* level0_out,  // if non-NULL, also write output here at [item_idx*width + cut_idx]
     float       min_edge_dist,
-    int*        err)
+    int*        err,
+    LaWorkItem* extra_leaves,
+    int*        n_extra,
+    int         total_levels)
 {
     if (*err) return;
 
@@ -387,14 +390,34 @@ extern "C" __global__ void la_expand(
     }
     __syncthreads();
 
-    // Axis-aligned plane at (slice+1)/(cpa+1) fraction of bbox extent
-    float frac = (slice + 1.f) / (cpa + 1.f);
-    float cut_pos = s_lo[axis] + frac * (s_hi[axis] - s_lo[axis]);
+    // Check if worst part is too small to cut in ALL axes
+    {
+        float eps = 1e-6f;
+        bool all_small = (s_hi[0]-s_lo[0] <= 2.f*min_edge_dist + eps) &&
+                         (s_hi[1]-s_lo[1] <= 2.f*min_edge_dist + eps) &&
+                         (s_hi[2]-s_lo[2] <= 2.f*min_edge_dist + eps);
 
-    // Skip cuts too close to the bbox edge (prevents degenerate thin slivers)
-    float dist_lo = cut_pos - s_lo[axis];
-    float dist_hi = s_hi[axis] - cut_pos;
-    if (dist_lo < min_edge_dist || dist_hi < min_edge_dist) return;
+        if (all_small) {
+            if (cut_idx == 0 && tid == 0 && extra_leaves != NULL) {
+                int ei = atomicAdd(n_extra, 1);
+                LaWorkItem* xl = &extra_leaves[ei];
+                *xl = *wi;  // copy parent state
+                // Pad level_costs with 0 from current n_levels to total_levels
+                for (int l = xl->n_levels; l < total_levels && l < LA_MAX_LEVELS; l++)
+                    xl->level_costs[l] = 0.0f;
+                xl->n_levels = (total_levels < LA_MAX_LEVELS) ? total_levels : LA_MAX_LEVELS;
+            }
+            return;
+        }
+    }
+
+    // Place cuts evenly in the valid range [lo+min_edge_dist, hi-min_edge_dist]
+    float lo_valid = s_lo[axis] + min_edge_dist;
+    float hi_valid = s_hi[axis] - min_edge_dist;
+    if (lo_valid >= hi_valid) return;  // this axis too narrow (but not all_small — other axes may work)
+
+    float frac = (slice + 1.f) / (cpa + 1.f);
+    float cut_pos = lo_valid + frac * (hi_valid - lo_valid);
 
     float pa = (axis == 0) ? 1.f : 0.f;
     float pb = (axis == 1) ? 1.f : 0.f;
@@ -548,7 +571,10 @@ extern "C" __global__ void la_expand_quick(
     int*        next_nitems,
     DevicePool* pool,
     float       min_edge_dist,
-    int*        err)
+    int*        err,
+    LaWorkItem* extra_leaves,
+    int*        n_extra,
+    int         total_levels)
 {
     if (*err) return;
 
@@ -600,6 +626,26 @@ extern "C" __global__ void la_expand_quick(
     }
     __syncthreads();
 
+    // Check if worst part is too small to cut in ALL axes
+    {
+        float eps = 1e-6f;
+        bool all_small = (s_hi[0]-s_lo[0] <= 2.f*min_edge_dist + eps) &&
+                         (s_hi[1]-s_lo[1] <= 2.f*min_edge_dist + eps) &&
+                         (s_hi[2]-s_lo[2] <= 2.f*min_edge_dist + eps);
+
+        if (all_small) {
+            if (tid == 0 && extra_leaves != NULL) {
+                int ei = atomicAdd(n_extra, 1);
+                LaWorkItem* xl = &extra_leaves[ei];
+                *xl = *wi;
+                for (int l = xl->n_levels; l < total_levels && l < LA_MAX_LEVELS; l++)
+                    xl->level_costs[l] = 0.0f;
+                xl->n_levels = (total_levels < LA_MAX_LEVELS) ? total_levels : LA_MAX_LEVELS;
+            }
+            return;
+        }
+    }
+
     // Try all 3 axes at midpoint, keep the best cut
     // NOTE: We cannot store the best PartPair in __shared__ memory because
     // plane_cut_block's __shared__ PartPair s_result may be aliased to the same
@@ -619,7 +665,7 @@ extern "C" __global__ void la_expand_quick(
 
     for (int axis = 0; axis < 3; axis++) {
         // Skip axes where the extent is too small for a valid midpoint cut
-        if (s_hi[axis] - s_lo[axis] < 2.0f * min_edge_dist) continue;
+        if (s_hi[axis] - s_lo[axis] <= 2.0f * min_edge_dist + 1e-6f) continue;
 
         float pa = (axis == 0) ? 1.f : 0.f;
         float pb = (axis == 1) ? 1.f : 0.f;
@@ -928,7 +974,9 @@ extern "C" __global__ void la_evaluate(
     DevicePool*    pool,
     int*           err,
     LaWorkItem*    level0_items,
-    float          min_edge_dist)
+    float          min_edge_dist,
+    LaWorkItem*    extra_leaves,
+    int            n_extra_leaves)
 {
     if (*err) return;
 
@@ -968,19 +1016,23 @@ extern "C" __global__ void la_evaluate(
     }
     __syncwarp();
 
-    // Fallback: for cuts with a valid level-0 split but no leaf descendants
-    // (all deeper expansions produced empty halves), use cost = 0.
-    // This happens when the level-0 cut already solved the part — all
-    // resulting pieces are small enough that further cuts fail, meaning
-    // they're provably below threshold (max hausdorff bounded by bbox
-    // diagonal < sqrt(3) * threshold/2 < threshold).
-    if (lane == 0 && level0_items != NULL) {
-        for (int c = 0; c < width; c++) {
-            if (s_cut_best[c] < 1e29f) continue;  // already has a leaf cost
+    // Scan extra leaves (parts too small to cut — padded with cost=0)
+    for (int i = lane; i < n_extra_leaves; i += WARP_SIZE) {
+        LaWorkItem* wi = &extra_leaves[i];
+        if (wi->src_part_idx != my_idx || wi->n_levels == 0) continue;
 
-            LaWorkItem* l0 = &level0_items[my_idx * width + c];
-            if (l0->nparts > 0)
-                s_cut_best[c] = 0.0f;
+        float path_cost = 0.0f;
+        for (int l = 0; l < wi->n_levels; l++)
+            path_cost += wi->level_costs[l];
+        path_cost /= (float)wi->n_levels;
+
+        int cut = wi->initial_cut_idx;
+        if (cut >= 0 && cut < width) {
+            float old = s_cut_best[cut];
+            while (path_cost < old) {
+                old = atomicMinF(&s_cut_best[cut], path_cost);
+                if (old <= path_cost) break;
+            }
         }
     }
     __syncwarp();

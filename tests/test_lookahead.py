@@ -188,6 +188,8 @@ class TestLookaheadDecompose:
     def test_export_glb(self, gpu_ctx):
         """Decompose shapes with lookahead and export GLB files."""
         os.makedirs(OUTPUT_DIR, exist_ok=True)
+        kw = dict(max_iters=100, width=60, width2=5, threshold=0.05,
+                  depth=2, quick_depth=0)
 
         # Cube
         v, t = _make_cube()
@@ -199,7 +201,7 @@ class TestLookaheadDecompose:
 
         # L-shape
         v, t = _make_lshape()
-        parts = _decompose_shape(gpu_ctx, v, t, label="lshape", max_iters=50, threshold=0.05)
+        parts = _decompose_shape(gpu_ctx, v, t, label="lshape", **kw)
         path = os.path.join(OUTPUT_DIR, "la_lshape.glb")
         _build_scene([("lshape", parts)]).export(path)
         print(f"\nExported {path}")
@@ -210,7 +212,7 @@ class TestLookaheadDecompose:
             mesh = trimesh.load(STL_49160, force="mesh")
             v = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
             t = np.ascontiguousarray(mesh.faces, dtype=np.int32)
-            parts = _decompose_shape(gpu_ctx, v, t, label="49160", max_iters=100, threshold=0.05)
+            parts = _decompose_shape(gpu_ctx, v, t, label="49160", **kw)
             path = os.path.join(OUTPUT_DIR, "la_49160.glb")
             _build_scene([("49160", parts)]).export(path)
             print(f"\nExported {path}")
@@ -221,7 +223,7 @@ class TestLookaheadDecompose:
             mesh = trimesh.load(OCTOCAT_OBJ, force="mesh")
             v = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
             t = np.ascontiguousarray(mesh.faces, dtype=np.int32)
-            parts = _decompose_shape(gpu_ctx, v, t, label="octocat", max_iters=100, threshold=0.05)
+            parts = _decompose_shape(gpu_ctx, v, t, label="octocat", **kw)
             path = os.path.join(OUTPUT_DIR, "la_octocat.glb")
             _build_scene([("octocat", parts)]).export(path)
             print(f"\nExported {path}")

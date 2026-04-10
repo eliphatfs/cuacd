@@ -131,6 +131,7 @@ int lookahead_decompose(
     CUdeviceptr d_err        = 0, d_n_cutting   = 0;
     CUdeviceptr d_cutting_idx = 0, d_results    = 0;
     CUdeviceptr d_nitems     = 0;
+    CUdeviceptr d_extra_leaves = 0, d_n_extra   = 0;
 
     // Pinned host memory for async D2H
     void* h_pinned = NULL;
@@ -164,6 +165,13 @@ int lookahead_decompose(
     LCHECK(cuMemAllocAsync(&d_items_b, items_bytes, s));
     LCHECK(cuMemsetD8Async(d_items_a, 0, items_bytes, s));
     LCHECK(cuMemsetD8Async(d_items_b, 0, items_bytes, s));
+
+    // Extra leaves buffer (for parts too small to cut further)
+    int max_extra = max_leaf_items;  // conservative upper bound
+    size_t extra_bytes = (size_t)max_extra * sizeof(struct LaWorkItem_h);
+    LCHECK(cuMemAllocAsync(&d_extra_leaves, extra_bytes, s));
+    LCHECK(cuMemsetD8Async(d_extra_leaves, 0, extra_bytes, s));
+    LCHECK(cuMemAllocAsync(&d_n_extra, sizeof(int), s));
 
     // Level-0 items buffer (preserved for la_apply_cuts)
     size_t level0_bytes = (size_t)max_n_cutting * width * sizeof(struct LaWorkItem_h);
@@ -319,6 +327,12 @@ int lookahead_decompose(
         // Minimum distance from bbox edge for cuts (prevents degenerate slivers)
         float min_edge_dist = threshold * 0.25f;
 
+        // Reset n_extra for this iteration
+        LCHECK(cuMemsetD32Async(d_n_extra, 0, 1, s));
+
+        // Pre-compute total_levels for this iteration
+        int total_levels = depth + quick_depth;
+
         // Full expansion levels
         for (int d = 0; d < depth; d++) {
             LCHECK(cuMemsetD32Async(d_nitems, 0, 1, s));
@@ -330,7 +344,8 @@ int lookahead_decompose(
                 CUdeviceptr l0_ptr = (d == 0) ? d_level0 : (CUdeviceptr)0;
                 void* args[] = { &d_cur, &cur_n, &d_next, &d_nitems,
                                  &ctx->d_pool_struct, &d_width, &l0_ptr,
-                                 &min_edge_dist, &d_err };
+                                 &min_edge_dist, &d_err,
+                                 &d_extra_leaves, &d_n_extra, &total_levels };
                 LCHECK(cuLaunchKernel(ctx->fn_la_expand,
                                        nblocks, 1, 1, 64, 1, 1, 0, s, args, NULL));
             }
@@ -395,7 +410,8 @@ int lookahead_decompose(
 
             {
                 void* args[] = { &d_cur, &cur_n, &d_next, &d_nitems,
-                                 &ctx->d_pool_struct, &min_edge_dist, &d_err };
+                                 &ctx->d_pool_struct, &min_edge_dist, &d_err,
+                                 &d_extra_leaves, &d_n_extra, &total_levels };
                 LCHECK(cuLaunchKernel(ctx->fn_la_expand_quick,
                                        cur_n, 1, 1, 64, 1, 1, 0, s, args, NULL));
             }
@@ -449,11 +465,13 @@ int lookahead_decompose(
 
         // Evaluate: find best initial cut per input part
         {
-            int total_levels = depth + quick_depth;
+            int h_n_extra = 0;
+            LCHECK(cuMemcpyDtoH(&h_n_extra, d_n_extra, sizeof(int)));
             void* args[] = { &d_cur, &cur_n, &n_cutting, &width,
                              &total_levels, &d_results,
                              &ctx->d_pool_struct, &d_err,
-                             &d_level0, &min_edge_dist };
+                             &d_level0, &min_edge_dist,
+                             &d_extra_leaves, &h_n_extra };
             LCHECK(cuLaunchKernel(ctx->fn_la_evaluate,
                                    n_cutting, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
@@ -677,19 +695,21 @@ int lookahead_decompose(
 
 cleanup:
     cuStreamSynchronize(s);
-    if (d_verts)       cuMemFreeAsync(d_verts,       s);
-    if (d_tris)        cuMemFreeAsync(d_tris,        s);
-    if (d_hverts)      cuMemFreeAsync(d_hverts,      s);
-    if (d_htris)       cuMemFreeAsync(d_htris,       s);
-    if (d_decomp)      cuMemFreeAsync(d_decomp,      s);
-    if (d_items_a)     cuMemFreeAsync(d_items_a,     s);
-    if (d_items_b)     cuMemFreeAsync(d_items_b,     s);
-    if (d_level0)      cuMemFreeAsync(d_level0,      s);
-    if (d_err)         cuMemFreeAsync(d_err,         s);
-    if (d_n_cutting)   cuMemFreeAsync(d_n_cutting,   s);
-    if (d_cutting_idx) cuMemFreeAsync(d_cutting_idx, s);
-    if (d_results)     cuMemFreeAsync(d_results,     s);
-    if (d_nitems)      cuMemFreeAsync(d_nitems,      s);
+    if (d_verts)        cuMemFreeAsync(d_verts,        s);
+    if (d_tris)         cuMemFreeAsync(d_tris,         s);
+    if (d_hverts)       cuMemFreeAsync(d_hverts,       s);
+    if (d_htris)        cuMemFreeAsync(d_htris,        s);
+    if (d_decomp)       cuMemFreeAsync(d_decomp,       s);
+    if (d_items_a)      cuMemFreeAsync(d_items_a,      s);
+    if (d_items_b)      cuMemFreeAsync(d_items_b,      s);
+    if (d_level0)       cuMemFreeAsync(d_level0,       s);
+    if (d_err)          cuMemFreeAsync(d_err,          s);
+    if (d_n_cutting)    cuMemFreeAsync(d_n_cutting,    s);
+    if (d_cutting_idx)  cuMemFreeAsync(d_cutting_idx,  s);
+    if (d_results)      cuMemFreeAsync(d_results,      s);
+    if (d_nitems)       cuMemFreeAsync(d_nitems,       s);
+    if (d_extra_leaves) cuMemFreeAsync(d_extra_leaves, s);
+    if (d_n_extra)      cuMemFreeAsync(d_n_extra,      s);
     cuStreamSynchronize(s);
     if (h_pinned) cuMemFreeHost(h_pinned);
     cuStreamDestroy(s);
