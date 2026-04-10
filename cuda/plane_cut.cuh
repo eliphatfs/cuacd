@@ -889,12 +889,19 @@ __device__ inline PartPair plane_cut_block(
                         int lvi_start = lvi;
                         int first = be_a2[start*2], cur = be_a2[start*2+1];
                         be_used[start] = 1;  // aliases loop_starts[start]; loop_starts[n_loops] set below
-                        if (lvi >= n_boundary) break;
+                        if (lvi >= n_boundary) {
+                            // [DIAG-8] lv buffer overflow
+                            if (lane == 0) DPRINTF("[pc-diag] LVI_OVERFLOW blk=%d lvi=%d n_boundary=%d n_loops=%d\n", blockIdx.x, lvi, n_boundary, n_loops);
+                            break;
+                        }
                         if (lane == 0) lv[lvi] = first;
                         lvi++;
                         int safety = n_boundary + 2;
                         while (cur != first && safety-- > 0) {
-                            if (lvi >= n_boundary) break;
+                            if (lvi >= n_boundary) {
+                                if (lane == 0) DPRINTF("[pc-diag] LVI_OVERFLOW_INNER blk=%d lvi=%d n_boundary=%d loop=%d\n", blockIdx.x, lvi, n_boundary, n_loops);
+                                break;
+                            }
                             if (lane == 0) lv[lvi] = cur;
                             lvi++;
                             // Warp-parallel edge search: each lane checks a stride
@@ -905,7 +912,11 @@ __device__ inline PartPair plane_cut_block(
                                 }
                             }
                             unsigned mask = __ballot_sync(0xFFFFFFFF, my_found_i >= 0);
-                            if (mask == 0) break;  // not found
+                            if (mask == 0) {
+                                // [DIAG-4] loop chain broken
+                                if (lane == 0) DPRINTF("[pc-diag] LOOP_BREAK blk=%d loop=%d cur=%d first=%d lvi=%d n_boundary=%d\n", blockIdx.x, n_loops, cur, first, lvi, n_boundary);
+                                break;
+                            }
                             int winner = __ffs(mask) - 1;  // lowest lane with a match
                             int found_i = __shfl_sync(0xFFFFFFFF, my_found_i, winner);
                             cur = be_a2[found_i*2+1];
@@ -919,6 +930,9 @@ __device__ inline PartPair plane_cut_block(
                         if (loop_sizes[n_loops] > 0) n_loops++;
                     }
                     if (lane == 0) s_w_n_loops = n_loops;
+                    // [DIAG-3] max_loops exceeded
+                    if (lane == 0 && n_loops >= 128)
+                        DPRINTF("[pc-diag] MAX_LOOPS blk=%d n_loops=%d n_boundary=%d\n", blockIdx.x, n_loops, n_boundary);
 
                     // be_a (lv_ptr) no longer needed — free to reclaim memory.
                     if (lane == 0) { heap_free(scratch_heap, lv_ptr); lv_ptr = NULL; s_be_a = NULL; }
@@ -1062,7 +1076,11 @@ __device__ inline PartPair plane_cut_block(
                                     float tv = au+s_*(bu-au)-mu_;
                                     if (tv>1e-10f && tv<best_t) { best_t=tv; best_edge=j; }
                                 }
-                                if (best_edge < 0) continue;
+                                if (best_edge < 0) {
+                                    // [DIAG-5] hole bridge failed
+                                    DPRINTF("[pc-diag] BRIDGE_FAIL blk=%d outer=%d hole=%d hs=%d poly_n=%d\n", blockIdx.x, oi, hi, hs, poly_n);
+                                    continue;
+                                }
                                 int jn=(best_edge+1)%poly_n;
                                 int p_pos = (all_verts[polygon[best_edge]*3+pu] >= all_verts[polygon[jn]*3+pu])
                                             ? best_edge : jn;
@@ -1129,6 +1147,9 @@ __device__ inline PartPair plane_cut_block(
                                 cap_tris[n_cap*3]=polygon[p]; cap_tris[n_cap*3+1]=polygon[cur]; cap_tris[n_cap*3+2]=polygon[n];
                                 n_cap++;
                             }
+                            // [DIAG-1] ear-clip gave up
+                            if (remaining > 3 && lane == 0)
+                                DPRINTF("[pc-diag] EARCLIP_FAIL blk=%d loop=%d remaining=%d poly_n=%d\n", blockIdx.x, oi, remaining, poly_n);
                             __syncwarp();
                         }
                     } // end for each outer loop

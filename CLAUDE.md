@@ -186,9 +186,12 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 - **CUDA error 700/716 is sticky** — once triggered, all subsequent CUDA calls fail. The *first* error is the real one.
 - **Isolate tests**: run single failing test alone to avoid cascade from earlier tests.
 - **compute-sanitizer**: `compute-sanitizer --tool memcheck python <script.py>` to find exact source.
-- **CheckedBuf**: `COACD_BEAM_DEBUG=1 pip install -e .` enables OOB detection in device code.
+- **COACD_BEAM_DEBUG**: `COACD_BEAM_DEBUG=1 pip install -e .` enables `DPRINTF` (device-side `printf`) and `CheckedBuf` OOB detection. Use `DPRINTF` guarded by `if (lane == 0)` or `if (tid == 0)` to add temporary device-side diagnostics in `.cuh` files — no extra includes needed, `DPRINTF` is defined in `common.cuh`.
 - **Debug mode**: `ctx.decompose(..., debug=1)` syncs after each kernel, prints per-stage status.
 - **Per-substep memory profiling**: `python -m pytest tests/test_decompose.py::test_octocat_decompose_debug_steps -v -s` — runs octocat with `debug=1`, use captured stdout/stderr to see per-substep pool usage.
+- **Lookahead verbose levels** (`lookahead_decompose`):
+  - `verbose=1`: per-part table each iteration (nv, nt, mesh_vol, hull_vol, rv_cost, hausdorff, full_cost; `*` = above threshold), per-iteration timing and n_cutting, kernel stage OK messages.
+  - `verbose=2`: additionally prints cutting_indices, la_evaluate results (best_cut_idx, best_cost per src part), leaf item details (src, cut, nparts, path_cost, level_costs), level-0 item details (per-cut per-source with per-part rv/hv/mv), per-cut best path cost summary.
 - See `docs/implementation_notes.md` for resolved bugs and gotchas.
 
 ## Current Status
