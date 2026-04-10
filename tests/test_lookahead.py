@@ -150,6 +150,18 @@ class TestLookaheadDecompose:
             label="octocat", max_iters=100, threshold=0.05)
         assert len(parts) >= 1
 
+    @pytest.mark.skipif(not os.path.exists(OCTOCAT_OBJ),
+                        reason="Octocat model not found")
+    def test_octocat_la_debug_steps(self, gpu_ctx):
+        """Octocat with debug=1 — prints per-step timing and memory usage."""
+        mesh = trimesh.load(OCTOCAT_OBJ, force="mesh")
+        parts = _decompose_shape(
+            gpu_ctx,
+            np.ascontiguousarray(mesh.vertices, dtype=np.float32),
+            np.ascontiguousarray(mesh.faces, dtype=np.int32),
+            label="octocat_debug", max_iters=100, threshold=0.05, debug=1)
+        assert len(parts) >= 1
+
     def test_la_convergence(self, gpu_ctx):
         """After decomposition with reasonable threshold, all parts should be roughly convex."""
         verts, tris = _make_lshape()
