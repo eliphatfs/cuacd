@@ -100,7 +100,7 @@ int lookahead_decompose(
     const int*   tris,       int nt,
     const float* hull_verts, int hull_nv,
     const int*   hull_tris,  int hull_nt,
-    int max_iters, int width, float threshold,
+    int max_iters, int width, int width2, float threshold,
     int depth, int quick_depth, int max_n_cutting,
     int verbose, int debug,
     struct beam_result* out)
@@ -156,7 +156,7 @@ int lookahead_decompose(
     // Tree item buffers (double-buffered for expansion levels)
     int max_leaf_items = max_n_cutting;
     for (int d = 0; d < depth; d++)
-        max_leaf_items *= width;
+        max_leaf_items *= (d == 0) ? width : width2;
     // quick_depth doesn't increase item count (1 child per item)
 
     size_t items_bytes = (size_t)max_leaf_items * sizeof(struct LaWorkItem_h);
@@ -323,12 +323,13 @@ int lookahead_decompose(
         for (int d = 0; d < depth; d++) {
             LCHECK(cuMemsetD32Async(d_nitems, 0, 1, s));
 
-            int nblocks = width * cur_n;
+            int d_width = (d == 0) ? width : width2;
+            int nblocks = d_width * cur_n;
             {
                 // First expansion level writes to d_level0; deeper levels pass NULL
                 CUdeviceptr l0_ptr = (d == 0) ? d_level0 : (CUdeviceptr)0;
                 void* args[] = { &d_cur, &cur_n, &d_next, &d_nitems,
-                                 &ctx->d_pool_struct, &width, &l0_ptr,
+                                 &ctx->d_pool_struct, &d_width, &l0_ptr,
                                  &min_edge_dist, &d_err };
                 LCHECK(cuLaunchKernel(ctx->fn_la_expand,
                                        nblocks, 1, 1, 64, 1, 1, 0, s, args, NULL));
@@ -451,7 +452,8 @@ int lookahead_decompose(
             int total_levels = depth + quick_depth;
             void* args[] = { &d_cur, &cur_n, &n_cutting, &width,
                              &total_levels, &d_results,
-                             &ctx->d_pool_struct, &d_err };
+                             &ctx->d_pool_struct, &d_err,
+                             &d_level0, &min_edge_dist };
             LCHECK(cuLaunchKernel(ctx->fn_la_evaluate,
                                    n_cutting, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }

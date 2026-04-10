@@ -316,7 +316,7 @@ static PyObject* py_decompose(PyObject* self, PyObject* args, PyObject* kwargs) 
 // ---------------------------------------------------------------------------
 // lookahead_decompose(verts_ptr, nv, tris_ptr, nt,
 //                     hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,
-//                     max_iters, width, threshold,
+//                     max_iters, width, width2, threshold,
 //                     depth=2, quick_depth=1, max_n_cutting=16,
 //                     verbose=0, debug=0)
 //   -> list of (verts_bytes, tris_bytes, nv, nt, mesh_vol, hull_vol)
@@ -327,21 +327,21 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
     static char* kwlist[] = {
         "verts_ptr", "nv", "tris_ptr", "nt",
         "hull_verts_ptr", "hull_nv", "hull_tris_ptr", "hull_nt",
-        "max_iters", "width", "threshold",
+        "max_iters", "width", "width2", "threshold",
         "depth", "quick_depth", "max_n_cutting",
         "verbose", "debug", NULL
     };
     unsigned long long vp, tp, hvp, htp;
     int nv, nt, hull_nv, hull_nt;
-    int max_iters, width;
+    int max_iters, width, width2;
     float threshold;
     int depth = 2, quick_depth = 1, max_n_cutting = 16;
     int verbose = 0, debug = 0;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiifiii|ii", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiiifiii|ii", kwlist,
             &vp, &nv, &tp, &nt,
             &hvp, &hull_nv, &htp, &hull_nt,
-            &max_iters, &width, &threshold,
+            &max_iters, &width, &width2, &threshold,
             &depth, &quick_depth, &max_n_cutting,
             &verbose, &debug))
         return NULL;
@@ -356,7 +356,7 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
         (const int*)  (uintptr_t)tp,  nt,
         (const float*)(uintptr_t)hvp, hull_nv,
         (const int*)  (uintptr_t)htp, hull_nt,
-        max_iters, width, threshold,
+        max_iters, width, width2, threshold,
         depth, quick_depth, max_n_cutting,
         verbose, debug,
         &result);

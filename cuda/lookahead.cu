@@ -926,7 +926,9 @@ extern "C" __global__ void la_evaluate(
     int            total_levels,
     LaEvalResult*  results,
     DevicePool*    pool,
-    int*           err)
+    int*           err,
+    LaWorkItem*    level0_items,
+    float          min_edge_dist)
 {
     if (*err) return;
 
@@ -936,7 +938,7 @@ extern "C" __global__ void la_evaluate(
     int lane = threadIdx.x;
 
     // Per-cut accumulators: track the minimum path cost per initial_cut_idx.
-    __shared__ float s_cut_best[32];  // indexed by initial_cut_idx (max width=30)
+    __shared__ float s_cut_best[64];
     if (lane == 0) {
         for (int c = 0; c < width; c++)
             s_cut_best[c] = 1e30f;
@@ -957,18 +959,28 @@ extern "C" __global__ void la_evaluate(
 
         int cut = wi->initial_cut_idx;
         if (cut >= 0 && cut < width) {
-            // Atomic min into shared memory (only lane 0 needs to update,
-            // but since different lanes might update different cuts, we use
-            // a simple comparison loop)
-            // Since each lane has its own cut index, we need a per-cut lock-free min.
-            // Use atomicMin on a float via atomicMinF or int CAS.
-            // Simplest: lane 0 does all updates via sequential scan.
-            // But we're parallel across lanes. Use atomicCAS float min.
             float old = s_cut_best[cut];
             while (path_cost < old) {
                 old = atomicMinF(&s_cut_best[cut], path_cost);
                 if (old <= path_cost) break;
             }
+        }
+    }
+    __syncwarp();
+
+    // Fallback: for cuts with a valid level-0 split but no leaf descendants
+    // (all deeper expansions produced empty halves), use cost = 0.
+    // This happens when the level-0 cut already solved the part — all
+    // resulting pieces are small enough that further cuts fail, meaning
+    // they're provably below threshold (max hausdorff bounded by bbox
+    // diagonal < sqrt(3) * threshold/2 < threshold).
+    if (lane == 0 && level0_items != NULL) {
+        for (int c = 0; c < width; c++) {
+            if (s_cut_best[c] < 1e29f) continue;  // already has a leaf cost
+
+            LaWorkItem* l0 = &level0_items[my_idx * width + c];
+            if (l0->nparts > 0)
+                s_cut_best[c] = 0.0f;
         }
     }
     __syncwarp();

@@ -266,7 +266,7 @@ class Context:
     # ------------------------------------------------------------------
 
     def lookahead_decompose(self, verts, tris, *,
-                            max_iters=100, width=30, threshold=0.05,
+                            max_iters=100, width=30, width2=None, threshold=0.05,
                             depth=2, quick_depth=1, max_n_cutting=16,
                             verbose=0, debug=0):
         """Decompose a mesh into convex parts using lookahead tree search.
@@ -316,12 +316,14 @@ class Context:
         inward = (normals * (v0 - centroid)).sum(axis=1) < 0
         hull_tris[inward] = hull_tris[inward][:, [0, 2, 1]]
 
+        if width2 is None:
+            width2 = width
         raw = _gpu.lookahead_decompose(
             verts.ctypes.data, len(verts),
             tris.ctypes.data, len(tris),
             hull_verts.ctypes.data, len(hull_verts),
             hull_tris.ctypes.data, len(hull_tris),
-            max_iters, width, threshold,
+            max_iters, width, width2, threshold,
             depth, quick_depth, max_n_cutting,
             verbose, debug)
 

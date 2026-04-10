@@ -138,7 +138,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto 
     volumes = ctx.batch_mesh_volume(verts_list, tris_list)
     results = ctx.batch_hull_dandc_mesh(pts_list)   # list of (verts, tris, volume) — exact D&C hull
     results = ctx.batch_kdop_hull_mesh(pts_list)    # list of (verts, tris, volume) — approximate k-DOP hull
-    parts = ctx.lookahead_decompose(verts, tris, max_iters=100, width=30, threshold=0.05)
+    parts = ctx.lookahead_decompose(verts, tris, max_iters=100, width=30, width2=5, threshold=0.05)
     used = ctx.pool_usage()     # bytes consumed from pool (monotonic high-water mark)
     ctx.heap_compact()          # no-op (coalescing handled by heap_free)
 ```
@@ -165,7 +165,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 **Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → sort`. Uses rv-only cost (no Hausdorff — it was removed because Hausdorff is non-monotonic over a single cut, preventing convergence). Pipelined in stream order, sync only after finalize. `beam_hull` uses `kdop_hull_block` (32 threads/block). See `docs/api_beam.md`.
 
-**Lookahead Search Decomposition** (`lookahead.cu` + `csrc/lookahead.c`): Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (width cuts each), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses rv-only cost for tree exploration (matching CoACD), but full cost `max(rv, hausdorff)` for the stopping criterion. Default depth=2, quick_depth=1. Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree.
+**Lookahead Search Decomposition** (`lookahead.cu` + `csrc/lookahead.c`): Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (`width` cuts at level 0, `width2` at deeper levels), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses rv-only cost for tree exploration (matching CoACD), but full cost `max(rv, hausdorff)` for the stopping criterion. Default depth=2, quick_depth=1. `la_evaluate` falls back to level-0 items when no leaf descendants exist for a cut (all deeper expansions produced empty halves because pieces were too small to cut further — such pieces are provably below threshold). Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree.
 
 ### Utility Functions
 
@@ -197,7 +197,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 - D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
 - `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Used by `beam_hull`. Produces exact hull via extreme-point prefilter + D&C.
 - `hausdorff_block` — 5 tests pass. Used by `beam_hausdorff`. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
-- `lookahead_decompose` — cube, L-shape, octocat, convergence, 49160 tests pass. Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=1. `la_count_cutting` deterministically selects highest-cost parts. `la_expand`/`la_expand_quick` enforce minimum edge distance = threshold/4 to prevent degenerate thin slivers (matching CoACD's approach of bounding cuts away from bbox edges).
+- `lookahead_decompose` — cube, L-shape, octocat, convergence, 49160 tests pass. Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=1. `la_count_cutting` deterministically selects highest-cost parts. `la_expand`/`la_expand_quick` enforce minimum edge distance = threshold/4 to prevent degenerate thin slivers (matching CoACD's approach of bounding cuts away from bbox edges). Supports separate `width2` for deeper expansion levels (default = width). `la_evaluate` falls back to level-0 items with cost 0 when all deeper expansions fail — fixes convergence stall on degenerate parts whose depth-0 cut solved them but depth-1 produced no children.
 
 ### Known Limitations
 - **Beam search item starvation**: `beam_decompose` can sometimes reduce to 0 work items before convergence. This happens when the last (worst-cost) part of every surviving WorkItem cannot be meaningfully split by any axis-aligned plane (all cuts produce an empty half), yet its cost remains above the threshold. Once nitems reaches 0, the algorithm spins uselessly until max_iters. This is a fundamental weakness of greedy beam search — it can prune all productive paths too early. The lookahead algorithm avoids this by maintaining a flat decomposition and applying cuts one at a time.

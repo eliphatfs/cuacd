@@ -226,7 +226,7 @@ int lookahead_decompose(
     const int*   tris,       int nt,
     const float* hull_verts, int hull_nv,
     const int*   hull_tris,  int hull_nt,
-    int max_iters, int width, float threshold,
+    int max_iters, int width, int width2, float threshold,
     int depth, int quick_depth, int max_n_cutting,
     int verbose, int debug,
     struct beam_result* out);
