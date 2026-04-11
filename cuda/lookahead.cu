@@ -1238,3 +1238,30 @@ extern "C" __global__ void la_cleanup_tree(
     }
     if (tid == 0) wi->nparts = 0;
 }
+
+// ============================================================================
+// la_free_decomp: <<<LA_MAX_DECOMP, 32>>>
+// Free heap-allocated mesh/hull data for all parts in a LaDecompState.
+// Call after reading results back to host, before freeing d_decomp itself.
+// ============================================================================
+extern "C" __global__ void la_free_decomp(
+    LaDecompState* decomp,
+    DevicePool*    pool)
+{
+    int i = blockIdx.x;
+    if (i >= decomp->nparts) return;
+
+    Part* pp = &decomp->parts[i];
+    if (threadIdx.x == 0) {
+        if (pp->mesh.refcount) {
+            int old = atomicAdd(pp->mesh.refcount, -1);
+            if (old == 1) heap_free(&pool->heap, (void*)pp->mesh.verts);
+        }
+        if (pp->hull.refcount == LA_REFCOUNT_HEAP) {
+            heap_free(&pool->heap, (void*)pp->hull.verts);
+        } else if (pp->hull.refcount) {
+            int old = atomicAdd(pp->hull.refcount, -1);
+            if (old == 1) heap_free(&pool->heap, (void*)pp->hull.verts);
+        }
+    }
+}

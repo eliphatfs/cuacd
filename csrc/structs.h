@@ -100,6 +100,7 @@ struct beam_ctx {
     CUfunction fn_la_apply_cuts;
     CUfunction fn_la_hull_decomp;
     CUfunction fn_la_cleanup_tree;
+    CUfunction fn_la_free_decomp;
 
     // Heaps embedded in d_pool_struct (beam.c update pending).
     // Fields d_heap, d_scratch, d_heap_compact_buf, d_scratch_compact_buf removed.

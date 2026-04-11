@@ -396,6 +396,16 @@ int lookahead_decompose(
                         iter, d, next_n, (double)_pu / (1024*1024));
             }
 
+            // Free d_cur items before overwriting the buffer (swap will reuse it as d_next).
+            // Seeds (depth=0) and intermediate items had their mesh refcounts incremented
+            // when seeded/copied; failing to decrement here leaks those heap blocks.
+            {
+                int nblocks = cur_n < 1024 ? cur_n : 1024;
+                void* cargs[] = { &d_cur, &cur_n, &ctx->d_pool_struct };
+                LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree,
+                                      nblocks, 1, 1, 32, 1, 1, 0, s, cargs, NULL));
+            }
+
             // Swap buffers
             CUdeviceptr tmp = d_cur;
             d_cur  = d_next;
@@ -454,6 +464,14 @@ int lookahead_decompose(
                 void* args[] = { &d_next, &next_n };
                 LCHECK(cuLaunchKernel(ctx->fn_la_record_level_cost,
                                        next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
+            }
+
+            // Free d_cur items before buffer reuse (same reason as full-expansion loop).
+            {
+                int nblocks = cur_n < 1024 ? cur_n : 1024;
+                void* cargs[] = { &d_cur, &cur_n, &ctx->d_pool_struct };
+                LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree,
+                                      nblocks, 1, 1, 32, 1, 1, 0, s, cargs, NULL));
             }
 
             CUdeviceptr tmp = d_cur;
@@ -698,7 +716,15 @@ cleanup:
     if (d_tris)         cuMemFreeAsync(d_tris,         s);
     if (d_hverts)       cuMemFreeAsync(d_hverts,       s);
     if (d_htris)        cuMemFreeAsync(d_htris,        s);
-    if (d_decomp)       cuMemFreeAsync(d_decomp,       s);
+    if (d_decomp) {
+        // Free heap-allocated mesh/hull data for all final parts before releasing struct.
+        void* fargs[] = { &d_decomp, &ctx->d_pool_struct };
+        cuLaunchKernel(ctx->fn_la_free_decomp,
+                       LA_MAX_DECOMP_H, 1, 1,
+                       32, 1, 1, 0, s, fargs, NULL);
+        cuStreamSynchronize(s);
+        cuMemFreeAsync(d_decomp, s);
+    }
     if (d_items_a)      cuMemFreeAsync(d_items_a,      s);
     if (d_items_b)      cuMemFreeAsync(d_items_b,      s);
     if (d_level0)       cuMemFreeAsync(d_level0,       s);

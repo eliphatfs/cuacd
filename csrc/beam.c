@@ -98,6 +98,7 @@ int beam_init(beam_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     cuModuleGetFunction(&ctx->fn_la_apply_cuts,        ctx->module, "la_apply_cuts");
     cuModuleGetFunction(&ctx->fn_la_hull_decomp,       ctx->module, "la_hull_decomp");
     cuModuleGetFunction(&ctx->fn_la_cleanup_tree,      ctx->module, "la_cleanup_tree");
+    cuModuleGetFunction(&ctx->fn_la_free_decomp,       ctx->module, "la_free_decomp");
 
     // Determine pool size: default to 80% of free device memory
     if (pool_bytes == 0) {
