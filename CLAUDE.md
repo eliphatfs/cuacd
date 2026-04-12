@@ -45,6 +45,7 @@ csrc/                 # C host code
   module.c            #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
   __init__.py         #   Context class (batch_hull_volume, batch_mesh_volume, batch_hull_dandc_mesh, batch_kdop_hull_mesh, lookahead_decompose)
+  cli.py              #   coacd-gpu console entry point (normalize → decompose → denormalize → export GLB)
 tests/                # All tests
   test_hull.py        #   Hull volume + mesh volume tests
   test_hull_mesh.py   #   D&C hull mesh extraction tests + k-DOP hull tests
