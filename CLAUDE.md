@@ -129,6 +129,7 @@ Setuptools compiles each `.cu` module in parallel (`-rdc=true -dc`), then device
 - **No PyTorch dependency** — numpy arrays in/out. Reuses existing CUDA context if available.
 - **No artificial limits** — use natural bounds (e.g. Euler's formula), not hardcoded constants.
 - **Evidence-based debugging** — Do not guess errors from partial output. Write a minimal reproducer or add instrumentation to observe the actual failure before making fixes.
+- **rv-only tree search with hausdorff stop is correct by design** — Our algorithm is based on CoACD. CoACD also uses rv-only cost for tree search but checks `max(rv, hausdorff)` for the stopping criterion. CoACD works. The mismatch between search cost and stop cost is intentional and not a bug. Do not propose "fixing" this mismatch as a solution to convergence issues.
 
 ### Python API
 
@@ -198,7 +199,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 ## Current Status
 
 ### Working
-- D&C hull, mesh volume, warp sort, plane cut (14 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
+- D&C hull, mesh volume, warp sort, plane cut (16 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
 - `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Used by `beam_hull`. Produces exact hull via extreme-point prefilter + D&C.
 - `hausdorff_block` — 5 tests pass. Used by `beam_hausdorff`. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
 - `lookahead_decompose` — cube, L-shape, octocat, convergence, 49160 tests pass. Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=0, width=60, width2=5. `la_count_cutting` deterministically selects highest-cost parts. `la_expand`/`la_expand_quick` place cuts evenly in the valid range `[lo+min_edge_dist, hi-min_edge_dist]` (min_edge_dist = threshold/4) to prevent degenerate thin slivers. Parts too small to cut in all axes (extent ≤ 2*min_edge_dist) are recorded as extra_leaves with zero cost for remaining levels — distinguishes genuinely solved parts from failed cuts (which get infinite cost). `plane_cut_block` detects incomplete cap triangulation (ear-clip gave up) and returns the whole mesh unsplit, so the lookahead tree search treats it as a failed cut rather than producing non-watertight parts. Two heap leak fixes: (1) `la_free_decomp` kernel frees final decomp part meshes/hulls after read-back; (2) `la_cleanup_tree` is called on `d_cur` before each buffer swap so that seed/intermediate items' refcounts are decremented before the buffer is reused.

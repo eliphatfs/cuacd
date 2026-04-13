@@ -69,6 +69,24 @@ Fix: (1) In `la_expand`, increment the mesh refcount when writing to the level-0
 
 `warp_sort_t<Part, LAPartKeyCmpRV>` corrupted Part data during sorting. The `warp_partition` step writes the pivot value into all "equal-key" slots, but for large structs like Part (80 bytes), this overwrites the entire struct — including `mesh.verts` and `refcount` pointers — with the pivot's values. This causes duplicate mesh references, double-frees, and NULL pointer dereferences at depth>1 expansion. Fix: replaced `warp_sort_t<Part>` with single-thread insertion sort (adequate for `LA_MAX_PARTS=16` and `LA_MAX_DECOMP=1024`).
 
+## plane_cut Hole-Bridge Overwrites Earlier Outer Loop Cap Triangles
+
+When `plane_cut_block` encounters multiple boundary loops on the cap plane (from cutting genus>0 meshes or meshes with self-overlapping cross-sections), it processes each outer loop and its holes sequentially. The hole-bridging step (which inserts hole vertices into the outer polygon) used `cap_tris` as scratch to rebuild the polygon:
+
+```cuda
+for (int j=0; j<=p_pos; j++) cap_tris[k++]=polygon[j];
+for (int j=0; j<hs; j++)     cap_tris[k++]=hole[(m_idx+j)%hs];
+cap_tris[k++]=hole[m_idx]; cap_tris[k++]=polygon[p_pos];
+for (int j=p_pos+1; j<poly_n; j++) cap_tris[k++]=polygon[j];
+for (int j=0; j<k; j++) polygon[j]=cap_tris[j];
+```
+
+But `cap_tris` is also the output buffer for ear-clip triangles (written at `cap_tris[n_cap*3..]`). When a second outer loop has holes, the bridging writes to `cap_tris[0..]`, overwriting cap triangles already emitted by the first outer loop's ear-clip. The corrupted entries contain vertex indices from the wrong loop, producing non-manifold edges (valence 3) and boundary edges (valence 1) in the output. The triangle count is correct but the content is wrong, so the cap-fail detection (`n_cap < n_cap_expected`) doesn't catch it.
+
+Triggered when: (1) the cut produces 3+ boundary loops, (2) at least 2 are independent outer loops, and (3) at least one outer loop has a hole. Common with genus>0 parts created by cutting through geometrically overlapping body sections (e.g., between an elephant's legs — the positive half has an annular cross-section creating genus-1 topology; a subsequent cut through the annulus produces 3 loops).
+
+Fix: use `ear_prevnext` (which is reinitialized before each ear-clip) as the bridging scratch buffer instead of `cap_tris`. `ear_prevnext` has `poly_cap * 2` ints, more than enough for the bridged polygon.
+
 ## L-shape Test Fixture Must Be Watertight
 
 The `_make_lshape()` fixture in `test_lookahead.py` was changed from the original `_merge_meshes([box_a, box_b])` approach to a hand-coded vertex/index list that was NOT watertight (euler_number=-1, is_watertight=False). Non-watertight input causes `mesh_volume_warp` to return incorrect volumes, making rv cost unreliable and preventing convergence. Fix: restored the original `_box()` + `_merge_meshes()` approach which produces a watertight L-shape (two overlapping boxes with outward-facing triangles). The merged mesh is watertight with volume=4 (unnormalized).

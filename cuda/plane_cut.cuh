@@ -616,7 +616,7 @@ __device__ inline PartPair plane_cut_block(
             } else {
                 // Non-on-plane vertices have opposite signs — split at on-plane vertex.
                 // The intersection of the a_i-b_i edge with the plane divides the triangle.
-                int nvi = FIND_ISECT(a_i, b_i); if (nvi < 0) continue;
+                int nvi = FIND_ISECT(a_i, b_i); if (nvi < 0) { DPRINTF("[pc-diag] FIND_ISECT_FAIL_ON blk=%d tri=%d a_i=%d b_i=%d\n", blockIdx.x, t, a_i, b_i); continue; }
                 if (sa > 0) {
                     int pi=atomicAdd(&s_counters[2],1); pos_tris[pi*3]=ov;pos_tris[pi*3+1]=a_i;pos_tris[pi*3+2]=nvi;
                     int ni=atomicAdd(&s_counters[3],1); neg_tris[ni*3]=ov;neg_tris[ni*3+1]=nvi;neg_tris[ni*3+2]=b_i;
@@ -629,10 +629,10 @@ __device__ inline PartPair plane_cut_block(
             int lone = -1;
             for (int k = 0; k < 3; k++)
                 if (si[k]!=si[(k+1)%3] && si[k]!=si[(k+2)%3]) { lone=k; break; }
-            if (lone < 0) continue;
+            if (lone < 0) { DPRINTF("[pc-diag] NO_LONE blk=%d tri=%d s=[%d,%d,%d]\n", blockIdx.x, t, si[0], si[1], si[2]); continue; }
             int lv=vi[lone], ov1=vi[(lone+1)%3], ov2=vi[(lone+2)%3], ls=si[lone];
             int nv1=FIND_ISECT(lv,ov1), nv2=FIND_ISECT(lv,ov2);
-            if (nv1<0||nv2<0) continue;
+            if (nv1<0||nv2<0) { DPRINTF("[pc-diag] FIND_ISECT_FAIL_LONE blk=%d tri=%d lv=%d ov1=%d ov2=%d nv1=%d nv2=%d\n", blockIdx.x, t, lv, ov1, ov2, nv1, nv2); continue; }
             if (ls > 0) {
                 int pi=atomicAdd(&s_counters[2],1); pos_tris[pi*3]=lv;pos_tris[pi*3+1]=nv1;pos_tris[pi*3+2]=nv2;
                 int ni=atomicAdd(&s_counters[3],2);
@@ -1087,11 +1087,11 @@ __device__ inline PartPair plane_cut_block(
                                 int p_pos = (all_verts[polygon[best_edge]*3+pu] >= all_verts[polygon[jn]*3+pu])
                                             ? best_edge : jn;
                                 int k = 0;
-                                for (int j=0; j<=p_pos; j++) cap_tris[k++]=polygon[j];
-                                for (int j=0; j<hs; j++) cap_tris[k++]=hole[(m_idx+j)%hs];
-                                cap_tris[k++]=hole[m_idx]; cap_tris[k++]=polygon[p_pos];
-                                for (int j=p_pos+1; j<poly_n; j++) cap_tris[k++]=polygon[j];
-                                for (int j=0; j<k; j++) polygon[j]=cap_tris[j];
+                                for (int j=0; j<=p_pos; j++) ear_prevnext[k++]=polygon[j];
+                                for (int j=0; j<hs; j++) ear_prevnext[k++]=hole[(m_idx+j)%hs];
+                                ear_prevnext[k++]=hole[m_idx]; ear_prevnext[k++]=polygon[p_pos];
+                                for (int j=p_pos+1; j<poly_n; j++) ear_prevnext[k++]=polygon[j];
+                                for (int j=0; j<k; j++) polygon[j]=ear_prevnext[j];
                                 poly_n=k;
                             }
                         }
