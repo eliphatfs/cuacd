@@ -7,6 +7,8 @@
 #include <Python.h>
 #include <string.h>
 #include "heap.h"
+#include "test.h"
+#include "lookahead.h"
 
 // ---------------------------------------------------------------------------
 // Module state: holds the GPU context

@@ -37,11 +37,13 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   test_hausdorff.cu   #   Test kernel: hausdorff_kernel
 csrc/                 # C host code
   structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, gpu_ctx
-  heap.h              #   Public C API (gpu_ctx_t, gpu_init/destroy/compact/pool_usage, batch ops) + Mesh_h/Part_h host mirrors
+  heap.h              #   GPU context lifecycle (gpu_ctx_t, gpu_init/destroy/compact/pool_usage) + Mesh_h/Part_h/gpu_result host mirrors
   heap.c              #   Host implementation: gpu_init/destroy, pool management, result_free
+  test.h              #   Declarations for kernel host launchers (hull, volume, plane cut, kdop, hausdorff, warp sort)
+  test.c              #   Host launcher implementations
+  lookahead.h         #   Declaration for lookahead_decompose
   lookahead.c         #   Host implementation: lookahead_decompose (full lookahead tree search with Hausdorff)
-  test.c              #   Test host launchers
-  module.c            #   CPython extension wrapping heap.h (Py_LIMITED_API cp310)
+  module.c            #   CPython extension wrapping heap.h/test.h/lookahead.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
   __init__.py         #   Context class (batch_hull_volume, batch_mesh_volume, batch_hull_dandc_mesh, batch_kdop_hull_mesh, lookahead_decompose)
   cli.py              #   coacd-gpu console entry point (normalize → decompose → denormalize → export GLB)
