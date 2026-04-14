@@ -16,8 +16,6 @@ import os
 import sys
 import shutil
 import subprocess
-import concurrent.futures
-
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 
@@ -90,7 +88,9 @@ _CUDA_MODULES = [
     "test_hull_dandc.cu",
     "test_mesh_volume.cu",
     "test_plane_cut.cu",
-    "lookahead.cu",
+    "la_expand.cu",
+    "la_refine.cu",
+    "la_lifecycle.cu",
     "test_kdop_hull.cu",
     "test_hausdorff.cu",
     "test_postprocess.cu",
@@ -115,22 +115,36 @@ def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
     cuda_dir = os.path.join(_ROOT, "cuda")
 
     # Compile each module to a relocatable device object in parallel.
+    # COACD_PARALLEL controls max concurrent nvcc processes (default: all).
+    max_jobs = int(os.environ.get("COACD_PARALLEL", 0)) or len(_CUDA_MODULES)
+    pending = []  # (Popen, name, obj)
     obj_files = []
-    def _compile_module(name):
+    failed = []
+    for name in _CUDA_MODULES:
+        # Wait for a slot if at capacity.
+        while len(pending) >= max_jobs:
+            for i, (proc, pname, obj) in enumerate(pending):
+                if proc.poll() is not None:
+                    (failed if proc.returncode else obj_files).append(
+                        pname if proc.returncode else obj)
+                    pending.pop(i)
+                    break
         src = os.path.join(cuda_dir, name)
         obj = os.path.join(build_dir, name.replace(".cu", ".o"))
-        subprocess.check_call([
+        proc = subprocess.Popen([
             nvcc, src, "-rdc=true", "-dc", "-O3", "--use_fast_math",
             "--generate-line-info", "-Xptxas=-v",
             *extra_defines,
             *gencode, "-o", obj,
         ])
-        return obj
-
-    with concurrent.futures.ThreadPoolExecutor() as pool:
-        futures = {pool.submit(_compile_module, name): name for name in _CUDA_MODULES}
-        for fut in concurrent.futures.as_completed(futures):
-            obj_files.append(fut.result())  # raises on error
+        pending.append((proc, name, obj))
+    # Drain remaining.
+    for proc, name, obj in pending:
+        proc.wait()
+        (failed if proc.returncode else obj_files).append(
+            name if proc.returncode else obj)
+    if failed:
+        raise RuntimeError(f"nvcc failed for: {', '.join(failed)}")
 
     # Device-link all objects into a single fatbin.
     subprocess.check_call([

@@ -28,7 +28,7 @@
 
 // Pack rank+parent into one unsigned int.
 //   Bits [31..DC_RANK_SHIFT] = rank,  bits [DC_RANK_SHIFT-1..0] = parent id.
-#define DC_RANK_SHIFT 20
+#define DC_RANK_SHIFT 24
 #define DC_ID_MASK    ((1u << DC_RANK_SHIFT) - 1)
 
 // Alignment helper (matches PC_ALIGN16 convention).

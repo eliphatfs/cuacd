@@ -27,9 +27,12 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   hausdorff.cuh       #   hausdorff_block: block-level (256 threads) bidirectional Hausdorff distance via sampling + linear BVH
   postprocess.cuh     #   decompose_components_block: block-level (128 threads) connected-components via union-find
   structs.cuh         #   Device-side: Mesh, Part, PartPair, LaWorkItem, LaDecompState, LaEvalResult
+  la_common.cuh       #   Shared lookahead constants (LA_REFCOUNT_HEAP, error codes) + la_part_cost/la_part_cost_rv inline functions
   mm.cu               #   heap_init_kernel
   kdop_const.cu       #   __constant__ KDOP_AXES[40][3] definition (broadcast-cached icosphere axes)
-  lookahead.cu        #   lookahead search kernels: la_initialize, la_expand, la_evaluate, la_apply_cuts, la_decompose_components, etc.
+  la_expand.cu        #   la_expand, la_hull, la_seed_tree, la_cleanup_tree (plane_cut + kdop_hull)
+  la_refine.cu        #   la_expand_quick, la_hausdorff_parts, la_evaluate, la_sort_items, la_record_level_cost (plane_cut + hausdorff)
+  la_lifecycle.cu     #   la_initialize, la_sort_parts, la_count_cutting, la_apply_cuts, la_hull_decomp, la_decompose_components, la_free_decomp (kdop_hull + postprocess)
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel
   test_mesh_volume.cu #   Test kernel: mesh_volume_kernel
@@ -79,7 +82,7 @@ CoACD/                # Reference C++ CoACD (embedded repo, not a submodule)
 
 Only stage project source files — never use `git add -A` or `git add .`. The repo contains directories that must not be committed:
 - `CoACD/` — embedded git repository (not a submodule)
-- `compare_output/`, `octocat_output/`, `tmpcompare/` — temporary output directories
+- `compare_output/`, `octocat_output/`, `decomp_output/`, `tmpcompare/` — temporary output directories
 - `*.ncu-rep` — NSight Compute profiling artifacts
 - Build artifacts (`*.fatbin`, `*.o`, `*.so`, `build/`, `*.egg-info/`)
 
@@ -97,6 +100,9 @@ COACD_GPU_ARCHS="89" pip install -e .
 # Run all tests
 python -m pytest tests/ -v
 
+# Integration test — decompose the full vhacd2 dataset (61 meshes)
+rm -rf decomp_output/vhacd2_data_r0.1_mv10k/* && coacd-gpu tests/data/vhacd2_data_r0.1_mv10k/ decomp_output/vhacd2_data_r0.1_mv10k/
+
 # Verbose build (see ptxas register usage)
 pip install -ve .
 
@@ -106,6 +112,9 @@ COACD_BEAM_DEBUG=1 pip install -e .     # device-side DPRINTF + CheckedBuf OOB d
 
 # Override arena count (default 64)
 COACD_GPU_ARENAS=32 pip install -e .
+
+# Limit parallel nvcc processes (default: all modules simultaneously)
+COACD_PARALLEL=4 pip install -e .
 
 # NCU profiling
 ncu --set full -o dandc_profile python tests/bench_dandc.py --n_pts 200 --n_hulls 8
@@ -170,7 +179,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 **Hausdorff Distance** (`hausdorff.cuh`): Block-level (256 threads, 8 warps). Computes bidirectional Hausdorff distance between two meshes via sampling + linear BVH. CoACD-matching area-proportional sampling with Wang hash pseudo-random barycentric coordinates. Brute-force path for ≤64 target triangles; linear BVH (Karras 2012 radix tree) for larger meshes with cooperative 4-warp Morton code sort. Used by `la_hausdorff_parts` kernel to fill `Part.hausdorff`.
 
-**Lookahead Search Decomposition** (`lookahead.cu` + `csrc/lookahead.c`): Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (`width` cuts at level 0, `width2` at deeper levels), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses rv-only cost for tree exploration (matching CoACD), but full cost `max(rv, hausdorff)` for the stopping criterion. Default depth=2, quick_depth=0, width=60, width2=5. `la_evaluate` falls back to level-0 items when no leaf descendants exist for a cut (all deeper expansions produced empty halves because pieces were too small to cut further — such pieces are provably below threshold). Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree, la_free_decomp, la_decompose_components.
+**Lookahead Search Decomposition** (`la_expand.cu` + `la_refine.cu` + `la_lifecycle.cu` + `csrc/lookahead.c`): Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (`width` cuts at level 0, `width2` at deeper levels), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses rv-only cost for tree exploration (matching CoACD), but full cost `max(rv, hausdorff)` for the stopping criterion. Default depth=2, quick_depth=0, width=60, width2=5. `la_evaluate` falls back to level-0 items when no leaf descendants exist for a cut (all deeper expansions produced empty halves because pieces were too small to cut further — such pieces are provably below threshold). Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree, la_free_decomp, la_decompose_components.
 
 **Connected-Components Decomposition** (`postprocess.cuh`): Block-level (128 threads) post-processing pass. Uses lock-free rank-based union-find over triangle adjacency to identify connected components in each decomposition part. Read-only find (no path compression) for GPU performance; rank-based union with CAS for lock-free merging. When a part has multiple components, allocates new mesh data per component from the main heap and appends extra parts to LaDecompState via atomicAdd on nparts. Controlled by `decompose_components` parameter (default False in Python API, True in CLI). Inherits hausdorff distance as upper bound; hulls are recomputed via la_hull_decomp after splitting.
 
