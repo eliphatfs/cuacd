@@ -77,6 +77,8 @@ def main():
                         help='Verbosity level (0/1/2).')
     parser.add_argument('--debug', type=int, default=0,
                         help='Debug level (0/1).')
+    parser.add_argument('--parts', action='store_true', default=False,
+                        help='Save cut parts instead of convex hulls (default: hulls).')
     args = parser.parse_args()
 
     meshes = _find_meshes(args.input, args.recursive)
@@ -117,8 +119,11 @@ def main():
                 continue
             elapsed = time.perf_counter() - t0
 
-            # Denormalize back to original space
-            parts = [(pv * scale + center, pt) for pv, pt in parts]
+            if not args.parts:
+                hulls = ctx.batch_kdop_hull_mesh([pv for pv, _ in parts])
+                parts = [(hv * scale + center, ht) for hv, ht, _ in hulls]
+            else:
+                parts = [(pv * scale + center, pt) for pv, pt in parts]
 
             _save_parts(parts, args.output, rel_path)
             print(f'{rel_path}  {elapsed:.2f}s  {len(parts)} parts')
