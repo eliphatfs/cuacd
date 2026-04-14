@@ -53,10 +53,14 @@ struct Part_h {
 };
 
 struct gpu_part_result {
-    float* verts;     // malloc'd, nv*3 floats
-    int*   tris;      // malloc'd, nt*3 ints
+    float* verts;       // malloc'd, nv*3 floats
+    int*   tris;        // malloc'd, nt*3 ints
     int    nv;
     int    nt;
+    float* hull_verts;  // malloc'd, hull_nv*3 floats
+    int*   hull_tris;   // malloc'd, hull_nt*3 ints
+    int    hull_nv;
+    int    hull_nt;
     float  mesh_vol;
     float  hull_vol;
     float  hausdorff;

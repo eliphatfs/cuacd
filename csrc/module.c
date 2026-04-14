@@ -325,24 +325,31 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
 
     for (int i = 0; i < result.nparts; i++) {
         struct gpu_part_result* p = &result.parts[i];
-        Py_ssize_t vbytes = (Py_ssize_t)p->nv * 3 * sizeof(float);
-        Py_ssize_t tbytes = (Py_ssize_t)p->nt * 3 * sizeof(int);
+        Py_ssize_t vbytes  = (Py_ssize_t)p->nv * 3 * sizeof(float);
+        Py_ssize_t tbytes  = (Py_ssize_t)p->nt * 3 * sizeof(int);
+        Py_ssize_t hvbytes = (Py_ssize_t)p->hull_nv * 3 * sizeof(float);
+        Py_ssize_t htbytes = (Py_ssize_t)p->hull_nt * 3 * sizeof(int);
 
-        PyObject* vbuf = PyBytes_FromStringAndSize((const char*)p->verts, vbytes);
-        PyObject* tbuf = PyBytes_FromStringAndSize((const char*)p->tris,  tbytes);
-        if (!vbuf || !tbuf) {
+        PyObject* vbuf  = PyBytes_FromStringAndSize((const char*)p->verts, vbytes);
+        PyObject* tbuf  = PyBytes_FromStringAndSize((const char*)p->tris,  tbytes);
+        PyObject* hvbuf = PyBytes_FromStringAndSize((const char*)p->hull_verts, hvbytes);
+        PyObject* htbuf = PyBytes_FromStringAndSize((const char*)p->hull_tris,  htbytes);
+        if (!vbuf || !tbuf || !hvbuf || !htbuf) {
             Py_XDECREF(vbuf); Py_XDECREF(tbuf);
+            Py_XDECREF(hvbuf); Py_XDECREF(htbuf);
             Py_DECREF(list);
             gpu_result_free(&result);
             return NULL;
         }
 
-        PyObject* tup = Py_BuildValue("(OOiiff)",
-            vbuf, tbuf,
-            p->nv, p->nt,
+        PyObject* tup = Py_BuildValue("(OOiiOOiiff)",
+            vbuf, tbuf, p->nv, p->nt,
+            hvbuf, htbuf, p->hull_nv, p->hull_nt,
             p->mesh_vol, p->hull_vol);
         Py_DECREF(vbuf);
         Py_DECREF(tbuf);
+        Py_DECREF(hvbuf);
+        Py_DECREF(htbuf);
         if (!tup) {
             Py_DECREF(list);
             gpu_result_free(&result);

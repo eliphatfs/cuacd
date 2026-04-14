@@ -123,10 +123,9 @@ def main():
             elapsed = time.perf_counter() - t0
 
             if not args.parts:
-                hulls = ctx.batch_kdop_hull_mesh([pv for pv, _ in parts])
-                parts = [(hv * scale + center, ht) for hv, ht, _ in hulls]
+                parts = [(hv * scale + center, ht) for _, _, hv, ht in parts]
             else:
-                parts = [(pv * scale + center, pt) for pv, pt in parts]
+                parts = [(pv * scale + center, pt) for pv, pt, _, _ in parts]
 
             _save_parts(parts, args.output, rel_path)
             print(f'{rel_path}  {elapsed:.2f}s  {len(parts)} parts')

@@ -294,7 +294,7 @@ class Context:
 
         Returns
         -------
-        list of (verts, tris) tuples, one per output part.
+        list of (verts, tris, hull_verts, hull_tris) tuples, one per output part.
         """
         import scipy.spatial
 
@@ -328,8 +328,10 @@ class Context:
             verbose, debug, decompose_components=int(decompose_components))
 
         results = []
-        for vb, tb, nv, nt, mv, hv in raw:
+        for vb, tb, nv, nt, hvb, htb, hnv, hnt, mv, hv in raw:
             v = np.frombuffer(vb, dtype=np.float32).reshape(nv, 3).copy()
             t = np.frombuffer(tb, dtype=np.int32).reshape(nt, 3).copy()
-            results.append((v, t))
+            hull_v = np.frombuffer(hvb, dtype=np.float32).reshape(hnv, 3).copy()
+            hull_t = np.frombuffer(htb, dtype=np.int32).reshape(hnt, 3).copy()
+            results.append((v, t, hull_v, hull_t))
         return results

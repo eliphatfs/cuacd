@@ -6,6 +6,7 @@ import pytest
 import trimesh
 
 import coacd_gpu
+from coacd_gpu import _mesh_volume_cpu
 
 
 # ---------------------------------------------------------------------------
@@ -68,17 +69,17 @@ def _decompose_shape(ctx, verts, tris, label="", **kwargs):
     kwargs.setdefault("verbose", 1)
     raw = ctx.lookahead_decompose(nv, tris, **kwargs)
 
-    # GPU hull volumes for each part (in normalized space)
-    hull_results = ctx.batch_kdop_hull_mesh([p[0] for p in raw])
-
+    # Hull volumes from the readback
     print(f"\n{label}: {len(raw)} parts" if label else f"\n{len(raw)} parts")
     print(f"  {'':>6s}  {'tm_mesh':>10s} {'gpu_hull':>10s} {'tm_hull':>10s} {'scipy_hull':>10s}")
 
     parts = []
-    for i, ((pv, pt), (_, ht, hv)) in enumerate(zip(raw, hull_results)):
+    for i, (pv, pt, hull_v, hull_t) in enumerate(raw):
         # tm mesh volume (normalized space)
         tm = trimesh.Trimesh(pv.copy(), pt.copy(), process=False)
         tm_mesh_vol = abs(tm.volume) if tm.is_volume else float('nan')
+        # GPU hull volume from readback
+        hv = _mesh_volume_cpu(hull_v, hull_t) if len(hull_t) > 0 else float('nan')
         # trimesh hull volume
         try:
             tm_hull_vol = abs(tm.convex_hull.volume)

@@ -74,6 +74,8 @@ static int la_read_result(
 
         pr->nv        = p->mesh.nv;
         pr->nt        = p->mesh.nt;
+        pr->hull_nv   = p->hull.nv;
+        pr->hull_nt   = p->hull.nt;
         pr->mesh_vol  = p->mesh_vol;
         pr->hull_vol  = p->hull_vol;
         pr->hausdorff = p->hausdorff;
@@ -87,6 +89,16 @@ static int la_read_result(
             pr->tris = (int*)malloc((size_t)p->mesh.nt * 3 * sizeof(int));
             cuMemcpyDtoHAsync(pr->tris, (CUdeviceptr)p->mesh.tris,
                               (size_t)p->mesh.nt * 3 * sizeof(int), s);
+        }
+        if (p->hull.nv > 0 && p->hull.verts) {
+            pr->hull_verts = (float*)malloc((size_t)p->hull.nv * 3 * sizeof(float));
+            cuMemcpyDtoHAsync(pr->hull_verts, (CUdeviceptr)p->hull.verts,
+                              (size_t)p->hull.nv * 3 * sizeof(float), s);
+        }
+        if (p->hull.nt > 0 && p->hull.tris) {
+            pr->hull_tris = (int*)malloc((size_t)p->hull.nt * 3 * sizeof(int));
+            cuMemcpyDtoHAsync(pr->hull_tris, (CUdeviceptr)p->hull.tris,
+                              (size_t)p->hull.nt * 3 * sizeof(int), s);
         }
     }
 

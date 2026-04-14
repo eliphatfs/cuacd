@@ -205,6 +205,8 @@ void gpu_result_free(struct gpu_result* result) {
     for (int i = 0; i < result->nparts; i++) {
         free(result->parts[i].verts);
         free(result->parts[i].tris);
+        free(result->parts[i].hull_verts);
+        free(result->parts[i].hull_tris);
     }
     free(result->parts);
     result->parts  = NULL;
