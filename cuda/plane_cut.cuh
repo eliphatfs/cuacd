@@ -1009,7 +1009,24 @@ __device__ inline PartPair plane_cut_block(
                             }
                         }
                         __syncwarp();
-                        if (parent[i] >= 0) is_hole[i] = 1;
+                    }
+
+                    // Compute nesting depth to classify even-depth as outer,
+                    // odd-depth as hole. A "hole inside a hole" (depth 2) is
+                    // really an island that should be ear-clipped independently.
+                    for (int i = 0; i < n_loops && i < max_loops; i++) {
+                        int depth = 0;
+                        for (int p = parent[i]; p >= 0; p = parent[p]) depth++;
+                        is_hole[i] = (depth & 1);  // odd depth = hole
+                        // Re-parent holes to nearest even-depth ancestor
+                        if (is_hole[i]) {
+                            // parent[i] is already the immediate enclosing outer loop
+                            // (it's at depth-1 which is even) — keep it.
+                        } else if (depth >= 2) {
+                            // Even depth >= 2: island inside a hole — treat as
+                            // independent outer loop (no parent to bridge into).
+                            parent[i] = -1;
+                        }
                     }
 
                     // Reverse hole loops to CW winding (they were oriented CCW above).

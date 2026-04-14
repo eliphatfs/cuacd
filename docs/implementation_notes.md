@@ -87,6 +87,21 @@ Triggered when: (1) the cut produces 3+ boundary loops, (2) at least 2 are indep
 
 Fix: use `ear_prevnext` (which is reinitialized before each ear-clip) as the bridging scratch buffer instead of `cap_tris`. `ear_prevnext` has `poly_cap * 2` ints, more than enough for the bridged polygon.
 
+## plane_cut Loop Classification: Nested Holes (Depth > 1) Misclassified as Holes
+
+The loop classification in `plane_cut_block` phase 10 used a simple rule: any loop with a parent (contained inside another loop) is a hole (`is_hole[i] = parent[i] >= 0`). This fails for loops at nesting depth ≥ 2.
+
+On high-genus meshes (e.g. hero.obj, genus 56), a cut through nested handles produces boundary loops at multiple nesting depths:
+- Depth 0: outer loop (cap independently)
+- Depth 1: hole inside an outer loop (bridge into parent, then ear-clip)
+- Depth 2: island inside a hole — geometrically an independent outer region
+
+The old code classified depth-2 loops as holes with `parent = depth-1 loop`. But the depth-1 loop is itself a hole, so when processing outer loops and collecting "direct children" (`parent[i] == oi`), the depth-2 loop was never collected by any outer loop. It was orphaned — never capped, producing boundary edges (valence 1) on both output halves.
+
+Example: hero.obj cut at y=0.148 produces 4 boundary loops. Loop 0 (47 edges, outer) contains loop 1 (102 edges, hole) which contains loop 3 (17 edges, island). Loop 3 was classified as a hole with parent=1, but loop 1 is a hole — so loop 3 was never capped. Both output halves had 17 boundary edges. Over 100 iterations, the uncapped holes accumulated, producing 549+ parts that never converged.
+
+Fix: after computing parent pointers, walk the parent chain to compute nesting depth. Even depth (0, 2, 4...) = outer loop; odd depth (1, 3, 5...) = hole. Depth-2+ islands get `parent = -1` to be processed as independent outer loops. This matches CDT's flood-fill parity approach (the library CoACD uses), where even-depth triangles are erased and odd-depth are kept.
+
 ## L-shape Test Fixture Must Be Watertight
 
 The `_make_lshape()` fixture in `test_lookahead.py` was changed from the original `_merge_meshes([box_a, box_b])` approach to a hand-coded vertex/index list that was NOT watertight (euler_number=-1, is_watertight=False). Non-watertight input causes `mesh_volume_warp` to return incorrect volumes, making rv cost unreliable and preventing convergence. Fix: restored the original `_box()` + `_merge_meshes()` approach which produces a watertight L-shape (two overlapping boxes with outward-facing triangles). The merged mesh is watertight with volume=4 (unnormalized).
