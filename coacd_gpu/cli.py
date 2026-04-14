@@ -79,6 +79,8 @@ def main():
                         help='Debug level (0/1).')
     parser.add_argument('--parts', action='store_true', default=False,
                         help='Save cut parts instead of convex hulls (default: hulls).')
+    parser.add_argument('--no-decompose-components', action='store_true', default=False,
+                        help='Skip connected components decomposition (default: enabled).')
     args = parser.parse_args()
 
     meshes = _find_meshes(args.input, args.recursive)
@@ -113,7 +115,8 @@ def main():
                     quick_depth=args.quick_depth,
                     threshold=args.threshold,
                     verbose=args.verbose,
-                    debug=args.debug)
+                    debug=args.debug,
+                    decompose_components=not args.no_decompose_components)
             except Exception as e:
                 print(f'{rel_path}: decompose error — {e}', file=sys.stderr)
                 continue

@@ -25,25 +25,29 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   kdop_hull.cuh       #   kdop_hull_block: single-warp (32 threads) exact hull via extreme-point prefilter + D&C
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   hausdorff.cuh       #   hausdorff_block: block-level (256 threads) bidirectional Hausdorff distance via sampling + linear BVH
+  postprocess.cuh     #   decompose_components_block: block-level (128 threads) connected-components via union-find
   structs.cuh         #   Device-side: Mesh, Part, PartPair, LaWorkItem, LaDecompState, LaEvalResult
   mm.cu               #   heap_init_kernel
   kdop_const.cu       #   __constant__ KDOP_AXES[40][3] definition (broadcast-cached icosphere axes)
-  lookahead.cu        #   lookahead search kernels: la_initialize, la_expand, la_evaluate, la_apply_cuts, etc.
+  lookahead.cu        #   lookahead search kernels: la_initialize, la_expand, la_evaluate, la_apply_cuts, la_decompose_components, etc.
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel
   test_mesh_volume.cu #   Test kernel: mesh_volume_kernel
   test_kdop_hull.cu   #   Test kernel: kdop_hull_kernel
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel
   test_hausdorff.cu   #   Test kernel: hausdorff_kernel
+  test_postprocess.cu #   Test kernel: test_postprocess_dc_kernel
 csrc/                 # C host code
   structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, gpu_ctx
   heap.h              #   GPU context lifecycle (gpu_ctx_t, gpu_init/destroy/compact/pool_usage) + Mesh_h/Part_h/gpu_result host mirrors
   heap.c              #   Host implementation: gpu_init/destroy, pool management, result_free
   test.h              #   Declarations for kernel host launchers (hull, volume, plane cut, kdop, hausdorff, warp sort)
   test.c              #   Host launcher implementations
+  postprocess.h       #   Declarations for post-processing host launchers (decompose_components)
+  postprocess.c       #   Host launcher implementations for post-processing
   lookahead.h         #   Declaration for lookahead_decompose
   lookahead.c         #   Host implementation: lookahead_decompose (full lookahead tree search with Hausdorff)
-  module.c            #   CPython extension wrapping heap.h/test.h/lookahead.h (Py_LIMITED_API cp310)
+  module.c            #   CPython extension wrapping heap.h/test.h/postprocess.h/lookahead.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
   __init__.py         #   Context class (batch_hull_volume, batch_mesh_volume, batch_hull_dandc_mesh, batch_kdop_hull_mesh, lookahead_decompose)
   cli.py              #   coacd-gpu console entry point (normalize → decompose → denormalize → export GLB)
@@ -56,6 +60,7 @@ tests/                # All tests
   gen_hausdorff_fixtures.py # Generates CoACD reference Hausdorff fixtures (C++ harness + .npz)
   ref_hausdorff.cpp    #   Standalone C++ CoACD Hausdorff reference harness
   test_lookahead.py   #   lookahead_decompose tests (cube, lshape, octocat, convergence, export_glb)
+  test_decompose_components.py # Connected-components decomposition tests (5 tests)
   test_edge_tracking.py # Max edge pairs stress test for D&C hull (requires COACD_TRACK_EDGES=1 build)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling
   bench_mm.py         #   Memory management benchmark
@@ -139,7 +144,8 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto 
     volumes = ctx.batch_mesh_volume(verts_list, tris_list)
     results = ctx.batch_hull_dandc_mesh(pts_list)   # list of (verts, tris, volume) — exact D&C hull
     results = ctx.batch_kdop_hull_mesh(pts_list)    # list of (verts, tris, volume) — approximate k-DOP hull
-    parts = ctx.lookahead_decompose(verts, tris, max_iters=100, width=60, width2=5, threshold=0.05)
+    parts = ctx.lookahead_decompose(verts, tris, max_iters=100, width=60, width2=5, threshold=0.05,
+                                     decompose_components=False)  # split parts into connected components
     used = ctx.pool_usage()     # bytes consumed from pool (monotonic high-water mark)
     ctx.heap_compact()          # no-op (coalescing handled by heap_free)
 ```
@@ -164,7 +170,9 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 **Hausdorff Distance** (`hausdorff.cuh`): Block-level (256 threads, 8 warps). Computes bidirectional Hausdorff distance between two meshes via sampling + linear BVH. CoACD-matching area-proportional sampling with Wang hash pseudo-random barycentric coordinates. Brute-force path for ≤64 target triangles; linear BVH (Karras 2012 radix tree) for larger meshes with cooperative 4-warp Morton code sort. Used by `la_hausdorff_parts` kernel to fill `Part.hausdorff`.
 
-**Lookahead Search Decomposition** (`lookahead.cu` + `csrc/lookahead.c`): Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (`width` cuts at level 0, `width2` at deeper levels), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses rv-only cost for tree exploration (matching CoACD), but full cost `max(rv, hausdorff)` for the stopping criterion. Default depth=2, quick_depth=0, width=60, width2=5. `la_evaluate` falls back to level-0 items when no leaf descendants exist for a cut (all deeper expansions produced empty halves because pieces were too small to cut further — such pieces are provably below threshold). Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree, la_free_decomp.
+**Lookahead Search Decomposition** (`lookahead.cu` + `csrc/lookahead.c`): Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (`width` cuts at level 0, `width2` at deeper levels), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses rv-only cost for tree exploration (matching CoACD), but full cost `max(rv, hausdorff)` for the stopping criterion. Default depth=2, quick_depth=0, width=60, width2=5. `la_evaluate` falls back to level-0 items when no leaf descendants exist for a cut (all deeper expansions produced empty halves because pieces were too small to cut further — such pieces are provably below threshold). Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree, la_free_decomp, la_decompose_components.
+
+**Connected-Components Decomposition** (`postprocess.cuh`): Block-level (128 threads) post-processing pass. Uses lock-free rank-based union-find over triangle adjacency to identify connected components in each decomposition part. Read-only find (no path compression) for GPU performance; rank-based union with CAS for lock-free merging. When a part has multiple components, allocates new mesh data per component from the main heap and appends extra parts to LaDecompState via atomicAdd on nparts. Controlled by `decompose_components` parameter (default False in Python API, True in CLI). Inherits hausdorff distance as upper bound; hulls are recomputed via la_hull_decomp after splitting.
 
 ### Utility Functions
 
@@ -175,6 +183,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 | `mesh_volume_warp` | warp (32 lanes) | mesh_volume.cuh |
 | `hausdorff_block` | block (256 threads) | hausdorff.cuh |
 | `kdop_hull_block` | warp (32 threads) | kdop_hull.cuh |
+| `decompose_components_block` | block (128 threads) | postprocess.cuh |
 | `pool_alloc` | thread 0 only | allocator.cuh |
 | `heap_alloc` / `heap_free` | thread 0 only | allocator.cuh |
 | `atomicMinF` / `atomicMaxF` | per-thread | common.cuh |
@@ -198,6 +207,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 - D&C hull, mesh volume, warp sort, plane cut (16 tests) — all tests pass.
 - `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Produces exact hull via extreme-point prefilter + D&C.
 - `hausdorff_block` — 5 tests pass. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
+- `decompose_components_block` / `la_decompose_components` — 5 tests pass. Connected-components decomposition via GPU union-find. Integrated as optional post-processing pass in lookahead_decompose (decompose_components parameter).
 - `lookahead_decompose` — cube, L-shape, octocat, convergence, 49160 tests pass. Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=0, width=60, width2=5. `la_count_cutting` deterministically selects highest-cost parts. `la_expand`/`la_expand_quick` place cuts evenly in the valid range `[lo+min_edge_dist, hi-min_edge_dist]` (min_edge_dist = threshold/4) to prevent degenerate thin slivers. Parts too small to cut in all axes (extent ≤ 2*min_edge_dist) are recorded as extra_leaves with zero cost for remaining levels — distinguishes genuinely solved parts from failed cuts (which get infinite cost). `plane_cut_block` detects incomplete cap triangulation (ear-clip gave up) and returns the whole mesh unsplit, so the lookahead tree search treats it as a failed cut rather than producing non-watertight parts. Two heap leak fixes: (1) `la_free_decomp` kernel frees final decomp part meshes/hulls after read-back; (2) `la_cleanup_tree` is called on `d_cur` before each buffer swap so that seed/intermediate items' refcounts are decremented before the buffer is reused.
 
 ### Known Limitations

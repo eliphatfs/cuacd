@@ -102,7 +102,7 @@ int lookahead_decompose(
     const int*   hull_tris,  int hull_nt,
     int max_iters, int width, int width2, float threshold,
     int depth, int quick_depth, int max_n_cutting,
-    int verbose, int debug,
+    int verbose, int debug, int decompose_components,
     struct gpu_result* out)
 {
 #define LCHECK(call) do { \
@@ -295,6 +295,23 @@ int lookahead_decompose(
 
         if (n_cutting == 0) {
             // All parts converged
+            if (decompose_components) {
+                int cur_np = 0;
+                LCHECK(cuMemcpyDtoHAsync(&cur_np,
+                    d_decomp + offsetof(struct LaDecompState_h, nparts),
+                    sizeof(int), s));
+                LCHECK(cuStreamSynchronize(s));
+                if (cur_np > 0) {
+                    void* dc_args[] = { &d_decomp, &cur_np, &ctx->d_pool_struct, &d_err };
+                    LCHECK(cuLaunchKernel(ctx->fn_la_decompose_components,
+                        cur_np, 1, 1, 128, 1, 1, 0, s, dc_args, NULL));
+                    LA_SYNC_CHECK("decompose_components");
+                    void* hull_args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
+                    LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
+                        LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, hull_args, NULL));
+                    LA_SYNC_CHECK("hull_decomp_post_dc");
+                }
+            }
             result_code = la_read_result(ctx, d_decomp, out, s);
             goto cleanup;
         }
@@ -705,6 +722,25 @@ int lookahead_decompose(
         TSTAMP(_t1);
         if (verbose)
             fprintf(stderr, "[la] iter %d: %.1f ms\n", iter, TELAPSED_MS(_t0, _t1));
+    }
+
+    // Post-processing: decompose connected components
+    if (decompose_components) {
+        int cur_np = 0;
+        LCHECK(cuMemcpyDtoHAsync(&cur_np,
+            d_decomp + offsetof(struct LaDecompState_h, nparts),
+            sizeof(int), s));
+        LCHECK(cuStreamSynchronize(s));
+        if (cur_np > 0) {
+            void* dc_args[] = { &d_decomp, &cur_np, &ctx->d_pool_struct, &d_err };
+            LCHECK(cuLaunchKernel(ctx->fn_la_decompose_components,
+                cur_np, 1, 1, 128, 1, 1, 0, s, dc_args, NULL));
+            LA_SYNC_CHECK("decompose_components");
+            void* hull_args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
+            LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
+                LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, hull_args, NULL));
+            LA_SYNC_CHECK("hull_decomp_post_dc");
+        }
     }
 
     // Iterations exhausted — read back decomposition

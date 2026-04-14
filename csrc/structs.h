@@ -94,6 +94,9 @@ struct gpu_ctx {
     CUfunction fn_la_hull_decomp;
     CUfunction fn_la_cleanup_tree;
     CUfunction fn_la_free_decomp;
+    CUfunction fn_la_decompose_components;
+
+    CUfunction fn_test_postprocess_dc;   // test kernel
 
     CUdeviceptr d_pool_mem;       // pool backing memory (user allocations)
     CUdeviceptr d_pool_off;       // unsigned long long offset counter (device)

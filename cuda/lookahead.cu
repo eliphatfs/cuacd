@@ -17,6 +17,7 @@
 #include "mesh_volume.cuh"
 #include "warp_sort.cuh"
 #include "hausdorff.cuh"
+#include "postprocess.cuh"
 
 // Sentinel refcount value: marks hull as heap-allocated by kdop_hull_block
 // (should be freed with heap_free, not refcount-decremented).
@@ -1237,6 +1238,64 @@ extern "C" __global__ void la_cleanup_tree(
         }
     }
     if (tid == 0) wi->nparts = 0;
+}
+
+// ============================================================================
+// la_decompose_components: <<<original_nparts, DC_BLOCK=128>>>
+// Post-processing: split each part in the decomposition into its connected
+// mesh components.  New component parts are appended via atomicAdd on
+// decomp->nparts.
+// ============================================================================
+#define DC_MAX_COMP_LA 32   // max components per part in the lookahead kernel
+
+extern "C" __global__ void la_decompose_components(
+    LaDecompState* decomp,
+    int            original_nparts,
+    DevicePool*    pool,
+    int*           err)
+{
+    if (*err) return;
+
+    int i = blockIdx.x;
+    if (i >= original_nparts) return;
+
+    Part* p = &decomp->parts[i];
+    if (p->mesh.nv == 0 || p->mesh.nt == 0) return;
+
+    __shared__ Part s_parts[DC_MAX_COMP_LA];
+
+    int n_comp = decompose_components_block(
+        p, s_parts, DC_MAX_COMP_LA,
+        &pool->heap, &pool->scratch, err);
+
+    __syncthreads();
+
+    if (n_comp <= 1) {
+        // 1 component or error — block function already wrote to s_parts[0]
+        // and left the original mesh/hull intact.
+        return;
+    }
+
+    // Write first component back into the original slot.
+    if (threadIdx.x == 0)
+        decomp->parts[i] = s_parts[0];
+
+    // Claim new slots for remaining components.
+    __shared__ int s_base_idx;
+    if (threadIdx.x == 0)
+        s_base_idx = atomicAdd(&decomp->nparts, n_comp - 1);
+    __syncthreads();
+
+    if (s_base_idx + n_comp - 1 > LA_MAX_DECOMP) {
+        if (threadIdx.x == 0)
+            atomicOr(err, LA_ERR_OVERFLOW);
+        return;
+    }
+
+    if (threadIdx.x == 0) {
+        for (int c = 1; c < n_comp; c++)
+            decomp->parts[s_base_idx + c - 1] = s_parts[c];
+    }
 }
 
 // ============================================================================

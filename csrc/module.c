@@ -8,6 +8,7 @@
 #include <string.h>
 #include "heap.h"
 #include "test.h"
+#include "postprocess.h"
 #include "lookahead.h"
 
 // ---------------------------------------------------------------------------
@@ -231,6 +232,41 @@ static PyObject* py_test_plane_cut(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// test_postprocess_dc(verts_ptr, nv, tris_ptr, nt,
+//                     max_components, max_verts_per, max_tris_per,
+//                     out_verts_ptr, out_tris_ptr,
+//                     out_nv_ptr, out_nt_ptr)
+//   -> n_components
+// ---------------------------------------------------------------------------
+
+static PyObject* py_test_postprocess_dc(PyObject* self, PyObject* args) {
+    unsigned long long vp, tp, ovp, otp, onvp, ontp;
+    int nv, nt, max_comp, max_vp, max_tp;
+
+    if (!PyArg_ParseTuple(args, "KiKiiiiKKKK",
+            &vp, &nv, &tp, &nt,
+            &max_comp, &max_vp, &max_tp,
+            &ovp, &otp, &onvp, &ontp))
+        return NULL;
+
+    REQUIRE_CTX();
+
+    int n_comp = 0;
+    int rc = gpu_test_postprocess_dc(g_state.ctx,
+        (const float*)(uintptr_t)vp, nv,
+        (const int*)  (uintptr_t)tp, nt,
+        max_comp, max_vp, max_tp,
+        (float*)(uintptr_t)ovp, (int*)(uintptr_t)otp,
+        (int*)(uintptr_t)onvp, (int*)(uintptr_t)ontp,
+        &n_comp);
+    if (rc != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "postprocess_dc failed");
+        return NULL;
+    }
+    return Py_BuildValue("i", n_comp);
+}
+
+// ---------------------------------------------------------------------------
 // lookahead_decompose(verts_ptr, nv, tris_ptr, nt,
 //                     hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,
 //                     max_iters, width, width2, threshold,
@@ -246,7 +282,7 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
         "hull_verts_ptr", "hull_nv", "hull_tris_ptr", "hull_nt",
         "max_iters", "width", "width2", "threshold",
         "depth", "quick_depth", "max_n_cutting",
-        "verbose", "debug", NULL
+        "verbose", "debug", "decompose_components", NULL
     };
     unsigned long long vp, tp, hvp, htp;
     int nv, nt, hull_nv, hull_nt;
@@ -254,13 +290,14 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
     float threshold;
     int depth = 2, quick_depth = 1, max_n_cutting = 16;
     int verbose = 0, debug = 0;
+    int decompose_components = 0;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiiifiii|ii", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiiifiii|iii", kwlist,
             &vp, &nv, &tp, &nt,
             &hvp, &hull_nv, &htp, &hull_nt,
             &max_iters, &width, &width2, &threshold,
             &depth, &quick_depth, &max_n_cutting,
-            &verbose, &debug))
+            &verbose, &debug, &decompose_components))
         return NULL;
 
     REQUIRE_CTX();
@@ -275,7 +312,7 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
         (const int*)  (uintptr_t)htp, hull_nt,
         max_iters, width, width2, threshold,
         depth, quick_depth, max_n_cutting,
-        verbose, debug,
+        verbose, debug, decompose_components,
         &result);
     if (rc != 0) {
         gpu_result_free(&result);
@@ -393,6 +430,7 @@ static PyMethodDef gpu_methods[] = {
     { "test_plane_cut",     py_test_plane_cut,     METH_VARARGS, "GPU plane cut with cap triangulation." },
     { "kdop_hull",          py_kdop_hull,          METH_VARARGS, "k-DOP approximate hull mesh extraction." },
     { "test_hausdorff",     py_test_hausdorff,     METH_VARARGS, "Bidirectional Hausdorff distance." },
+    { "test_postprocess_dc", py_test_postprocess_dc, METH_VARARGS, "Split mesh into connected components." },
     { "lookahead_decompose", (PyCFunction)py_lookahead_decompose, METH_VARARGS | METH_KEYWORDS,
       "lookahead_decompose(verts_ptr, nv, tris_ptr, nt, hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,\n"
       "                    max_iters, width, threshold, depth=2, quick_depth=1, max_n_cutting=16, verbose=0, debug=0)\n"
