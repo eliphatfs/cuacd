@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**coacd_gpu** — GPU convex approximate decomposition. Single CPython extension (abi3, cp310+) via CUDA driver API. Sub-algorithms: D&C convex hull, plane cut, beam search decomposition. All run on GPU with a custom heap allocator.
+**coacd_gpu** — GPU convex approximate decomposition. Single CPython extension (abi3, cp310+) via CUDA driver API. Sub-algorithms: D&C convex hull, plane cut, lookahead tree search decomposition. All run on GPU with a custom heap allocator.
 
 `CoACD/` — Reference C++ CoACD implementation (SIGGRAPH 2022), not part of the GPU extension.
 
@@ -25,10 +25,9 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   kdop_hull.cuh       #   kdop_hull_block: single-warp (32 threads) exact hull via extreme-point prefilter + D&C
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume of a Mesh
   hausdorff.cuh       #   hausdorff_block: block-level (256 threads) bidirectional Hausdorff distance via sampling + linear BVH
-  structs.cuh         #   Device-side: Mesh, Part, PartPair, WorkItem, AlgoState, LaWorkItem, LaDecompState, LaEvalResult
+  structs.cuh         #   Device-side: Mesh, Part, PartPair, LaWorkItem, LaDecompState, LaEvalResult
   mm.cu               #   heap_init_kernel
   kdop_const.cu       #   __constant__ KDOP_AXES[40][3] definition (broadcast-cached icosphere axes)
-  beam.cu             #   beam_expansion, beam_hull, beam_hausdorff, beam_sort, beam_finalize kernels
   lookahead.cu        #   lookahead search kernels: la_initialize, la_expand, la_evaluate, la_apply_cuts, etc.
   test_warp_sort.cu   #   Test kernel: test_warp_sort_kernel
   test_hull_dandc.cu  #   Test kernel: hull_dandc_kernel
@@ -37,12 +36,12 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   test_plane_cut.cu   #   Test kernel: plane_cut_kernel
   test_hausdorff.cu   #   Test kernel: hausdorff_kernel
 csrc/                 # C host code
-  structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, beam_ctx
-  beam.h              #   Public C API (beam_ctx_t, beam_init/destroy/compact/pool_usage, batch ops) + Mesh_h/Part_h host mirrors
-  beam.c              #   Host implementation: beam_init/destroy, beam_decompose (rv-only cost after Hausdorff removal)
+  structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, gpu_ctx
+  heap.h              #   Public C API (gpu_ctx_t, gpu_init/destroy/compact/pool_usage, batch ops) + Mesh_h/Part_h host mirrors
+  heap.c              #   Host implementation: gpu_init/destroy, pool management, result_free
   lookahead.c         #   Host implementation: lookahead_decompose (full lookahead tree search with Hausdorff)
   test.c              #   Test host launchers
-  module.c            #   CPython extension wrapping beam.h (Py_LIMITED_API cp310)
+  module.c            #   CPython extension wrapping heap.h (Py_LIMITED_API cp310)
 coacd_gpu/            # Python package (import name)
   __init__.py         #   Context class (batch_hull_volume, batch_mesh_volume, batch_hull_dandc_mesh, batch_kdop_hull_mesh, lookahead_decompose)
   cli.py              #   coacd-gpu console entry point (normalize → decompose → denormalize → export GLB)
@@ -54,7 +53,6 @@ tests/                # All tests
   test_hausdorff.py   #   Hausdorff distance tests (5 tests) + CoACD reference comparison
   gen_hausdorff_fixtures.py # Generates CoACD reference Hausdorff fixtures (C++ harness + .npz)
   ref_hausdorff.cpp    #   Standalone C++ CoACD Hausdorff reference harness
-  test_beam.py        #   beam_decompose tests (cube, lshape, octocat, octocat_debug_steps)
   test_lookahead.py   #   lookahead_decompose tests (cube, lshape, octocat, convergence, export_glb)
   test_edge_tracking.py # Max edge pairs stress test for D&C hull (requires COACD_TRACK_EDGES=1 build)
   bench_dandc.py      #   D&C hull benchmark for NCU profiling
@@ -64,7 +62,6 @@ docs/                 # Detailed documentation
   arena_sweep.md      #   Arena count sweep results
   api_hull_dandc.md   #   D&C hull algorithm and hull_dandc_warp_mesh API
   api_plane_cut.md    #   plane_cut_block API details
-  api_beam.md         #   Beam search kernel APIs (initialize, expansion, hull, sort, finalize, decompose)
   api_heap_allocator.md#  Heap arena allocator design
   api_kdop_hull.md    #   kdop_hull_block algorithm and API (extreme-point prefilter + D&C)
   implementation_notes.md# Resolved bugs and implementation gotchas
@@ -161,11 +158,9 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 
 **Plane Cut** (`plane_cut.cuh`): Block-level (64 threads) mesh splitting along an arbitrary plane. Produces `PartPair` with pos/neg meshes. Handles disjoint components: when the plane doesn't intersect any edge but vertices exist on both sides, triangles are separated by vertex sign with per-side vertex compaction. Cap triangulation handles multiple boundary loops with arbitrary nesting depth via parity classification (even depth = outer, odd depth = hole). See `docs/api_plane_cut.md`.
 
-**Hull with Extreme-Point Prefilter** (`kdop_hull.cuh`): Single-warp (32 threads). Fast path: direct D&C hull for nv ≤ 1024. Main path: warp argmax/argmin over 40 icosphere axes finds up to 80 extreme vertices → D&C rough inner hull → ballot/popcount half-space filter discards interior points → D&C final hull of survivors. Result is the exact convex hull. Exposed as `ctx.batch_kdop_hull_mesh()`. Used by `beam_hull` kernel. See `docs/api_kdop_hull.md`.
+**Hull with Extreme-Point Prefilter** (`kdop_hull.cuh`): Single-warp (32 threads). Fast path: direct D&C hull for nv ≤ 1024. Main path: warp argmax/argmin over 40 icosphere axes finds up to 80 extreme vertices → D&C rough inner hull → ballot/popcount half-space filter discards interior points → D&C final hull of survivors. Result is the exact convex hull. Exposed as `ctx.batch_kdop_hull_mesh()`. Used by `la_hull` kernel. See `docs/api_kdop_hull.md`.
 
-**Hausdorff Distance** (`hausdorff.cuh`): Block-level (256 threads, 8 warps). Computes bidirectional Hausdorff distance between two meshes via sampling + linear BVH. CoACD-matching area-proportional sampling with Wang hash pseudo-random barycentric coordinates. Brute-force path for ≤64 target triangles; linear BVH (Karras 2012 radix tree) for larger meshes with cooperative 4-warp Morton code sort. Used by `beam_hausdorff` kernel to fill `Part.hausdorff`.
-
-**Beam Search Decomposition** (`beam.cu` + `csrc/beam.c`): Iterative beam search: `finalize → expansion → hull → sort`. Uses rv-only cost (no Hausdorff — it was removed because Hausdorff is non-monotonic over a single cut, preventing convergence). Pipelined in stream order, sync only after finalize. `beam_hull` uses `kdop_hull_block` (32 threads/block). See `docs/api_beam.md`.
+**Hausdorff Distance** (`hausdorff.cuh`): Block-level (256 threads, 8 warps). Computes bidirectional Hausdorff distance between two meshes via sampling + linear BVH. CoACD-matching area-proportional sampling with Wang hash pseudo-random barycentric coordinates. Brute-force path for ≤64 target triangles; linear BVH (Karras 2012 radix tree) for larger meshes with cooperative 4-warp Morton code sort. Used by `la_hausdorff_parts` kernel to fill `Part.hausdorff`.
 
 **Lookahead Search Decomposition** (`lookahead.cu` + `csrc/lookahead.c`): Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (`width` cuts at level 0, `width2` at deeper levels), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses rv-only cost for tree exploration (matching CoACD), but full cost `max(rv, hausdorff)` for the stopping criterion. Default depth=2, quick_depth=0, width=60, width2=5. `la_evaluate` falls back to level-0 items when no leaf descendants exist for a cut (all deeper expansions produced empty halves because pieces were too small to cut further — such pieces are provably below threshold). Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree, la_free_decomp.
 
@@ -189,8 +184,7 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 - **Isolate tests**: run single failing test alone to avoid cascade from earlier tests.
 - **compute-sanitizer**: `compute-sanitizer --tool memcheck python <script.py>` to find exact source.
 - **COACD_BEAM_DEBUG**: `COACD_BEAM_DEBUG=1 pip install -e .` enables `DPRINTF` (device-side `printf`) and `CheckedBuf` OOB detection. Use `DPRINTF` guarded by `if (lane == 0)` or `if (tid == 0)` to add temporary device-side diagnostics in `.cuh` files — no extra includes needed, `DPRINTF` is defined in `common.cuh`.
-- **Debug mode**: `ctx.decompose(..., debug=1)` syncs after each kernel, prints per-stage status.
-- **Per-substep memory profiling**: `python -m pytest tests/test_decompose.py::test_octocat_decompose_debug_steps -v -s` — runs octocat with `debug=1`, use captured stdout/stderr to see per-substep pool usage.
+- **Debug mode**: `ctx.lookahead_decompose(..., debug=1)` syncs after each kernel, prints per-stage status.
 - **Lookahead verbose levels** (`lookahead_decompose`):
   - `verbose=1`: per-part table each iteration (nv, nt, mesh_vol, hull_vol, rv_cost, hausdorff, full_cost; `*` = above threshold), per-iteration timing and n_cutting, kernel stage OK messages.
   - `verbose=2`: additionally prints cutting_indices, la_evaluate results (best_cut_idx, best_cost per src part), leaf item details (src, cut, nparts, path_cost, level_costs), level-0 item details (per-cut per-source with per-part rv/hv/mv), per-cut best path cost summary.
@@ -199,13 +193,12 @@ Memory layout in `hull_dandc_warp_mesh`: presort `BtPoint32` array is heap-alloc
 ## Current Status
 
 ### Working
-- D&C hull, mesh volume, warp sort, plane cut (16 tests), beam_decompose (cube/lshape/octocat) — all tests pass.
-- `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Used by `beam_hull`. Produces exact hull via extreme-point prefilter + D&C.
-- `hausdorff_block` — 5 tests pass. Used by `beam_hausdorff`. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
+- D&C hull, mesh volume, warp sort, plane cut (16 tests) — all tests pass.
+- `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Produces exact hull via extreme-point prefilter + D&C.
+- `hausdorff_block` — 5 tests pass. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
 - `lookahead_decompose` — cube, L-shape, octocat, convergence, 49160 tests pass. Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=0, width=60, width2=5. `la_count_cutting` deterministically selects highest-cost parts. `la_expand`/`la_expand_quick` place cuts evenly in the valid range `[lo+min_edge_dist, hi-min_edge_dist]` (min_edge_dist = threshold/4) to prevent degenerate thin slivers. Parts too small to cut in all axes (extent ≤ 2*min_edge_dist) are recorded as extra_leaves with zero cost for remaining levels — distinguishes genuinely solved parts from failed cuts (which get infinite cost). `plane_cut_block` detects incomplete cap triangulation (ear-clip gave up) and returns the whole mesh unsplit, so the lookahead tree search treats it as a failed cut rather than producing non-watertight parts. Two heap leak fixes: (1) `la_free_decomp` kernel frees final decomp part meshes/hulls after read-back; (2) `la_cleanup_tree` is called on `d_cur` before each buffer swap so that seed/intermediate items' refcounts are decremented before the buffer is reused.
 
 ### Known Limitations
-- **Beam search item starvation**: `beam_decompose` can sometimes reduce to 0 work items before convergence. This happens when the last (worst-cost) part of every surviving WorkItem cannot be meaningfully split by any axis-aligned plane (all cuts produce an empty half), yet its cost remains above the threshold. Once nitems reaches 0, the algorithm spins uselessly until max_iters. This is a fundamental weakness of greedy beam search — it can prune all productive paths too early. The lookahead algorithm avoids this by maintaining a flat decomposition and applying cuts one at a time.
 - **Lookahead residual pool growth (~1 MB/call)**: After fixing two confirmed leaks (final decomp meshes never freed; seed buffer overwritten without refcount decrement before swap), pool usage still grows ~1 MB/call over 100 repeated calls. Cause unconfirmed — may be allocator bin fragmentation (varying chunk sizes → new slabs) or a remaining minor leak. Not yet experimentally distinguished.
 
 ### Not Yet Implemented

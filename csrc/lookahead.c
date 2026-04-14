@@ -1,7 +1,7 @@
 // lookahead.c — Host-side implementation for lookahead tree search decomposition.
 // Uses CUDA driver API exclusively — links only against libcuda.so.
 
-#include "beam.h"
+#include "heap.h"
 #include "structs.h"
 #include <cuda.h>
 #include <stdlib.h>
@@ -49,7 +49,7 @@ struct LaEvalResult_h {
 
 // Read back the decomposition from device into host result.
 static int la_read_result(
-    beam_ctx_t ctx, CUdeviceptr d_decomp, struct beam_result* out, CUstream s)
+    gpu_ctx_t ctx, CUdeviceptr d_decomp, struct gpu_result* out, CUstream s)
 {
     struct LaDecompState_h h_decomp;
     CUresult r = cuMemcpyDtoH(&h_decomp, d_decomp, sizeof(h_decomp));
@@ -65,12 +65,12 @@ static int la_read_result(
     out->nparts = np;
     if (np == 0) { out->parts = NULL; return 0; }
 
-    out->parts = (struct beam_part_result*)calloc(np, sizeof(struct beam_part_result));
+    out->parts = (struct gpu_part_result*)calloc(np, sizeof(struct gpu_part_result));
     if (!out->parts) return -1;
 
     for (int i = 0; i < np; i++) {
         struct Part_h*           p  = &h_decomp.parts[i];
-        struct beam_part_result* pr = &out->parts[i];
+        struct gpu_part_result* pr = &out->parts[i];
 
         pr->nv        = p->mesh.nv;
         pr->nt        = p->mesh.nt;
@@ -95,7 +95,7 @@ static int la_read_result(
 }
 
 int lookahead_decompose(
-    beam_ctx_t   ctx,
+    gpu_ctx_t   ctx,
     const float* verts,      int nv,
     const int*   tris,       int nt,
     const float* hull_verts, int hull_nv,
@@ -103,7 +103,7 @@ int lookahead_decompose(
     int max_iters, int width, int width2, float threshold,
     int depth, int quick_depth, int max_n_cutting,
     int verbose, int debug,
-    struct beam_result* out)
+    struct gpu_result* out)
 {
 #define LCHECK(call) do { \
     CUresult _r = (call); \

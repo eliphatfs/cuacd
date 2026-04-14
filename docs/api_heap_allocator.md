@@ -8,7 +8,7 @@
 - **Slab layout**: each new pool slab has `[leading sentinel 32B][free block][trailing sentinel 32B]`. Sentinels (`is_free=0`, `data_size=0`) prevent coalescing across slab boundaries.
 - **Allocation** (thread 0 only): bitmap search for lowest eligible sub-bin (O(1) via `__ffsll`); pop head; split remainder if >= `HEAP_HDR_SIZE + HEAP_ALIGN + HEAP_FTR_SIZE`. If no sub-bin has a free block, allocate a new slab from the pool (min 128 KB or next-pow-2).
 - **Free** (thread 0 only): inspect prev footer and next header; coalesce adjacent free blocks via doubly-linked O(1) removal; insert merged block into correct sub-bin. Arena for insertion = block's stored `arena_idx` (all blocks in a slab share the same arena, so coalescing is always intra-arena).
-- **No compact**: `beam_heap_compact()` is a no-op -- coalescing is handled in-place by `heap_free`. Pool remains stable across all calls.
+- **No compact**: `gpu_heap_compact()` is a no-op -- coalescing is handled in-place by `heap_free`. Pool remains stable across all calls.
 
 ## DevicePool layout (must match csrc/structs.h)
 

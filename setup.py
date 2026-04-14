@@ -2,8 +2,8 @@
 Build logic for coacd_gpu.
 
 One extension is built:
-  coacd_gpu._gpu — Native CPython extension for beam search decomposition,
-                   Hausdorff distance, and pairwise merge cost.
+  coacd_gpu._gpu — Native CPython extension for GPU convex decomposition,
+                   Hausdorff distance, and convex hull computation.
 
 Embeds CUDA fatbin and links only against libcuda (driver API).
 Metadata lives in pyproject.toml.
@@ -90,7 +90,6 @@ _CUDA_MODULES = [
     "test_hull_dandc.cu",
     "test_mesh_volume.cu",
     "test_plane_cut.cu",
-    "beam.cu",
     "lookahead.cu",
     "test_kdop_hull.cu",
     "test_hausdorff.cu",
@@ -179,7 +178,7 @@ class CoacdBuildExt(build_ext):
         _fatbin_to_header(fatbin_file, header_file, "kernels_fatbin")
 
         ext.include_dirs = [
-            os.path.join(_ROOT, "csrc"),              # beam.h
+            os.path.join(_ROOT, "csrc"),              # heap.h
             build_dir,                                 # kernels_fatbin.h
             os.path.join(cuda_home, "include"),        # cuda.h
         ]
@@ -203,7 +202,7 @@ _gpu_ext = Extension(
     name="coacd_gpu._gpu",
     sources=[
         os.path.join("csrc", "module.c"),
-        os.path.join("csrc", "beam.c"),
+        os.path.join("csrc", "heap.c"),
         os.path.join("csrc", "lookahead.c"),
         os.path.join("csrc", "test.c"),
     ],

@@ -13,4 +13,4 @@
 - **Counters** (`n_cross`, `n_all_verts`, `n_pos`, `n_neg`): stored in `__shared__ int s_counters[4]`; `atomicAdd` on shared memory. Not on heap.
 - **Early exit** (`n_cross == 0`): if all vertices are on one side, entire input mesh goes to that side; other side gets empty `Mesh {NULL,NULL,0,0}`. If vertices exist on both sides (disjoint components separated by the plane), triangles are classified by vertex sign, vertices are compacted per side, and two separate meshes are output — no cap triangulation needed since no edges cross the plane.
 - **No-boundary / one-empty-side cases**: handled by natural fallthrough -- compaction produces a 0-entry side correctly.
-- **Call sites**: `test_plane_cut.cu` (thin `__global__` wrapper) and `test_beam.c` (host launcher) pass `DeviceHeap*` pointers into the embedded heaps of `DevicePool`.
+- **Call sites**: `test_plane_cut.cu` (thin `__global__` wrapper) and `test.c` (host launcher) pass `DeviceHeap*` pointers into the embedded heaps of `DevicePool`.

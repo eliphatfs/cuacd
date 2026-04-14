@@ -1,8 +1,8 @@
-// test_beam.c — Host launchers for test/diagnostic GPU kernels.
-// Compiled into the same extension as beam.c; separated to keep beam.c focused
+// test.c — Host launchers for test/diagnostic GPU kernels.
+// Compiled into the same extension as heap.c; separated to keep heap.c focused
 // on init/destroy.
 
-#include "beam.h"
+#include "heap.h"
 #include "structs.h"
 #include <cuda.h>
 #include <stdlib.h>
@@ -16,7 +16,7 @@
         const char* _msg = NULL; \
         cuGetErrorString(_r, &_msg); \
         snprintf(ctx->last_error, sizeof(ctx->last_error), \
-                 "%s failed at test_beam.c:%d: %s", #call, __LINE__, _msg ? _msg : "unknown"); \
+                 "%s failed at test.c:%d: %s", #call, __LINE__, _msg ? _msg : "unknown"); \
         return (int)_r; \
     } \
 } while(0)
@@ -27,13 +27,13 @@
 #define D_SCRATCH(ctx) ((ctx)->d_pool_struct + offsetof(struct DevicePool, scratch))
 
 // ---------------------------------------------------------------------------
-// beam_test_warp_sort
+// gpu_test_warp_sort
 // ---------------------------------------------------------------------------
 // points: packed int[total_pts * 4] (x,y,z,index)
 // offsets: int[n_arrays + 1]
 // Sorts each sub-array in-place.
 
-int beam_test_warp_sort(beam_ctx_t ctx,
+int gpu_test_warp_sort(gpu_ctx_t ctx,
     int* points, int total_pts, const int* offsets, int n_arrays)
 {
     if (!ctx || !ctx->fn_test_warp_sort) return -1;
@@ -83,14 +83,14 @@ int beam_test_warp_sort(beam_ctx_t ctx,
 }
 
 // ---------------------------------------------------------------------------
-// beam_hull_dandc
+// gpu_hull_dandc
 // ---------------------------------------------------------------------------
 // Extract convex hull mesh for each point cloud.
 // Uses persistent pool->heap (output) and pool->scratch (scratch).
 // Both heaps share the same pool; all allocations are freed by the kernel.
 
-int beam_hull_dandc(
-    beam_ctx_t   ctx,
+int gpu_hull_dandc(
+    gpu_ctx_t   ctx,
     const float* pts,
     int          total_pts,
     const int*   offsets,
@@ -107,7 +107,7 @@ int beam_hull_dandc(
     if (!ctx || !ctx->fn_hull_dandc) return -1;
     if (!ctx->d_pool_struct) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "persistent heaps not initialized; call beam_init first");
+                 "persistent heaps not initialized; call gpu_init first");
         return -1;
     }
     CUstream s = NULL;
@@ -157,12 +157,12 @@ int beam_hull_dandc(
 }
 
 // ---------------------------------------------------------------------------
-// beam_test_mesh_volume
+// gpu_test_mesh_volume
 // ---------------------------------------------------------------------------
 // Compute volume of a single mesh via divergence theorem (GPU warp).
 
-int beam_test_mesh_volume(
-    beam_ctx_t   ctx,
+int gpu_test_mesh_volume(
+    gpu_ctx_t   ctx,
     const float* verts,
     int          n_verts,
     const int*   tris,
@@ -190,11 +190,11 @@ int beam_test_mesh_volume(
 }
 
 // ---------------------------------------------------------------------------
-// beam_batch_mesh_volume
+// gpu_batch_mesh_volume
 // ---------------------------------------------------------------------------
 
-int beam_batch_mesh_volume(
-    beam_ctx_t   ctx,
+int gpu_batch_mesh_volume(
+    gpu_ctx_t   ctx,
     const float* verts,
     int          total_verts,
     const int*   tris,
@@ -238,13 +238,13 @@ int beam_batch_mesh_volume(
 }
 
 // ---------------------------------------------------------------------------
-// beam_test_plane_cut
+// gpu_test_plane_cut
 // ---------------------------------------------------------------------------
 // Uses persistent pool->heap (output) and pool->scratch (scratch).
 // Both heaps share the same pool; all allocations are freed by the kernel.
 
-int beam_test_plane_cut(
-    beam_ctx_t   ctx,
+int gpu_test_plane_cut(
+    gpu_ctx_t   ctx,
     const float* vertices, int n_verts,
     const int*   triangles, int n_tris,
     float pa, float pb, float pc_n, float pd,
@@ -258,7 +258,7 @@ int beam_test_plane_cut(
     if (!ctx || !ctx->fn_plane_cut) return -1;
     if (!ctx->d_pool_struct) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "persistent heaps not initialized; call beam_init first");
+                 "persistent heaps not initialized; call gpu_init first");
         return -1;
     }
 
@@ -351,13 +351,13 @@ cleanup_err:
 }
 
 // ---------------------------------------------------------------------------
-// beam_kdop_hull
+// gpu_kdop_hull
 // ---------------------------------------------------------------------------
 // Approximate convex hull via k-DOP for a batch of point clouds.
 // Uses persistent pool->heap (output) and pool->scratch (scratch).
 
-int beam_kdop_hull(
-    beam_ctx_t   ctx,
+int gpu_kdop_hull(
+    gpu_ctx_t   ctx,
     const float* pts,
     int          total_pts,
     const int*   offsets,
@@ -374,7 +374,7 @@ int beam_kdop_hull(
     if (!ctx || !ctx->fn_kdop_hull) return -1;
     if (!ctx->d_pool_struct) {
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "persistent heaps not initialized; call beam_init first");
+                 "persistent heaps not initialized; call gpu_init first");
         return -1;
     }
     CUstream s = NULL;
@@ -423,11 +423,11 @@ int beam_kdop_hull(
 }
 
 // ---------------------------------------------------------------------------
-// beam_test_hausdorff
+// gpu_test_hausdorff
 // ---------------------------------------------------------------------------
 
-int beam_test_hausdorff(
-    beam_ctx_t   ctx,
+int gpu_test_hausdorff(
+    gpu_ctx_t   ctx,
     const float* hull_verts, int hull_nv,
     const int*   hull_tris,  int hull_nt,
     const float* mesh_verts, int mesh_nv,

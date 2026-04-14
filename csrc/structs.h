@@ -1,13 +1,6 @@
 // Host-side data structures for GPU kernels.
-// Included by beam.c and test_beam.c.
+// Included by heap.c, lookahead.c, and test.c.
 // DevicePool, DeviceHeap, HeapArena must stay in sync with cuda/allocator.cuh.
-//
-// NOTE: beam.c update pending (next phase) to match the new DevicePool layout:
-//   - DevicePool now embeds both DeviceHeap instances as direct fields.
-//   - DeviceHeap has a DevicePool* pool back-pointer (set by heap_init_kernel).
-//   - sizeof(DevicePool) is now much larger; allocate d_pool_struct accordingly.
-//   - heap_compact_kernel removed; replaced by heap_init_kernel<<<128,32>>>.
-//   - d_heap, d_scratch, d_heap_compact_buf, d_scratch_compact_buf removed from beam_ctx.
 
 #ifndef STRUCTS_H
 #define STRUCTS_H
@@ -68,9 +61,9 @@ struct DevicePool {
 };
 
 // ---------------------------------------------------------------------------
-// Main GPU context  (beam.c update pending — see note above)
+// Main GPU context
 // ---------------------------------------------------------------------------
-struct beam_ctx {
+struct gpu_ctx {
     CUdevice   device;
     CUcontext  cuda_ctx;
     CUmodule   module;
@@ -102,8 +95,6 @@ struct beam_ctx {
     CUfunction fn_la_cleanup_tree;
     CUfunction fn_la_free_decomp;
 
-    // Heaps embedded in d_pool_struct (beam.c update pending).
-    // Fields d_heap, d_scratch, d_heap_compact_buf, d_scratch_compact_buf removed.
     CUdeviceptr d_pool_mem;       // pool backing memory (user allocations)
     CUdeviceptr d_pool_off;       // unsigned long long offset counter (device)
     CUdeviceptr d_pool_struct;    // struct DevicePool on device (much larger now)

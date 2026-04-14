@@ -2,8 +2,8 @@
 // Uses CUDA driver API internally — no CUDA runtime dependency.
 // Linked into a CPython extension module; not a standalone shared library.
 
-#ifndef BEAM_H
-#define BEAM_H
+#ifndef HEAP_H
+#define HEAP_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -14,32 +14,32 @@ extern "C" {
 #endif
 
 // Opaque handle to GPU context
-typedef struct beam_ctx* beam_ctx_t;
+typedef struct gpu_ctx* gpu_ctx_t;
 
 // pool_bytes: backing memory for both heaps combined.
 //   0 = auto: use 70% of free device memory at init time.
-int  beam_init(beam_ctx_t* ctx, int device_ordinal, size_t pool_bytes);
-void beam_destroy(beam_ctx_t ctx);
+int  gpu_init(gpu_ctx_t* ctx, int device_ordinal, size_t pool_bytes);
+void gpu_destroy(gpu_ctx_t ctx);
 
-const char* beam_last_error(beam_ctx_t ctx);
+const char* gpu_last_error(gpu_ctx_t ctx);
 
-// beam_heap_compact — coalesce free blocks in both persistent heaps.
+// gpu_heap_compact — coalesce free blocks in both persistent heaps.
 // Call periodically to recover fragmented memory between kernel launches.
 // Blocks until compaction is complete.
-int  beam_heap_compact(beam_ctx_t ctx);
+int  gpu_heap_compact(gpu_ctx_t ctx);
 
-// beam_pool_usage — read back how many bytes have been bump-allocated from
+// gpu_pool_usage — read back how many bytes have been bump-allocated from
 // the shared pool (= peak live device memory used by both heaps combined).
 // The offset never decreases; freed blocks go to heap free-lists, not back
 // to the pool. Returns 0 on error.
-size_t beam_pool_usage(beam_ctx_t ctx);
+size_t gpu_pool_usage(gpu_ctx_t ctx);
 
 // ---------------------------------------------------------------------------
 // Test: warp_sort — sort BtPoint32 sub-arrays in-place
 // points: packed int[total_pts * 4] (x,y,z,index), modified in-place
 // offsets: [n_arrays + 1]
 // ---------------------------------------------------------------------------
-int beam_test_warp_sort(beam_ctx_t ctx,
+int gpu_test_warp_sort(gpu_ctx_t ctx,
     int* points, int total_pts, const int* offsets, int n_arrays);
 
 // ---------------------------------------------------------------------------
@@ -51,8 +51,8 @@ int beam_test_warp_sort(beam_ctx_t ctx,
 // out_verts:      float[n_hulls * max_hull_verts * 3]
 // out_tris:       int[n_hulls * max_hull_tris * 3]  (per-hull relative indices)
 // out_nv, out_nt, out_errors: int[n_hulls]
-int beam_hull_dandc(
-    beam_ctx_t   ctx,
+int gpu_hull_dandc(
+    gpu_ctx_t    ctx,
     const float* pts,
     int          total_pts,
     const int*   offsets,
@@ -69,8 +69,8 @@ int beam_hull_dandc(
 // ---------------------------------------------------------------------------
 // test_mesh_volume — compute volume of a single mesh
 // ---------------------------------------------------------------------------
-int beam_test_mesh_volume(
-    beam_ctx_t   ctx,
+int gpu_test_mesh_volume(
+    gpu_ctx_t    ctx,
     const float* verts,
     int          n_verts,
     const int*   tris,
@@ -85,8 +85,8 @@ int beam_test_mesh_volume(
 // tri_offsets:  int[n_meshes + 1]
 // vert_offsets: int[n_meshes + 1] or NULL (treated as all-zero)
 // out_volumes:  float[n_meshes]
-int beam_batch_mesh_volume(
-    beam_ctx_t   ctx,
+int gpu_batch_mesh_volume(
+    gpu_ctx_t    ctx,
     const float* verts,
     int          total_verts,
     const int*   tris,
@@ -95,20 +95,6 @@ int beam_batch_mesh_volume(
     const int*   vert_offsets,
     int          n_meshes,
     float*       out_volumes);
-
-// ---------------------------------------------------------------------------
-// beam_decompose — full beam-search convex decomposition
-// ---------------------------------------------------------------------------
-// Inputs: mesh (verts/tris) and its precomputed convex hull (hull_verts/hull_tris).
-// Hyperparams:
-//   max_iters:      outer iteration cap
-//   cuts_per_axis:  number of candidate planes per axis (3 axes)
-//   threshold:      stop when best-part cost falls below this value
-//   max_keep:       beam width (max WorkItems retained per round)
-//
-// Output: beam_result filled with the parts of the best WorkItem.
-//   All verts/tris in beam_part_result are malloc'd; call beam_result_free to release.
-//   Returns 0 on success, non-zero on error (see beam_last_error).
 
 // Host-side mirrors of CUDA device structs.
 // Pointer fields use CUdeviceptr (uint64) to match 64-bit device pointers.
@@ -128,7 +114,7 @@ struct Part_h {
     float hausdorff;
 };
 
-struct beam_part_result {
+struct gpu_part_result {
     float* verts;     // malloc'd, nv*3 floats
     int*   tris;      // malloc'd, nt*3 ints
     int    nv;
@@ -138,29 +124,18 @@ struct beam_part_result {
     float  hausdorff;
 };
 
-struct beam_result {
-    struct beam_part_result* parts;  // malloc'd array of nparts entries
+struct gpu_result {
+    struct gpu_part_result* parts;  // malloc'd array of nparts entries
     int nparts;
 };
 
-// verbose: if non-zero, print per-iteration sync wait time and final readback time to stderr.
-int beam_decompose(
-    beam_ctx_t   ctx,
-    const float* verts,      int nv,
-    const int*   tris,       int nt,
-    const float* hull_verts, int hull_nv,
-    const int*   hull_tris,  int hull_nt,
-    int max_iters, int cuts_per_axis, float threshold, int max_keep,
-    int verbose, int debug,
-    struct beam_result* out);
-
-void beam_result_free(struct beam_result* result);
+void gpu_result_free(struct gpu_result* result);
 
 // ---------------------------------------------------------------------------
 // kdop_hull — approximate convex hull via k-DOP for a batch of point clouds
 // ---------------------------------------------------------------------------
-int beam_kdop_hull(
-    beam_ctx_t   ctx,
+int gpu_kdop_hull(
+    gpu_ctx_t    ctx,
     const float* pts,
     int          total_pts,
     const int*   offsets,
@@ -177,8 +152,8 @@ int beam_kdop_hull(
 // ---------------------------------------------------------------------------
 // test_hausdorff — bidirectional Hausdorff distance between two meshes
 // ---------------------------------------------------------------------------
-int beam_test_hausdorff(
-    beam_ctx_t   ctx,
+int gpu_test_hausdorff(
+    gpu_ctx_t    ctx,
     const float* hull_verts, int hull_nv,
     const int*   hull_tris,  int hull_nt,
     const float* mesh_verts, int mesh_nv,
@@ -193,8 +168,8 @@ int beam_test_hausdorff(
 //
 // pa, pb, pc_n, pd: plane equation  pa*x + pb*y + pc_n*z + pd = 0
 //   positive side: pa*x + pb*y + pc_n*z + pd > 0
-int beam_test_plane_cut(
-    beam_ctx_t   ctx,
+int gpu_test_plane_cut(
+    gpu_ctx_t    ctx,
     const float* vertices, int n_verts,
     const int*   triangles, int n_tris,
     float pa, float pb, float pc_n, float pd,
@@ -217,11 +192,11 @@ int beam_test_plane_cut(
 //   quick_depth:    number of quick expansion levels (1 child per item, best-axis midpoint)
 //   max_n_cutting:  max parts processed in parallel per iteration
 //
-// Output: beam_result (reused) filled with the parts of the final decomposition.
-//   Returns 0 on success, non-zero on error (see beam_last_error).
+// Output: gpu_result filled with the parts of the final decomposition.
+//   Returns 0 on success, non-zero on error (see gpu_last_error).
 
 int lookahead_decompose(
-    beam_ctx_t   ctx,
+    gpu_ctx_t    ctx,
     const float* verts,      int nv,
     const int*   tris,       int nt,
     const float* hull_verts, int hull_nv,
@@ -229,10 +204,10 @@ int lookahead_decompose(
     int max_iters, int width, int width2, float threshold,
     int depth, int quick_depth, int max_n_cutting,
     int verbose, int debug,
-    struct beam_result* out);
+    struct gpu_result* out);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // BEAM_H
+#endif // HEAP_H

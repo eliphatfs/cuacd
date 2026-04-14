@@ -28,4 +28,4 @@ Instrumentation (`#ifdef COACD_BEAM_DEBUG`): `BtDCState` carries 4 counter field
 - **BtPool (edge pool)**: starts with 1 pre-allocated slab per group; growth slabs (`BTPOOL_BLOCK_SIZE=1024` edges) allocated on demand via `btpool_add_block`. Lane 0 only; free-list setup is serial. Up to `BTPOOL_MAX_BLOCKS=64` slabs tracked per group in `BtLanePoolCleanup.blocks` for cleanup.
 - **Two-pass mesh extraction**: count pass (`bt_extractMesh` with NULL buffers, counts nv/nt via fan formula) -> `heap_alloc(heap, ...)` for exact output -> extract pass (writes verts+tris). BFS queue rewound between passes.
 - **dandc_scratch_bytes**: no longer includes the `6*n*sizeof(BtEdge)` edge pool term (pool now comes from scratch_heap separately).
-- **Call sites**: `test_hull_dandc.cu` (kernel) and `test_beam.c` (host launcher) pass `DeviceHeap*` pointers into the embedded heaps of `DevicePool`.
+- **Call sites**: `test_hull_dandc.cu` (kernel) and `test.c` (host launcher) pass `DeviceHeap*` pointers into the embedded heaps of `DevicePool`.
