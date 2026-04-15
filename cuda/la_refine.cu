@@ -163,12 +163,12 @@ extern "C" __global__ void la_expand_quick(
             if (tid == 0) {
                 if (pp.pos.mesh.verts) {
                     int r = heap_free(&pool->heap, (void*)pp.pos.mesh.verts);
-                    if (r) { printf("expand_quick[%d]: empty-free pos err=%d axis=%d ptr=%p\n",
+                    if (r) { DPRINTF("expand_quick[%d]: empty-free pos err=%d axis=%d ptr=%p\n",
                                     item_idx, r, axis, pp.pos.mesh.verts); atomicOr(err, r); }
                 }
                 if (pp.neg.mesh.verts) {
                     int r = heap_free(&pool->heap, (void*)pp.neg.mesh.verts);
-                    if (r) { printf("expand_quick[%d]: empty-free neg err=%d axis=%d ptr=%p\n",
+                    if (r) { DPRINTF("expand_quick[%d]: empty-free neg err=%d axis=%d ptr=%p\n",
                                     item_idx, r, axis, pp.neg.mesh.verts); atomicOr(err, r); }
                 }
                 s_costs[axis] = 1e30f;
@@ -249,7 +249,7 @@ extern "C" __global__ void la_expand_quick(
                 int r0 = heap_free(&pool->heap, s_vptrs[a][0]);
                 int r1 = heap_free(&pool->heap, s_vptrs[a][1]);
                 if (r0 || r1) {
-                    printf("expand_quick[%d]: free axis=%d pos_err=%d neg_err=%d ptrs=%p %p\n",
+                    DPRINTF("expand_quick[%d]: free axis=%d pos_err=%d neg_err=%d ptrs=%p %p\n",
                            item_idx, a, r0, r1, s_vptrs[a][0], s_vptrs[a][1]);
                     atomicOr(err, r0 | r1);
                 }

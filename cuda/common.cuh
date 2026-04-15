@@ -21,14 +21,14 @@ struct CheckedBuf {
     __device__ __forceinline__ CheckedBuf(T* p, int n, const char* nm) : ptr_(p), count_(n), name_(nm) {}
     __device__ __forceinline__ T& operator[](int i) {
         if (__builtin_expect(i < 0 || i >= count_, 0)) {
-            printf("[OOB] %s: idx=%d count=%d blk=%d tid=%d\n", name_, i, count_, blockIdx.x, threadIdx.x);
+            DPRINTF("[OOB] %s: idx=%d count=%d blk=%d tid=%d\n", name_, i, count_, blockIdx.x, threadIdx.x);
             return ptr_[0];
         }
         return ptr_[i];
     }
     __device__ __forceinline__ const T& operator[](int i) const {
         if (__builtin_expect(i < 0 || i >= count_, 0)) {
-            printf("[OOB] %s: idx=%d count=%d blk=%d tid=%d\n", name_, i, count_, blockIdx.x, threadIdx.x);
+            DPRINTF("[OOB] %s: idx=%d count=%d blk=%d tid=%d\n", name_, i, count_, blockIdx.x, threadIdx.x);
             return ptr_[0];
         }
         return ptr_[i];
@@ -36,7 +36,7 @@ struct CheckedBuf {
     __device__ __forceinline__ T* raw() const { return ptr_; }
     __device__ __forceinline__ CheckedBuf<T> slice(int offset, int len) const {
         if (__builtin_expect(offset < 0 || offset + len > count_, 0)) {
-            printf("[OOB-slice] %s: offset=%d len=%d count=%d blk=%d tid=%d\n",
+            DPRINTF("[OOB-slice] %s: offset=%d len=%d count=%d blk=%d tid=%d\n",
                    name_, offset, len, count_, blockIdx.x, threadIdx.x);
         }
         return CheckedBuf<T>(ptr_ + offset, len, name_);

@@ -206,7 +206,7 @@ extern "C" __global__ void la_apply_cuts(
             int om = atomicAdd(old->mesh.refcount, -1);
             if (om == 1) {
                 free_err = heap_free(&pool->heap, (void*)old->mesh.verts);
-                if (free_err) printf("apply_cuts[%d]: mesh free err=%d ptr=%p rc_was=%d\n",
+                if (free_err) DPRINTF("apply_cuts[%d]: mesh free err=%d ptr=%p rc_was=%d\n",
                                      i, free_err, old->mesh.verts, om);
             }
         }
@@ -214,13 +214,13 @@ extern "C" __global__ void la_apply_cuts(
         if (old->hull.refcount == LA_REFCOUNT_HEAP) {
             // Heap-allocated hull from la_hull_decomp — free directly
             free_err = heap_free(&pool->heap, (void*)old->hull.verts);
-            if (free_err) printf("apply_cuts[%d]: hull(HEAP) free err=%d ptr=%p\n",
+            if (free_err) DPRINTF("apply_cuts[%d]: hull(HEAP) free err=%d ptr=%p\n",
                                  i, free_err, old->hull.verts);
         } else if (old->hull.refcount) {
             int oh = atomicAdd(old->hull.refcount, -1);
             if (oh == 1) {
                 free_err = heap_free(&pool->heap, (void*)old->hull.verts);
-                if (free_err) printf("apply_cuts[%d]: hull(rc) free err=%d ptr=%p rc_was=%d\n",
+                if (free_err) DPRINTF("apply_cuts[%d]: hull(rc) free err=%d ptr=%p rc_was=%d\n",
                                      i, free_err, old->hull.verts, oh);
             }
         }
