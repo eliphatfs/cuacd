@@ -215,17 +215,20 @@ __device__ inline int decompose_components_block(
 
     // -------------------------------------------------------------------------
     // Phase 5: Assign sequential component IDs.
-    // First two sub-passes run in parallel across all threads:
-    //   A) vert_comp[v] = dc_find(parents, v)  — root walk per vertex
-    //   B) parents[v] = ~0u                     — clear for root→id map
-    // Then thread 0 assigns sequential IDs (depends on both A and B).
+    //   A) All threads: vert_comp[v] = dc_find(parents, v)
+    //   B) All threads: parents[v] = ~0u  (must complete after A — dc_find
+    //      reads parents[], so clearing it concurrently would corrupt the walk)
+    //   C) Thread 0: assign sequential IDs using vert_comp[] + parents[] map
     // -------------------------------------------------------------------------
     {
-        // Sub-pass A + B in parallel (one pass over vertices).
-        for (int v = tid; v < nv; v += DC_BLOCK) {
+        // Sub-pass A: root walk (reads parents[]).
+        for (int v = tid; v < nv; v += DC_BLOCK)
             s_vert_comp[v] = dc_find(s_parents, (unsigned int)v);
+        __syncthreads();
+
+        // Sub-pass B: clear parents[] for root→id map (writes parents[]).
+        for (int v = tid; v < nv; v += DC_BLOCK)
             s_parents[v] = ~0u;
-        }
         __syncthreads();
 
         // Sub-pass C: sequential ID assignment (thread 0).
