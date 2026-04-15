@@ -58,6 +58,7 @@ python -m pytest tests/ -v                          # Run all tests
 COACD_DEBUG=1 pip install -e .                      # Host-side debug output
 COACD_BEAM_DEBUG=1 pip install -e .                 # Device-side DPRINTF + CheckedBuf OOB detection
 COACD_GPU_ARENAS=32 pip install -e .                # Override arena count (default 64)
+COACD_MEMCHECK=1 pip install -e .                    # Device-side memory sanitizer (-fdevice-sanitize=memcheck)
 COACD_PARALLEL=4 pip install -e .                   # Limit parallel nvcc processes
 pip install -ve .                                   # Verbose build (see ptxas register usage)
 ```

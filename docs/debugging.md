@@ -10,6 +10,7 @@
 
 - `COACD_DEBUG=1 pip install -e .` — host-side debug output.
 - `COACD_BEAM_DEBUG=1 pip install -e .` — device-side `DPRINTF` + `CheckedBuf` OOB detection. Use `DPRINTF` guarded by `if (lane == 0)` or `if (tid == 0)` to add temporary device-side diagnostics in `.cuh` files — no extra includes needed, `DPRINTF` is defined in `common.cuh`.
+- `COACD_MEMCHECK=1 pip install -e .` — compiles with `-fdevice-sanitize=memcheck` for device-side memory error detection (requires compute-sanitizer support in nvcc).
 
 ## Runtime Debug Modes
 

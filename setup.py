@@ -110,6 +110,8 @@ def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
         extra_defines.append("-DCOACD_BEAM_DEBUG")
     if os.environ.get("COACD_SERIAL_MERGE"):
         extra_defines.append("-DBT_SERIAL_MERGE")
+    if os.environ.get("COACD_MEMCHECK"):
+        extra_defines.append("-fdevice-sanitize=memcheck")
 
     gencode = _fatbin_gencode_flags()
     cuda_dir = os.path.join(_ROOT, "cuda")

@@ -3,12 +3,24 @@
 import argparse
 import multiprocessing
 import os
+import re
 import sys
 import time
 import pathlib
 import numpy as np
 import trimesh
 import coacd_gpu
+
+
+def _parse_pool_bytes(s):
+    """Parse pool size string with optional K/M/G suffix to bytes. '0' means auto."""
+    m = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([KMG])?', s, re.IGNORECASE)
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid pool size: {s!r} (use e.g. 512M, 2G, or 0 for auto)")
+    val = float(m.group(1))
+    suffix = (m.group(2) or '').upper()
+    mult = {'': 1, 'K': 1024, 'M': 1024**2, 'G': 1024**3}[suffix]
+    return int(val * mult)
 
 
 def _find_meshes(input_path, recursive):
@@ -100,7 +112,7 @@ def _loader_worker(mesh_list, load_queue, print_lock):
 
 def _processor_worker(load_queue, save_queue, print_lock, args):
     """Decompose meshes from load_queue, push results into save_queue."""
-    ctx = coacd_gpu.Context(device=args.device)
+    ctx = coacd_gpu.Context(device=args.device, pool_bytes=args.pool)
     try:
         while True:
             item = load_queue.get()
@@ -123,7 +135,7 @@ def _processor_worker(load_queue, save_queue, print_lock, args):
                             ctx.close()
                         except Exception:
                             pass
-                        ctx = coacd_gpu.Context(device=args.device)
+                        ctx = coacd_gpu.Context(device=args.device, pool_bytes=args.pool)
                     else:
                         with print_lock:
                             print(f'{rel_path}: decompose error on retry — {e}',
@@ -173,6 +185,8 @@ def main():
                         help='Max outer iterations (default: 100).')
     parser.add_argument('--device', type=int, default=-1,
                         help='GPU device ordinal (default: -1 = reuse existing context).')
+    parser.add_argument('--pool', type=_parse_pool_bytes, default=0,
+                        help='GPU pool size in bytes (supports K/M/G suffix, e.g. 512M, 2G; 0 = auto).')
     parser.add_argument('--verbose', type=int, default=0,
                         help='Verbosity level (0/1/2).')
     parser.add_argument('--debug', type=int, default=0,
@@ -193,7 +207,7 @@ def main():
         sys.exit(1)
 
     if args.serial:
-        ctx = coacd_gpu.Context(device=args.device)
+        ctx = coacd_gpu.Context(device=args.device, pool_bytes=args.pool)
         try:
             for abs_path, rel_path in meshes:
                 try:
