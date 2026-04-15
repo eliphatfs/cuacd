@@ -319,6 +319,8 @@ class Context:
 
         if width2 is None:
             width2 = width
+        if width >= 512:
+            raise ValueError(f"width must be < 512 (got {width}); la_evaluate uses a fixed shared buffer of 512 entries")
         raw = _gpu.lookahead_decompose(
             verts.ctypes.data, len(verts),
             tris.ctypes.data, len(tris),

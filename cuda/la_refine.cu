@@ -426,7 +426,7 @@ extern "C" __global__ void la_evaluate(
     int lane = threadIdx.x;
 
     // Per-cut accumulators: track the minimum path cost per initial_cut_idx.
-    __shared__ float s_cut_best[64];
+    __shared__ float s_cut_best[512];
     if (lane == 0) {
         for (int c = 0; c < width; c++)
             s_cut_best[c] = 1e30f;
