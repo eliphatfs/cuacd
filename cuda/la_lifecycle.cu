@@ -355,7 +355,7 @@ extern "C" __global__ void la_decompose_components(
         s_base_idx = atomicAdd(&decomp->nparts, n_comp - 1);
     __syncthreads();
 
-    if (s_base_idx + n_comp - 1 > LA_MAX_DECOMP) {
+    if (s_base_idx + n_comp - 1 >= LA_MAX_DECOMP) {
         if (threadIdx.x == 0)
             atomicOr(err, KERR_LA_OVERFLOW);
         return;

@@ -34,6 +34,34 @@ def _load_mesh(path):
     return verts, tris
 
 
+def _decompose_mesh(ctx, verts, tris, args):
+    """Normalize, decompose, and denormalize a mesh. Returns list of (verts, tris)."""
+    lo = verts.min(axis=0)
+    hi = verts.max(axis=0)
+    center = (lo + hi) / 2
+    extent = float((hi - lo).max())
+    scale = extent / 2 if extent > 0 else 1.0
+    norm_verts = ((verts - center) / scale).astype(np.float32)
+
+    parts = ctx.lookahead_decompose(
+        norm_verts, tris,
+        max_iters=args.max_iters,
+        width=args.width,
+        width2=args.width2,
+        depth=args.depth,
+        quick_depth=args.quick_depth,
+        threshold=args.threshold,
+        verbose=args.verbose,
+        debug=args.debug,
+        decompose_components=not args.no_decompose_components,
+        decompose_components_per_iter=args.decompose_components_per_iter)
+
+    if not args.parts:
+        return [(hv * scale + center, ht) for _, _, hv, ht in parts]
+    else:
+        return [(pv * scale + center, pt) for pv, pt, _, _ in parts]
+
+
 def _save_parts(parts, output_dir, rel_path):
     """Save decomposition as a single GLB with random per-part colors."""
     rng = np.random.default_rng(0)
@@ -80,29 +108,11 @@ def _processor_worker(load_queue, save_queue, print_lock, args):
                 break
             rel_path, verts, tris = item
 
-            # Normalize to [-1, 1]
-            lo = verts.min(axis=0)
-            hi = verts.max(axis=0)
-            center = (lo + hi) / 2
-            extent = float((hi - lo).max())
-            scale = extent / 2 if extent > 0 else 1.0
-            norm_verts = ((verts - center) / scale).astype(np.float32)
-
             t0 = time.perf_counter()
-            parts = None
+            out_parts = None
             for attempt in range(2):
                 try:
-                    parts = ctx.lookahead_decompose(
-                        norm_verts, tris,
-                        max_iters=args.max_iters,
-                        width=args.width,
-                        width2=args.width2,
-                        depth=args.depth,
-                        quick_depth=args.quick_depth,
-                        threshold=args.threshold,
-                        verbose=args.verbose,
-                        debug=args.debug,
-                        decompose_components=not args.no_decompose_components)
+                    out_parts = _decompose_mesh(ctx, verts, tris, args)
                     break
                 except Exception as e:
                     if attempt == 0:
@@ -119,16 +129,10 @@ def _processor_worker(load_queue, save_queue, print_lock, args):
                             print(f'{rel_path}: decompose error on retry — {e}',
                                   file=sys.stderr, flush=True)
 
-            if parts is None:
+            if out_parts is None:
                 continue
 
             elapsed = time.perf_counter() - t0
-
-            if not args.parts:
-                out_parts = [(hv * scale + center, ht) for _, _, hv, ht in parts]
-            else:
-                out_parts = [(pv * scale + center, pt) for pv, pt, _, _ in parts]
-
             save_queue.put((rel_path, out_parts, elapsed))
     finally:
         ctx.close()
@@ -177,12 +181,40 @@ def main():
                         help='Save cut parts instead of convex hulls (default: hulls).')
     parser.add_argument('--no-decompose-components', action='store_true', default=False,
                         help='Skip connected components decomposition (default: enabled).')
+    parser.add_argument('--decompose-components-per-iter', action='store_true', default=False,
+                        help='Run connected components decomposition each iteration (default: off).')
+    parser.add_argument('--serial', action='store_true', default=False,
+                        help='Serial load-process-save instead of pipelined workers (easier debugging).')
     args = parser.parse_args()
 
     meshes = _find_meshes(args.input, args.recursive)
     if not meshes:
         print(f'No mesh files found in: {args.input}', file=sys.stderr)
         sys.exit(1)
+
+    if args.serial:
+        ctx = coacd_gpu.Context(device=args.device)
+        try:
+            for abs_path, rel_path in meshes:
+                try:
+                    verts, tris = _load_mesh(abs_path)
+                except Exception as e:
+                    print(f'{rel_path}: load error — {e}', file=sys.stderr, flush=True)
+                    continue
+
+                t0 = time.perf_counter()
+                try:
+                    out_parts = _decompose_mesh(ctx, verts, tris, args)
+                except Exception as e:
+                    print(f'{rel_path}: decompose error — {e}', file=sys.stderr, flush=True)
+                    continue
+
+                elapsed = time.perf_counter() - t0
+                _save_parts(out_parts, args.output, rel_path)
+                print(f'{rel_path}  {elapsed:.2f}s  {len(out_parts)} parts', flush=True)
+        finally:
+            ctx.close()
+        return
 
     mp_ctx = multiprocessing.get_context('spawn')
     print_lock = mp_ctx.Lock()

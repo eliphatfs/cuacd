@@ -16,12 +16,14 @@
 //   9  Scatter vertices with atomicAdd index (all threads).
 //  10  Re-zero comp_nt                (all threads).
 //  11  Scatter triangles with remapped indices (all threads).
+// 11b  Compute mesh_vol per output component (1 warp each, 4 warps stride).
 //  12  Free input mesh + scratch (thread 0).
 //
 #pragma once
 #include "common.cuh"
 #include "allocator.cuh"
 #include "structs.cuh"
+#include "mesh_volume.cuh"
 
 // Block size for decompose_components_block.
 #define DC_BLOCK 128
@@ -100,8 +102,14 @@ __device__ inline void dc_union(unsigned int* parents, unsigned int x, unsigned 
             unsigned int new_val = dc_pack(dc_getRank(vloser), winner);
             if (atomicCAS(&parents[loser], vloser, new_val) == vloser) {
                 if (rx == ry) {
+                    // Only bump rank if winner is still a root (self-pointing).
+                    // Without the id check, a concurrent merge of winner into
+                    // another node Z could leave parents[winner] = pack(r, Z);
+                    // our CAS would then write pack(r+1, winner), re-rooting
+                    // winner and silently undoing the other merge.
                     unsigned int vw = parents[winner];
-                    atomicCAS(&parents[winner], vw, dc_pack(dc_getRank(vw) + 1, winner));
+                    if (dc_getId(vw) == winner)
+                        atomicCAS(&parents[winner], vw, dc_pack(dc_getRank(vw) + 1, winner));
                 }
                 return;
             }
@@ -363,6 +371,21 @@ __device__ inline int decompose_components_block(
         dst[local_t * 3 + 0] = (int)s_vert_local_idx[i0];
         dst[local_t * 3 + 1] = (int)s_vert_local_idx[i1];
         dst[local_t * 3 + 2] = (int)s_vert_local_idx[i2];
+    }
+    __syncthreads();
+
+    // -------------------------------------------------------------------------
+    // Phase 11b: Compute mesh_vol for each output component (1 warp each).
+    // DC_BLOCK=128 → 4 warps stride over n_comp components.
+    // -------------------------------------------------------------------------
+    {
+        int warp_id = tid / WARP_SIZE;
+        int lane    = tid & (WARP_SIZE - 1);
+        for (int c = warp_id; c < n_comp; c += (DC_BLOCK / WARP_SIZE)) {
+            float mvol = mesh_volume_warp(&output_parts[c].mesh, lane);
+            if (lane == 0)
+                output_parts[c].mesh_vol = mvol;
+        }
     }
     __syncthreads();
 

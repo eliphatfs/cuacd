@@ -116,6 +116,7 @@ int lookahead_decompose(
     int max_iters, int width, int width2, float threshold,
     int depth, int quick_depth, int max_n_cutting,
     int verbose, int debug, int decompose_components,
+    int decompose_components_per_iter,
     struct gpu_result* out)
 {
 #define LCHECK(call) do { \
@@ -226,6 +227,27 @@ int lookahead_decompose(
     // Main loop
     for (int iter = 0; iter < max_iters; iter++) {
         TSTAMP(_t0);
+
+        // Per-iteration decompose components: split multi-component parts
+        // before evaluation (meaningful on iter 0 for multi-component input;
+        // on later iters this is a fast no-op since point B already handled it).
+        if (decompose_components_per_iter) {
+            int cur_np = 0;
+            LCHECK(cuMemcpyDtoHAsync(&cur_np,
+                d_decomp + offsetof(struct LaDecompState_h, nparts),
+                sizeof(int), s));
+            LCHECK(cuStreamSynchronize(s));
+            if (cur_np > 0) {
+                void* dc_args[] = { &d_decomp, &cur_np, &ctx->d_pool_struct, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_decompose_components,
+                    cur_np, 1, 1, 128, 1, 1, 0, s, dc_args, NULL));
+                LA_SYNC_CHECK("dc_pre_eval");
+                void* hull_args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
+                    LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, hull_args, NULL));
+                LA_SYNC_CHECK("hull_decomp_pre_eval");
+            }
+        }
 
         // Sort parts by rv-only cost first
         {
@@ -695,6 +717,26 @@ int lookahead_decompose(
                                    LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
         LA_SYNC_CHECK("hull_decomp");
+
+        // Per-iteration decompose components: split multi-component parts
+        // produced by plane cuts before the next iteration evaluates them.
+        if (decompose_components_per_iter) {
+            int cur_np = 0;
+            LCHECK(cuMemcpyDtoHAsync(&cur_np,
+                d_decomp + offsetof(struct LaDecompState_h, nparts),
+                sizeof(int), s));
+            LCHECK(cuStreamSynchronize(s));
+            if (cur_np > 0) {
+                void* dc_args[] = { &d_decomp, &cur_np, &ctx->d_pool_struct, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_decompose_components,
+                    cur_np, 1, 1, 128, 1, 1, 0, s, dc_args, NULL));
+                LA_SYNC_CHECK("dc_post_cuts");
+                void* hull_args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
+                    LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, hull_args, NULL));
+                LA_SYNC_CHECK("hull_decomp_post_dc");
+            }
+        }
 
         // Cleanup tree: free meshes from level-0 items
         {

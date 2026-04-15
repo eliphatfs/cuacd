@@ -890,8 +890,12 @@ __device__ inline PartPair plane_cut_block(
                         int first = be_a2[start*2], cur = be_a2[start*2+1];
                         be_used[start] = 1;  // aliases loop_starts[start]; loop_starts[n_loops] set below
                         if (lvi >= n_boundary) {
-                            // [DIAG-8] lv buffer overflow
-                            if (lane == 0) DPRINTF("[pc-diag] LVI_OVERFLOW blk=%d lvi=%d n_boundary=%d n_loops=%d\n", blockIdx.x, lvi, n_boundary, n_loops);
+                            // [DIAG-8] lv buffer overflow — can't reconstruct
+                            // all loops, signal cap failure.
+                            if (lane == 0) {
+                                DPRINTF("[pc-diag] LVI_OVERFLOW blk=%d lvi=%d n_boundary=%d n_loops=%d\n", blockIdx.x, lvi, n_boundary, n_loops);
+                                s_n_cap = -1;
+                            }
                             break;
                         }
                         if (lane == 0) lv[lvi] = first;
@@ -921,6 +925,12 @@ __device__ inline PartPair plane_cut_block(
                             int found_i = __shfl_sync(0xFFFFFFFF, my_found_i, winner);
                             cur = be_a2[found_i*2+1];
                             be_used[found_i] = 1;
+                        }
+                        // Detect incomplete loop: chain broke, buffer
+                        // overflowed, or safety counter expired.
+                        if (cur != first) {
+                            if (lane == 0) s_n_cap = -1;
+                            break;  // abandon loop reconstruction
                         }
                         if (lane == 0) {
                             loop_starts[n_loops] = lvi_start;
@@ -1119,9 +1129,13 @@ __device__ inline PartPair plane_cut_block(
                                     if (tv>1e-10f && tv<best_t) { best_t=tv; best_edge=j; }
                                 }
                                 if (best_edge < 0) {
-                                    // [DIAG-5] hole bridge failed
+                                    // [DIAG-5] hole bridge failed — the hole's
+                                    // boundary edges won't be capped, producing
+                                    // a non-watertight mesh.  Signal cap failure
+                                    // so we return the mesh unsplit.
                                     DPRINTF("[pc-diag] BRIDGE_FAIL blk=%d outer=%d hole=%d hs=%d poly_n=%d\n", blockIdx.x, oi, hi, hs, poly_n);
-                                    continue;
+                                    s_n_cap = -1;
+                                    break;
                                 }
                                 int jn=(best_edge+1)%poly_n;
                                 int p_pos = (all_verts[polygon[best_edge]*3+pu] >= all_verts[polygon[jn]*3+pu])

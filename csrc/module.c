@@ -282,7 +282,8 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
         "hull_verts_ptr", "hull_nv", "hull_tris_ptr", "hull_nt",
         "max_iters", "width", "width2", "threshold",
         "depth", "quick_depth", "max_n_cutting",
-        "verbose", "debug", "decompose_components", NULL
+        "verbose", "debug", "decompose_components",
+        "decompose_components_per_iter", NULL
     };
     unsigned long long vp, tp, hvp, htp;
     int nv, nt, hull_nv, hull_nt;
@@ -291,13 +292,15 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
     int depth = 2, quick_depth = 1, max_n_cutting = 16;
     int verbose = 0, debug = 0;
     int decompose_components = 0;
+    int decompose_components_per_iter = 0;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiiifiii|iii", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiiifiii|iiii", kwlist,
             &vp, &nv, &tp, &nt,
             &hvp, &hull_nv, &htp, &hull_nt,
             &max_iters, &width, &width2, &threshold,
             &depth, &quick_depth, &max_n_cutting,
-            &verbose, &debug, &decompose_components))
+            &verbose, &debug, &decompose_components,
+            &decompose_components_per_iter))
         return NULL;
 
     REQUIRE_CTX();
@@ -313,6 +316,7 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
         max_iters, width, width2, threshold,
         depth, quick_depth, max_n_cutting,
         verbose, debug, decompose_components,
+        decompose_components_per_iter,
         &result);
     if (rc != 0) {
         gpu_result_free(&result);

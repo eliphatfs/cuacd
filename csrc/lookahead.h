@@ -34,6 +34,7 @@ int lookahead_decompose(
     int max_iters, int width, int width2, float threshold,
     int depth, int quick_depth, int max_n_cutting,
     int verbose, int debug, int decompose_components,
+    int decompose_components_per_iter,
     struct gpu_result* out);
 
 #ifdef __cplusplus

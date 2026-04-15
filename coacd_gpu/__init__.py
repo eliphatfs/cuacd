@@ -268,7 +268,8 @@ class Context:
     def lookahead_decompose(self, verts, tris, *,
                             max_iters=100, width=60, width2=5, threshold=0.05,
                             depth=2, quick_depth=0, max_n_cutting=16,
-                            verbose=0, debug=0, decompose_components=False):
+                            verbose=0, debug=0, decompose_components=False,
+                            decompose_components_per_iter=False):
         """Decompose a mesh into convex parts using lookahead tree search.
 
         Parameters
@@ -325,7 +326,8 @@ class Context:
             hull_tris.ctypes.data, len(hull_tris),
             max_iters, width, width2, threshold,
             depth, quick_depth, max_n_cutting,
-            verbose, debug, decompose_components=int(decompose_components))
+            verbose, debug, decompose_components=int(decompose_components),
+            decompose_components_per_iter=int(decompose_components_per_iter))
 
         results = []
         for vb, tb, nv, nt, hvb, htb, hnv, hnt, mv, hv in raw:

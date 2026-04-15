@@ -102,6 +102,36 @@ Example: hero.obj cut at y=0.148 produces 4 boundary loops. Loop 0 (47 edges, ou
 
 Fix: after computing parent pointers, walk the parent chain to compute nesting depth. Even depth (0, 2, 4...) = outer loop; odd depth (1, 3, 5...) = hole. Depth-2+ islands get `parent = -1` to be processed as independent outer loops. This matches CDT's flood-fill parity approach (the library CoACD uses), where even-depth triangles are erased and odd-depth are kept.
 
+## plane_cut LVI Overflow and Broken Loop Chains Now Signal Cap Failure
+
+Previously, when the loop vertex buffer (`lv`) overflowed during loop reconstruction (phase 10), the code only printed a diagnostic but continued, producing corrupted cap geometry. Similarly, if a loop chain broke (didn't return to its starting vertex due to safety counter expiration or boundary edge anomalies), the code continued with a partial loop, producing non-watertight caps.
+
+Fix: both conditions now set `s_n_cap = -1` (cap failure), causing `plane_cut_block` to return the mesh unsplit. This ensures the lookahead tree search treats such cuts as failed rather than producing non-watertight parts that corrupt downstream processing.
+
+## plane_cut Hole-Bridge Failure Now Signals Cap Failure
+
+When the hole-bridge step fails to find a visible edge to connect a hole into its parent outer polygon, the hole's boundary edges were previously left uncapped (the code `continue`d to the next hole), producing boundary edges in the output mesh. Fix: bridge failure now sets `s_n_cap = -1` (cap failure), returning the mesh unsplit. This is consistent with the other cap failure modes (cycle detection, buffer overflow, broken loops).
+
+## decompose_components Union-Find: Rank Bump Must Verify Winner Is Still Root
+
+In `dc_union`, after a successful CAS merging loser→winner, the code bumps the winner's rank when `rx == ry`. However, a concurrent thread may have already merged winner into another node Z (changing `parents[winner]` from `pack(r, winner)` to `pack(r, Z)`). The old code unconditionally did `atomicCAS(&parents[winner], vw, pack(r+1, winner))`, which could re-root winner and silently undo the concurrent merge (leaving Z with a dangling child). Fix: check `dc_getId(vw) == winner` (winner is still a self-pointing root) before attempting the rank-bump CAS.
+
+## decompose_components Off-by-One: nparts Overflow Check
+
+`la_decompose_components` checked `s_base_idx + n_comp - 1 > LA_MAX_DECOMP` but the correct check is `>= LA_MAX_DECOMP` (array is indexed 0..LA_MAX_DECOMP-1). The off-by-one allowed writing to `parts[LA_MAX_DECOMP]`, one past the end.
+
+## decompose_components_per_iter: Per-Iteration Connected-Components Splitting
+
+Added `decompose_components_per_iter` parameter to `lookahead_decompose`. When enabled, runs `la_decompose_components` + `la_hull_decomp` at two points each iteration: (1) before evaluation (splits multi-component input or previously-cut parts for more accurate cost assessment), and (2) after applying cuts (splits multi-component results before the next iteration). This is useful for multi-component input meshes where splitting early allows the lookahead tree search to evaluate each component independently. The existing `decompose_components` parameter (end-of-decomposition only) remains the default.
+
+## CLI: Refactored Normalize/Decompose/Denormalize into _decompose_mesh
+
+Extracted the normalize→decompose→denormalize pipeline from `_processor_worker` into `_decompose_mesh()`, reused by the new `--serial` mode. Added `--serial` flag for single-threaded load-process-save (easier debugging). Added `--decompose-components-per-iter` CLI flag.
+
+## decompose_components_block Now Computes mesh_vol per Component
+
+Added phase 11b to `decompose_components_block`: after scattering vertices and triangles into per-component output meshes, each component's `mesh_vol` is computed via `mesh_volume_warp` (4 warps stride over components in DC_BLOCK=128 threads). This replaces the inherited parent volume, giving accurate per-component volumes for downstream cost evaluation.
+
 ## L-shape Test Fixture Must Be Watertight
 
 The `_make_lshape()` fixture in `test_lookahead.py` was changed from the original `_merge_meshes([box_a, box_b])` approach to a hand-coded vertex/index list that was NOT watertight (euler_number=-1, is_watertight=False). Non-watertight input causes `mesh_volume_warp` to return incorrect volumes, making rv cost unreliable and preventing convergence. Fix: restored the original `_box()` + `_merge_meshes()` approach which produces a watertight L-shape (two overlapping boxes with outward-facing triangles). The merged mesh is watertight with volume=4 (unnormalized).
