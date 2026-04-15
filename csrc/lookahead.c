@@ -358,6 +358,7 @@ int lookahead_decompose(
 
         // Minimum distance from bbox edge for cuts (prevents degenerate slivers)
         float min_edge_dist = threshold * 0.25f;
+        if (min_edge_dist > 0.015f) min_edge_dist = 0.015f;
 
         // Reset n_extra for this iteration
         LCHECK(cuMemsetD32Async(d_n_extra, 0, 1, s));
