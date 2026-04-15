@@ -208,6 +208,10 @@ __device__ inline int decompose_components_block(
         int i0 = s_in_tris[t * 3 + 0];
         int i1 = s_in_tris[t * 3 + 1];
         int i2 = s_in_tris[t * 3 + 2];
+        // [BUG] Debug: catch negative or OOB triangle vertex indices
+        if (i0 < 0 || i0 >= nv || i1 < 0 || i1 >= nv || i2 < 0 || i2 >= nv)
+            DPRINTF("[BUG] phase4 OOB tri idx: t=%d i0=%d i1=%d i2=%d nv=%d blk=%d tid=%d\n",
+                    t, i0, i1, i2, nv, blockIdx.x, tid);
         dc_union(s_parents, (unsigned int)i0, (unsigned int)i1);
         dc_union(s_parents, (unsigned int)i0, (unsigned int)i2);
     }
@@ -276,11 +280,27 @@ __device__ inline int decompose_components_block(
     // -------------------------------------------------------------------------
     // Phase 7: Count verts and tris per component.
     // -------------------------------------------------------------------------
-    for (int v = tid; v < nv; v += DC_BLOCK)
-        atomicAdd(&s_comp_nv[s_vert_comp[v]], 1u);
+    for (int v = tid; v < nv; v += DC_BLOCK) {
+        unsigned int cv = s_vert_comp[v];
+        // [BUG] Debug: catch OOB component index
+        if (cv >= (unsigned int)n_comp)
+            DPRINTF("[BUG] phase7 vert comp OOB: v=%d comp=%u n_comp=%d blk=%d tid=%d\n",
+                    v, cv, n_comp, blockIdx.x, tid);
+        atomicAdd(&s_comp_nv[cv], 1u);
+    }
 
-    for (int t = tid; t < nt; t += DC_BLOCK)
-        atomicAdd(&s_comp_nt[s_vert_comp[(unsigned int)s_in_tris[t * 3]]], 1u);
+    for (int t = tid; t < nt; t += DC_BLOCK) {
+        int i0 = s_in_tris[t * 3];
+        unsigned int cv = s_vert_comp[(unsigned int)i0];
+        // [BUG] Debug: catch OOB component index or negative tri idx
+        if (i0 < 0 || i0 >= nv)
+            DPRINTF("[BUG] phase7 tri idx OOB: t=%d i0=%d nv=%d blk=%d tid=%d\n",
+                    t, i0, nv, blockIdx.x, tid);
+        if (cv >= (unsigned int)n_comp)
+            DPRINTF("[BUG] phase7 tri comp OOB: t=%d i0=%d comp=%u n_comp=%d blk=%d tid=%d\n",
+                    t, i0, cv, n_comp, blockIdx.x, tid);
+        atomicAdd(&s_comp_nt[cv], 1u);
+    }
 
     __syncthreads();
 
@@ -350,6 +370,10 @@ __device__ inline int decompose_components_block(
         if (c >= n_comp) continue;  // guard against truncated alloc
         int local_idx = (int)atomicAdd(&s_comp_nv[c], 1u);
         s_vert_local_idx[v] = (unsigned int)local_idx;
+        // [BUG] Debug: catch OOB vertex scatter
+        if (local_idx >= output_parts[c].mesh.nv)
+            DPRINTF("[BUG] phase9 vert scatter OOB: v=%d c=%d local_idx=%d mesh_nv=%d blk=%d tid=%d\n",
+                    v, c, local_idx, output_parts[c].mesh.nv, blockIdx.x, tid);
         float* dst = output_parts[c].mesh.verts;
         dst[local_idx * 3 + 0] = s_in_verts[v * 3 + 0];
         dst[local_idx * 3 + 1] = s_in_verts[v * 3 + 1];
@@ -371,10 +395,24 @@ __device__ inline int decompose_components_block(
         int i0 = s_in_tris[t * 3 + 0];
         int i1 = s_in_tris[t * 3 + 1];
         int i2 = s_in_tris[t * 3 + 2];
+        // [BUG] Debug: catch negative or OOB tri indices before vert_comp lookup
+        if (i0 < 0 || i0 >= nv || i1 < 0 || i1 >= nv || i2 < 0 || i2 >= nv)
+            DPRINTF("[BUG] phase11 OOB tri idx: t=%d i0=%d i1=%d i2=%d nv=%d blk=%d tid=%d\n",
+                    t, i0, i1, i2, nv, blockIdx.x, tid);
         int c  = (int)s_vert_comp[i0];
         if (c >= n_comp) continue;
+        // [BUG] Debug: catch cross-component triangle (verts in different components)
+        int c1 = (int)s_vert_comp[i1];
+        int c2 = (int)s_vert_comp[i2];
+        if (c1 != c || c2 != c)
+            DPRINTF("[BUG] phase11 cross-comp tri: t=%d i0=%d(i0_c=%d) i1=%d(i1_c=%d) i2=%d(i2_c=%d) blk=%d tid=%d\n",
+                    t, i0, c, i1, c1, i2, c2, blockIdx.x, tid);
         int local_t = (int)atomicAdd(&s_comp_nt[c], 1u);
         int* dst = output_parts[c].mesh.tris;
+        // [BUG] Debug: catch OOB triangle scatter index
+        if (local_t >= output_parts[c].mesh.nt)
+            DPRINTF("[BUG] phase11 tri scatter OOB: t=%d c=%d local_t=%d mesh_nt=%d blk=%d tid=%d\n",
+                    t, c, local_t, output_parts[c].mesh.nt, blockIdx.x, tid);
         dst[local_t * 3 + 0] = (int)s_vert_local_idx[i0];
         dst[local_t * 3 + 1] = (int)s_vert_local_idx[i1];
         dst[local_t * 3 + 2] = (int)s_vert_local_idx[i2];

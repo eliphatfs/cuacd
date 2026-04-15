@@ -143,3 +143,9 @@ Meshes with thick shells (e.g., the Stanford bunny, which has an outer surface a
 Root cause: the bunny is a thick shell — outer surface + inner cavity surface. Together they form one valid volume. After splitting, the inner surface has flipped winding (normals point into the cavity, correct from the solid's perspective but inverted as a standalone mesh). `plane_cut` operating on this flipped-winding input produces broken edge consistency.
 
 Fix: in `decompose_components_block` Phase 11b, compute signed volume via `mesh_signed_volume_warp` instead of `mesh_volume_warp`. Components with negative signed volume are inner shells — they are compacted out of the output array and their mesh memory is freed. At least one component is always kept (if all have negative signed volume, filtering is skipped). Plane cut cannot produce inner shells from outer shells, so this filtering is only needed in decompose_components.
+
+## decompose_components: n_comp==1 After Inner-Shell Compaction Leaves Dangling Pointers
+
+When `decompose_components_block` splits a part into multiple components but inner-shell compaction reduces the output back to a single component, the function still frees the input mesh/hull in Phase 12 and returns `n_comp=1` with the surviving component in `output_parts[0]`. However, the caller `la_decompose_components` treated `n_comp <= 1` as "no change needed" and skipped writing `s_parts[0]` back to `decomp->parts[i]`. This left `decomp->parts[i]` pointing to the now-freed input mesh/hull memory — a use-after-free that corrupts the heap when subsequent kernels (hull_decomp, Hausdorff, etc.) read/write through those dangling pointers.
+
+Fix: always write `s_parts[0]` back to `decomp->parts[i]` when `n_comp >= 1`, since `decompose_components_block` always frees the input regardless of whether compaction reduced the count.

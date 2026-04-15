@@ -339,15 +339,21 @@ extern "C" __global__ void la_decompose_components(
 
     __syncthreads();
 
-    if (n_comp <= 1) {
-        // 1 component or error — block function already wrote to s_parts[0]
-        // and left the original mesh/hull intact.
+    if (n_comp <= 0) {
+        // Error — nothing to do.
         return;
     }
 
-    // Write first component back into the original slot.
+    // [BUG] Fix: decompose_components_block always frees the input mesh/hull
+    // (Phase 12), even when inner-shell compaction reduces n_comp back to 1.
+    // The surviving component is in s_parts[0] with its own heap-allocated
+    // mesh. We must always write s_parts[0] back to decomp->parts[i].
     if (threadIdx.x == 0)
         decomp->parts[i] = s_parts[0];
+
+    if (n_comp == 1) {
+        return;
+    }
 
     // Claim new slots for remaining components.
     __shared__ int s_base_idx;
