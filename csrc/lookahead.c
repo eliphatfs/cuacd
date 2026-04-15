@@ -3,6 +3,7 @@
 
 #include "heap.h"
 #include "structs.h"
+#include "error_codes.h"
 #include <cuda.h>
 #include <stdlib.h>
 #include <string.h>
@@ -217,7 +218,8 @@ int lookahead_decompose(
             result_code = (int)_sr; goto cleanup; \
         } \
         int _e = 0; cuMemcpyDtoH(&_e, d_err, sizeof(int)); \
-        if (_e) { fprintf(stderr, "[la] ERR 0x%x after %s\n", _e, label); result_code = _e; goto cleanup; } \
+        if (_e) { char _eb[512]; kerr_decode(_e, _eb, sizeof(_eb)); \
+            fprintf(stderr, "[la] %s after %s\n", _eb, label); result_code = _e; goto cleanup; } \
         if (verbose) fprintf(stderr, "[la] %s OK\n", label); \
     } } while(0)
 
@@ -333,8 +335,10 @@ int lookahead_decompose(
         LCHECK(cuMemcpyDtoHAsync(h_err_p, d_err, sizeof(int), s));
         LCHECK(cuStreamSynchronize(s));
         if (*h_err_p) {
+            char errbuf[512];
+            kerr_decode(*h_err_p, errbuf, sizeof(errbuf));
             snprintf(ctx->last_error, sizeof(ctx->last_error),
-                     "lookahead_decompose: GPU error 0x%x at iter %d (sort/hausdorff/count)", *h_err_p, iter);
+                     "lookahead_decompose: %s at iter %d (sort/hausdorff/count)", errbuf, iter);
             result_code = *h_err_p;
             goto cleanup;
         }
@@ -722,8 +726,10 @@ int lookahead_decompose(
         LCHECK(cuMemcpyDtoHAsync(h_err_p, d_err, sizeof(int), s));
         LCHECK(cuStreamSynchronize(s));
         if (*h_err_p) {
+            char errbuf[512];
+            kerr_decode(*h_err_p, errbuf, sizeof(errbuf));
             snprintf(ctx->last_error, sizeof(ctx->last_error),
-                     "lookahead_decompose: GPU error 0x%x at iter %d", *h_err_p, iter);
+                     "lookahead_decompose: %s at iter %d", errbuf, iter);
             result_code = *h_err_p;
             goto cleanup;
         }

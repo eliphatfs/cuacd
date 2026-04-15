@@ -27,7 +27,8 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   hausdorff.cuh       #   hausdorff_block: block-level (256 threads) bidirectional Hausdorff distance via sampling + linear BVH
   postprocess.cuh     #   decompose_components_block: block-level (128 threads) connected-components via union-find
   structs.cuh         #   Device-side: Mesh, Part, PartPair, LaWorkItem, LaDecompState, LaEvalResult
-  la_common.cuh       #   Shared lookahead constants (LA_REFCOUNT_HEAP, error codes) + la_part_cost/la_part_cost_rv inline functions
+  error_codes.cuh     #   Centralized GPU kernel error flags (KERR_*); 22 unique bit flags combined via atomicOr
+  la_common.cuh       #   Shared lookahead constants (LA_REFCOUNT_HEAP) + la_part_cost/la_part_cost_rv inline functions
   mm.cu               #   heap_init_kernel
   kdop_const.cu       #   __constant__ KDOP_AXES[40][3] definition (broadcast-cached icosphere axes)
   la_expand.cu        #   la_expand, la_hull, la_seed_tree, la_cleanup_tree (plane_cut + kdop_hull)
@@ -48,6 +49,7 @@ csrc/                 # C host code
   test.c              #   Host launcher implementations
   postprocess.h       #   Declarations for post-processing host launchers (decompose_components)
   postprocess.c       #   Host launcher implementations for post-processing
+  error_codes.h       #   Host-side error decoding: kerr_decode() maps KERR_* bit flags to human-readable strings
   lookahead.h         #   Declaration for lookahead_decompose
   lookahead.c         #   Host implementation: lookahead_decompose (full lookahead tree search with Hausdorff)
   module.c            #   CPython extension wrapping heap.h/test.h/postprocess.h/lookahead.h (Py_LIMITED_API cp310)

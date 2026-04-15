@@ -35,6 +35,7 @@
 // Must stay in sync with csrc/structs.h.
 #pragma once
 #include "common.cuh"
+#include "error_codes.cuh"
 
 // ============================================================================
 // Configuration
@@ -51,9 +52,8 @@
 // Slab overhead: leading sentinel (32B) + block hdr+ftr (32B) + trailing sentinel (32B)
 #define HEAP_SLAB_OVERHEAD  96
 
-// Error codes
+// Success code (error codes in error_codes.cuh: KERR_HEAP_*)
 #define HEAP_OK      0
-#define HEAP_ERR_OOM 1
 
 // ============================================================================
 // Structures (must match csrc/structs.h)
@@ -204,7 +204,7 @@ __device__ inline void subbin_push_head(HeapArena* arena, int s,
 //
 // Allocate req_size bytes from heap h. Uses h->pool for new slabs.
 // Arena = blockIdx.x % HEAP_NUM_ARENAS.
-// On success: sets *out and returns HEAP_OK.  On failure: HEAP_ERR_OOM.
+// On success: sets *out and returns HEAP_OK.  On failure: KERR_HEAP_OOM.
 
 __device__ inline int heap_alloc(DeviceHeap* h, unsigned int req_size, void** out) {
     unsigned int aligned = (req_size + HEAP_ALIGN - 1) & ~(unsigned int)(HEAP_ALIGN - 1);
@@ -241,7 +241,7 @@ __device__ inline int heap_alloc(DeviceHeap* h, unsigned int req_size, void** ou
         unsigned long long off = atomicAdd(pool->offset, (unsigned long long)slab_total);
         if (off + slab_total > pool->capacity) {
             arena_unlock(arena);
-            return HEAP_ERR_OOM;
+            return KERR_HEAP_OOM;
         }
 
         unsigned long long base = (unsigned long long)pool->base + off;
@@ -307,7 +307,7 @@ __device__ inline int heap_free(DeviceHeap* h, void* ptr) {
     int        aidx  = (int)((HeapBlockHdr*)blk)->arena_idx;
 
     if (aidx < 0 || aidx >= HEAP_NUM_ARENAS) {
-        return 2;  // HEAP_ERR_CORRUPT — caller should report
+        return KERR_HEAP_CORRUPT;
     }
 
     HeapArena* arena = &h->arenas[aidx];
@@ -323,7 +323,7 @@ __device__ inline int heap_free(DeviceHeap* h, void* ptr) {
             int prev_aidx = (int)((HeapBlockHdr*)prev_blk)->arena_idx;
             if (prev_aidx < 0 || prev_aidx >= HEAP_NUM_ARENAS) {
                 arena_unlock(arena);
-                return 3;  // HEAP_ERR_CORRUPT_PREV
+                return KERR_HEAP_CORRUPT_PREV;
             }
             subbin_remove(arena, heap_subbin_for_size(prev_ds), prev_blk);
             ds  = prev_ds + HEAP_FTR_SIZE + HEAP_HDR_SIZE + ds;

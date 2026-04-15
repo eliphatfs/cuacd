@@ -4,17 +4,14 @@
 #pragma once
 
 #include "structs.cuh"
+#include "error_codes.cuh"
 
 // Sentinel refcount value: marks hull as heap-allocated by kdop_hull_block
 // (should be freed with heap_free, not refcount-decremented).
 // Valid refcounts are always aligned pointers; (int*)1 is never a valid address.
 #define LA_REFCOUNT_HEAP ((int*)1)
 
-// Error codes (distinct from beam search and plane_cut codes).
-#define LA_ERR_OVERFLOW     0x100000  // LaWorkItem exceeded LA_MAX_PARTS
-#define LA_ERR_SORT_OOM     0x200000  // scratch heap allocation failed in sort
-#define LA_ERR_SORT_STACK   0x400000  // warp_sort_t stack overflow
-#define LA_ERR_EVAL_OOM     0x800000  // scratch heap allocation failed in evaluate
+// Error codes: see error_codes.cuh (KERR_LA_*)
 
 // Lookahead uses full cost including Hausdorff — the lookahead tree structure
 // handles non-monotonicity well (unlike beam search which fails to converge).

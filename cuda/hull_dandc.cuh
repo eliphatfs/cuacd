@@ -208,7 +208,6 @@ __device__ inline BtRational64 shfl_br64(BtRational64 r, unsigned mask) {
 // Pool allocator backed by DeviceHeap (lane 0 only)
 // ============================================================================
 
-#define BT_ERR_POOL_EXHAUST 8
 #define BTPOOL_BLOCK_SIZE   1024   // edges per slab
 #define BTPOOL_MAX_BLOCKS   64     // max heap slabs tracked for cleanup
 
@@ -251,7 +250,7 @@ __device__ inline BtEdge* btpool_new_edge(BtPool* p) { return (BtEdge*)btpool_ne
 // Simple alloc from WarpPool (lane 0 only)
 __device__ inline void* bt_alloc(WarpPool* wp, int bytes) {
     int aligned = (bytes + 15) & ~15;
-    if (wp->offset + aligned > wp->capacity) { wp->error = 1; return NULL; }
+    if (wp->offset + aligned > wp->capacity) { wp->error = KERR_BT_WARP_OOM; return NULL; }
     void* ptr = wp->base + wp->offset;
     wp->offset += aligned;
     return ptr;
@@ -269,12 +268,6 @@ __device__ inline void bt_rewind(WarpPool* wp, int saved_offset) {
 
 #define BT_DC_MAX_STACK  4096
 #define BT_DC_MAX_STACK_LOCAL 64
-
-// Error codes (binary flags, combined via OR)
-#define BT_ERR_WARP_POOL_OOM  1   // bt_alloc failed (WarpPool capacity exceeded)
-#define BT_ERR_SORT_STACK     2
-#define BT_ERR_HEAP_TO_WARP  16   // heap_alloc for WarpPool backing failed
-#define BT_ERR_HEAP_OUTPUT   32   // heap_alloc for output mesh chunk failed
 
 // ============================================================================
 // Scratch size calculation
@@ -1015,7 +1008,6 @@ __device__ inline void bt_computeBase(BtDCState* __restrict__ dc, int start, int
 // computeInternal — iterative D&C with explicit local stack (single-thread)
 // ============================================================================
 
-#define BT_ERR_DC_STACK     4
 
 // bt_computeInternal — two-thread cooperative iterative D&C hull.
 //
@@ -1062,7 +1054,7 @@ __device__ inline void bt_computeInternal(BtDCState* __restrict__ dc, int start,
                 BtDCStackItem* merge_ptr = &stack[sp - 1];
 
                 // Push right child (result → merge parent's right_hull)
-                if (sp >= BT_DC_MAX_STACK_LOCAL) { dc->edgePool.error = BT_ERR_DC_STACK; return; }
+                if (sp >= BT_DC_MAX_STACK_LOCAL) { dc->edgePool.error = KERR_BT_DC_STACK; return; }
                 stack[sp].start = split1;
                 stack[sp].end = item->end;
                 stack[sp].stage = 0;
@@ -1072,7 +1064,7 @@ __device__ inline void bt_computeInternal(BtDCState* __restrict__ dc, int start,
                 sp++;
 
                 // Push left child (result → merge parent's result directly)
-                if (sp >= BT_DC_MAX_STACK_LOCAL) { dc->edgePool.error = BT_ERR_DC_STACK; return; }
+                if (sp >= BT_DC_MAX_STACK_LOCAL) { dc->edgePool.error = KERR_BT_DC_STACK; return; }
                 stack[sp].start = item->start;
                 stack[sp].end = split0;
                 stack[sp].stage = 0;
@@ -1289,10 +1281,10 @@ struct BtLanePoolCleanup {
 __device__ inline int btpool_add_block(BtPool* p) {
     BtLanePoolCleanup* c = p->cleanup;
     int idx = atomicAdd(&c->nblocks, 1);
-    if (idx >= BT_HULL_GROUPS * BTPOOL_MAX_BLOCKS || !c->blocks) { p->error = BT_ERR_POOL_EXHAUST; return -1; }
+    if (idx >= BT_HULL_GROUPS * BTPOOL_MAX_BLOCKS || !c->blocks) { p->error = KERR_BT_POOL_EXHAUST; return -1; }
     void* block = NULL;
     if (heap_alloc(p->scratch_heap, (unsigned int)(BTPOOL_BLOCK_SIZE * p->objSize), &block) != HEAP_OK) {
-        p->error = BT_ERR_POOL_EXHAUST; return -1;
+        p->error = KERR_BT_POOL_EXHAUST; return -1;
     }
     c->blocks[idx] = block;
     // slot[0] -> existing freeList; slot[i] -> slot[i-1] for i > 0
@@ -1403,7 +1395,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         if (lane == 0) {
             void* blk = NULL;
             if (heap_alloc(shared_sh, (unsigned int)slab_stride * BT_HULL_GROUPS, &blk) != HEAP_OK) {
-                shared_wp->error = BT_ERR_POOL_EXHAUST;
+                shared_wp->error = KERR_BT_POOL_EXHAUST;
             } else {
                 s_edge_slab_base = blk;
             }
@@ -1566,7 +1558,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
             s_pool.capacity = sz;
             s_pool.error    = 0;
         } else {
-            local_err = BT_ERR_HEAP_TO_WARP;
+            local_err = KERR_BT_HEAP_TO_WARP;
         }
     }
     __syncwarp();
@@ -1594,7 +1586,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
     __syncwarp();
 
     BtPoint32* points = bt_compute_presort(state, pts, n, lane);
-    if (!points) { local_err = 1; goto done; }
+    if (!points) { local_err = KERR_BT_WARP_OOM; goto done; }
     if (lane == 0) s_points_scratch = points;
 
     {
@@ -1607,11 +1599,11 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
         }
         { long long sp = __shfl_sync(WARP_MASK, (long long)sort_scratch, 0);
           sort_scratch = (char*)sp; }
-        if (!sort_scratch) { local_err = 1; goto done; }
+        if (!sort_scratch) { local_err = KERR_BT_WARP_OOM; goto done; }
 
         int sort_err = warp_sort_bp32(points, sort_scratch, n, lane);
         __syncwarp();
-        if (sort_err) { local_err = BT_ERR_SORT_STACK; goto done; }
+        if (sort_err) { local_err = KERR_BT_SORT_STACK; goto done; }
 
         if (lane == 0) bt_rewind(&s_pool, pre_sort_offset);
         __syncwarp();
@@ -1636,7 +1628,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
             int pre_count = s_pool.offset;
             int nv = 0, nt = 0;
             if (bt_extractMesh(state, NULL, NULL, &nv, &nt) < 0)
-                { local_err = 6; goto done; }
+                { local_err = KERR_BT_EXTRACT_FAIL; goto done; }
             bt_rewind(&s_pool, pre_count);
 
             // Allocate output Mesh chunk from heap: [verts (16-byte aligned) | tris (16-byte aligned) | refcount]
@@ -1648,7 +1640,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
                 size_t rb = 16;
                 void* chunk = NULL;
                 if (heap_alloc(heap, (unsigned int)(va + ta + rb), &chunk) != HEAP_OK)
-                    { local_err = BT_ERR_HEAP_OUTPUT; goto done; }
+                    { local_err = KERR_BT_HEAP_OUTPUT; goto done; }
                 float* ov = (float*)chunk;
                 int*   ot = (int*)((char*)chunk + va);
                 int*   rc = (int*)((char*)chunk + va + ta);
@@ -1658,7 +1650,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
                 int pre_ext = s_pool.offset;
                 int nv2 = 0, nt2 = 0;
                 if (bt_extractMesh(state, ov, ot, &nv2, &nt2) < 0)
-                    { local_err = 6; goto done; }
+                    { local_err = KERR_BT_EXTRACT_FAIL; goto done; }
                 bt_rewind(&s_pool, pre_ext);
 
                 s_result->verts = ov; s_result->tris = ot;

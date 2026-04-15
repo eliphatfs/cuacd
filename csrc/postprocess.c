@@ -3,6 +3,7 @@
 
 #include "postprocess.h"
 #include "structs.h"
+#include "error_codes.h"
 #include <cuda.h>
 #include <stdio.h>
 
@@ -90,8 +91,10 @@ int gpu_test_postprocess_dc(
     CHECK_CU(cuStreamSynchronize(s));
 
     if (kerr_h) {
+        char errbuf[512];
+        kerr_decode(kerr_h, errbuf, sizeof(errbuf));
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "postprocess_dc kernel error: 0x%x", kerr_h);
+                 "postprocess_dc %s", errbuf);
         goto cleanup_err;
     }
 

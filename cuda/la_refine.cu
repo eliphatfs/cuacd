@@ -75,7 +75,7 @@ extern "C" __global__ void la_expand_quick(
         s_mesh_bad = (mesh->nv <= 0 || mesh->nt <= 0 ||
                       mesh->nv > 1000000 || mesh->nt > 1000000 ||
                       mesh->verts == NULL || mesh->tris == NULL) ? 1 : 0;
-        if (s_mesh_bad) atomicOr(err, 0x100000);
+        if (s_mesh_bad) atomicOr(err, KERR_MESH_INVALID);
     }
     __syncthreads();
     if (s_mesh_bad) return;
@@ -251,7 +251,7 @@ extern "C" __global__ void la_expand_quick(
                 if (r0 || r1) {
                     printf("expand_quick[%d]: free axis=%d pos_err=%d neg_err=%d ptrs=%p %p\n",
                            item_idx, a, r0, r1, s_vptrs[a][0], s_vptrs[a][1]);
-                    atomicOr(err, r0 ? r0 : r1);
+                    atomicOr(err, r0 | r1);
                 }
             }
         }
@@ -263,7 +263,7 @@ extern "C" __global__ void la_expand_quick(
     // Guard against exceeding part capacity
     if (np + 1 > LA_MAX_PARTS) {
         if (tid == 0) {
-            atomicOr(err, LA_ERR_OVERFLOW);
+            atomicOr(err, KERR_LA_OVERFLOW);
             heap_free(&pool->heap, s_vptrs[s_best_axis][0]);
             heap_free(&pool->heap, s_vptrs[s_best_axis][1]);
         }

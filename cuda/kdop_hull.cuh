@@ -86,7 +86,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
             if (lane == 0) s_volume = vol;
             __syncwarp();
         } else if (s_local_err) {
-            if (lane == 0) atomicOr(kernel_error, 0x100000);
+            if (lane == 0) atomicOr(kernel_error, s_local_err);
         }
         if (lane == 0) DPRINTF("[kdop] block=%d FAST nv=%d result_nv=%d result_nt=%d dt=%lld\n",
             blockIdx.x, nv, s_result.nv, s_result.nt, clock64() - t_start);
@@ -100,7 +100,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     if (lane == 0) {
         void* ptr = NULL;
         if (heap_alloc(scratch_heap, KDOP_MAX_EXTREMES * 3 * sizeof(float), &ptr) != HEAP_OK) {
-            s_local_err = 1;
+            s_local_err = KERR_KDOP_SCRATCH_OOM;
             DPRINTF("[kdop blk=%d] step1: extreme_pts alloc failed\n", blockIdx.x);
         } else {
             s_extreme_pts = (float*)ptr;
@@ -109,7 +109,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     }
     __syncwarp();
     if (s_local_err) {
-        if (lane == 0) atomicOr(kernel_error, 0x100000);
+        if (lane == 0) atomicOr(kernel_error, s_local_err);
         *out_volume = 0.0f;
         return s_result;
     }
@@ -157,7 +157,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         hull_dandc_warp_mesh(
             s_extreme_pts, s_n_extreme, lane,
             scratch_heap, scratch_heap, &err, &s_ext_hull);
-        if (lane == 0 && err) s_local_err = 2;
+        if (lane == 0 && err) s_local_err = err;
     }
     __syncwarp();
     if (s_local_err) goto cleanup;
@@ -169,7 +169,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         void* ptr = NULL;
         int max_pts = nv + s_ext_hull.nv;
         if (heap_alloc(scratch_heap, max_pts * 3 * sizeof(float), &ptr) != HEAP_OK) {
-            s_local_err = 4;
+            s_local_err = KERR_KDOP_SCRATCH_OOM;
         } else {
             s_filtered = (float*)ptr;
             s_n_filtered = 0;
@@ -209,7 +209,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         if (lane == 0) {
             void* ptr = NULL;
             if (heap_alloc(scratch_heap, nt_ext * 4 * sizeof(float), &ptr) != HEAP_OK) {
-                s_local_err = 3;
+                s_local_err = KERR_KDOP_SCRATCH_OOM;
             } else {
                 s_planes = (float*)ptr;
             }
@@ -299,7 +299,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
             hull_dandc_warp_mesh(
                 s_filtered, n_filt, lane,
                 heap, scratch_heap, &err, &s_result);
-            if (lane == 0 && err) s_local_err = 5;
+            if (lane == 0 && err) s_local_err = err;
         }
     }
     __syncwarp();
@@ -321,7 +321,7 @@ cleanup:
         if (s_ext_hull.verts) heap_free(scratch_heap, s_ext_hull.verts);
         if (s_extreme_pts) heap_free(scratch_heap, s_extreme_pts);
         if (s_local_err) {
-            atomicOr(kernel_error, 0x100000 + s_local_err);
+            atomicOr(kernel_error, s_local_err);
             // Free result mesh on error (it was allocated on heap)
             if (s_result.verts) heap_free(heap, s_result.verts);
             s_result.verts = NULL; s_result.tris = NULL;

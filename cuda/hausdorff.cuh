@@ -28,9 +28,7 @@
 #define HD_MIN_SAMPLES 1000
 #define HD_BVH_STACK    32
 
-// Error codes (bits in kernel_error).
-#define HD_KERR_SCRATCH_OOM  0x200000
-#define HD_KERR_SORT_ERR     0x400000
+// Error codes: see error_codes.cuh (KERR_HD_*)
 
 // ============================================================================
 // Helper: Wang hash for deterministic pseudo-random sampling
@@ -400,7 +398,7 @@ __device__ __forceinline__ float hausdorff_block(
     }
     __syncthreads();
     if (!s_alloc_ok) {
-        if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, HD_KERR_SCRATCH_OOM); }
+        if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, KERR_HD_SCRATCH_OOM); }
         return 0.0f;
     }
 
@@ -488,7 +486,7 @@ __device__ __forceinline__ float hausdorff_block(
     }
     __syncthreads();
     if (!s_alloc_ok) {
-        if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, HD_KERR_SCRATCH_OOM); }
+        if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, KERR_HD_SCRATCH_OOM); }
         return 0.0f;
     }
 
@@ -678,7 +676,7 @@ __device__ __forceinline__ float hausdorff_block(
     }
     __syncthreads();
     if (!s_alloc_ok) {
-        if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, HD_KERR_SCRATCH_OOM); }
+        if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, KERR_HD_SCRATCH_OOM); }
         return 0.0f;
     }
 
@@ -741,7 +739,7 @@ __device__ __forceinline__ float hausdorff_block(
         }
         __syncthreads();
         if (!s_alloc_ok) {
-            if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, HD_KERR_SCRATCH_OOM); }
+            if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, KERR_HD_SCRATCH_OOM); }
             return 0.0f;
         }
 
@@ -809,7 +807,7 @@ __device__ __forceinline__ float hausdorff_block(
                     int* my_stack_hi = my_stack_lo + WS_MAX_STACK;
                     int serr = warp_sort_inner<MortonPoint, MortonPointCmp>(
                         data, tmp, my_stack_lo, my_stack_hi, seg_lo, seg_hi, lane);
-                    if (serr && lane == 0) atomicOr(kernel_error, HD_KERR_SORT_ERR);
+                    if (serr && lane == 0) atomicOr(kernel_error, KERR_HD_SORT_ERR);
                 }
             }
         } else {
@@ -882,7 +880,7 @@ __device__ __forceinline__ float hausdorff_block(
                     int* my_stack_hi = my_stack_lo + WS_MAX_STACK;
                     int serr = warp_sort_inner<MortonPoint, MortonPointCmp>(
                         data, tmp, my_stack_lo, my_stack_hi, seg_lo, seg_hi, lane);
-                    if (serr && lane == 0) atomicOr(kernel_error, HD_KERR_SORT_ERR);
+                    if (serr && lane == 0) atomicOr(kernel_error, KERR_HD_SORT_ERR);
                 }
             }
         }
@@ -924,7 +922,7 @@ __device__ __forceinline__ float hausdorff_block(
         }
         __syncthreads();
         if (!s_alloc_ok) {
-            if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, HD_KERR_SCRATCH_OOM); }
+            if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, KERR_HD_SCRATCH_OOM); }
             return 0.0f;
         }
 
@@ -1052,7 +1050,7 @@ __device__ __forceinline__ float hausdorff_block(
         }
         __syncthreads();
         if (!s_alloc_ok) {
-            if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, HD_KERR_SCRATCH_OOM); }
+            if (tid == 0) { HD_FREE_ALL_SCRATCH(); atomicOr(kernel_error, KERR_HD_SCRATCH_OOM); }
             return 0.0f;
         }
 

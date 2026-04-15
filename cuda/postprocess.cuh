@@ -34,8 +34,7 @@
 // Alignment helper (matches PC_ALIGN16 convention).
 #define DC_ALIGN16(x) (((x) + 15) & ~15)
 
-// OOM error flag for the caller's err word.
-#define DC_ERR_OOM 0x2000000
+// Error codes: see error_codes.cuh (KERR_DC_*)
 
 // LA_REFCOUNT_HEAP sentinel — hull allocated by kdop_hull_block, freed directly.
 #ifndef LA_REFCOUNT_HEAP
@@ -170,7 +169,7 @@ __device__ inline int decompose_components_block(
         void* raw = NULL;
         int rc = heap_alloc(scratch, total, &raw);
         if (rc != HEAP_OK || !raw) {
-            atomicOr(err, DC_ERR_OOM);
+            atomicOr(err, KERR_DC_OOM);
             s_scratch_base = NULL;
         } else {
             unsigned int* base = (unsigned int*)raw;
@@ -234,7 +233,7 @@ __device__ inline int decompose_components_block(
         if (n_comp <= 1) {
             output_parts[0] = *input_part;
         } else if (n_comp > max_out) {
-            atomicOr(err, DC_ERR_OOM);
+            atomicOr(err, KERR_DC_OOM);
             s_n_components = -1;  // signal error
         }
     }
@@ -288,7 +287,7 @@ __device__ inline int decompose_components_block(
             void* chunk = NULL;
             int rc = heap_alloc(heap, sz, &chunk);
             if (rc != HEAP_OK || !chunk) {
-                atomicOr(err, DC_ERR_OOM);
+                atomicOr(err, KERR_DC_OOM);
                 // Leave remaining parts zeroed; caller checks err.
                 for (int cc = c; cc < n_comp; cc++)
                     dc_zero_part(&output_parts[cc]);

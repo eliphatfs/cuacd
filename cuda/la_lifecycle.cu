@@ -192,7 +192,7 @@ extern "C" __global__ void la_apply_cuts(
     __syncthreads();
 
     if (s_new_idx >= LA_MAX_DECOMP) {
-        if (tid == 0) atomicOr(err, LA_ERR_OVERFLOW);
+        if (tid == 0) atomicOr(err, KERR_LA_OVERFLOW);
         return;
     }
 
@@ -357,7 +357,7 @@ extern "C" __global__ void la_decompose_components(
 
     if (s_base_idx + n_comp - 1 > LA_MAX_DECOMP) {
         if (threadIdx.x == 0)
-            atomicOr(err, LA_ERR_OVERFLOW);
+            atomicOr(err, KERR_LA_OVERFLOW);
         return;
     }
 

@@ -99,7 +99,7 @@ extern "C" __global__ void la_expand(
         s_mesh_bad = (mesh->nv <= 0 || mesh->nt <= 0 ||
                       mesh->nv > 1000000 || mesh->nt > 1000000 ||
                       mesh->verts == NULL || mesh->tris == NULL) ? 1 : 0;
-        if (s_mesh_bad) atomicOr(err, 0x100000);
+        if (s_mesh_bad) atomicOr(err, KERR_MESH_INVALID);
     }
     __syncthreads();
     if (s_mesh_bad) return;
@@ -181,7 +181,7 @@ extern "C" __global__ void la_expand(
     // Guard against exceeding part capacity
     if (np + 1 > LA_MAX_PARTS) {
         if (tid == 0) {
-            atomicOr(err, LA_ERR_OVERFLOW);
+            atomicOr(err, KERR_LA_OVERFLOW);
             heap_free(&pool->heap, (void*)pp.pos.mesh.verts);
             heap_free(&pool->heap, (void*)pp.neg.mesh.verts);
         }

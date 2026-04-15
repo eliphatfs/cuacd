@@ -130,9 +130,7 @@ __device__ inline void pc_intersect(
 // Kernel
 // ============================================================================
 
-#define PC_KERR_SCRATCH_OOM 1
-#define PC_KERR_POOL_OOM    2
-#define PC_KERR_SORT_ERR    4
+// Error codes: see error_codes.cuh (KERR_PC_*)
 
 __device__ inline void pc_zero_part(Part* __restrict__ p) {
     p->mesh.verts = NULL; p->mesh.tris = NULL; p->mesh.nv = 0; p->mesh.nt = 0; p->mesh.refcount = NULL;
@@ -251,7 +249,7 @@ __device__ inline PartPair plane_cut_block(
     }
     __syncthreads();
     if (!s_alloc_ok) {
-        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, KERR_PC_SCRATCH_OOM); }
         return s_result;
     }
 
@@ -278,7 +276,7 @@ __device__ inline PartPair plane_cut_block(
     }
     __syncthreads();
     if (!s_alloc_ok) {
-        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, KERR_PC_SCRATCH_OOM); }
         return s_result;
     }
 
@@ -337,7 +335,7 @@ __device__ inline PartPair plane_cut_block(
                 unsigned int sz = vb + tb + rb; if (!sz) sz = 1;
                 void* chunk = NULL;
                 if (heap_alloc(heap, sz, &chunk) != HEAP_OK) {
-                    atomicOr(kernel_error, PC_KERR_POOL_OOM);
+                    atomicOr(kernel_error, KERR_PC_POOL_OOM);
                 } else {
                     float* pv = (float*)chunk;
                     int*   pt = (int*)((char*)chunk + vb);
@@ -372,7 +370,7 @@ __device__ inline PartPair plane_cut_block(
                 int* vmap = NULL;
                 void* vmap_p;
                 if (heap_alloc(scratch_heap, (unsigned int)(n_verts * (int)sizeof(int)), &vmap_p) != HEAP_OK) {
-                    atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);
+                    atomicOr(kernel_error, KERR_PC_SCRATCH_OOM);
                     PC_FREE_ALL_SHARED_SCRATCH();
                 } else {
                     vmap = (int*)vmap_p;
@@ -394,7 +392,7 @@ __device__ inline PartPair plane_cut_block(
                     unsigned int psz=pvb+ptb+prc; if (!psz) psz=1;
                     void* pchunk=NULL;
                     if (heap_alloc(heap, psz, &pchunk) != HEAP_OK) {
-                        atomicOr(kernel_error, PC_KERR_POOL_OOM);
+                        atomicOr(kernel_error, KERR_PC_POOL_OOM);
                     } else {
                         float* opv=(float*)pchunk;
                         int*   opt=(int*)((char*)pchunk+pvb);
@@ -433,7 +431,7 @@ __device__ inline PartPair plane_cut_block(
                     unsigned int nsz=nvb+ntb+nrc; if (!nsz) nsz=1;
                     void* nchunk=NULL;
                     if (heap_alloc(heap, nsz, &nchunk) != HEAP_OK) {
-                        atomicOr(kernel_error, PC_KERR_POOL_OOM);
+                        atomicOr(kernel_error, KERR_PC_POOL_OOM);
                     } else {
                         float* onv=(float*)nchunk;
                         int*   ont=(int*)((char*)nchunk+nvb);
@@ -478,7 +476,7 @@ __device__ inline PartPair plane_cut_block(
     }
     __syncthreads();
     if (!s_alloc_ok) {
-        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, KERR_PC_SCRATCH_OOM); }
         return s_result;
     }
 
@@ -487,7 +485,7 @@ __device__ inline PartPair plane_cut_block(
     // === Phase 4: Sort crossing edges (warp 0) ===
     if (warp_id == 0) {
         int serr = warp_sort_t<Edge2i, Edge2iCmp>(cross_edges.raw(), s_sort_scratch, n_cross, lane);
-        if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
+        if (serr && lane == 0) atomicOr(kernel_error, KERR_PC_SORT_ERR);
     }
     __syncthreads();
 
@@ -509,7 +507,7 @@ __device__ inline PartPair plane_cut_block(
     }
     __syncthreads();
     if (!s_alloc_ok) {
-        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, KERR_PC_SCRATCH_OOM); }
         return s_result;
     }
 
@@ -560,7 +558,7 @@ __device__ inline PartPair plane_cut_block(
     }
     __syncthreads();
     if (!s_alloc_ok) {
-        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, KERR_PC_SCRATCH_OOM); }
         return s_result;
     }
 
@@ -692,7 +690,7 @@ __device__ inline PartPair plane_cut_block(
     }
     __syncthreads();
     if (!s_alloc_ok) {
-        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+        if (tid == 0) { PC_FREE_ALL_SHARED_SCRATCH(); atomicOr(kernel_error, KERR_PC_SCRATCH_OOM); }
         return s_result;
     }
 
@@ -727,7 +725,7 @@ __device__ inline PartPair plane_cut_block(
             // Small: single bitonic sort by warp 0, nothing left for phase 8b.
             if (warp_id == 0) {
                 int serr = warp_sort_t<Edge2i, Edge2iNormCmp>(dir_edges.raw(), s_dir_sort, n_de, lane);
-                if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
+                if (serr && lane == 0) atomicOr(kernel_error, KERR_PC_SORT_ERR);
                 if (lane == 0) { s_mid_lo = 0; s_mid_hi = n_de; }
             }
         } else {
@@ -748,12 +746,12 @@ __device__ inline PartPair plane_cut_block(
             if (warp_id == 0 && mid_lo > 1) {
                 int serr = warp_sort_inner<Edge2i, Edge2iNormCmp>(
                     dir_edges.raw(), dir_tmp, stack_lo_w0, stack_hi_w0, 0, mid_lo, lane);
-                if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
+                if (serr && lane == 0) atomicOr(kernel_error, KERR_PC_SORT_ERR);
             }
             if (warp_id == 1 && (n_de - mid_hi) > 1) {
                 int serr = warp_sort_inner<Edge2i, Edge2iNormCmp>(
                     dir_edges.raw(), dir_tmp, stack_lo_w1, stack_hi_w1, mid_hi, n_de, lane);
-                if (serr && lane == 0) atomicOr(kernel_error, PC_KERR_SORT_ERR);
+                if (serr && lane == 0) atomicOr(kernel_error, KERR_PC_SORT_ERR);
             }
         }
     }
@@ -790,7 +788,7 @@ __device__ inline PartPair plane_cut_block(
         if (n_de > 0) {
             void* p;
             if (heap_alloc(scratch_heap, (unsigned int)(n_de * 2 * (int)sizeof(int)), &p) != HEAP_OK)
-                { s_alloc_ok = 0; p = NULL; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+                { s_alloc_ok = 0; p = NULL; atomicOr(kernel_error, KERR_PC_SCRATCH_OOM); }
             s_be_a = (int*)p;
         }
     }
@@ -851,7 +849,7 @@ __device__ inline PartPair plane_cut_block(
                         ) * (int)sizeof(int));
                     if (heap_alloc(scratch_heap, loop_blk_sz, &loop_blk) != HEAP_OK) { kern_ok = 0; }
                     if (kern_ok && heap_alloc(scratch_heap, (unsigned int)(poly_cap_ * (int)sizeof(int)), &cap_ptr) != HEAP_OK) { kern_ok = 0; }
-                    if (!kern_ok) atomicOr(kernel_error, PC_KERR_SCRATCH_OOM);
+                    if (!kern_ok) atomicOr(kernel_error, KERR_PC_SCRATCH_OOM);
                     s_w_ptrs[0] = loop_blk; s_w_ptrs[1] = cap_ptr;
                     s_w_kern_ok = kern_ok;
                 }
@@ -1241,11 +1239,11 @@ __device__ inline PartPair plane_cut_block(
                 void* p;
                 if (heap_alloc(scratch_heap, (unsigned int)(n_all * (int)sizeof(int)), &p) == HEAP_OK)
                     s_pr_ptr = (int*)p;
-                else { s_alloc_ok = 0; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+                else { s_alloc_ok = 0; atomicOr(kernel_error, KERR_PC_SCRATCH_OOM); }
                 if (s_alloc_ok) {
                     if (heap_alloc(scratch_heap, (unsigned int)(n_all * (int)sizeof(int)), &p) == HEAP_OK)
                         s_nr_ptr = (int*)p;
-                    else { s_alloc_ok = 0; atomicOr(kernel_error, PC_KERR_SCRATCH_OOM); }
+                    else { s_alloc_ok = 0; atomicOr(kernel_error, KERR_PC_SCRATCH_OOM); }
                 }
             }
             heap_free(scratch_heap, lv_ptr); s_be_a = NULL;
@@ -1268,7 +1266,7 @@ __device__ inline PartPair plane_cut_block(
             unsigned int sz = vb + tb + rb; if (!sz) sz = 1;
             void* chunk = NULL;
             if (heap_alloc(heap, sz, &chunk) != HEAP_OK) {
-                atomicOr(kernel_error, PC_KERR_POOL_OOM);
+                atomicOr(kernel_error, KERR_PC_POOL_OOM);
             } else {
                 float* ov = (float*)chunk;
                 int*   ot = (int*)((char*)chunk + vb);
@@ -1427,7 +1425,7 @@ __device__ inline PartPair plane_cut_block(
                 s_result.neg.mesh.nv=nnv;      s_result.neg.mesh.nt=out_neg_nt;
                 s_result.neg.mesh.refcount=rcn;
             } else {
-                atomicOr(kernel_error, PC_KERR_POOL_OOM);
+                atomicOr(kernel_error, KERR_PC_POOL_OOM);
                 if (pchunk) heap_free(heap, pchunk);
                 s_pvp=NULL; s_ptp=NULL; s_nvp=NULL; s_ntp=NULL;
             }

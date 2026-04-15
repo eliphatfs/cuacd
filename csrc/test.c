@@ -4,6 +4,7 @@
 
 #include "heap.h"
 #include "structs.h"
+#include "error_codes.h"
 #include <cuda.h>
 #include <stdlib.h>
 #include <string.h>
@@ -314,8 +315,10 @@ int gpu_test_plane_cut(
     CHECK_CU(cuStreamSynchronize(s));
 
     if (kerr_h) {
+        char errbuf[512];
+        kerr_decode(kerr_h, errbuf, sizeof(errbuf));
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "plane_cut kernel error: 0x%x", kerr_h);
+                 "plane_cut %s", errbuf);
         goto cleanup_err;
     }
 
@@ -471,8 +474,10 @@ int gpu_test_hausdorff(
     cuMemFree(d_out); cuMemFree(d_err);
 
     if (h_err) {
+        char errbuf[512];
+        kerr_decode(h_err, errbuf, sizeof(errbuf));
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "hausdorff kernel error: 0x%x", h_err);
+                 "hausdorff %s", errbuf);
         return h_err;
     }
     return 0;
