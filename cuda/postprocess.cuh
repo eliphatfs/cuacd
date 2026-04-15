@@ -5,11 +5,12 @@
 //
 // Algorithm:
 //   1  Read input dims (thread 0), early-return if nv==0 or nt==0.
-//   2  Scratch alloc: parents[nv] + vert_comp[nv] + vert_local_idx[nv]
-//                     + comp_nv[max_out] + comp_nt[max_out]  (thread 0).
+//   2  Scratch alloc: parents[nv] + vert_comp[nv] + vert_local_idx[nv]  (thread 0).
+//                     comp_nv/comp_nt are shared memory (DC_MAX_OUT each).
 //   3  Init parents[v] = pack(0,v)   (all threads).
 //   4  Union edges from triangles     (all threads).
-//   5  Assign sequential component IDs via root walk (thread 0).
+//   5  Assign sequential component IDs: parallel root walk + clear (all threads),
+//      then sequential ID assignment (thread 0).
 //   6  Zero comp_nv / comp_nt         (all threads).
 //   7  Count verts/tris per component (all threads, atomicAdd).
 //   8  Alloc output meshes + reset comp_nv/comp_nt to zero for scatter (thread 0).
@@ -27,6 +28,9 @@
 
 // Block size for decompose_components_block.
 #define DC_BLOCK 128
+
+// Maximum output components (capacity of output_parts[]).
+#define DC_MAX_OUT 32
 
 // Pack rank+parent into one unsigned int.
 //   Bits [31..DC_RANK_SHIFT] = rank,  bits [DC_RANK_SHIFT-1..0] = parent id.
@@ -125,8 +129,7 @@ __device__ inline void dc_union(unsigned int* parents, unsigned int x, unsigned 
 
 __device__ inline int decompose_components_block(
     Part*       input_part,
-    Part*       output_parts,   // caller-provided array for results
-    int         max_out,        // capacity of output_parts[]
+    Part*       output_parts,   // caller-provided array [DC_MAX_OUT]
     DeviceHeap* heap,           // main heap for output mesh allocations
     DeviceHeap* scratch,        // scratch heap for temporaries
     int*        err)
@@ -141,8 +144,8 @@ __device__ inline int decompose_components_block(
     __shared__ unsigned int* s_parents;
     __shared__ unsigned int* s_vert_comp;
     __shared__ unsigned int* s_vert_local_idx;
-    __shared__ unsigned int* s_comp_nv;
-    __shared__ unsigned int* s_comp_nt;
+    __shared__ unsigned int s_comp_nv[DC_MAX_OUT];
+    __shared__ unsigned int s_comp_nt[DC_MAX_OUT];
     __shared__ int    s_n_components;
 
     // -------------------------------------------------------------------------
@@ -169,11 +172,11 @@ __device__ inline int decompose_components_block(
 
     // -------------------------------------------------------------------------
     // Phase 2: Single scratch alloc (thread 0).
-    // Layout: [parents(nv) | vert_comp(nv) | vert_local_idx(nv) |
-    //          comp_nv(max_out) | comp_nt(max_out)]  all unsigned int.
+    // Layout: [parents(nv) | vert_comp(nv) | vert_local_idx(nv)]
+    // comp_nv/comp_nt are in shared memory (DC_MAX_OUT entries each).
     // -------------------------------------------------------------------------
     if (tid == 0) {
-        unsigned int total = (unsigned int)(3 * nv + 2 * max_out) * sizeof(unsigned int);
+        unsigned int total = (unsigned int)(3 * nv) * sizeof(unsigned int);
         void* raw = NULL;
         int rc = heap_alloc(scratch, total, &raw);
         if (rc != HEAP_OK || !raw) {
@@ -185,8 +188,6 @@ __device__ inline int decompose_components_block(
             s_parents         = base;
             s_vert_comp       = base + nv;
             s_vert_local_idx  = base + 2 * nv;
-            s_comp_nv         = base + 3 * nv;
-            s_comp_nt         = base + 3 * nv + max_out;
         }
     }
     __syncthreads();
@@ -213,36 +214,39 @@ __device__ inline int decompose_components_block(
     __syncthreads();
 
     // -------------------------------------------------------------------------
-    // Phase 5: Assign sequential component IDs (thread 0).
+    // Phase 5: Assign sequential component IDs.
+    // First two sub-passes run in parallel across all threads:
+    //   A) vert_comp[v] = dc_find(parents, v)  — root walk per vertex
+    //   B) parents[v] = ~0u                     — clear for root→id map
+    // Then thread 0 assigns sequential IDs (depends on both A and B).
     // -------------------------------------------------------------------------
-    if (tid == 0) {
-        int n_comp = 0;
-
-        // First pass: store root index in vert_comp[v].
-        for (int v = 0; v < nv; v++)
+    {
+        // Sub-pass A + B in parallel (one pass over vertices).
+        for (int v = tid; v < nv; v += DC_BLOCK) {
             s_vert_comp[v] = dc_find(s_parents, (unsigned int)v);
-
-        // Repurpose parents[] as root→comp_id map.
-        // Mark all as unassigned using ~0u.
-        for (int v = 0; v < nv; v++)
             s_parents[v] = ~0u;
-
-        // Second pass: assign sequential IDs.
-        for (int v = 0; v < nv; v++) {
-            unsigned int root = s_vert_comp[v];
-            if (s_parents[root] == ~0u)
-                s_parents[root] = (unsigned int)(n_comp++);
-            s_vert_comp[v] = s_parents[root];
         }
+        __syncthreads();
 
-        s_n_components = n_comp;
+        // Sub-pass C: sequential ID assignment (thread 0).
+        if (tid == 0) {
+            int n_comp = 0;
+            for (int v = 0; v < nv; v++) {
+                unsigned int root = s_vert_comp[v];
+                if (s_parents[root] == ~0u)
+                    s_parents[root] = (unsigned int)(n_comp++);
+                s_vert_comp[v] = s_parents[root];
+            }
 
-        // Early-exit if already 1 component or too many components.
-        if (n_comp <= 1) {
-            output_parts[0] = *input_part;
-        } else if (n_comp > max_out) {
-            atomicOr(err, KERR_DC_OOM);
-            s_n_components = -1;  // signal error
+            s_n_components = n_comp;
+
+            // Early-exit if already 1 component or too many components.
+            if (n_comp <= 1) {
+                output_parts[0] = *input_part;
+            } else if (n_comp > DC_MAX_OUT) {
+                atomicOr(err, KERR_DC_OOM);
+                s_n_components = -1;  // signal error
+            }
         }
     }
     __syncthreads();
@@ -258,9 +262,9 @@ __device__ inline int decompose_components_block(
     }
 
     // -------------------------------------------------------------------------
-    // Phase 6: Zero comp_nv / comp_nt counters.
+    // Phase 6: Zero comp_nv / comp_nt counters (shared memory).
     // -------------------------------------------------------------------------
-    for (int c = tid; c < n_comp; c += DC_BLOCK) {
+    for (int c = tid; c < DC_MAX_OUT; c += DC_BLOCK) {
         s_comp_nv[c] = 0u;
         s_comp_nt[c] = 0u;
     }
@@ -353,7 +357,7 @@ __device__ inline int decompose_components_block(
     // -------------------------------------------------------------------------
     // Phase 10: Re-zero comp_nt for triangle scatter cursor.
     // -------------------------------------------------------------------------
-    for (int c = tid; c < n_comp; c += DC_BLOCK)
+    for (int c = tid; c < DC_MAX_OUT; c += DC_BLOCK)
         s_comp_nt[c] = 0u;
     __syncthreads();
 
@@ -382,8 +386,8 @@ __device__ inline int decompose_components_block(
     // -------------------------------------------------------------------------
     {
         // Use a shared flag array to mark inner shells without mutating Part.
-        __shared__ int s_is_inner[32];  // matches DC_MAX_COMP_LA
-        for (int c = tid; c < 32; c += DC_BLOCK)
+        __shared__ char s_is_inner[DC_MAX_OUT];
+        for (int c = tid; c < DC_MAX_OUT; c += DC_BLOCK)
             s_is_inner[c] = 0;
         __syncthreads();
 

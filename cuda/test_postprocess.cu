@@ -10,7 +10,7 @@
 #include "postprocess.cuh"
 
 // Maximum components the test kernel can handle (shared-memory array).
-#define DC_MAX_COMP 32
+#define DC_MAX_COMP DC_MAX_OUT
 
 extern "C" __global__ void test_postprocess_dc_kernel(
     const float* __restrict__ in_verts,
@@ -29,7 +29,7 @@ extern "C" __global__ void test_postprocess_dc_kernel(
     DeviceHeap*  scratch_heap,
     int*         __restrict__ kernel_error)
 {
-    __shared__ Part  s_parts[DC_MAX_COMP];
+    __shared__ Part  s_parts[DC_MAX_OUT];
     __shared__ Part  s_input_part;
 
     int tid = threadIdx.x;
@@ -80,9 +80,9 @@ extern "C" __global__ void test_postprocess_dc_kernel(
     // -------------------------------------------------------------------------
     // Step 3: Call decompose_components_block.
     // -------------------------------------------------------------------------
-    int max_out = (max_components < DC_MAX_COMP) ? max_components : DC_MAX_COMP;
+    int max_out = (max_components < DC_MAX_OUT) ? max_components : DC_MAX_OUT;
     int n_comp = decompose_components_block(
-        &s_input_part, s_parts, max_out,
+        &s_input_part, s_parts,
         heap, scratch_heap, kernel_error);
     __syncthreads();
 

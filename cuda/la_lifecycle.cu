@@ -315,7 +315,7 @@ extern "C" __global__ void la_hull_decomp(
 // mesh components.  New component parts are appended via atomicAdd on
 // decomp->nparts.
 // ============================================================================
-#define DC_MAX_COMP_LA 32   // max components per part in the lookahead kernel
+#define DC_MAX_COMP_LA DC_MAX_OUT   // max components per part in the lookahead kernel
 
 extern "C" __global__ void la_decompose_components(
     LaDecompState* decomp,
@@ -331,10 +331,10 @@ extern "C" __global__ void la_decompose_components(
     Part* p = &decomp->parts[i];
     if (p->mesh.nv == 0 || p->mesh.nt == 0) return;
 
-    __shared__ Part s_parts[DC_MAX_COMP_LA];
+    __shared__ Part s_parts[DC_MAX_OUT];
 
     int n_comp = decompose_components_block(
-        p, s_parts, DC_MAX_COMP_LA,
+        p, s_parts,
         &pool->heap, &pool->scratch, err);
 
     __syncthreads();
