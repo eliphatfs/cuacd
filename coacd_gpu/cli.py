@@ -1,6 +1,7 @@
 """coacd-gpu — CLI for lookahead convex decomposition of mesh files."""
 
 import argparse
+import multiprocessing
 import os
 import sys
 import time
@@ -51,6 +52,101 @@ def _save_parts(parts, output_dir, rel_path):
     return out_path
 
 
+# -- Pipeline workers for multiprocessing --
+
+_SENTINEL = None  # signals end-of-stream
+
+
+def _loader_worker(mesh_list, load_queue, print_lock):
+    """Load meshes and push (rel_path, verts, tris) into load_queue."""
+    for abs_path, rel_path in mesh_list:
+        try:
+            verts, tris = _load_mesh(abs_path)
+        except Exception as e:
+            with print_lock:
+                print(f'{rel_path}: load error — {e}', file=sys.stderr, flush=True)
+            continue
+        load_queue.put((rel_path, verts, tris))
+    load_queue.put(_SENTINEL)
+
+
+def _processor_worker(load_queue, save_queue, print_lock, args):
+    """Decompose meshes from load_queue, push results into save_queue."""
+    ctx = coacd_gpu.Context(device=args.device)
+    try:
+        while True:
+            item = load_queue.get()
+            if item is _SENTINEL:
+                break
+            rel_path, verts, tris = item
+
+            # Normalize to [-1, 1]
+            lo = verts.min(axis=0)
+            hi = verts.max(axis=0)
+            center = (lo + hi) / 2
+            extent = float((hi - lo).max())
+            scale = extent / 2 if extent > 0 else 1.0
+            norm_verts = ((verts - center) / scale).astype(np.float32)
+
+            t0 = time.perf_counter()
+            parts = None
+            for attempt in range(2):
+                try:
+                    parts = ctx.lookahead_decompose(
+                        norm_verts, tris,
+                        max_iters=args.max_iters,
+                        width=args.width,
+                        width2=args.width2,
+                        depth=args.depth,
+                        quick_depth=args.quick_depth,
+                        threshold=args.threshold,
+                        verbose=args.verbose,
+                        debug=args.debug,
+                        decompose_components=not args.no_decompose_components)
+                    break
+                except Exception as e:
+                    if attempt == 0:
+                        with print_lock:
+                            print(f'{rel_path}: decompose error — {e}, recreating context and retrying',
+                                  file=sys.stderr, flush=True)
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
+                        ctx = coacd_gpu.Context(device=args.device)
+                    else:
+                        with print_lock:
+                            print(f'{rel_path}: decompose error on retry — {e}',
+                                  file=sys.stderr, flush=True)
+
+            if parts is None:
+                continue
+
+            elapsed = time.perf_counter() - t0
+
+            if not args.parts:
+                out_parts = [(hv * scale + center, ht) for _, _, hv, ht in parts]
+            else:
+                out_parts = [(pv * scale + center, pt) for pv, pt, _, _ in parts]
+
+            save_queue.put((rel_path, out_parts, elapsed))
+    finally:
+        ctx.close()
+    save_queue.put(_SENTINEL)
+
+
+def _saver_worker(save_queue, output_dir, print_lock):
+    """Save decomposed parts from save_queue."""
+    while True:
+        item = save_queue.get()
+        if item is _SENTINEL:
+            break
+        rel_path, parts, elapsed = item
+        _save_parts(parts, output_dir, rel_path)
+        with print_lock:
+            print(f'{rel_path}  {elapsed:.2f}s  {len(parts)} parts', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='coacd-gpu',
@@ -88,47 +184,22 @@ def main():
         print(f'No mesh files found in: {args.input}', file=sys.stderr)
         sys.exit(1)
 
-    with coacd_gpu.Context(device=args.device) as ctx:
-        for abs_path, rel_path in meshes:
-            try:
-                verts, tris = _load_mesh(abs_path)
-            except Exception as e:
-                print(f'{rel_path}: load error — {e}', file=sys.stderr)
-                continue
+    mp_ctx = multiprocessing.get_context('spawn')
+    print_lock = mp_ctx.Lock()
+    load_queue = mp_ctx.Queue(maxsize=2)
+    save_queue = mp_ctx.Queue(maxsize=2)
 
-            # Normalize to [-1, 1]
-            lo = verts.min(axis=0)
-            hi = verts.max(axis=0)
-            center = (lo + hi) / 2
-            extent = float((hi - lo).max())
-            scale = extent / 2 if extent > 0 else 1.0
-            norm_verts = ((verts - center) / scale).astype(np.float32)
+    loader = mp_ctx.Process(target=_loader_worker, args=(meshes, load_queue, print_lock))
+    processor = mp_ctx.Process(target=_processor_worker, args=(load_queue, save_queue, print_lock, args))
+    saver = mp_ctx.Process(target=_saver_worker, args=(save_queue, args.output, print_lock))
 
-            t0 = time.perf_counter()
-            try:
-                parts = ctx.lookahead_decompose(
-                    norm_verts, tris,
-                    max_iters=args.max_iters,
-                    width=args.width,
-                    width2=args.width2,
-                    depth=args.depth,
-                    quick_depth=args.quick_depth,
-                    threshold=args.threshold,
-                    verbose=args.verbose,
-                    debug=args.debug,
-                    decompose_components=not args.no_decompose_components)
-            except Exception as e:
-                print(f'{rel_path}: decompose error — {e}', file=sys.stderr)
-                continue
-            elapsed = time.perf_counter() - t0
+    loader.start()
+    processor.start()
+    saver.start()
 
-            if not args.parts:
-                parts = [(hv * scale + center, ht) for _, _, hv, ht in parts]
-            else:
-                parts = [(pv * scale + center, pt) for pv, pt, _, _ in parts]
-
-            _save_parts(parts, args.output, rel_path)
-            print(f'{rel_path}  {elapsed:.2f}s  {len(parts)} parts')
+    loader.join()
+    processor.join()
+    saver.join()
 
 
 if __name__ == '__main__':
