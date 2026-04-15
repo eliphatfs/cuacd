@@ -5,7 +5,7 @@
 - D&C hull, mesh volume, warp sort, plane cut (16 tests) — all tests pass.
 - `kdop_hull_block` / `batch_kdop_hull_mesh` — 5 tests pass. Produces exact hull via extreme-point prefilter + D&C.
 - `hausdorff_block` — 5 tests pass. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
-- `decompose_components_block` / `la_decompose_components` — 5 tests pass. Connected-components decomposition via GPU union-find. Integrated as optional post-processing pass in lookahead_decompose (decompose_components parameter).
+- `decompose_components_block` / `la_decompose_components` — 5 tests pass. Connected-components decomposition via GPU union-find. Integrated as optional post-processing pass in lookahead_decompose (decompose_components parameter). Inner shells (negative signed volume) are filtered out to prevent non-manifold output from downstream plane_cut.
 - `lookahead_decompose` — cube, L-shape, octocat, convergence, 49160 tests pass. Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=0, width=60, width2=5.
 
 ## Known Limitations

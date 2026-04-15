@@ -4,10 +4,10 @@
 #include "geometry.cuh"
 #include "structs.cuh"
 
-// Compute |volume| of a watertight Mesh using the signed tetrahedron sum.
+// Compute signed volume of a mesh using the signed tetrahedron sum.
 // All 32 lanes must call with identical arguments.
-// Returns the absolute volume on every lane.
-__device__ inline float mesh_volume_warp(const Mesh* mesh, int lane)
+// Returns the signed volume on every lane (positive = outward winding).
+__device__ inline float mesh_signed_volume_warp(const Mesh* mesh, int lane)
 {
     float local = 0.0f;
     for (int t = lane; t < mesh->nt; t += WARP_SIZE) {
@@ -21,5 +21,13 @@ __device__ inline float mesh_volume_warp(const Mesh* mesh, int lane)
     }
     for (int off = 16; off > 0; off >>= 1)
         local += __shfl_xor_sync(WARP_MASK, local, off);
-    return fabsf(local);
+    return local;
+}
+
+// Compute |volume| of a watertight Mesh using the signed tetrahedron sum.
+// All 32 lanes must call with identical arguments.
+// Returns the absolute volume on every lane.
+__device__ inline float mesh_volume_warp(const Mesh* mesh, int lane)
+{
+    return fabsf(mesh_signed_volume_warp(mesh, lane));
 }

@@ -375,19 +375,68 @@ __device__ inline int decompose_components_block(
     __syncthreads();
 
     // -------------------------------------------------------------------------
-    // Phase 11b: Compute mesh_vol for each output component (1 warp each).
+    // Phase 11b: Compute signed mesh_vol for each output component (1 warp each).
     // DC_BLOCK=128 → 4 warps stride over n_comp components.
+    // Components with negative signed volume are inner shells (cavity surfaces)
+    // and are discarded.  At least one component is always kept.
     // -------------------------------------------------------------------------
     {
+        // Use a shared flag array to mark inner shells without mutating Part.
+        __shared__ int s_is_inner[32];  // matches DC_MAX_COMP_LA
+        for (int c = tid; c < 32; c += DC_BLOCK)
+            s_is_inner[c] = 0;
+        __syncthreads();
+
         int warp_id = tid / WARP_SIZE;
         int lane    = tid & (WARP_SIZE - 1);
         for (int c = warp_id; c < n_comp; c += (DC_BLOCK / WARP_SIZE)) {
-            float mvol = mesh_volume_warp(&output_parts[c].mesh, lane);
-            if (lane == 0)
-                output_parts[c].mesh_vol = mvol;
+            float svol = mesh_signed_volume_warp(&output_parts[c].mesh, lane);
+            if (lane == 0) {
+                output_parts[c].mesh_vol = fabsf(svol);
+                if (svol < 0.0f)
+                    s_is_inner[c] = 1;
+            }
+        }
+        __syncthreads();
+
+        // Compact: remove inner-shell components (only if n_comp > 1 and
+        // at least one is an outer shell).
+        if (n_comp > 1) {
+            int n_inner = 0;
+            for (int c = 0; c < n_comp; c++)
+                n_inner += s_is_inner[c];
+
+            if (n_inner > 0 && n_inner < n_comp) {
+                // Some inner shells, some outer — compact
+                if (tid == 0) {
+                    int keep = 0;
+                    for (int c = 0; c < n_comp; c++) {
+                        if (s_is_inner[c]) {
+                            // Free discarded component's mesh allocation
+                            if (output_parts[c].mesh.refcount) {
+                                int old = atomicAdd(output_parts[c].mesh.refcount, -1);
+                                if (old == 1)
+                                    heap_free(heap, (void*)output_parts[c].mesh.verts);
+                            }
+                        } else {
+                            if (keep != c)
+                                output_parts[keep] = output_parts[c];
+                            keep++;
+                        }
+                    }
+                    // Zero out stale slots
+                    for (int c = keep; c < n_comp; c++)
+                        dc_zero_part(&output_parts[c]);
+                    n_comp = keep;
+                    s_n_components = keep;
+                }
+                __syncthreads();
+                n_comp = s_n_components;
+            }
+            // If all components are inner shells (n_inner == n_comp), keep all.
+            // This is unusual but preserves the original data intact.
         }
     }
-    __syncthreads();
 
     // -------------------------------------------------------------------------
     // Phase 12: Free input mesh + scratch (thread 0).
