@@ -49,16 +49,6 @@ docs/                 # Documentation (see below)
 CoACD/                # Reference C++ CoACD (embedded repo, not a submodule)
 ```
 
-## Git Usage
-
-Only stage project source files — never use `git add -A` or `git add .`. The repo contains directories that must not be committed:
-- `CoACD/` — embedded git repository (not a submodule)
-- `compare_output/`, `octocat_output/`, `decomp_output/`, `tmpcompare/` — temporary output directories
-- `*.ncu-rep` — NSight Compute profiling artifacts
-- Build artifacts (`*.fatbin`, `*.o`, `*.so`, `build/`, `*.egg-info/`)
-
-Before staging, always run `git status` and `git diff --stat` to verify only expected tracked files are modified.
-
 ## Build Commands
 
 ```bash
