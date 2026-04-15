@@ -842,7 +842,7 @@ __device__ inline PartPair plane_cut_block(
                     // Merged allocation: ls + lsz + lv2 + poly + ep + sb
                     // All int-sized, so natural alignment within the block is fine.
                     int poly_cap_ = n_boundary * 4 + 64;
-                    int sb_ints = 256 + 256;  // inner_idx(256 int) + inner_max_u(256 float)
+                    int sb_ints = 256 + 256;  // parent(128) + is_hole(128) + h_idx(128) + h_max_u(128 float)
                     unsigned int loop_blk_sz = (unsigned int)(
                         (n_boundary * 3            // ls + lsz + lv2
                          + poly_cap_               // polygon
@@ -875,8 +875,8 @@ __device__ inline PartPair plane_cut_block(
                     PC_BUF(int,   polygon,      poly_raw, poly_cap);
                     PC_BUF(int,   cap_tris,     cap_ptr,  poly_cap * 3);
                     PC_BUF(int,   ear_prevnext, ep_raw,   poly_cap * 2);
-                    PC_BUF(int,   inner_idx,    sb_raw,   256);
-                    float* inner_max_u  = (float*)(sb_raw + 256);
+                    // sb_raw[512] is carved into CheckedBufs later:
+                    // parent(128) + is_hole(128) + h_idx(128) + h_max_u(128 float)
 
                     // Phase 10: reconstruct loops from boundary edge pairs
                     // Lane 0 drives chain-following; all lanes help with inner search.
@@ -968,16 +968,17 @@ __device__ inline PartPair plane_cut_block(
 
                     // Classify: is_hole[i] = 1 if loop i's first vertex is inside some other loop.
                     // parent[i] = enclosing loop index (smallest enclosing area), or -1.
-                    // Reuse inner_idx as parent[], inner_max_u's int-alias as is_hole[].
-                    // Both are 256-element buffers from sb_ptr.
-                    // First 128 entries: parent/is_hole classification (read-only after fill).
-                    // Second 128 entries: per-outer hole sort scratch.
-                    int*   parent    = inner_idx.raw();
-                    int*   is_hole   = inner_idx.raw() + 128;
-                    int*   h_idx     = (int*)inner_max_u;          // hole sort: indices
-                    float* h_max_u   = inner_max_u + 128;          // hole sort: max-u values
+                    // Reuse sb_raw as 4 × 128-element CheckedBufs:
+                    //   parent(128) + is_hole(128) + h_idx(128) + h_max_u(128 float).
+                    PC_BUF(int,   parent,    sb_raw,               128);
+                    PC_BUF(int,   is_hole,   sb_raw + 128,         128);
+                    int*   h_idx     = sb_raw + 256;               // hole sort: indices
+                    float* h_max_u   = (float*)(sb_raw + 384);     // hole sort: max-u values
                     int max_loops = 128;  // limit loops to fit classification arrays
-                    for (int i = 0; i < n_loops && i < max_loops; i++) { parent[i] = -1; is_hole[i] = 0; }
+                    if (lane == 0) {
+                        for (int i = 0; i < n_loops && i < max_loops; i++) { parent[i] = -1; is_hole[i] = 0; }
+                    }
+                    __syncwarp();
 
                     for (int i = 0; i < n_loops && i < max_loops; i++) {
                         if (loop_sizes[i] < 3) continue;
@@ -1011,23 +1012,47 @@ __device__ inline PartPair plane_cut_block(
                         __syncwarp();
                     }
 
+                    // Detect cycles in the parent tree.  A cycle means the
+                    // containment test was ambiguous (e.g. near-shared vertex);
+                    // nesting classification is unreliable so treat the whole
+                    // cap as failed — handled by the s_n_cap < 0 path.
+                    int parent_cycle = 0;
+                    if (lane == 0) {
+                        for (int i = 0; i < n_loops && i < max_loops; i++) {
+                            int steps = 0;
+                            for (int p = parent[i]; p >= 0; p = parent[p]) {
+                                if (++steps > n_loops) { parent_cycle = 1; break; }
+                            }
+                            if (parent_cycle) break;
+                        }
+                        if (parent_cycle) {
+                            DPRINTF("[pc-diag] PARENT_CYCLE blk=%d n_loops=%d\n", blockIdx.x, n_loops);
+                            s_n_cap = -1;
+                        }
+                    }
+                    parent_cycle = __shfl_sync(0xFFFFFFFF, parent_cycle, 0);
+
+                  if (!parent_cycle) {
                     // Compute nesting depth to classify even-depth as outer,
                     // odd-depth as hole. A "hole inside a hole" (depth 2) is
                     // really an island that should be ear-clipped independently.
-                    for (int i = 0; i < n_loops && i < max_loops; i++) {
-                        int depth = 0;
-                        for (int p = parent[i]; p >= 0; p = parent[p]) depth++;
-                        is_hole[i] = (depth & 1);  // odd depth = hole
-                        // Re-parent holes to nearest even-depth ancestor
-                        if (is_hole[i]) {
-                            // parent[i] is already the immediate enclosing outer loop
-                            // (it's at depth-1 which is even) — keep it.
-                        } else if (depth >= 2) {
-                            // Even depth >= 2: island inside a hole — treat as
-                            // independent outer loop (no parent to bridge into).
-                            parent[i] = -1;
+                    if (lane == 0) {
+                        for (int i = 0; i < n_loops && i < max_loops; i++) {
+                            int depth = 0;
+                            for (int p = parent[i]; p >= 0; p = parent[p]) depth++;
+                            is_hole[i] = (depth & 1);  // odd depth = hole
+                            // Re-parent holes to nearest even-depth ancestor
+                            if (is_hole[i]) {
+                                // parent[i] is already the immediate enclosing outer loop
+                                // (it's at depth-1 which is even) — keep it.
+                            } else if (depth >= 2) {
+                                // Even depth >= 2: island inside a hole — treat as
+                                // independent outer loop (no parent to bridge into).
+                                parent[i] = -1;
+                            }
                         }
                     }
+                    __syncwarp();
 
                     // Reverse hole loops to CW winding (they were oriented CCW above).
                     for (int i = 0; i < n_loops && i < max_loops; i++) {
@@ -1173,6 +1198,8 @@ __device__ inline PartPair plane_cut_block(
                             __syncwarp();
                         }
                     } // end for each outer loop
+
+                  } // end if (!parent_cycle)
 
                     // Check if cap triangulation is complete.  If ear-clipping
                     // gave up on any polygon, treat as a failed cut: signal via
