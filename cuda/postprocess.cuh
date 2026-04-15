@@ -240,19 +240,23 @@ __device__ inline int decompose_components_block(
             int n_comp = 0;
             for (int v = 0; v < nv; v++) {
                 unsigned int root = s_vert_comp[v];
-                if (s_parents[root] == ~0u)
-                    s_parents[root] = (unsigned int)(n_comp++);
+                if (s_parents[root] == ~0u) {
+                    if (n_comp < DC_MAX_OUT)
+                        s_parents[root] = (unsigned int)(n_comp++);
+                    else
+                        s_parents[root] = (unsigned int)(DC_MAX_OUT - 1);  // clamp: merge into last slot
+                }
                 s_vert_comp[v] = s_parents[root];
             }
 
+            if (n_comp > DC_MAX_OUT)
+                n_comp = DC_MAX_OUT;  // actual distinct output count
+
             s_n_components = n_comp;
 
-            // Early-exit if already 1 component or too many components.
+            // Early-exit if already 1 component.
             if (n_comp <= 1) {
                 output_parts[0] = *input_part;
-            } else if (n_comp > DC_MAX_OUT) {
-                atomicOr(err, KERR_DC_OOM);
-                s_n_components = -1;  // signal error
             }
         }
     }
@@ -265,7 +269,7 @@ __device__ inline int decompose_components_block(
         if (tid == 0)
             heap_free(scratch, (void*)s_scratch_base);
         __syncthreads();
-        return (n_comp == 1) ? 1 : 0;  // 0 if error was set above (-1)
+        return (n_comp == 1) ? 1 : 0;
     }
 
     // -------------------------------------------------------------------------
@@ -282,23 +286,16 @@ __device__ inline int decompose_components_block(
     // -------------------------------------------------------------------------
     for (int v = tid; v < nv; v += DC_BLOCK) {
         unsigned int cv = s_vert_comp[v];
-        // [BUG] Debug: catch OOB component index
-        if (cv >= (unsigned int)n_comp)
-            DPRINTF("[BUG] phase7 vert comp OOB: v=%d comp=%u n_comp=%d blk=%d tid=%d\n",
-                    v, cv, n_comp, blockIdx.x, tid);
         atomicAdd(&s_comp_nv[cv], 1u);
     }
 
     for (int t = tid; t < nt; t += DC_BLOCK) {
         int i0 = s_in_tris[t * 3];
         unsigned int cv = s_vert_comp[(unsigned int)i0];
-        // [BUG] Debug: catch OOB component index or negative tri idx
+        // [BUG] Debug: catch negative tri idx
         if (i0 < 0 || i0 >= nv)
             DPRINTF("[BUG] phase7 tri idx OOB: t=%d i0=%d nv=%d blk=%d tid=%d\n",
                     t, i0, nv, blockIdx.x, tid);
-        if (cv >= (unsigned int)n_comp)
-            DPRINTF("[BUG] phase7 tri comp OOB: t=%d i0=%d comp=%u n_comp=%d blk=%d tid=%d\n",
-                    t, i0, cv, n_comp, blockIdx.x, tid);
         atomicAdd(&s_comp_nt[cv], 1u);
     }
 

@@ -208,3 +208,32 @@ def test_volume_conservation():
     comp_vol_sum = sum(abs(_signed_volume(cv, ct)) for cv, ct in comps)
     assert abs(comp_vol_sum - original_vol) < 1e-3, \
         f"Volume mismatch: {comp_vol_sum} vs {original_vol}"
+
+
+def test_33_disjoint_cubes_clamp_to_32():
+    """33 disjoint unit cubes exceed DC_MAX_OUT=32.
+
+    The clamp merges the last two components into one output slot,
+    producing 32 output parts: 31 with volume=1 and 1 with volume=2.
+    All must be watertight with positive volume.
+    """
+    cubes = [_make_cube(center=(i * 3, 0, 0), size=1.0) for i in range(33)]
+    verts, tris = _merge_meshes(cubes)
+
+    comps = _decompose(verts, tris)
+    assert len(comps) == 32, \
+        f"Expected 32 components, got {len(comps)}"
+
+    vols = sorted([abs(_signed_volume(cv, ct)) for cv, ct in comps])
+    # 31 components with vol≈1, 1 component with vol≈2
+    vol1_count = sum(1 for v in vols if abs(v - 1.0) < 1e-3)
+    vol2_count = sum(1 for v in vols if abs(v - 2.0) < 1e-3)
+    assert vol1_count == 31, \
+        f"Expected 31 components with volume 1.0, got {vol1_count}; vols={vols}"
+    assert vol2_count == 1, \
+        f"Expected 1 component with volume 2.0, got {vol2_count}; vols={vols}"
+
+    # All components must be watertight (positive signed volume)
+    for i, (cv, ct) in enumerate(comps):
+        sv = _signed_volume(cv, ct)
+        assert sv > 0, f"Component {i} has non-positive signed volume {sv}"
