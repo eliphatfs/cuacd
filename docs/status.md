@@ -7,7 +7,7 @@
 - `hausdorff_block` — 5 tests pass. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
 - `decompose_components_block` / `la_decompose_components` — 5 tests pass. Connected-components decomposition via GPU union-find. Integrated as optional post-processing pass in lookahead_decompose (decompose_components parameter). Inner shells (negative signed volume) are filtered out to prevent non-manifold output from downstream plane_cut.
 - `lookahead_decompose` — cube, L-shape, octocat, convergence, 49160 tests pass. Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=0, width=60, width2=5.
-- `la_find_concave_edges` — concave edge detection kernel. Generates cutting planes from concave mesh edges for first-layer expansion. Exposed via `n_concave_edges` parameter (default 0 = disabled). **Currently has a hang bug when enabled** — kernel or host orchestration issue under investigation.
+- `la_find_concave_edges` — concave edge detection kernel. Generates cutting planes from concave mesh edges for first-layer expansion. Exposed via `n_concave_edges` parameter (default 0 = disabled). **Currently has a hang bug when enabled** — warp sync divergence: thread 0 waits on `__shfl_sync` while threads 1-31 wait on `__syncwarp` inside `warp_sort_t`. Root cause under investigation.
 
 ## Known Limitations
 
@@ -15,7 +15,7 @@
 
 ## Not Yet Implemented
 
-- **Concave edge sampling hang bug**: `la_find_concave_edges` + host orchestration hangs when `n_concave_edges > 0`. Likely issue in `la_concave.cu` kernel (WarpPool allocation from global pool consuming bump space that's never reclaimed, or infinite loop in sort/scan), or in `la_expand.cu` edge-cut path (deadlock from `__syncthreads` with divergent edge/axis paths). Under investigation.
+- **Concave edge sampling hang bug**: `la_find_concave_edges` hangs when `n_concave_edges > 0`. Debugger shows warp sync divergence: thread 0 on `__shfl_sync` while threads 1-31 on `__syncwarp` inside `warp_sort_t`. The WarpPool→heap_alloc/heap_free migration (removing irreversible bump allocation) did not fix the hang; the sync divergence is a separate issue likely caused by divergent control flow in `warp_sort_inner` or its callers. Under investigation.
 - `__cuda_array_interface__` support for GPU tensor input
 - **Ternary search refinement** for lookahead cut selection: CoACD refines the MCTS-selected cut position via ternary search (`TernaryMCTS`, up to 10 iterations, epsilon=0.0001) to find the optimal cut within ±interval of the grid point. Our implementation uses only the fixed grid (width/3 cuts per axis). Adding refinement would let the algorithm find exact structural corners (e.g. the L-shape junction) instead of relying on the nearest grid point.
 - **Centroid-based mesh volume**: `mesh_volume_warp` computes volume via divergence theorem relative to origin (`signed_tet_volume` sums tetrahedra formed with the origin). For non-watertight meshes (boundary edges from plane_cut ear-clipping giving up), this effectively connects open edges to the origin, introducing volume error proportional to the distance from origin to the hole. Computing relative to the mesh centroid instead would reduce this error since the implicit triangles closing the holes would be much smaller. Low priority — the main convergence issue is rv-only tree search, not volume accuracy.

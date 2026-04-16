@@ -78,30 +78,31 @@ extern "C" __global__ void la_find_concave_edges(
 
     int n_dir_edges = 3 * nt;  // total directed edges
 
-    // Allocate scratch for sort: EdgeFace array + sort workspace
-    // scratch = n_dir_edges * sizeof(EdgeFace) + n_dir_edges * sizeof(EdgeFace)
-    //         + WS_MAX_STACK * 2 * sizeof(int)
-    size_t ef_bytes   = (size_t)n_dir_edges * sizeof(EdgeFace);
-    size_t sort_extra = ef_bytes + (size_t)WS_MAX_STACK * 2 * sizeof(int);
-    size_t scratch_needed = ef_bytes + sort_extra;
+    // Allocate scratch from scratch heap for sort + reservoir.
+    // Layout: [EdgeFace array][sort tmp][sort stacks][reservoir]
+    size_t ef_bytes = (size_t)n_dir_edges * sizeof(EdgeFace);
+    size_t sort_tmp = ef_bytes;  // warp_sort needs a second copy for partitioning
+    size_t sort_stacks = (size_t)WS_MAX_STACK * 2 * sizeof(int);
+    size_t reservoir_bytes = (size_t)n_concave_edges * 4 * sizeof(int);
+    size_t total_scratch = ef_bytes + sort_tmp + sort_stacks + reservoir_bytes;
 
-    // Allocate from global pool (all lanes must see the pointer)
-    WarpPool wp;
+    // Lane 0 allocates, then broadcasts pointer
+    __shared__ void* s_scratch_base;
+    __shared__ int   s_alloc_ok;
     if (lane == 0) {
-        if (warppool_from_global(pool, (int)scratch_needed, &wp) != 0) {
-            wp.base = NULL;
-        }
+        s_alloc_ok = (heap_alloc(&pool->scratch, (unsigned int)total_scratch, &s_scratch_base) == HEAP_OK) ? 1 : 0;
+        if (!s_alloc_ok) atomicOr(err, KERR_LA_SORT_OOM);
     }
-    long long wp_base = (long long)wp.base;
-    wp_base = __shfl_sync(WARP_MASK, wp_base, 0);
-    wp.base = (char*)wp_base;
-    if (wp_base == 0) {
-        if (lane == 0) { n_edge_cuts[i] = 0; }
+    __syncwarp();
+    if (!s_alloc_ok) {
+        if (lane == 0) n_edge_cuts[i] = 0;
         return;
     }
 
-    EdgeFace* ef_arr = (EdgeFace*)wp.base;
-    char* sort_scratch = wp.base + ef_bytes;
+    char* scratch = (char*)s_scratch_base;
+    EdgeFace* ef_arr    = (EdgeFace*)(scratch);
+    char*     sort_scratch = scratch + ef_bytes;
+    int*      reservoir = (int*)(scratch + ef_bytes + sort_tmp + sort_stacks);
 
     // Build directed-edge array: each lane processes a strided subset
     for (int e = lane; e < n_dir_edges; e += 32) {
@@ -119,46 +120,18 @@ extern "C" __global__ void la_find_concave_edges(
     // Sort by (lo, hi, face_idx)
     int sort_rc = warp_sort_t<EdgeFace, EdgeFaceCmp>(ef_arr, sort_scratch, n_dir_edges, lane);
     if (sort_rc != 0) {
-        if (lane == 0) { n_edge_cuts[i] = 0; }
+        if (lane == 0) {
+            atomicOr(err, KERR_LA_SORT_STACK);
+            heap_free(&pool->scratch, s_scratch_base);
+            n_edge_cuts[i] = 0;
+        }
         return;
     }
     __syncwarp();
 
-    // Scan sorted edges: find shared edges (consecutive pairs with same lo,hi)
-    // and compute dihedral angle.  Count concave edges.
-    // We need: face normals.  Compute on the fly.
-
-    // For each shared edge, we need:
-    //   - The two face indices
-    //   - The two vertex indices of the edge
-    //   - The "other" vertex of face 1 (to determine concave vs convex)
-    //
-    // We'll use a second scratch region to store sampled concave edge info.
-    // Each sampled edge produces up to 4 ConcaveEdgePlane values.
-    // Maximum output per block: 4 * n_concave_edges planes.
-    // We need scratch for storing (v0, v1, face0, face1) of concave edges
-    // as we find them during the scan.  Max concave edges = n_dir_edges/2.
-    // But we only keep n_concave_edges via reservoir sampling.
-
-    // Reservoir sampling state (lane 0 manages):
-    // reservoir[0..n_concave_edges-1] stores concave edge info
-    // n_seen = total concave edges encountered so far
-
-    // Scratch for reservoir: n_concave_edges * 4 ints (v0, v1, f0, f1)
-    size_t reservoir_bytes = (size_t)n_concave_edges * 4 * sizeof(int);
-    int* reservoir = NULL;
-    if (n_concave_edges > 0 && lane == 0) {
-        reservoir = (int*)warp_pool_alloc(&wp, (int)reservoir_bytes, lane);
-    }
-    long long res_ptr = (long long)reservoir;
-    res_ptr = __shfl_sync(WARP_MASK, res_ptr, 0);
-    reservoir = (int*)res_ptr;
-
-    // Initialize reservoir
-    if (reservoir) {
-        for (int j = lane; j < n_concave_edges * 4; j += 32)
-            reservoir[j] = -1;
-    }
+    // Initialize reservoir to -1
+    for (int j = lane; j < n_concave_edges * 4; j += 32)
+        reservoir[j] = -1;
     __syncwarp();
 
     __shared__ int s_n_seen;   // total concave edges seen
@@ -171,10 +144,7 @@ extern "C" __global__ void la_find_concave_edges(
     if (lane == 0) s_rng = (unsigned int)(blockIdx.x * 2654435761u + 1u);
     __syncwarp();
 
-    // Scan sorted edges for shared edges
-    // Each lane checks e and e+1; but to avoid races, lane 0 does it sequentially.
-    // For small meshes this is fine; for large meshes we could parallelize.
-    // Since the kernel is 1 warp, lane 0 sequential scan is adequate.
+    // Scan sorted edges for shared edges — lane 0 sequential
     if (lane == 0) {
         for (int e = 0; e < n_dir_edges - 1; e++) {
             EdgeFace* ef0 = &ef_arr[e];
@@ -372,6 +342,8 @@ extern "C" __global__ void la_find_concave_edges(
     }
     __syncwarp();
 
-    // Note: WarpPool memory is reclaimed automatically (bump alloc from global pool).
-    // It will be reclaimed when the pool offset is reset or the pool is destroyed.
+    // Free scratch memory
+    if (lane == 0) {
+        heap_free(&pool->scratch, s_scratch_base);
+    }
 }
