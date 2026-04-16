@@ -35,6 +35,10 @@ int lookahead_decompose(
     int depth, int quick_depth, int max_n_cutting,
     int verbose, int debug, int decompose_components,
     int decompose_components_per_iter,
+    int n_concave_edges,
+    float concave_eps,
+    float concave_threshold,
+    int concave_iters,
     struct gpu_result* out);
 
 #ifdef __cplusplus

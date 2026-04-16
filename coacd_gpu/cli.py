@@ -66,7 +66,11 @@ def _decompose_mesh(ctx, verts, tris, args):
         verbose=args.verbose,
         debug=args.debug,
         decompose_components=not args.no_decompose_components,
-        decompose_components_per_iter=args.decompose_components_per_iter)
+        decompose_components_per_iter=args.decompose_components_per_iter,
+        n_concave_edges=args.n_concave_edges,
+        concave_eps=args.concave_eps,
+        concave_threshold=args.concave_threshold,
+        concave_iters=args.concave_iters)
 
     if not args.parts:
         return [(hv * scale + center, ht) for _, _, hv, ht in parts]
@@ -197,6 +201,14 @@ def main():
                         help='Skip connected components decomposition (default: enabled).')
     parser.add_argument('--decompose-components-per-iter', action='store_true', default=False,
                         help='Run connected components decomposition each iteration (default: off).')
+    parser.add_argument('--n-concave-edges', type=int, default=0,
+                        help='Max concave edges to sample per cutting part (default: 0 = disabled).')
+    parser.add_argument('--concave-eps', type=float, default=0.005,
+                        help='Epsilon offset for edge-based planes (default: 0.005).')
+    parser.add_argument('--concave-threshold', type=float, default=3.49,
+                        help='Dihedral angle threshold in radians for concavity (default: 3.49 ~200deg).')
+    parser.add_argument('--concave-iters', type=int, default=1,
+                        help='Number of first iterations to include concave edge sampling (default: 1).')
     parser.add_argument('--serial', action='store_true', default=False,
                         help='Serial load-process-save instead of pipelined workers (easier debugging).')
     args = parser.parse_args()

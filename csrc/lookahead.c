@@ -48,6 +48,10 @@ struct LaEvalResult_h {
     int _pad[2];
 };
 
+struct ConcaveEdgePlane_h {
+    float pa, pb, pc, pd;
+};
+
 // Read back the decomposition from device into host result.
 static int la_read_result(
     gpu_ctx_t ctx, CUdeviceptr d_decomp, struct gpu_result* out, CUstream s)
@@ -117,6 +121,10 @@ int lookahead_decompose(
     int depth, int quick_depth, int max_n_cutting,
     int verbose, int debug, int decompose_components,
     int decompose_components_per_iter,
+    int n_concave_edges,
+    float concave_eps,
+    float concave_threshold,
+    int concave_iters,
     struct gpu_result* out)
 {
 #define LCHECK(call) do { \
@@ -146,6 +154,7 @@ int lookahead_decompose(
     CUdeviceptr d_cutting_idx = 0, d_results    = 0;
     CUdeviceptr d_nitems     = 0;
     CUdeviceptr d_extra_leaves = 0, d_n_extra   = 0;
+    CUdeviceptr d_edge_planes  = 0, d_n_edge_cuts = 0;
 
     // Pinned host memory for async D2H
     void* h_pinned = NULL;
@@ -169,9 +178,10 @@ int lookahead_decompose(
     LCHECK(cuMemsetD8Async(d_decomp, 0, sizeof(struct LaDecompState_h), s));
 
     // Tree item buffers (double-buffered for expansion levels)
+    int total_width_max = width + 4 * n_concave_edges;  // upper bound
     int max_leaf_items = max_n_cutting;
     for (int d = 0; d < depth; d++)
-        max_leaf_items *= (d == 0) ? width : width2;
+        max_leaf_items *= (d == 0) ? total_width_max : width2;
     // quick_depth doesn't increase item count (1 child per item)
 
     size_t items_bytes = (size_t)max_leaf_items * sizeof(struct LaWorkItem_h);
@@ -188,9 +198,17 @@ int lookahead_decompose(
     LCHECK(cuMemAllocAsync(&d_n_extra, sizeof(int), s));
 
     // Level-0 items buffer (preserved for la_apply_cuts)
-    size_t level0_bytes = (size_t)max_n_cutting * width * sizeof(struct LaWorkItem_h);
+    size_t level0_bytes = (size_t)max_n_cutting * total_width_max * sizeof(struct LaWorkItem_h);
     LCHECK(cuMemAllocAsync(&d_level0, level0_bytes, s));
     LCHECK(cuMemsetD8Async(d_level0, 0, level0_bytes, s));
+
+    // Concave edge buffers (if enabled)
+    if (n_concave_edges > 0) {
+        size_t ep_bytes = (size_t)max_n_cutting * 4 * n_concave_edges * sizeof(struct ConcaveEdgePlane_h);
+        LCHECK(cuMemAllocAsync(&d_edge_planes, ep_bytes, s));
+        LCHECK(cuMemsetD8Async(d_edge_planes, 0, ep_bytes, s));
+        LCHECK(cuMemAllocAsync(&d_n_edge_cuts, (size_t)max_n_cutting * sizeof(int), s));
+    }
 
     // Error and status scalars
     LCHECK(cuMemAllocAsync(&d_err,          sizeof(int), s));
@@ -388,19 +406,65 @@ int lookahead_decompose(
         // Pre-compute total_levels for this iteration
         int total_levels = depth + quick_depth;
 
+        // Concave edge detection for this iteration
+        int iter_n_edge_cuts = 0;     // actual edge plane count for this iter
+        int iter_total_width = width;  // total width including edge cuts
+
+        if (n_concave_edges > 0 && iter < concave_iters) {
+            // Zero the output buffers
+            size_t ep_bytes = (size_t)n_cutting * 4 * n_concave_edges * sizeof(struct ConcaveEdgePlane_h);
+            LCHECK(cuMemsetD8Async(d_edge_planes, 0, ep_bytes, s));
+            LCHECK(cuMemsetD32Async(d_n_edge_cuts, 0, n_cutting, s));
+
+            // Launch concave edge detection
+            {
+                void* args[] = { &d_decomp, &d_cutting_idx, &n_cutting,
+                                 &n_concave_edges, &concave_eps, &concave_threshold,
+                                 &d_edge_planes, &d_n_edge_cuts,
+                                 &ctx->d_pool_struct, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_find_concave_edges,
+                                       n_cutting, 1, 1, 32, 1, 1, 0, s, args, NULL));
+            }
+            LA_SYNC_CHECK("find_concave_edges");
+
+            // Read back per-part edge counts
+            int* h_n_edge_cuts = (int*)malloc((size_t)n_cutting * sizeof(int));
+            if (h_n_edge_cuts) {
+                LCHECK(cuMemcpyDtoH(h_n_edge_cuts, d_n_edge_cuts, (size_t)n_cutting * sizeof(int)));
+                // Take the maximum across all cutting parts (all use same stride)
+                int max_ec = 0;
+                for (int k = 0; k < n_cutting; k++) {
+                    if (h_n_edge_cuts[k] > max_ec)
+                        max_ec = h_n_edge_cuts[k];
+                }
+                iter_n_edge_cuts = max_ec;
+                free(h_n_edge_cuts);
+            }
+            iter_total_width = width + iter_n_edge_cuts;
+            if (verbose)
+                fprintf(stderr, "[la] iter %d: concave edges: %d edge cuts, total_width=%d\n",
+                        iter, iter_n_edge_cuts, iter_total_width);
+        }
+
         // Full expansion levels
         for (int d = 0; d < depth; d++) {
             LCHECK(cuMemsetD32Async(d_nitems, 0, 1, s));
 
-            int d_width = (d == 0) ? width : width2;
-            int nblocks = d_width * cur_n;
+            int d_axis_width = (d == 0) ? width : width2;  // axis-aligned cuts only
+            int d_n_edge = (d == 0) ? iter_n_edge_cuts : 0;
+            int d_total_width = d_axis_width + d_n_edge;   // total width for this depth
+            int nblocks = d_total_width * cur_n;
             {
                 // First expansion level writes to d_level0; deeper levels pass NULL
                 CUdeviceptr l0_ptr = (d == 0) ? d_level0 : (CUdeviceptr)0;
+                CUdeviceptr ep_ptr = (d == 0 && d_n_edge > 0) ? d_edge_planes : (CUdeviceptr)0;
+                int h_n_edge = (d == 0) ? d_n_edge : 0;
+                int h_n_max  = (d == 0 && d_n_edge > 0) ? n_concave_edges : 0;
                 void* args[] = { &d_cur, &cur_n, &d_next, &d_nitems,
-                                 &ctx->d_pool_struct, &d_width, &l0_ptr,
+                                 &ctx->d_pool_struct, &d_axis_width, &l0_ptr,
                                  &min_edge_dist, &d_err,
-                                 &d_extra_leaves, &d_n_extra, &total_levels };
+                                 &d_extra_leaves, &d_n_extra, &total_levels,
+                                 &h_n_edge, &h_n_max, &ep_ptr };
                 LCHECK(cuLaunchKernel(ctx->fn_la_expand,
                                        nblocks, 1, 1, 64, 1, 1, 0, s, args, NULL));
             }
@@ -540,7 +604,7 @@ int lookahead_decompose(
         {
             int h_n_extra = 0;
             LCHECK(cuMemcpyDtoH(&h_n_extra, d_n_extra, sizeof(int)));
-            void* args[] = { &d_cur, &cur_n, &n_cutting, &width,
+            void* args[] = { &d_cur, &cur_n, &n_cutting, &iter_total_width,
                              &total_levels, &d_results,
                              &ctx->d_pool_struct, &d_err,
                              &d_level0, &min_edge_dist,
@@ -613,7 +677,7 @@ int lookahead_decompose(
 
             // Read back level-0 items for per-cut detail
             {
-                int n_l0 = n_cutting * width;
+                int n_l0 = n_cutting * iter_total_width;
                 struct LaWorkItem_h* h_l0 =
                     (struct LaWorkItem_h*)malloc((size_t)n_l0 * sizeof(struct LaWorkItem_h));
                 if (h_l0) {
@@ -624,8 +688,8 @@ int lookahead_decompose(
                         fprintf(stderr, "[la]   level0_items: %d items\n", n_l0);
                         for (int _src = 0; _src < n_cutting; _src++) {
                             fprintf(stderr, "[la]     src_part=%d:\n", _src);
-                            for (int _c = 0; _c < width; _c++) {
-                                struct LaWorkItem_h* _wi = &h_l0[_src * width + _c];
+                            for (int _c = 0; _c < iter_total_width; _c++) {
+                                struct LaWorkItem_h* _wi = &h_l0[_src * iter_total_width + _c];
                                 if (_wi->nparts <= 0) {
                                     fprintf(stderr, "[la]       cut[%d]: EMPTY (no valid split)\n", _c);
                                     continue;
@@ -663,31 +727,31 @@ int lookahead_decompose(
             // Per-cut summary from leaf items: best path cost per initial_cut_idx
             // (This mirrors what la_evaluate computes on the GPU, but visible on host.)
             if (h_leaves_valid && n_cutting > 0) {
-                float* cut_best = (float*)malloc((size_t)n_cutting * (size_t)width * sizeof(float));
+                float* cut_best = (float*)malloc((size_t)n_cutting * (size_t)iter_total_width * sizeof(float));
                 if (cut_best) {
-                    for (int _i = 0; _i < n_cutting * width; _i++)
+                    for (int _i = 0; _i < n_cutting * iter_total_width; _i++)
                         cut_best[_i] = 1e30f;
 
                     for (int _li = 0; _li < cur_n; _li++) {
                         struct LaWorkItem_h* _wi = &h_leaves[_li];
                         if (_wi->nparts <= 0 || _wi->n_levels == 0) continue;
                         if (_wi->src_part_idx < 0 || _wi->src_part_idx >= n_cutting) continue;
-                        if (_wi->initial_cut_idx < 0 || _wi->initial_cut_idx >= width) continue;
+                        if (_wi->initial_cut_idx < 0 || _wi->initial_cut_idx >= iter_total_width) continue;
 
                         float path_cost = 0.0f;
                         for (int _l = 0; _l < _wi->n_levels; _l++)
                             path_cost += _wi->level_costs[_l];
                         if (_wi->n_levels > 0) path_cost /= (float)_wi->n_levels;
 
-                        int idx = _wi->src_part_idx * width + _wi->initial_cut_idx;
+                        int idx = _wi->src_part_idx * iter_total_width + _wi->initial_cut_idx;
                         if (path_cost < cut_best[idx])
                             cut_best[idx] = path_cost;
                     }
 
                     for (int _src = 0; _src < n_cutting; _src++) {
                         fprintf(stderr, "[la]   per_cut_best: src_part=%d:", _src);
-                        for (int _c = 0; _c < width; _c++) {
-                            float v = cut_best[_src * width + _c];
+                        for (int _c = 0; _c < iter_total_width; _c++) {
+                            float v = cut_best[_src * iter_total_width + _c];
                             if (v < 1e29f)
                                 fprintf(stderr, " %d:%.6f", _c, v);
                         }
@@ -703,7 +767,7 @@ int lookahead_decompose(
         // Apply best cuts to the persistent decomposition
         {
             void* args[] = { &d_decomp, &d_cutting_idx, &n_cutting,
-                             &d_level0, &d_results, &width,
+                             &d_level0, &d_results, &iter_total_width,
                              &ctx->d_pool_struct, &d_err };
             LCHECK(cuLaunchKernel(ctx->fn_la_apply_cuts,
                                    n_cutting, 1, 1, 64, 1, 1, 0, s, args, NULL));
@@ -740,7 +804,7 @@ int lookahead_decompose(
 
         // Cleanup tree: free meshes from level-0 items
         {
-            int n_l0 = n_cutting * width;
+            int n_l0 = n_cutting * iter_total_width;
             void* args[] = { &d_level0, &n_l0, &ctx->d_pool_struct };
             LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree,
                                    n_l0, 1, 1, 32, 1, 1, 0, s, args, NULL));
@@ -832,6 +896,8 @@ cleanup:
     if (d_nitems)       cuMemFreeAsync(d_nitems,       s);
     if (d_extra_leaves) cuMemFreeAsync(d_extra_leaves, s);
     if (d_n_extra)      cuMemFreeAsync(d_n_extra,      s);
+    if (d_edge_planes)  cuMemFreeAsync(d_edge_planes,  s);
+    if (d_n_edge_cuts)  cuMemFreeAsync(d_n_edge_cuts,  s);
     cuStreamSynchronize(s);
     if (h_pinned) cuMemFreeHost(h_pinned);
     cuStreamDestroy(s);

@@ -100,6 +100,7 @@ int gpu_init(gpu_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     cuModuleGetFunction(&ctx->fn_la_cleanup_tree,      ctx->module, "la_cleanup_tree");
     cuModuleGetFunction(&ctx->fn_la_free_decomp,       ctx->module, "la_free_decomp");
     cuModuleGetFunction(&ctx->fn_la_decompose_components, ctx->module, "la_decompose_components");
+    cuModuleGetFunction(&ctx->fn_la_find_concave_edges,   ctx->module, "la_find_concave_edges");
     cuModuleGetFunction(&ctx->fn_test_postprocess_dc, ctx->module, "test_postprocess_dc_kernel");
 
     // Determine pool size: default to 80% of free device memory

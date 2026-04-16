@@ -91,6 +91,7 @@ _CUDA_MODULES = [
     "la_expand.cu",
     "la_refine.cu",
     "la_lifecycle.cu",
+    "la_concave.cu",
     "test_kdop_hull.cu",
     "test_hausdorff.cu",
     "test_postprocess.cu",

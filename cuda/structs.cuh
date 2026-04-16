@@ -78,3 +78,10 @@ struct LaEvalResult {
     int   best_cut_idx;    // initial cut index achieving best_cost
     int   _pad[2];
 };
+
+// ============================================================================
+// ConcaveEdgePlane — plane coefficients from a concave edge sample
+// ============================================================================
+struct ConcaveEdgePlane {
+    float pa, pb, pc, pd;
+};

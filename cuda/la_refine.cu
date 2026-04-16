@@ -408,7 +408,7 @@ extern "C" __global__ void la_evaluate(
     LaWorkItem*    leaf_items,
     int            n_leaf_items,
     int            n_cutting,
-    int            width,
+    int            total_width,
     int            total_levels,
     LaEvalResult*  results,
     DevicePool*    pool,
@@ -428,7 +428,7 @@ extern "C" __global__ void la_evaluate(
     // Per-cut accumulators: track the minimum path cost per initial_cut_idx.
     __shared__ float s_cut_best[512];
     if (lane == 0) {
-        for (int c = 0; c < width; c++)
+        for (int c = 0; c < total_width; c++)
             s_cut_best[c] = 1e30f;
     }
     __syncwarp();
@@ -446,7 +446,7 @@ extern "C" __global__ void la_evaluate(
         path_cost /= (float)wi->n_levels;
 
         int cut = wi->initial_cut_idx;
-        if (cut >= 0 && cut < width) {
+        if (cut >= 0 && cut < total_width) {
             float old = s_cut_best[cut];
             while (path_cost < old) {
                 old = atomicMinF(&s_cut_best[cut], path_cost);
@@ -467,7 +467,7 @@ extern "C" __global__ void la_evaluate(
         path_cost /= (float)wi->n_levels;
 
         int cut = wi->initial_cut_idx;
-        if (cut >= 0 && cut < width) {
+        if (cut >= 0 && cut < total_width) {
             float old = s_cut_best[cut];
             while (path_cost < old) {
                 old = atomicMinF(&s_cut_best[cut], path_cost);
@@ -481,7 +481,7 @@ extern "C" __global__ void la_evaluate(
     if (lane == 0) {
         float best = 1e30f;
         int best_idx = 0;
-        for (int c = 0; c < width; c++) {
+        for (int c = 0; c < total_width; c++) {
             if (s_cut_best[c] < best) {
                 best = s_cut_best[c];
                 best_idx = c;

@@ -95,6 +95,7 @@ struct gpu_ctx {
     CUfunction fn_la_cleanup_tree;
     CUfunction fn_la_free_decomp;
     CUfunction fn_la_decompose_components;
+    CUfunction fn_la_find_concave_edges;
 
     CUfunction fn_test_postprocess_dc;   // test kernel
 

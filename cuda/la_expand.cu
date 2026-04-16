@@ -68,21 +68,22 @@ extern "C" __global__ void la_expand(
     int*        next_nitems,
     DevicePool* pool,
     int         width,
-    LaWorkItem* level0_out,  // if non-NULL, also write output here at [item_idx*width + cut_idx]
+    LaWorkItem* level0_out,  // if non-NULL, also write output here at [item_idx*total_width + cut_idx]
     float       min_edge_dist,
     int*        err,
     LaWorkItem* extra_leaves,
     int*        n_extra,
-    int         total_levels)
+    int         total_levels,
+    int         n_edge_cuts,           // number of edge-based cut planes
+    int         n_concave_edges_max,   // stride per part in edge_planes
+    ConcaveEdgePlane* edge_planes)     // edge plane data [n_cutting * 4 * n_concave_edges_max]
 {
     if (*err) return;
 
     int tid      = threadIdx.x;
-    int cpa      = width / 3;
-    int item_idx = blockIdx.x / width;
-    int cut_idx  = blockIdx.x % width;
-    int axis     = cut_idx / cpa;
-    int slice    = cut_idx % cpa;
+    int total_width = width + n_edge_cuts;
+    int item_idx = blockIdx.x / total_width;
+    int cut_idx  = blockIdx.x % total_width;
 
     if (item_idx >= cur_nitems) return;
 
@@ -104,7 +105,26 @@ extern "C" __global__ void la_expand(
     __syncthreads();
     if (s_mesh_bad) return;
 
-    // Compute bounding box
+    // For edge-based cuts, read plane coefficients directly and skip bbox computation
+    __shared__ float s_pa, s_pb, s_pc, s_pd;
+    __shared__ int   s_edge_cut;  // 1 if this is an edge-based cut
+
+    if (cut_idx >= width) {
+        // Edge-based cut
+        if (tid == 0) {
+            s_edge_cut = 1;
+            int edge_cut_idx = cut_idx - width;
+            ConcaveEdgePlane ep = edge_planes[item_idx * 4 * n_concave_edges_max + edge_cut_idx];
+            s_pa = ep.pa; s_pb = ep.pb; s_pc = ep.pc; s_pd = ep.pd;
+        }
+        __syncthreads();
+        // Skip degenerate edge planes (all zeros)
+        if (s_pa == 0.0f && s_pb == 0.0f && s_pc == 0.0f) return;
+    } else {
+        s_edge_cut = 0;
+    }
+
+    // Compute bounding box (needed for axis-aligned cuts and all_small check)
     __shared__ float s_lo[3], s_hi[3];
     if (tid < 3) { s_lo[tid] = 1e30f; s_hi[tid] = -1e30f; }
     __syncthreads();
@@ -152,18 +172,29 @@ extern "C" __global__ void la_expand(
         }
     }
 
-    // Place cuts evenly in the valid range [lo+min_edge_dist, hi-min_edge_dist]
-    float lo_valid = s_lo[axis] + min_edge_dist;
-    float hi_valid = s_hi[axis] - min_edge_dist;
-    if (lo_valid >= hi_valid) return;  // this axis too narrow (but not all_small — other axes may work)
+    // Compute plane coefficients
+    float pa, pb, pc, pd;
+    if (s_edge_cut) {
+        // Use edge-based plane coefficients (already in shared memory)
+        pa = s_pa; pb = s_pb; pc = s_pc; pd = s_pd;
+    } else {
+        // Axis-aligned cut
+        int cpa   = width / 3;
+        int axis  = cut_idx / cpa;
+        int slice = cut_idx % cpa;
 
-    float frac = (slice + 1.f) / (cpa + 1.f);
-    float cut_pos = lo_valid + frac * (hi_valid - lo_valid);
+        float lo_valid = s_lo[axis] + min_edge_dist;
+        float hi_valid = s_hi[axis] - min_edge_dist;
+        if (lo_valid >= hi_valid) return;  // this axis too narrow
 
-    float pa = (axis == 0) ? 1.f : 0.f;
-    float pb = (axis == 1) ? 1.f : 0.f;
-    float pc = (axis == 2) ? 1.f : 0.f;
-    float pd = -cut_pos;
+        float frac = (slice + 1.f) / (cpa + 1.f);
+        float cut_pos = lo_valid + frac * (hi_valid - lo_valid);
+
+        pa = (axis == 0) ? 1.f : 0.f;
+        pb = (axis == 1) ? 1.f : 0.f;
+        pc = (axis == 2) ? 1.f : 0.f;
+        pd = -cut_pos;
+    }
 
     PartPair pp = plane_cut_block(mesh, pa, pb, pc, pd,
                                   &pool->heap, &pool->scratch, err);
@@ -255,7 +286,7 @@ extern "C" __global__ void la_expand(
 
     // Also write to level0_out if provided (first expansion level only)
     if (level0_out != NULL && wi->n_levels == 0) {
-        LaWorkItem* l0 = &level0_out[item_idx * width + cut_idx];
+        LaWorkItem* l0 = &level0_out[item_idx * total_width + cut_idx];
         // Copy the output item to level0
         int out_ints = (np + 1) * (int)(sizeof(Part) / sizeof(int));
         int* src_i2 = (int*)wo->parts;

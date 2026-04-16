@@ -24,7 +24,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume
   hausdorff.cuh       #   hausdorff_block: block-level bidirectional Hausdorff via sampling + linear BVH
   postprocess.cuh     #   decompose_components_block: block-level connected-components via union-find
-  structs.cuh         #   Device-side: Mesh, Part, PartPair, LaWorkItem, LaDecompState, LaEvalResult
+  structs.cuh         #   Device-side: Mesh, Part, PartPair, LaWorkItem, LaDecompState, LaEvalResult, ConcaveEdgePlane
   error_codes.cuh     #   Centralized GPU kernel error flags (KERR_*)
   la_common.cuh       #   Shared lookahead constants + la_part_cost/la_part_cost_rv inline functions
   mm.cu               #   heap_init_kernel
@@ -32,6 +32,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   la_expand.cu        #   la_expand, la_hull, la_seed_tree, la_cleanup_tree
   la_refine.cu        #   la_expand_quick, la_hausdorff_parts, la_evaluate, la_sort_items, la_record_level_cost
   la_lifecycle.cu     #   la_initialize, la_sort_parts, la_count_cutting, la_apply_cuts, la_hull_decomp, la_decompose_components, la_free_decomp
+  la_concave.cu       #   la_find_concave_edges: concave edge detection + plane generation
   test_*.cu           #   Test kernels
 csrc/                 # C host code
   structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, gpu_ctx
@@ -89,7 +90,9 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto 
     results = ctx.batch_kdop_hull_mesh(pts_list)    # list of (verts, tris, volume) — approximate k-DOP hull
     parts = ctx.lookahead_decompose(verts, tris, max_iters=100, width=60, width2=5, threshold=0.05,
                                      decompose_components=False,
-                                     decompose_components_per_iter=False)  # list of (verts, tris, hull_verts, hull_tris)
+                                     decompose_components_per_iter=False,
+                                     n_concave_edges=0, concave_eps=0.005,
+                                     concave_threshold=3.49, concave_iters=1)  # list of (verts, tris, hull_verts, hull_tris)
     used = ctx.pool_usage()     # bytes consumed from pool (monotonic high-water mark)
     ctx.heap_compact()          # no-op (coalescing handled by heap_free)
 ```

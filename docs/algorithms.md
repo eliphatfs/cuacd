@@ -20,9 +20,13 @@ Block-level (256 threads, 8 warps). Computes bidirectional Hausdorff distance be
 
 ## Lookahead Search Decomposition
 
-Source files: `la_expand.cu` + `la_refine.cu` + `la_lifecycle.cu` + `csrc/lookahead.c`.
+Source files: `la_expand.cu` + `la_refine.cu` + `la_lifecycle.cu` + `la_concave.cu` + `csrc/lookahead.c`.
 
 Maintains a flat decomposition (LaDecompState). For each part above threshold, explores a shallow tree of candidate cuts: `depth` full expansion levels (`width` cuts at level 0, `width2` at deeper levels), then `quick_depth` levels (1 best-axis midpoint cut each). Path cost = average worst-part cost across levels; cut selection = minimum path cost per initial cut. Uses rv-only cost for tree exploration (matching CoACD), but full cost `max(rv, hausdorff)` for the stopping criterion. Default depth=2, quick_depth=0, width=60, width2=5.
+
+### Concave Edge Sampling (`la_concave.cu`)
+
+Optional first-layer expansion supplement. When `n_concave_edges > 0`, the `la_find_concave_edges` kernel (<<<n_cutting, 32>>>) processes each cutting part's mesh: sorts directed edges via `warp_sort_t`, scans for shared edges (consecutive pairs with same vertex key), computes dihedral angles, and reservoir-samples up to `n_concave_edges` concave edges. For each sampled edge, generates up to 4 cutting planes: two face-offset planes and two bisector planes (bisector skipped when `||n1+n2|| < 1e-4`). Total first-layer candidates = `width + n_edge_cuts` (must be < 512). Controlled by `n_concave_edges` (default 0 = disabled), `concave_eps`, `concave_threshold` (radians, default 3.49 ≈ 200°), `concave_iters` (iterations to apply, default 1).
 
 `la_evaluate` falls back to level-0 items when no leaf descendants exist for a cut (all deeper expansions produced empty halves because pieces were too small to cut further — such pieces are provably below threshold).
 

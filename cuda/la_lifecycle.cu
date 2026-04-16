@@ -168,7 +168,7 @@ extern "C" __global__ void la_apply_cuts(
     int            n_cutting,
     LaWorkItem*    level0_items,
     LaEvalResult*  results,
-    int            width,
+    int            total_width,
     DevicePool*    pool,
     int*           err)
 {
@@ -182,7 +182,7 @@ extern "C" __global__ void la_apply_cuts(
     int best_cut = results[i].best_cut_idx;
 
     // The level-0 item produced by the best cut
-    LaWorkItem* best_wi = &level0_items[i * width + best_cut];
+    LaWorkItem* best_wi = &level0_items[i * total_width + best_cut];
 
     if (best_wi->nparts < 2) return;  // shouldn't happen if cut was valid
 

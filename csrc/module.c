@@ -283,7 +283,8 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
         "max_iters", "width", "width2", "threshold",
         "depth", "quick_depth", "max_n_cutting",
         "verbose", "debug", "decompose_components",
-        "decompose_components_per_iter", NULL
+        "decompose_components_per_iter",
+        "n_concave_edges", "concave_eps", "concave_threshold", "concave_iters", NULL
     };
     unsigned long long vp, tp, hvp, htp;
     int nv, nt, hull_nv, hull_nt;
@@ -293,14 +294,19 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
     int verbose = 0, debug = 0;
     int decompose_components = 0;
     int decompose_components_per_iter = 0;
+    int n_concave_edges = 0;
+    float concave_eps = 0.005f;
+    float concave_threshold = 3.49f;
+    int concave_iters = 1;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiiifiii|iiii", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiKiKiKiiiifiii|iiiiiffi", kwlist,
             &vp, &nv, &tp, &nt,
             &hvp, &hull_nv, &htp, &hull_nt,
             &max_iters, &width, &width2, &threshold,
             &depth, &quick_depth, &max_n_cutting,
             &verbose, &debug, &decompose_components,
-            &decompose_components_per_iter))
+            &decompose_components_per_iter,
+            &n_concave_edges, &concave_eps, &concave_threshold, &concave_iters))
         return NULL;
 
     REQUIRE_CTX();
@@ -317,6 +323,7 @@ static PyObject* py_lookahead_decompose(PyObject* self, PyObject* args, PyObject
         depth, quick_depth, max_n_cutting,
         verbose, debug, decompose_components,
         decompose_components_per_iter,
+        n_concave_edges, concave_eps, concave_threshold, concave_iters,
         &result);
     if (rc != 0) {
         gpu_result_free(&result);
