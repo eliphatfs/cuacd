@@ -7,7 +7,7 @@ decomp_output/vhacd2_data_r0.1_mv10k_ablations/<param_encoding>/ with the GLB
 results and a run log.
 
 Usage:
-    python scripts/ablation_study.py [--dry-run]
+    python scripts/ablation_study.py [--dry-run] [--only-new] [--dc-only]
 """
 
 import argparse
@@ -25,9 +25,9 @@ INPUT_DIR = "tests/data/vhacd2_data_r0.1_mv10k"
 OUTPUT_BASE = "decomp_output/vhacd2_data_r0.1_mv10k_ablations"
 
 WIDTHS = [15, 30, 60, 120, 240]
-N_CONCAVE_EDGES = [0, 4, 16, 32]
+N_CONCAVE_EDGES = [0, 4, 16, 32, 64]
 DECOMPOSE_COMPONENTS_PER_ITER = [False, True]
-CONCAVE_ITERS = [1, 3, 5, 10]  # only used when n_concave_edges > 0
+CONCAVE_ITERS = [1, 3, 5, 10, 20]  # only used when n_concave_edges > 0
 
 
 def encode_params(width, n_concave_edges, dc_per_iter, concave_iters):
@@ -37,10 +37,11 @@ def encode_params(width, n_concave_edges, dc_per_iter, concave_iters):
     return f"w{width}_nc{n_concave_edges}_{dc_str}_{ci_str}"
 
 
-def build_configs():
+def build_configs(dc_only=False):
     """Build the full list of ablation configurations."""
+    dc_values = [True] if dc_only else DECOMPOSE_COMPONENTS_PER_ITER
     configs = []
-    for width, nce, dc in itertools.product(WIDTHS, N_CONCAVE_EDGES, DECOMPOSE_COMPONENTS_PER_ITER):
+    for width, nce, dc in itertools.product(WIDTHS, N_CONCAVE_EDGES, dc_values):
         if nce == 0:
             configs.append({
                 "width": width,
@@ -57,6 +58,18 @@ def build_configs():
                     "concave_iters": ci,
                 })
     return configs
+
+
+def config_already_done(config):
+    """Check if a config's output directory already exists with a run.log."""
+    name = encode_params(
+        width=config["width"],
+        n_concave_edges=config["n_concave_edges"],
+        dc_per_iter=config["decompose_components_per_iter"],
+        concave_iters=config["concave_iters"],
+    )
+    output_dir = pathlib.Path(OUTPUT_BASE) / name
+    return output_dir.exists() and (output_dir / "run.log").exists()
 
 
 def run_config(config, dry_run=False):
@@ -114,9 +127,19 @@ def main():
     parser = argparse.ArgumentParser(description="Ablation study driver for coacd-gpu")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running them")
     parser.add_argument("--start-from", type=int, default=0, help="Skip first N configurations (for resuming)")
+    parser.add_argument("--only-new", action="store_true", help="Skip configurations that already have results")
+    parser.add_argument("--dc-only", action="store_true", help="Only run decompose-components-per-iter configs")
     args = parser.parse_args()
 
-    configs = build_configs()
+    configs = build_configs(dc_only=args.dc_only)
+
+    if args.only_new:
+        before = len(configs)
+        configs = [c for c in configs if not config_already_done(c)]
+        skipped = before - len(configs)
+        if skipped:
+            print(f"Skipping {skipped} already-completed configurations")
+
     total = len(configs)
 
     print(f"Ablation study: {total} configurations")

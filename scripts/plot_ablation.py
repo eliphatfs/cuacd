@@ -15,8 +15,8 @@ import numpy as np
 
 BASE = pathlib.Path("decomp_output/vhacd2_data_r0.1_mv10k_ablations")
 WIDTHS = [15, 30, 60, 120, 240]
-N_CONCAVE_EDGES = [0, 4, 16, 32]
-CONCAVE_ITERS = [1, 3, 5, 10]
+N_CONCAVE_EDGES = [0, 4, 16, 32, 64]
+CONCAVE_ITERS = [1, 3, 5, 10, 20]
 DC_VALUES = [False, True]
 
 LINE_PATTERN = re.compile(r"^(.+\.obj)\s+([\d.]+)s\s+(\d+)\s+parts$", re.MULTILINE)
