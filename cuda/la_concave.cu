@@ -144,202 +144,216 @@ extern "C" __global__ void la_find_concave_edges(
     if (lane == 0) s_rng = (unsigned int)(blockIdx.x * 2654435761u + 1u);
     __syncwarp();
 
-    // Scan sorted edges for shared edges — lane 0 sequential
-    if (lane == 0) {
-        for (int e = 0; e < n_dir_edges - 1; e++) {
-            EdgeFace* ef0 = &ef_arr[e];
-            EdgeFace* ef1 = &ef_arr[e + 1];
-            if (ef0->lo != ef1->lo || ef0->hi != ef1->hi) continue;
-            if (ef0->face_idx == ef1->face_idx) continue;  // shouldn't happen
+    // Scan sorted edges for shared edges — warp-parallel detection, lane 0 reservoir sampling.
+    // Each batch of 32 lanes evaluates 32 consecutive edges in parallel up to the
+    // dihedral threshold test. Results are staged in shared memory and lane 0
+    // consumes them in order to preserve reservoir-sampling determinism.
+    __shared__ int s_batch_valid[32];
+    __shared__ int s_batch_v0[32];
+    __shared__ int s_batch_v1[32];
+    __shared__ int s_batch_f0[32];
+    __shared__ int s_batch_f1[32];
 
-            // Shared edge between ef0->face_idx and ef1->face_idx
-            int v0 = ef0->lo;
-            int v1 = ef0->hi;
-            int f0 = ef0->face_idx;
-            int f1 = ef1->face_idx;
+    int total_edges = n_dir_edges - 1;
+    for (int batch = 0; batch < total_edges; batch += 32) {
+        int e = batch + lane;
+        int valid = 0;
+        int v0 = -1, v1 = -1, f0 = -1, f1 = -1;
 
-            // Compute face normals
-            float3 n0, n1;
-            {
-                int t0a = mesh->tris[3*f0+0], t0b = mesh->tris[3*f0+1], t0c = mesh->tris[3*f0+2];
-                float3 p0a = {mesh->verts[3*t0a+0], mesh->verts[3*t0a+1], mesh->verts[3*t0a+2]};
-                float3 p0b = {mesh->verts[3*t0b+0], mesh->verts[3*t0b+1], mesh->verts[3*t0b+2]};
-                float3 p0c = {mesh->verts[3*t0c+0], mesh->verts[3*t0c+1], mesh->verts[3*t0c+2]};
-                float3 e1 = {p0b.x-p0a.x, p0b.y-p0a.y, p0b.z-p0a.z};
-                float3 e2 = {p0c.x-p0a.x, p0c.y-p0a.y, p0c.z-p0a.z};
-                n0.x = e1.y*e2.z - e1.z*e2.y;
-                n0.y = e1.z*e2.x - e1.x*e2.z;
-                n0.z = e1.x*e2.y - e1.y*e2.x;
-                float len0 = sqrtf(n0.x*n0.x + n0.y*n0.y + n0.z*n0.z);
-                if (len0 < 1e-12f) continue;
-                n0.x /= len0; n0.y /= len0; n0.z /= len0;
-            }
-            {
-                int t1a = mesh->tris[3*f1+0], t1b = mesh->tris[3*f1+1], t1c = mesh->tris[3*f1+2];
-                float3 p1a = {mesh->verts[3*t1a+0], mesh->verts[3*t1a+1], mesh->verts[3*t1a+2]};
-                float3 p1b = {mesh->verts[3*t1b+0], mesh->verts[3*t1b+1], mesh->verts[3*t1b+2]};
-                float3 p1c = {mesh->verts[3*t1c+0], mesh->verts[3*t1c+1], mesh->verts[3*t1c+2]};
-                float3 e1 = {p1b.x-p1a.x, p1b.y-p1a.y, p1b.z-p1a.z};
-                float3 e2 = {p1c.x-p1a.x, p1c.y-p1a.y, p1c.z-p1a.z};
-                n1.x = e1.y*e2.z - e1.z*e2.y;
-                n1.y = e1.z*e2.x - e1.x*e2.z;
-                n1.z = e1.x*e2.y - e1.y*e2.x;
-                float len1 = sqrtf(n1.x*n1.x + n1.y*n1.y + n1.z*n1.z);
-                if (len1 < 1e-12f) continue;
-                n1.x /= len1; n1.y /= len1; n1.z /= len1;
-            }
+        if (e < total_edges) {
+            EdgeFace ef0 = ef_arr[e];
+            EdgeFace ef1 = ef_arr[e + 1];
 
-            // Compute dihedral angle
-            float cos_a = n0.x*n1.x + n0.y*n1.y + n0.z*n1.z;
-            cos_a = fmaxf(-1.0f, fminf(1.0f, cos_a));
-            float alpha = acosf(cos_a);
+            // First occurrence of this (lo, hi) in sorted array — prevents
+            // double-counting on non-manifold edges (3+ faces sharing an edge).
+            bool is_first = (e == 0) ||
+                            (ef_arr[e - 1].lo != ef0.lo) ||
+                            (ef_arr[e - 1].hi != ef0.hi);
+            bool is_shared = (ef0.lo == ef1.lo) && (ef0.hi == ef1.hi) &&
+                             (ef0.face_idx != ef1.face_idx);
 
-            // Find "other" vertex of f0 not on the edge
-            int v_other = -1;
-            for (int vi = 0; vi < 3; vi++) {
-                int vv = mesh->tris[3*f0+vi];
-                if (vv != v0 && vv != v1) { v_other = vv; break; }
-            }
-            if (v_other < 0) continue;
+            if (is_first && is_shared) {
+                v0 = ef0.lo;
+                v1 = ef0.hi;
+                f0 = ef0.face_idx;
+                f1 = ef1.face_idx;
 
-            // Determine concave vs convex using dot product
-            float3 edge_v = {mesh->verts[3*v0+0], mesh->verts[3*v0+1], mesh->verts[3*v0+2]};
-            float3 other_v = {mesh->verts[3*v_other+0], mesh->verts[3*v_other+1], mesh->verts[3*v_other+2]};
-            float3 diff = {other_v.x - edge_v.x, other_v.y - edge_v.y, other_v.z - edge_v.z};
-            float d = diff.x*n1.x + diff.y*n1.y + diff.z*n1.z;
+                float3 n0, n1;
+                bool ok = true;
 
-            const float pi = 3.14159265358979f;
-            float dihedral = (d > 0.0f) ? (pi + alpha) : (pi - alpha);
+                {
+                    int t0a = mesh->tris[3*f0+0], t0b = mesh->tris[3*f0+1], t0c = mesh->tris[3*f0+2];
+                    float3 p0a = {mesh->verts[3*t0a+0], mesh->verts[3*t0a+1], mesh->verts[3*t0a+2]};
+                    float3 p0b = {mesh->verts[3*t0b+0], mesh->verts[3*t0b+1], mesh->verts[3*t0b+2]};
+                    float3 p0c = {mesh->verts[3*t0c+0], mesh->verts[3*t0c+1], mesh->verts[3*t0c+2]};
+                    float3 e1v = {p0b.x-p0a.x, p0b.y-p0a.y, p0b.z-p0a.z};
+                    float3 e2v = {p0c.x-p0a.x, p0c.y-p0a.y, p0c.z-p0a.z};
+                    n0.x = e1v.y*e2v.z - e1v.z*e2v.y;
+                    n0.y = e1v.z*e2v.x - e1v.x*e2v.z;
+                    n0.z = e1v.x*e2v.y - e1v.y*e2v.x;
+                    float len0 = sqrtf(n0.x*n0.x + n0.y*n0.y + n0.z*n0.z);
+                    if (len0 < 1e-12f) ok = false;
+                    else { n0.x /= len0; n0.y /= len0; n0.z /= len0; }
+                }
+                if (ok) {
+                    int t1a = mesh->tris[3*f1+0], t1b = mesh->tris[3*f1+1], t1c = mesh->tris[3*f1+2];
+                    float3 p1a = {mesh->verts[3*t1a+0], mesh->verts[3*t1a+1], mesh->verts[3*t1a+2]};
+                    float3 p1b = {mesh->verts[3*t1b+0], mesh->verts[3*t1b+1], mesh->verts[3*t1b+2]};
+                    float3 p1c = {mesh->verts[3*t1c+0], mesh->verts[3*t1c+1], mesh->verts[3*t1c+2]};
+                    float3 e1v = {p1b.x-p1a.x, p1b.y-p1a.y, p1b.z-p1a.z};
+                    float3 e2v = {p1c.x-p1a.x, p1c.y-p1a.y, p1c.z-p1a.z};
+                    n1.x = e1v.y*e2v.z - e1v.z*e2v.y;
+                    n1.y = e1v.z*e2v.x - e1v.x*e2v.z;
+                    n1.z = e1v.x*e2v.y - e1v.y*e2v.x;
+                    float len1 = sqrtf(n1.x*n1.x + n1.y*n1.y + n1.z*n1.z);
+                    if (len1 < 1e-12f) ok = false;
+                    else { n1.x /= len1; n1.y /= len1; n1.z /= len1; }
+                }
 
-            if (dihedral <= concave_threshold) continue;  // not concave enough
+                if (ok) {
+                    float cos_a = n0.x*n1.x + n0.y*n1.y + n0.z*n1.z;
+                    cos_a = fmaxf(-1.0f, fminf(1.0f, cos_a));
+                    float alpha = acosf(cos_a);
 
-            // This edge is concave — reservoir sampling
-            s_n_seen++;
-            if (s_n_res < n_concave_edges) {
-                // Fill reservoir
-                int slot = s_n_res;
-                reservoir[4*slot+0] = v0;
-                reservoir[4*slot+1] = v1;
-                reservoir[4*slot+2] = f0;
-                reservoir[4*slot+3] = f1;
-                s_n_res++;
-            } else {
-                // Replace with probability n_concave_edges / s_n_seen
-                unsigned int rng = lcg_next(&s_rng);
-                unsigned int threshold_r = (unsigned int)((float)n_concave_edges / (float)s_n_seen * 4294967295.0f);
-                if (rng < threshold_r) {
-                    // Pick random slot to replace
-                    unsigned int r2 = lcg_next(&s_rng);
-                    int slot = (int)(r2 % (unsigned int)n_concave_edges);
-                    reservoir[4*slot+0] = v0;
-                    reservoir[4*slot+1] = v1;
-                    reservoir[4*slot+2] = f0;
-                    reservoir[4*slot+3] = f1;
+                    int v_other = -1;
+                    for (int vi = 0; vi < 3; vi++) {
+                        int vv = mesh->tris[3*f0+vi];
+                        if (vv != v0 && vv != v1) { v_other = vv; break; }
+                    }
+
+                    if (v_other >= 0) {
+                        float3 edge_v = {mesh->verts[3*v0+0], mesh->verts[3*v0+1], mesh->verts[3*v0+2]};
+                        float3 other_v = {mesh->verts[3*v_other+0], mesh->verts[3*v_other+1], mesh->verts[3*v_other+2]};
+                        float3 diff = {other_v.x - edge_v.x, other_v.y - edge_v.y, other_v.z - edge_v.z};
+                        float d = diff.x*n1.x + diff.y*n1.y + diff.z*n1.z;
+
+                        const float pi = 3.14159265358979f;
+                        float dihedral = (d > 0.0f) ? (pi + alpha) : (pi - alpha);
+
+                        if (dihedral > concave_threshold) valid = 1;
+                    }
                 }
             }
+        }
 
-            // Skip past the pair (e and e+1 are same edge)
-            // Check if e+2 is also same edge (3+ faces sharing an edge — skip extra)
-            while (e + 2 < n_dir_edges &&
-                   ef_arr[e+2].lo == ef0->lo && ef_arr[e+2].hi == ef0->hi) {
-                e++;  // skip non-manifold edge (shared by 3+ faces)
+        s_batch_valid[lane] = valid;
+        s_batch_v0[lane]    = v0;
+        s_batch_v1[lane]    = v1;
+        s_batch_f0[lane]    = f0;
+        s_batch_f1[lane]    = f1;
+        __syncwarp();
+
+        // Lane 0 consumes the batch in lane-order (= edge order) to preserve
+        // the deterministic reservoir-sampling behavior of the sequential version.
+        if (lane == 0) {
+            for (int k = 0; k < 32; k++) {
+                if (!s_batch_valid[k]) continue;
+
+                s_n_seen++;
+                if (s_n_res < n_concave_edges) {
+                    int slot = s_n_res;
+                    reservoir[4*slot+0] = s_batch_v0[k];
+                    reservoir[4*slot+1] = s_batch_v1[k];
+                    reservoir[4*slot+2] = s_batch_f0[k];
+                    reservoir[4*slot+3] = s_batch_f1[k];
+                    s_n_res++;
+                } else {
+                    unsigned int rng = lcg_next(&s_rng);
+                    unsigned int threshold_r = (unsigned int)((float)n_concave_edges / (float)s_n_seen * 4294967295.0f);
+                    if (rng < threshold_r) {
+                        unsigned int r2 = lcg_next(&s_rng);
+                        int slot = (int)(r2 % (unsigned int)n_concave_edges);
+                        reservoir[4*slot+0] = s_batch_v0[k];
+                        reservoir[4*slot+1] = s_batch_v1[k];
+                        reservoir[4*slot+2] = s_batch_f0[k];
+                        reservoir[4*slot+3] = s_batch_f1[k];
+                    }
+                }
             }
-            e++;  // skip ef1
+        }
+        __syncwarp();
+    }
+
+    // Generate planes from reservoir entries — warp-parallel across slots.
+    int n_res = s_n_res;
+    __shared__ int s_plane_count;
+    if (lane == 0) s_plane_count = 0;
+    __syncwarp();
+
+    ConcaveEdgePlane* out = &edge_planes[i * 4 * n_concave_edges];
+
+    for (int r = lane; r < n_res; r += 32) {
+        int v0 = reservoir[4*r+0];
+        int v1 = reservoir[4*r+1];
+        int f0 = reservoir[4*r+2];
+        int f1 = reservoir[4*r+3];
+        if (v0 < 0) continue;
+
+        float3 n0, n1;
+        {
+            int t0a = mesh->tris[3*f0+0], t0b = mesh->tris[3*f0+1], t0c = mesh->tris[3*f0+2];
+            float3 p0a = {mesh->verts[3*t0a+0], mesh->verts[3*t0a+1], mesh->verts[3*t0a+2]};
+            float3 p0b = {mesh->verts[3*t0b+0], mesh->verts[3*t0b+1], mesh->verts[3*t0b+2]};
+            float3 p0c = {mesh->verts[3*t0c+0], mesh->verts[3*t0c+1], mesh->verts[3*t0c+2]};
+            float3 e1 = {p0b.x-p0a.x, p0b.y-p0a.y, p0b.z-p0a.z};
+            float3 e2 = {p0c.x-p0a.x, p0c.y-p0a.y, p0c.z-p0a.z};
+            n0.x = e1.y*e2.z - e1.z*e2.y;
+            n0.y = e1.z*e2.x - e1.x*e2.z;
+            n0.z = e1.x*e2.y - e1.y*e2.x;
+            float len0 = sqrtf(n0.x*n0.x + n0.y*n0.y + n0.z*n0.z);
+            if (len0 < 1e-12f) continue;
+            n0.x /= len0; n0.y /= len0; n0.z /= len0;
+        }
+        {
+            int t1a = mesh->tris[3*f1+0], t1b = mesh->tris[3*f1+1], t1c = mesh->tris[3*f1+2];
+            float3 p1a = {mesh->verts[3*t1a+0], mesh->verts[3*t1a+1], mesh->verts[3*t1a+2]};
+            float3 p1b = {mesh->verts[3*t1b+0], mesh->verts[3*t1b+1], mesh->verts[3*t1b+2]};
+            float3 p1c = {mesh->verts[3*t1c+0], mesh->verts[3*t1c+1], mesh->verts[3*t1c+2]};
+            float3 e1 = {p1b.x-p1a.x, p1b.y-p1a.y, p1b.z-p1a.z};
+            float3 e2 = {p1c.x-p1a.x, p1c.y-p1a.y, p1c.z-p1a.z};
+            n1.x = e1.y*e2.z - e1.z*e2.y;
+            n1.y = e1.z*e2.x - e1.x*e2.z;
+            n1.z = e1.x*e2.y - e1.y*e2.x;
+            float len1 = sqrtf(n1.x*n1.x + n1.y*n1.y + n1.z*n1.z);
+            if (len1 < 1e-12f) continue;
+            n1.x /= len1; n1.y /= len1; n1.z /= len1;
+        }
+
+        float midx = (mesh->verts[3*v0+0] + mesh->verts[3*v1+0]) * 0.5f;
+        float midy = (mesh->verts[3*v0+1] + mesh->verts[3*v1+1]) * 0.5f;
+        float midz = (mesh->verts[3*v0+2] + mesh->verts[3*v1+2]) * 0.5f;
+        float eps  = concave_eps;
+
+        int idx = atomicAdd(&s_plane_count, 2);
+        out[idx].pa   = n1.x;
+        out[idx].pb   = n1.y;
+        out[idx].pc   = n1.z;
+        out[idx].pd   = -(n1.x*midx + n1.y*midy + n1.z*midz + eps);
+        out[idx+1].pa = n0.x;
+        out[idx+1].pb = n0.y;
+        out[idx+1].pc = n0.z;
+        out[idx+1].pd = -(n0.x*midx + n0.y*midy + n0.z*midz + eps);
+
+        float bx = n0.x + n1.x;
+        float by = n0.y + n1.y;
+        float bz = n0.z + n1.z;
+        float blen = sqrtf(bx*bx + by*by + bz*bz);
+        if (blen >= 1e-4f) {
+            bx /= blen; by /= blen; bz /= blen;
+            int idx2 = atomicAdd(&s_plane_count, 2);
+            out[idx2].pa   = bx;
+            out[idx2].pb   = by;
+            out[idx2].pc   = bz;
+            out[idx2].pd   = -(bx*midx + by*midy + bz*midz + eps);
+            out[idx2+1].pa = bx;
+            out[idx2+1].pb = by;
+            out[idx2+1].pc = bz;
+            out[idx2+1].pd = -(bx*midx + by*midy + bz*midz - eps);
         }
     }
     __syncwarp();
 
-    // Now generate planes from reservoir entries (lane 0)
-    int n_res = s_n_res;
-    if (lane == 0) {
-        int plane_count = 0;
-        ConcaveEdgePlane* out = &edge_planes[i * 4 * n_concave_edges];
-
-        for (int r = 0; r < n_res; r++) {
-            int v0 = reservoir[4*r+0];
-            int v1 = reservoir[4*r+1];
-            int f0 = reservoir[4*r+2];
-            int f1 = reservoir[4*r+3];
-            if (v0 < 0) continue;  // unused slot
-
-            // Compute face normals again
-            float3 n0, n1;
-            {
-                int t0a = mesh->tris[3*f0+0], t0b = mesh->tris[3*f0+1], t0c = mesh->tris[3*f0+2];
-                float3 p0a = {mesh->verts[3*t0a+0], mesh->verts[3*t0a+1], mesh->verts[3*t0a+2]};
-                float3 p0b = {mesh->verts[3*t0b+0], mesh->verts[3*t0b+1], mesh->verts[3*t0b+2]};
-                float3 p0c = {mesh->verts[3*t0c+0], mesh->verts[3*t0c+1], mesh->verts[3*t0c+2]};
-                float3 e1 = {p0b.x-p0a.x, p0b.y-p0a.y, p0b.z-p0a.z};
-                float3 e2 = {p0c.x-p0a.x, p0c.y-p0a.y, p0c.z-p0a.z};
-                n0.x = e1.y*e2.z - e1.z*e2.y;
-                n0.y = e1.z*e2.x - e1.x*e2.z;
-                n0.z = e1.x*e2.y - e1.y*e2.x;
-                float len0 = sqrtf(n0.x*n0.x + n0.y*n0.y + n0.z*n0.z);
-                if (len0 < 1e-12f) continue;
-                n0.x /= len0; n0.y /= len0; n0.z /= len0;
-            }
-            {
-                int t1a = mesh->tris[3*f1+0], t1b = mesh->tris[3*f1+1], t1c = mesh->tris[3*f1+2];
-                float3 p1a = {mesh->verts[3*t1a+0], mesh->verts[3*t1a+1], mesh->verts[3*t1a+2]};
-                float3 p1b = {mesh->verts[3*t1b+0], mesh->verts[3*t1b+1], mesh->verts[3*t1b+2]};
-                float3 p1c = {mesh->verts[3*t1c+0], mesh->verts[3*t1c+1], mesh->verts[3*t1c+2]};
-                float3 e1 = {p1b.x-p1a.x, p1b.y-p1a.y, p1b.z-p1a.z};
-                float3 e2 = {p1c.x-p1a.x, p1c.y-p1a.y, p1c.z-p1a.z};
-                n1.x = e1.y*e2.z - e1.z*e2.y;
-                n1.y = e1.z*e2.x - e1.x*e2.z;
-                n1.z = e1.x*e2.y - e1.y*e2.x;
-                float len1 = sqrtf(n1.x*n1.x + n1.y*n1.y + n1.z*n1.z);
-                if (len1 < 1e-12f) continue;
-                n1.x /= len1; n1.y /= len1; n1.z /= len1;
-            }
-
-            // Edge midpoint
-            float midx = (mesh->verts[3*v0+0] + mesh->verts[3*v1+0]) * 0.5f;
-            float midy = (mesh->verts[3*v0+1] + mesh->verts[3*v1+1]) * 0.5f;
-            float midz = (mesh->verts[3*v0+2] + mesh->verts[3*v1+2]) * 0.5f;
-
-            float eps = concave_eps;
-
-            // Plane 1: face-offset using n1 (offset eps outside face 1)
-            out[plane_count].pa = n1.x;
-            out[plane_count].pb = n1.y;
-            out[plane_count].pc = n1.z;
-            out[plane_count].pd = -(n1.x*midx + n1.y*midy + n1.z*midz + eps);
-            plane_count++;
-
-            // Plane 2: face-offset using n2 (offset eps outside face 2)
-            out[plane_count].pa = n0.x;
-            out[plane_count].pb = n0.y;
-            out[plane_count].pc = n0.z;
-            out[plane_count].pd = -(n0.x*midx + n0.y*midy + n0.z*midz + eps);
-            plane_count++;
-
-            // Bisector planes (skip if ||n1+n2|| < 1e-4)
-            float bx = n0.x + n1.x;
-            float by = n0.y + n1.y;
-            float bz = n0.z + n1.z;
-            float blen = sqrtf(bx*bx + by*by + bz*bz);
-            if (blen >= 1e-4f) {
-                bx /= blen; by /= blen; bz /= blen;
-
-                // Plane 3: bisector + eps
-                out[plane_count].pa = bx;
-                out[plane_count].pb = by;
-                out[plane_count].pc = bz;
-                out[plane_count].pd = -(bx*midx + by*midy + bz*midz + eps);
-                plane_count++;
-
-                // Plane 4: bisector - eps
-                out[plane_count].pa = bx;
-                out[plane_count].pb = by;
-                out[plane_count].pc = bz;
-                out[plane_count].pd = -(bx*midx + by*midy + bz*midz - eps);
-                plane_count++;
-            }
-        }
-
-        n_edge_cuts[i] = plane_count;
-    }
+    if (lane == 0) n_edge_cuts[i] = s_plane_count;
     __syncwarp();
 
     // Free scratch memory
