@@ -1455,7 +1455,9 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         }
     }
     __syncwarp();
+#ifdef COACD_BEAM_DEBUG
     *t_subhull = clock64();
+#endif
     // Check for errors from any lane
     {
         int my_err = my_dc.edgePool.error;
@@ -1509,7 +1511,9 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     }
 
     __syncwarp();
+#ifdef COACD_BEAM_DEBUG
     *t_treemerge = clock64();
+#endif
 }
 
 // ============================================================================
@@ -1538,8 +1542,12 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
 
     // Use a local error variable to avoid racing on *err with other blocks.
     // Only lane 0 writes; atomicOr to *err at the end.
+#ifdef COACD_BEAM_DEBUG
     long long t_start = clock64();
     long long t_sort = t_start, t_subhull = t_start, t_treemerge = t_start;
+#else
+    long long t_subhull = 0, t_treemerge = 0;
+#endif
     int local_err = 0;
     if (lane == 0) s_lane_cleanup.nblocks = 0;
     if (lane == 0) { s_result->verts = NULL; s_result->tris = NULL;
@@ -1607,7 +1615,9 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
 
         if (lane == 0) bt_rewind(&s_pool, pre_sort_offset);
         __syncwarp();
+#ifdef COACD_BEAM_DEBUG
         t_sort = clock64();
+#endif
         // --- Phase 3: post-sort D&C (vertex init: all lanes, D&C + edgePool init: lane 0) ---
         // postsort frees points (via s_points_scratch) after copying into vblock.
         bt_compute_postsort(state, points, n, lane, &s_lane_cleanup, &s_points_scratch, &t_subhull, &t_treemerge);
