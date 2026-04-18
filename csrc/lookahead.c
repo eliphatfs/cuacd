@@ -769,16 +769,10 @@ int lookahead_decompose(
         }
         LA_SYNC_CHECK("apply_cuts");
 
-        // Compute hulls for new parts (la_apply_cuts sets hull_vol=0)
-        {
-            void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
-            LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
-                                   LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, args, NULL));
-        }
-        LA_SYNC_CHECK("hull_decomp");
-
-        // Per-iteration decompose components: split multi-component parts
-        // produced by plane cuts before the next iteration evaluates them.
+        // Compute hulls for new parts (la_apply_cuts sets hull_vol=0).
+        // When decompose_components_per_iter is on, skip this: decompose_components
+        // below always frees the input hull for any part it splits (Phase 12),
+        // and the post-dc hull_decomp covers all remaining hull_vol==0 parts.
         if (decompose_components_per_iter) {
             int cur_np = 0;
             LCHECK(cuMemcpyDtoHAsync(&cur_np,
@@ -795,6 +789,11 @@ int lookahead_decompose(
                     LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, hull_args, NULL));
                 LA_SYNC_CHECK("hull_decomp_post_dc");
             }
+        } else {
+            void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
+            LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
+                                   LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, args, NULL));
+            LA_SYNC_CHECK("hull_decomp");
         }
 
         // Cleanup tree: free meshes from level-0 items
