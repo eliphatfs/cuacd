@@ -29,8 +29,12 @@ extern "C" __global__ void la_hausdorff_parts(
 
     Part* p = &decomp->parts[i];
 
-    // Skip if hull not computed yet or rv-cost already >= threshold
+    // Skip if hull not computed yet, hausdorff already computed,
+    // or rv-cost already >= threshold.
+    // hausdorff == 0 is the "not computed" sentinel — set by part-creation sites
+    // (la_initialize, la_expand_quick, la_apply_cuts, la_decompose_components).
     if (p->hull.verts == NULL) return;
+    if (p->hausdorff > 0.0f) return;
     float rv_cost = la_part_cost_rv(*p);
     if (rv_cost >= threshold) return;
 

@@ -341,7 +341,9 @@ __device__ inline int decompose_components_block(
             output_parts[c].mesh.refcount = refcnt_ptr;
             output_parts[c].mesh.nv       = (int)cnv;
             output_parts[c].mesh.nt       = (int)cnt;
-            output_parts[c].hausdorff     = input_part->hausdorff;
+            // Reset hausdorff to 0 (sentinel for "not computed") — components
+            // have different meshes than the input so the cached value is stale.
+            output_parts[c].hausdorff     = 0.0f;
 
             // Reset counters to zero — will be reused as scatter cursors.
             s_comp_nv[c] = 0u;
