@@ -7,7 +7,7 @@
 - `hausdorff_block` — 5 tests pass. Sampling-based bidirectional Hausdorff distance with linear BVH acceleration.
 - `decompose_components_block` / `la_decompose_components` — 5 tests pass. Connected-components decomposition via GPU union-find. Integrated as optional post-processing pass in lookahead_decompose (decompose_components parameter). Inner shells (negative signed volume) are filtered out to prevent non-manifold output from downstream plane_cut.
 - `lookahead_decompose` — cube, L-shape, octocat, convergence, 49160 tests pass. Uses full cost `max(rv, hausdorff)` for stopping criterion, rv-only for tree search. Default depth=2, quick_depth=0, width=60, width2=5.
-- `la_find_concave_edges` — concave edge detection kernel. Generates cutting planes from concave mesh edges for first-layer expansion. Exposed via `n_concave_edges` parameter (default 0 = disabled). Uses `heap_alloc`/`heap_free` from scratch heap for sort+reservoir scratch. 9 tests pass.
+- `la_find_concave_edges` — concave edge detection kernel. Generates cutting planes from concave mesh edges for first-layer expansion. Exposed via `n_concave_edges` parameter (default 32). Uses `heap_alloc`/`heap_free` from scratch heap for sort+reservoir scratch. 9 tests pass.
 
 ## Known Limitations
 

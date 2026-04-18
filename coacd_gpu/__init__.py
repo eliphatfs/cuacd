@@ -269,9 +269,9 @@ class Context:
                             max_iters=100, width=60, width2=5, threshold=0.05,
                             depth=2, quick_depth=0, max_n_cutting=16,
                             verbose=0, debug=0, decompose_components=False,
-                            decompose_components_per_iter=False,
-                            n_concave_edges=0, concave_eps=0.005,
-                            concave_threshold=3.49, concave_iters=1):
+                            no_decompose_components_per_iter=False,
+                            n_concave_edges=32, concave_eps=0.005,
+                            concave_threshold=3.49, concave_iters=10):
         """Decompose a mesh into convex parts using lookahead tree search.
 
         Parameters
@@ -333,7 +333,7 @@ class Context:
             max_iters, width, width2, threshold,
             depth, quick_depth, max_n_cutting,
             verbose, debug, decompose_components=int(decompose_components),
-            decompose_components_per_iter=int(decompose_components_per_iter),
+            no_decompose_components_per_iter=int(no_decompose_components_per_iter),
             n_concave_edges=n_concave_edges,
             concave_eps=concave_eps,
             concave_threshold=concave_threshold,

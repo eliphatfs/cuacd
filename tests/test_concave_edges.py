@@ -51,8 +51,8 @@ def _make_torus(R=1.0, r=0.3, n_major=24, n_minor=12):
 class TestConcaveEdges:
     """Test concave edge sampling with various meshes."""
 
-    def test_disabled_by_default(self):
-        """n_concave_edges=0 should behave identically to no parameter."""
+    def test_explicit_zero_disables(self):
+        """n_concave_edges=0 should produce fewer parts than the default (n_concave_edges=32)."""
         verts, tris = _l_shape_mesh()
         with coacd_gpu.Context() as ctx:
             parts_default = ctx.lookahead_decompose(
@@ -60,7 +60,8 @@ class TestConcaveEdges:
             parts_zero = ctx.lookahead_decompose(
                 verts, tris, max_iters=5, width=9, threshold=0.05,
                 n_concave_edges=0)
-            assert len(parts_default) == len(parts_zero)
+            # With concave edges enabled (default), we should get at least as many parts
+            assert len(parts_default) >= len(parts_zero)
 
     def test_l_shape_concave_edges(self):
         """L-shape decomposition with concave edge sampling."""

@@ -122,11 +122,11 @@ In `dc_union`, after a successful CAS merging loser→winner, the code bumps the
 
 ## decompose_components_per_iter: Per-Iteration Connected-Components Splitting
 
-Added `decompose_components_per_iter` parameter to `lookahead_decompose`. When enabled, runs `la_decompose_components` + `la_hull_decomp` at two points each iteration: (1) before evaluation (splits multi-component input or previously-cut parts for more accurate cost assessment), and (2) after applying cuts (splits multi-component results before the next iteration). This is useful for multi-component input meshes where splitting early allows the lookahead tree search to evaluate each component independently. The existing `decompose_components` parameter (end-of-decomposition only) remains the default.
+Added `decompose_components_per_iter` parameter to `lookahead_decompose`. When enabled, runs `la_decompose_components` + `la_hull_decomp` at two points each iteration: (1) before evaluation (splits multi-component input or previously-cut parts for more accurate cost assessment), and (2) after applying cuts (splits multi-component results before the next iteration). This is useful for multi-component input meshes where splitting early allows the lookahead tree search to evaluate each component independently. Now enabled by default; the Python API exposes this as `no_decompose_components_per_iter=False` (set True to disable).
 
 ## CLI: Refactored Normalize/Decompose/Denormalize into _decompose_mesh
 
-Extracted the normalize→decompose→denormalize pipeline from `_processor_worker` into `_decompose_mesh()`, reused by the new `--serial` mode. Added `--serial` flag for single-threaded load-process-save (easier debugging). Added `--decompose-components-per-iter` CLI flag.
+Extracted the normalize→decompose→denormalize pipeline from `_processor_worker` into `_decompose_mesh()`, reused by the new `--serial` mode. Added `--serial` flag for single-threaded load-process-save (easier debugging). Added `--no-decompose-components-per-iter` CLI flag (opt-out; per-iter decompose is now on by default).
 
 ## decompose_components_block Now Computes mesh_vol per Component
 
@@ -138,7 +138,7 @@ The `_make_lshape()` fixture in `test_lookahead.py` was changed from the origina
 
 ## decompose_components: Inner Shell Filtering
 
-Meshes with thick shells (e.g., the Stanford bunny, which has an outer surface and an inner cavity surface) decompose into multiple connected components where the inner cavity surface has negative signed volume as a standalone mesh (its normals point inward toward the cavity center). When `decompose_components_per_iter=True`, these inner-shell components were passed to `plane_cut`, which produced non-manifold output — 73 duplicated directed edges (same-direction edge appearing twice instead of once each way).
+Meshes with thick shells (e.g., the Stanford bunny, which has an outer surface and an inner cavity surface) decompose into multiple connected components where the inner cavity surface has negative signed volume as a standalone mesh (its normals point inward toward the cavity center). When `decompose_components_per_iter` is enabled (now the default), these inner-shell components were passed to `plane_cut`, which produced non-manifold output — 73 duplicated directed edges (same-direction edge appearing twice instead of once each way).
 
 Root cause: the bunny is a thick shell — outer surface + inner cavity surface. Together they form one valid volume. After splitting, the inner surface has flipped winding (normals point into the cavity, correct from the solid's perspective but inverted as a standalone mesh). `plane_cut` operating on this flipped-winding input produces broken edge consistency.
 

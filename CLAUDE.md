@@ -90,9 +90,9 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto 
     results = ctx.batch_kdop_hull_mesh(pts_list)    # list of (verts, tris, volume) — approximate k-DOP hull
     parts = ctx.lookahead_decompose(verts, tris, max_iters=100, width=60, width2=5, threshold=0.05,
                                      decompose_components=False,
-                                     decompose_components_per_iter=False,
-                                     n_concave_edges=0, concave_eps=0.005,
-                                     concave_threshold=3.49, concave_iters=1)  # list of (verts, tris, hull_verts, hull_tris)
+                                     no_decompose_components_per_iter=False,
+                                     n_concave_edges=32, concave_eps=0.005,
+                                     concave_threshold=3.49, concave_iters=10)  # list of (verts, tris, hull_verts, hull_tris)
     used = ctx.pool_usage()     # bytes consumed from pool (monotonic high-water mark)
     ctx.heap_compact()          # no-op (coalescing handled by heap_free)
 ```

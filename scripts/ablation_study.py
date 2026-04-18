@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ablation study driver for coacd-gpu lookahead decomposition.
 
-Sweeps over combinations of width, n_concave_edges, decompose_components_per_iter,
+Sweeps over combinations of width, n_concave_edges, no_decompose_components_per_iter,
 and concave_iters. Each configuration gets its own output directory under
 decomp_output/vhacd2_data_r0.1_mv10k_ablations/<param_encoding>/ with the GLB
 results and a run log.
@@ -46,7 +46,7 @@ def build_configs(dc_only=False):
             configs.append({
                 "width": width,
                 "n_concave_edges": nce,
-                "decompose_components_per_iter": dc,
+                "no_decompose_components_per_iter": dc,
                 "concave_iters": 1,  # irrelevant when nce=0, use default
             })
         else:
@@ -54,7 +54,7 @@ def build_configs(dc_only=False):
                 configs.append({
                     "width": width,
                     "n_concave_edges": nce,
-                    "decompose_components_per_iter": dc,
+                    "no_decompose_components_per_iter": dc,
                     "concave_iters": ci,
                 })
     return configs
@@ -65,7 +65,7 @@ def config_already_done(config):
     name = encode_params(
         width=config["width"],
         n_concave_edges=config["n_concave_edges"],
-        dc_per_iter=config["decompose_components_per_iter"],
+        dc_per_iter=config["no_decompose_components_per_iter"],
         concave_iters=config["concave_iters"],
     )
     output_dir = pathlib.Path(OUTPUT_BASE) / name
@@ -78,7 +78,7 @@ def run_config(config, dry_run=False):
     name = encode_params(
         width=params["width"],
         n_concave_edges=params["n_concave_edges"],
-        dc_per_iter=params["decompose_components_per_iter"],
+        dc_per_iter=params["no_decompose_components_per_iter"],
         concave_iters=params["concave_iters"],
     )
     output_dir = pathlib.Path(OUTPUT_BASE) / name
@@ -90,8 +90,8 @@ def run_config(config, dry_run=False):
         "--n-concave-edges", str(params["n_concave_edges"]),
         "--concave-iters", str(params["concave_iters"]),
     ]
-    if params["decompose_components_per_iter"]:
-        cmd.append("--decompose-components-per-iter")
+    if params["no_decompose_components_per_iter"]:
+        cmd.append("--no-decompose-components-per-iter")
 
     if dry_run:
         print(f"  [DRY RUN] {name}")
@@ -128,7 +128,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running them")
     parser.add_argument("--start-from", type=int, default=0, help="Skip first N configurations (for resuming)")
     parser.add_argument("--only-new", action="store_true", help="Skip configurations that already have results")
-    parser.add_argument("--dc-only", action="store_true", help="Only run decompose-components-per-iter configs")
+    parser.add_argument("--dc-only", action="store_true", help="Only run no-decompose-components-per-iter configs")
     args = parser.parse_args()
 
     configs = build_configs(dc_only=args.dc_only)
