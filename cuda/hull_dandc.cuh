@@ -1097,106 +1097,185 @@ struct BtPointCmp {
 
 // bt_extractMesh: BFS over the half-edge graph, assigns sequential indices to
 // vertices, converts BtPoint32 back to float world space, and fan-triangulates
-// each face. Lane 0 only.
+// each face. Warp-parallel: all 32 lanes must call.
 //
 // When out_verts == NULL: count-only mode — counts nv and nt without writing.
 // When out_verts != NULL: extract mode — writes vertices and triangles.
 // Callers rewind the WarpPool offset between count and extract passes.
 //
-// Returns 0 on success, -1 on pool OOM.
-__device__ inline int bt_extractMesh(BtHullState* __restrict__ s,
+// Face ownership during triangulation uses the min-address edge in the face
+// ring (avoids CAS races where multiple lanes enter the same face via
+// different edges).
+//
+// Returns 0 on success, -1 on pool OOM. Only lane 0 writes *n_verts_out /
+// *n_tris_out; other lanes should ignore them.
+__device__ inline int bt_extractMesh(BtHullState* __restrict__ s, int lane,
     float* __restrict__ out_verts, int* __restrict__ out_tris,
     int* __restrict__ n_verts_out, int* __restrict__ n_tris_out)
 {
-    *n_verts_out = 0;
-    *n_tris_out  = 0;
+    __shared__ int        s_n_verts;
+    __shared__ int        s_qhead;
+    __shared__ int        s_n_tris;
+    __shared__ BtVIndex*  s_queue;
+    __shared__ int        s_vstamp;
+    __shared__ int        s_idx_base;
+    __shared__ int        s_alloc_fail;
+    __shared__ int        s_empty;
 
-    if (s->vertexList == BT_VI_NULL) return 0;
-
-    BtVIndex* queue = (BtVIndex*)bt_alloc(s->wp, s->npoints * (int)sizeof(BtVIndex));
-    if (!queue) return -1;
-    int n_verts = 0;
-    int n_tris  = 0;
-
-    int vstamp = --s->mergeStamp;
-    s->vblock[s->vertexList].copy = vstamp;
-    queue[n_verts++] = s->vertexList;
-
-    // BFS: discover all hull vertices
-    int qhead = 0;
-    while (qhead < n_verts) {
-        BtVIndex v = queue[qhead++];
-        BtEdge* e = s->vblock[v].edges;
-        if (!e) continue;
-        do {
-            if (s->vblock[e->target].copy != vstamp) {
-                s->vblock[e->target].copy = vstamp;
-                queue[n_verts++] = e->target;
+    if (lane == 0) {
+        s_n_verts    = 0;
+        s_qhead      = 0;
+        s_n_tris     = 0;
+        s_queue      = NULL;
+        s_alloc_fail = 0;
+        s_empty      = (s->vertexList == BT_VI_NULL) ? 1 : 0;
+        if (!s_empty) {
+            s_queue = (BtVIndex*)bt_alloc(s->wp, s->npoints * (int)sizeof(BtVIndex));
+            if (!s_queue) {
+                s_alloc_fail = 1;
+            } else {
+                s_vstamp = --s->mergeStamp;
+                s->vblock[s->vertexList].copy = s_vstamp;
+                s_queue[0] = s->vertexList;
+                s_n_verts  = 1;
             }
-            e = e->next;
-        } while (e != s->vblock[v].edges);
+        }
+    }
+    __syncwarp();
+
+    if (s_alloc_fail) {
+        if (lane == 0) { *n_verts_out = 0; *n_tris_out = 0; }
+        return -1;
+    }
+    if (s_empty) {
+        if (lane == 0) { *n_verts_out = 0; *n_tris_out = 0; }
+        return 0;
     }
 
-    if (out_verts) {
-        // Extract mode: encode vertex indices, write verts, fan-triangulate faces.
-        int idx_base = --s->mergeStamp;
-        for (int i = 0; i < n_verts; i++)
-            s->vblock[queue[i]].copy = idx_base - i;
+    const int       vstamp = s_vstamp;
+    BtVIndex* const queue  = s_queue;
 
-        for (int i = 0; i < n_verts; i++) {
+    // BFS: warp-parallel — each iteration dequeues up to WARP_SIZE vertices,
+    // each lane scans its vertex's edge ring and enqueues unseen neighbours.
+    for (;;) {
+        __syncwarp();
+        int cur_qhead   = s_qhead;
+        int cur_n_verts = s_n_verts;
+        if (cur_qhead >= cur_n_verts) break;
+
+        int avail = cur_n_verts - cur_qhead;
+        int batch = (avail < WARP_SIZE) ? avail : WARP_SIZE;
+        BtVIndex v = (lane < batch) ? queue[cur_qhead + lane] : BT_VI_NULL;
+        if (lane == 0) s_qhead = cur_qhead + batch;
+
+        if (v != BT_VI_NULL) {
+            BtEdge* e = s->vblock[v].edges;
+            if (e) {
+                BtEdge* const start = e;
+                do {
+                    BtVIndex tgt = e->target;
+                    int cur = s->vblock[tgt].copy;
+                    if (cur != vstamp) {
+                        int prev = atomicCAS(&s->vblock[tgt].copy, cur, vstamp);
+                        if (prev == cur) {
+                            int slot = atomicAdd(&s_n_verts, 1);
+                            queue[slot] = tgt;
+                        }
+                    }
+                    e = e->next;
+                } while (e != start);
+            }
+        }
+    }
+    __syncwarp();
+
+    int n_verts = s_n_verts;
+
+    if (out_verts) {
+        if (lane == 0) s_idx_base = --s->mergeStamp;
+        __syncwarp();
+        const int idx_base = s_idx_base;
+
+        // Tag each vertex with its output index.
+        for (int i = lane; i < n_verts; i += WARP_SIZE)
+            s->vblock[queue[i]].copy = idx_base - i;
+        __syncwarp();
+
+        // Write vertices.
+        for (int i = lane; i < n_verts; i += WARP_SIZE) {
             BtVIndex v = queue[i];
             int idx = s->vblock[v].point.index;
             out_verts[i * 3 + 0] = s->pts[idx * 3 + 0];
             out_verts[i * 3 + 1] = s->pts[idx * 3 + 1];
             out_verts[i * 3 + 2] = s->pts[idx * 3 + 2];
         }
+        __syncwarp();
 
-        int fstamp = --s->mergeStamp;
-        for (int i = 0; i < n_verts; i++) {
+        // Fan-triangulate faces. Each face is owned by the lane whose current
+        // edge e is the min-address edge in the face ring, giving a
+        // race-free single-owner-per-face guarantee.
+        for (int i = lane; i < n_verts; i += WARP_SIZE) {
             BtVIndex v = queue[i];
             BtEdge* e = s->vblock[v].edges;
             if (!e) continue;
+            BtEdge* const vstart = e;
             do {
-                if (e->copy != fstamp) {
+                BtEdge* min_e = e;
+                int k = 1;
+                BtEdge* f = e->reverse->prev;
+                while (f != e) {
+                    if (f < min_e) min_e = f;
+                    f = f->reverse->prev;
+                    k++;
+                }
+                if (min_e == e && k >= 3) {
+                    int slot = atomicAdd(&s_n_tris, k - 2);
+                    int cur_v_idx = idx_base - s->vblock[v].copy;
                     BtVIndex a = BT_VI_NULL, b = BT_VI_NULL;
-                    BtEdge* f = e;
+                    BtEdge* g = e;
                     do {
                         if (a != BT_VI_NULL && b != BT_VI_NULL) {
-                            out_tris[n_tris * 3 + 0] = idx_base - s->vblock[v].copy;
-                            out_tris[n_tris * 3 + 1] = idx_base - s->vblock[a].copy;
-                            out_tris[n_tris * 3 + 2] = idx_base - s->vblock[b].copy;
-                            n_tris++;
+                            out_tris[slot * 3 + 0] = cur_v_idx;
+                            out_tris[slot * 3 + 1] = idx_base - s->vblock[a].copy;
+                            out_tris[slot * 3 + 2] = idx_base - s->vblock[b].copy;
+                            slot++;
                         }
-                        f->copy = fstamp;
                         a = b;
-                        b = f->target;
-                        f = f->reverse->prev;
-                    } while (f != e);
+                        b = g->target;
+                        g = g->reverse->prev;
+                    } while (g != e);
                 }
                 e = e->next;
-            } while (e != s->vblock[v].edges);
+            } while (e != vstart);
         }
+        __syncwarp();
     } else {
-        // Count-only mode: count triangles via fan formula (k edges → k-2 tris).
-        int fstamp = --s->mergeStamp;
-        for (int i = 0; i < n_verts; i++) {
+        // Count-only: each face contributes k-2 triangles; min-address owner.
+        for (int i = lane; i < n_verts; i += WARP_SIZE) {
             BtVIndex v = queue[i];
             BtEdge* e = s->vblock[v].edges;
             if (!e) continue;
+            BtEdge* const vstart = e;
             do {
-                if (e->copy != fstamp) {
-                    int k = 0;
-                    BtEdge* f = e;
-                    do { f->copy = fstamp; k++; f = f->reverse->prev; } while (f != e);
-                    if (k >= 3) n_tris += k - 2;
+                BtEdge* min_e = e;
+                int k = 1;
+                BtEdge* f = e->reverse->prev;
+                while (f != e) {
+                    if (f < min_e) min_e = f;
+                    f = f->reverse->prev;
+                    k++;
                 }
+                if (min_e == e && k >= 3) atomicAdd(&s_n_tris, k - 2);
                 e = e->next;
-            } while (e != s->vblock[v].edges);
+            } while (e != vstart);
         }
+        __syncwarp();
     }
 
-    *n_verts_out = n_verts;
-    *n_tris_out  = n_tris;
+    if (lane == 0) {
+        *n_verts_out = n_verts;
+        *n_tris_out  = s_n_tris;
+    }
     return 0;
 }
 
@@ -1622,26 +1701,47 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
         // postsort frees points (via s_points_scratch) after copying into vblock.
         bt_compute_postsort(state, points, n, lane, &s_lane_cleanup, &s_points_scratch, &t_subhull, &t_treemerge);
 
+        __shared__ int   s_pre_count;
+        __shared__ int   s_pre_ext;
+        __shared__ int   s_nv_count;
+        __shared__ int   s_nt_count;
+        __shared__ int   s_nv_ext;
+        __shared__ int   s_nt_ext;
+        __shared__ int   s_extract_err;
+        __shared__ float* s_ov;
+        __shared__ int*   s_ot;
+        __shared__ int*   s_rc;
+
         if (lane == 0) {
+            s_extract_err = 0;
+            s_ov = NULL; s_ot = NULL; s_rc = NULL;
             if (s_pool.error) {
                 local_err = s_pool.error;
-                goto done;
+                s_extract_err = 1;
+            } else {
+                DPRINTF("[hull] n=%d fma_calls=%d edges: total=%d avg=%.1f min=%d max=%d\n",
+                    n, state->fma_calls, state->fma_total_edges,
+                    state->fma_calls > 0 ? (float)state->fma_total_edges / state->fma_calls : 0.f,
+                    state->fma_min_edges == 0x7fffffff ? 0 : state->fma_min_edges,
+                    state->fma_max_edges);
+                s_pre_count = s_pool.offset;
+                s_nv_count = 0; s_nt_count = 0;
             }
+        }
+        __syncwarp();
+        if (s_extract_err) {
+            local_err = __shfl_sync(WARP_MASK, local_err, 0);
+            goto done;
+        }
 
-            DPRINTF("[hull] n=%d fma_calls=%d edges: total=%d avg=%.1f min=%d max=%d\n",
-                n, state->fma_calls, state->fma_total_edges,
-                state->fma_calls > 0 ? (float)state->fma_total_edges / state->fma_calls : 0.f,
-                state->fma_min_edges == 0x7fffffff ? 0 : state->fma_min_edges,
-                state->fma_max_edges);
+        // Count pass (warp-parallel)
+        int rc_count = bt_extractMesh(state, lane, NULL, NULL, &s_nv_count, &s_nt_count);
+        __syncwarp();
+        if (rc_count < 0) { local_err = KERR_BT_EXTRACT_FAIL; goto done; }
 
-            // Count pass: exact nv and nt without writing output
-            int pre_count = s_pool.offset;
-            int nv = 0, nt = 0;
-            if (bt_extractMesh(state, NULL, NULL, &nv, &nt) < 0)
-                { local_err = KERR_BT_EXTRACT_FAIL; goto done; }
-            bt_rewind(&s_pool, pre_count);
-
-            // Allocate output Mesh chunk from heap: [verts (16-byte aligned) | tris (16-byte aligned) | refcount]
+        if (lane == 0) {
+            bt_rewind(&s_pool, s_pre_count);
+            int nv = s_nv_count, nt = s_nt_count;
             if (nv > 0) {
                 size_t vb = (size_t)nv * 3 * sizeof(float);
                 size_t va = (vb + 15) & ~(size_t)15;
@@ -1649,23 +1749,36 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
                 size_t ta = (tb + 15) & ~(size_t)15;
                 size_t rb = 16;
                 void* chunk = NULL;
-                if (heap_alloc(heap, (unsigned int)(va + ta + rb), &chunk) != HEAP_OK)
-                    { local_err = KERR_BT_HEAP_OUTPUT; goto done; }
-                float* ov = (float*)chunk;
-                int*   ot = (int*)((char*)chunk + va);
-                int*   rc = (int*)((char*)chunk + va + ta);
-                *rc = 1;
+                if (heap_alloc(heap, (unsigned int)(va + ta + rb), &chunk) != HEAP_OK) {
+                    local_err = KERR_BT_HEAP_OUTPUT;
+                    s_extract_err = 1;
+                } else {
+                    s_ov = (float*)chunk;
+                    s_ot = (int*)((char*)chunk + va);
+                    s_rc = (int*)((char*)chunk + va + ta);
+                    *s_rc = 1;
+                    s_pre_ext = s_pool.offset;
+                    s_nv_ext = 0; s_nt_ext = 0;
+                }
+            }
+        }
+        __syncwarp();
+        if (s_extract_err) {
+            local_err = __shfl_sync(WARP_MASK, local_err, 0);
+            goto done;
+        }
 
-                // Extract pass
-                int pre_ext = s_pool.offset;
-                int nv2 = 0, nt2 = 0;
-                if (bt_extractMesh(state, ov, ot, &nv2, &nt2) < 0)
-                    { local_err = KERR_BT_EXTRACT_FAIL; goto done; }
-                bt_rewind(&s_pool, pre_ext);
+        if (s_nv_count > 0) {
+            // Extract pass (warp-parallel)
+            int rc_ext = bt_extractMesh(state, lane, s_ov, s_ot, &s_nv_ext, &s_nt_ext);
+            __syncwarp();
+            if (rc_ext < 0) { local_err = KERR_BT_EXTRACT_FAIL; goto done; }
 
-                s_result->verts = ov; s_result->tris = ot;
-                s_result->nv    = nv; s_result->nt   = nt;
-                s_result->refcount = rc;
+            if (lane == 0) {
+                bt_rewind(&s_pool, s_pre_ext);
+                s_result->verts = s_ov; s_result->tris = s_ot;
+                s_result->nv    = s_nv_count; s_result->nt = s_nt_count;
+                s_result->refcount = s_rc;
             }
         }
     }
