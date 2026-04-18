@@ -267,14 +267,9 @@ int lookahead_decompose(
             }
         }
 
-        // Sort parts by rv-only cost first
-        {
-            void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
-            LCHECK(cuLaunchKernel(ctx->fn_la_sort_parts, 1, 1, 1, 32, 1, 1, 0, s, args, NULL));
-        }
-        LA_SYNC_CHECK("sort_parts1");
-
-        // Compute Hausdorff for parts with rv-cost below threshold
+        // Compute Hausdorff for parts with rv-cost below threshold.
+        // Each block processes one part independently by blockIdx.x, so no
+        // pre-sort is required — only the post-sort below matters.
         {
             void* args[] = { &d_decomp, &ctx->d_pool_struct, &threshold, &d_err };
             LCHECK(cuLaunchKernel(ctx->fn_la_hausdorff_parts,
@@ -282,12 +277,12 @@ int lookahead_decompose(
         }
         LA_SYNC_CHECK("hausdorff_parts");
 
-        // Sort again by full cost (rv + hausdorff)
+        // Sort by full cost (rv + hausdorff) for la_count_cutting downstream.
         {
             void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
             LCHECK(cuLaunchKernel(ctx->fn_la_sort_parts, 1, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
-        LA_SYNC_CHECK("sort_parts2");
+        LA_SYNC_CHECK("sort_parts");
 
         // Diagnostic: print per-part cost breakdown
         if (verbose) {
