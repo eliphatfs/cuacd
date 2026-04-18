@@ -45,7 +45,7 @@ The Karras 2012 linear BVH construction finds the split point gamma via a power-
 
 ## hausdorff BVH: Heap Free-List Overlap on Sample Buffers
 
-Four separate `heap_alloc` calls for `s_samples_a`, `s_tri_ids_a`, `s_samples_b`, `s_tri_ids_b` could return overlapping regions when the free-list had recently freed blocks of similar size. Observed: last 64 bytes of `s_samples_a` aliased first 64 bytes of `s_samples_b`, corrupting ~5 sample positions. This silently corrupted Morton codes and BVH leaf placement, causing the B→A traversal to miss correct triangles. Fix: allocate all four arrays as a single contiguous `heap_alloc` block and compute sub-pointers manually.
+Separate `heap_alloc` calls for the A and B sample buffers could return overlapping regions when the free-list had recently freed blocks of similar size. Observed: last 64 bytes of `s_samples_a` aliased first 64 bytes of `s_samples_b`, corrupting ~5 sample positions. This silently corrupted Morton codes and BVH leaf placement, causing the B→A traversal to miss correct triangles. Fix: allocate both sample buffers as a single contiguous `heap_alloc` block and compute sub-pointers manually. (Historical note: at the time of this bug the block also held per-sample `tri_ids_a/b` arrays; those were removed when BVH leaves were rekeyed from samples to unique target triangles.)
 
 ## warp_sort PartKeyCmp: Equal-Cost Parts Cause Refcount Corruption
 

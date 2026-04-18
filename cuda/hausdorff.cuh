@@ -255,7 +255,7 @@ __device__ inline void hd_block_prefix_sum(
 #define HD_FREE_ALL_SCRATCH() do { \
     heap_free(scratch_heap, (void*)s_counts_a); \
     heap_free(scratch_heap, (void*)s_counts_b); \
-    heap_free(scratch_heap, (void*)s_samples_a); /* single block for samples+tri_ids */ \
+    heap_free(scratch_heap, (void*)s_samples_a); /* single block for both sample sets */ \
     heap_free(scratch_heap, (void*)s_morton_a); \
     heap_free(scratch_heap, (void*)s_morton_b); \
     heap_free(scratch_heap, (void*)s_sort_scratch); \
@@ -287,8 +287,6 @@ __device__ __forceinline__ float hausdorff_block(
     __shared__ int*          s_counts_b;
     __shared__ float*        s_samples_a;
     __shared__ float*        s_samples_b;
-    __shared__ int*          s_tri_ids_a;
-    __shared__ int*          s_tri_ids_b;
     __shared__ MortonPoint*  s_morton_a;
     __shared__ MortonPoint*  s_morton_b;
     __shared__ char*         s_sort_scratch;
@@ -305,17 +303,35 @@ __device__ __forceinline__ float hausdorff_block(
     __shared__ float s_total_area_b;
     __shared__ float s_dir_ab;
     __shared__ float s_dir_ba;
-    __shared__ float s_bbox_min[3];
-    __shared__ float s_bbox_max[3];
+    __shared__ float s_bbox_min_b[3];
+    __shared__ float s_bbox_max_b[3];
+    __shared__ float s_bbox_min_a[3];
+    __shared__ float s_bbox_max_a[3];
 
     // Sort coordination.
     __shared__ int s_seg_a[6];  // segment boundaries for 4-warp sort
     __shared__ int s_seg_b[6];
 
+#ifdef COACD_BEAM_DEBUG
+    // Instrumentation: nodes visited (stack pops) and leaf triangle tests
+    // per direction. Brute-force counters track direct triangle tests.
+    __shared__ unsigned long long s_hd_nodes_ab;
+    __shared__ unsigned long long s_hd_leaves_ab;
+    __shared__ unsigned long long s_hd_nodes_ba;
+    __shared__ unsigned long long s_hd_leaves_ba;
+    __shared__ unsigned long long s_hd_brute_ab;
+    __shared__ unsigned long long s_hd_brute_ba;
+    __shared__ long long s_hd_clk_build_b;
+    __shared__ long long s_hd_clk_build_a;
+    __shared__ long long s_hd_clk_query_ab;
+    __shared__ long long s_hd_clk_query_ba;
+    __shared__ int s_hd_path_ab;  // 0=unused, 1=brute, 2=bvh
+    __shared__ int s_hd_path_ba;
+#endif
+
     if (tid == 0) {
         s_counts_a = NULL; s_counts_b = NULL;
         s_samples_a = NULL; s_samples_b = NULL;
-        s_tri_ids_a = NULL; s_tri_ids_b = NULL;
         s_morton_a = NULL; s_morton_b = NULL;
         s_sort_scratch = NULL;
         s_bvh_a = NULL; s_bvh_b = NULL;
@@ -323,6 +339,14 @@ __device__ __forceinline__ float hausdorff_block(
         s_result = 0.0f;
         s_dir_ab = 0.0f;
         s_dir_ba = 0.0f;
+#ifdef COACD_BEAM_DEBUG
+        s_hd_nodes_ab = 0; s_hd_leaves_ab = 0;
+        s_hd_nodes_ba = 0; s_hd_leaves_ba = 0;
+        s_hd_brute_ab = 0; s_hd_brute_ba = 0;
+        s_hd_clk_build_b = 0; s_hd_clk_build_a = 0;
+        s_hd_clk_query_ab = 0; s_hd_clk_query_ba = 0;
+        s_hd_path_ab = 0; s_hd_path_ba = 0;
+#endif
     }
     __syncthreads();
 
@@ -470,19 +494,15 @@ __device__ __forceinline__ float hausdorff_block(
     // overlap from fragmented free-list allocations.
     if (tid == 0) {
         unsigned int sa_bytes = (unsigned int)(n_sa * 3) * (unsigned int)sizeof(float);
-        unsigned int ta_bytes = (unsigned int)n_sa * (unsigned int)sizeof(int);
         unsigned int sb_bytes = (unsigned int)(n_sb * 3) * (unsigned int)sizeof(float);
-        unsigned int tb_bytes = (unsigned int)n_sb * (unsigned int)sizeof(int);
-        unsigned int total = sa_bytes + ta_bytes + sb_bytes + tb_bytes;
+        unsigned int total = sa_bytes + sb_bytes;
         void* buf = NULL;
         s_alloc_ok = 1;
         if (heap_alloc(scratch_heap, total, &buf) != HEAP_OK)
             { s_alloc_ok = 0; buf = NULL; }
         char* p = (char*)buf;
         s_samples_a = (float*)p;               p += sa_bytes;
-        s_tri_ids_a = (int*)p;                 p += ta_bytes;
-        s_samples_b = (float*)p;               p += sb_bytes;
-        s_tri_ids_b = (int*)p;
+        s_samples_b = (float*)p;
     }
     __syncthreads();
     if (!s_alloc_ok) {
@@ -491,9 +511,7 @@ __device__ __forceinline__ float hausdorff_block(
     }
 
     PC_BUF(float, samples_a, s_samples_a, n_sa * 3);
-    PC_BUF(int,   tri_ids_a, s_tri_ids_a, n_sa);
     PC_BUF(float, samples_b, s_samples_b, n_sb * 3);
-    PC_BUF(int,   tri_ids_b, s_tri_ids_b, n_sb);
 
     // Generate samples for mesh A.
     for (int t = tid; t < a->nt; t += HD_BLOCK) {
@@ -514,7 +532,6 @@ __device__ __forceinline__ float hausdorff_block(
             samples_a[idx * 3 + 0] = (1.0f - sqa) * p0x + sqa * (1.0f - rb) * p1x + sqa * rb * p2x;
             samples_a[idx * 3 + 1] = (1.0f - sqa) * p0y + sqa * (1.0f - rb) * p1y + sqa * rb * p2y;
             samples_a[idx * 3 + 2] = (1.0f - sqa) * p0z + sqa * (1.0f - rb) * p1z + sqa * rb * p2z;
-            tri_ids_a[idx] = t;
         }
     }
 
@@ -537,7 +554,6 @@ __device__ __forceinline__ float hausdorff_block(
             samples_b[idx * 3 + 0] = (1.0f - sqa) * p0x + sqa * (1.0f - rb) * p1x + sqa * rb * p2x;
             samples_b[idx * 3 + 1] = (1.0f - sqa) * p0y + sqa * (1.0f - rb) * p1y + sqa * rb * p2y;
             samples_b[idx * 3 + 2] = (1.0f - sqa) * p0z + sqa * (1.0f - rb) * p1z + sqa * rb * p2z;
-            tri_ids_b[idx] = t;
         }
     }
     __syncthreads();
@@ -556,6 +572,10 @@ __device__ __forceinline__ float hausdorff_block(
     // Direction A->B: query samples_a against mesh b's triangles.
     if (b->nt <= HD_BRUTE_THRESH) {
         // Brute force.
+#ifdef COACD_BEAM_DEBUG
+        long long clk0 = 0;
+        if (tid == 0) { clk0 = clock64(); s_hd_path_ab = 1; }
+#endif
         float local_max = 0.0f;
         for (int i = tid; i < n_sa; i += HD_BLOCK) {
             float qx = samples_a[i * 3], qy = samples_a[i * 3 + 1], qz = samples_a[i * 3 + 2];
@@ -572,11 +592,22 @@ __device__ __forceinline__ float hausdorff_block(
         }
         float dir_ab = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ab = dir_ab;
+#ifdef COACD_BEAM_DEBUG
+        __syncthreads();
+        if (tid == 0) {
+            s_hd_clk_query_ab = clock64() - clk0;
+            s_hd_brute_ab = (unsigned long long)n_sa * (unsigned long long)b->nt;
+        }
+#endif
         __syncthreads();
     }
 
     // Direction B->A: query samples_b against mesh a's triangles.
     if (a->nt <= HD_BRUTE_THRESH) {
+#ifdef COACD_BEAM_DEBUG
+        long long clk0 = 0;
+        if (tid == 0) { clk0 = clock64(); s_hd_path_ba = 1; }
+#endif
         float local_max = 0.0f;
         for (int i = tid; i < n_sb; i += HD_BLOCK) {
             float qx = samples_b[i * 3], qy = samples_b[i * 3 + 1], qz = samples_b[i * 3 + 2];
@@ -593,6 +624,13 @@ __device__ __forceinline__ float hausdorff_block(
         }
         float dir_ba = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ba = dir_ba;
+#ifdef COACD_BEAM_DEBUG
+        __syncthreads();
+        if (tid == 0) {
+            s_hd_clk_query_ba = clock64() - clk0;
+            s_hd_brute_ba = (unsigned long long)n_sb * (unsigned long long)a->nt;
+        }
+#endif
         __syncthreads();
     }
 
@@ -607,72 +645,79 @@ __device__ __forceinline__ float hausdorff_block(
 
     // =================================================================
     // Phase 4: Morton code computation (for BVH paths).
+    //
+    // BVH leaves are target *triangles* (not samples). Morton keys are
+    // computed from triangle centroids, normalized by the target mesh's
+    // vertex bbox.
     // =================================================================
 
-    // Compute combined bounding box of all samples.
-    if (tid < 3) { s_bbox_min[tid] = 1e30f; s_bbox_max[tid] = -1e30f; }
+    // Determine which directions need BVH.
+    bool need_bvh_b = (b->nt > HD_BRUTE_THRESH);  // for A->B direction (target = b)
+    bool need_bvh_a = (a->nt > HD_BRUTE_THRESH);  // for B->A direction (target = a)
+
+    // Compute per-target vertex bboxes for whichever direction needs a BVH.
+    if (tid < 3) {
+        s_bbox_min_b[tid] = 1e30f; s_bbox_max_b[tid] = -1e30f;
+        s_bbox_min_a[tid] = 1e30f; s_bbox_max_a[tid] = -1e30f;
+    }
     __syncthreads();
 
-    {
+    if (need_bvh_b) {
         float tlo[3] = { 1e30f, 1e30f, 1e30f };
         float thi[3] = { -1e30f, -1e30f, -1e30f };
-
-        // Samples A.
-        for (int i = tid; i < n_sa; i += HD_BLOCK) {
-            float x = samples_a[i * 3], y = samples_a[i * 3 + 1], z = samples_a[i * 3 + 2];
+        for (int i = tid; i < b->nv; i += HD_BLOCK) {
+            float x = bv[i * 3], y = bv[i * 3 + 1], z = bv[i * 3 + 2];
             tlo[0] = fminf(tlo[0], x); thi[0] = fmaxf(thi[0], x);
             tlo[1] = fminf(tlo[1], y); thi[1] = fmaxf(thi[1], y);
             tlo[2] = fminf(tlo[2], z); thi[2] = fmaxf(thi[2], z);
         }
-        // Samples B.
-        for (int i = tid; i < n_sb; i += HD_BLOCK) {
-            float x = samples_b[i * 3], y = samples_b[i * 3 + 1], z = samples_b[i * 3 + 2];
-            tlo[0] = fminf(tlo[0], x); thi[0] = fmaxf(thi[0], x);
-            tlo[1] = fminf(tlo[1], y); thi[1] = fmaxf(thi[1], y);
-            tlo[2] = fminf(tlo[2], z); thi[2] = fmaxf(thi[2], z);
-        }
-        // Warp reduce.
         int lane = tid & 31;
         for (int ax = 0; ax < 3; ax++) {
             tlo[ax] = warp_min_f(tlo[ax]);
             thi[ax] = warp_max_f(thi[ax]);
         }
         if (lane == 0) {
-            atomicMinF(&s_bbox_min[0], tlo[0]); atomicMaxF(&s_bbox_max[0], thi[0]);
-            atomicMinF(&s_bbox_min[1], tlo[1]); atomicMaxF(&s_bbox_max[1], thi[1]);
-            atomicMinF(&s_bbox_min[2], tlo[2]); atomicMaxF(&s_bbox_max[2], thi[2]);
+            atomicMinF(&s_bbox_min_b[0], tlo[0]); atomicMaxF(&s_bbox_max_b[0], thi[0]);
+            atomicMinF(&s_bbox_min_b[1], tlo[1]); atomicMaxF(&s_bbox_max_b[1], thi[1]);
+            atomicMinF(&s_bbox_min_b[2], tlo[2]); atomicMaxF(&s_bbox_max_b[2], thi[2]);
+        }
+    }
+    if (need_bvh_a) {
+        float tlo[3] = { 1e30f, 1e30f, 1e30f };
+        float thi[3] = { -1e30f, -1e30f, -1e30f };
+        for (int i = tid; i < a->nv; i += HD_BLOCK) {
+            float x = av[i * 3], y = av[i * 3 + 1], z = av[i * 3 + 2];
+            tlo[0] = fminf(tlo[0], x); thi[0] = fmaxf(thi[0], x);
+            tlo[1] = fminf(tlo[1], y); thi[1] = fmaxf(thi[1], y);
+            tlo[2] = fminf(tlo[2], z); thi[2] = fmaxf(thi[2], z);
+        }
+        int lane = tid & 31;
+        for (int ax = 0; ax < 3; ax++) {
+            tlo[ax] = warp_min_f(tlo[ax]);
+            thi[ax] = warp_max_f(thi[ax]);
+        }
+        if (lane == 0) {
+            atomicMinF(&s_bbox_min_a[0], tlo[0]); atomicMaxF(&s_bbox_max_a[0], thi[0]);
+            atomicMinF(&s_bbox_min_a[1], tlo[1]); atomicMaxF(&s_bbox_max_a[1], thi[1]);
+            atomicMinF(&s_bbox_min_a[2], tlo[2]); atomicMaxF(&s_bbox_max_a[2], thi[2]);
         }
     }
     __syncthreads();
 
-    float bb_min[3] = { s_bbox_min[0], s_bbox_min[1], s_bbox_min[2] };
-    float bb_ext[3] = {
-        s_bbox_max[0] - s_bbox_min[0],
-        s_bbox_max[1] - s_bbox_min[1],
-        s_bbox_max[2] - s_bbox_min[2]
-    };
-    // Prevent division by zero.
-    for (int ax = 0; ax < 3; ax++)
-        if (bb_ext[ax] < 1e-20f) bb_ext[ax] = 1e-20f;
-
-    // Determine which directions need BVH.
-    bool need_bvh_b = (b->nt > HD_BRUTE_THRESH);  // for A->B direction
-    bool need_bvh_a = (a->nt > HD_BRUTE_THRESH);  // for B->A direction
-
-    // Allocate morton arrays for whichever we need.
+    // Allocate morton arrays — one entry per target triangle.
     if (tid == 0) {
         void *p1 = NULL, *p2 = NULL;
         s_alloc_ok = 1;
         if (need_bvh_b) {
-            if (heap_alloc(scratch_heap, (unsigned int)(n_sb * (int)sizeof(MortonPoint)), &p1) != HEAP_OK)
+            if (heap_alloc(scratch_heap, (unsigned int)(b->nt * (int)sizeof(MortonPoint)), &p1) != HEAP_OK)
                 { s_alloc_ok = 0; p1 = NULL; }
         }
         if (need_bvh_a) {
-            if (heap_alloc(scratch_heap, (unsigned int)(n_sa * (int)sizeof(MortonPoint)), &p2) != HEAP_OK)
+            if (heap_alloc(scratch_heap, (unsigned int)(a->nt * (int)sizeof(MortonPoint)), &p2) != HEAP_OK)
                 { s_alloc_ok = 0; p2 = NULL; }
         }
-        s_morton_b = (MortonPoint*)p1;  // BVH over B's samples (for A->B query)
-        s_morton_a = (MortonPoint*)p2;  // BVH over A's samples (for B->A query)
+        s_morton_b = (MortonPoint*)p1;  // BVH over B's triangles (for A->B query)
+        s_morton_a = (MortonPoint*)p2;  // BVH over A's triangles (for B->A query)
     }
     __syncthreads();
     if (!s_alloc_ok) {
@@ -680,27 +725,45 @@ __device__ __forceinline__ float hausdorff_block(
         return 0.0f;
     }
 
-    // Compute Morton codes.
-    PC_BUF(MortonPoint, morton_b, s_morton_b, need_bvh_b ? n_sb : 0);
-    PC_BUF(MortonPoint, morton_a, s_morton_a, need_bvh_a ? n_sa : 0);
+    // Compute Morton codes from triangle centroids.
+    PC_BUF(MortonPoint, morton_b, s_morton_b, need_bvh_b ? b->nt : 0);
+    PC_BUF(MortonPoint, morton_a, s_morton_a, need_bvh_a ? a->nt : 0);
     if (need_bvh_b) {
-        for (int i = tid; i < n_sb; i += HD_BLOCK) {
-            float x = samples_b[i * 3], y = samples_b[i * 3 + 1], z = samples_b[i * 3 + 2];
-            unsigned int mx = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (x - bb_min[0]) / bb_ext[0] * 1023.0f));
-            unsigned int my = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (y - bb_min[1]) / bb_ext[1] * 1023.0f));
-            unsigned int mz = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (z - bb_min[2]) / bb_ext[2] * 1023.0f));
-            morton_b[i].code = hd_morton3D(mx, my, mz);
-            morton_b[i].index = i;
+        float bmin[3] = { s_bbox_min_b[0], s_bbox_min_b[1], s_bbox_min_b[2] };
+        float bext[3] = {
+            fmaxf(1e-20f, s_bbox_max_b[0] - s_bbox_min_b[0]),
+            fmaxf(1e-20f, s_bbox_max_b[1] - s_bbox_min_b[1]),
+            fmaxf(1e-20f, s_bbox_max_b[2] - s_bbox_min_b[2]),
+        };
+        for (int t = tid; t < b->nt; t += HD_BLOCK) {
+            int i0 = bt[t*3+0], i1 = bt[t*3+1], i2 = bt[t*3+2];
+            float cx = (bv[i0*3+0] + bv[i1*3+0] + bv[i2*3+0]) * (1.0f/3.0f);
+            float cy = (bv[i0*3+1] + bv[i1*3+1] + bv[i2*3+1]) * (1.0f/3.0f);
+            float cz = (bv[i0*3+2] + bv[i1*3+2] + bv[i2*3+2]) * (1.0f/3.0f);
+            unsigned int mx = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (cx - bmin[0]) / bext[0] * 1023.0f));
+            unsigned int my = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (cy - bmin[1]) / bext[1] * 1023.0f));
+            unsigned int mz = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (cz - bmin[2]) / bext[2] * 1023.0f));
+            morton_b[t].code  = hd_morton3D(mx, my, mz);
+            morton_b[t].index = t;
         }
     }
     if (need_bvh_a) {
-        for (int i = tid; i < n_sa; i += HD_BLOCK) {
-            float x = samples_a[i * 3], y = samples_a[i * 3 + 1], z = samples_a[i * 3 + 2];
-            unsigned int mx = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (x - bb_min[0]) / bb_ext[0] * 1023.0f));
-            unsigned int my = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (y - bb_min[1]) / bb_ext[1] * 1023.0f));
-            unsigned int mz = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (z - bb_min[2]) / bb_ext[2] * 1023.0f));
-            morton_a[i].code = hd_morton3D(mx, my, mz);
-            morton_a[i].index = i;
+        float bmin[3] = { s_bbox_min_a[0], s_bbox_min_a[1], s_bbox_min_a[2] };
+        float bext[3] = {
+            fmaxf(1e-20f, s_bbox_max_a[0] - s_bbox_min_a[0]),
+            fmaxf(1e-20f, s_bbox_max_a[1] - s_bbox_min_a[1]),
+            fmaxf(1e-20f, s_bbox_max_a[2] - s_bbox_min_a[2]),
+        };
+        for (int t = tid; t < a->nt; t += HD_BLOCK) {
+            int i0 = at[t*3+0], i1 = at[t*3+1], i2 = at[t*3+2];
+            float cx = (av[i0*3+0] + av[i1*3+0] + av[i2*3+0]) * (1.0f/3.0f);
+            float cy = (av[i0*3+1] + av[i1*3+1] + av[i2*3+1]) * (1.0f/3.0f);
+            float cz = (av[i0*3+2] + av[i1*3+2] + av[i2*3+2]) * (1.0f/3.0f);
+            unsigned int mx = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (cx - bmin[0]) / bext[0] * 1023.0f));
+            unsigned int my = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (cy - bmin[1]) / bext[1] * 1023.0f));
+            unsigned int mz = (unsigned int)fminf(1023.0f, fmaxf(0.0f, (cz - bmin[2]) / bext[2] * 1023.0f));
+            morton_a[t].code  = hd_morton3D(mx, my, mz);
+            morton_a[t].index = t;
         }
     }
     __syncthreads();
@@ -718,8 +781,8 @@ __device__ __forceinline__ float hausdorff_block(
         MortonPoint* sort_data[2] = { NULL, NULL };
         int sort_n[2] = { 0, 0 };
         int n_sets = 0;
-        if (need_bvh_b) { sort_data[n_sets] = s_morton_b; sort_n[n_sets] = n_sb; n_sets++; }
-        if (need_bvh_a) { sort_data[n_sets] = s_morton_a; sort_n[n_sets] = n_sa; n_sets++; }
+        if (need_bvh_b) { sort_data[n_sets] = s_morton_b; sort_n[n_sets] = b->nt; n_sets++; }
+        if (need_bvh_a) { sort_data[n_sets] = s_morton_a; sort_n[n_sets] = a->nt; n_sets++; }
 
         // Allocate sort scratch.
         int max_n = 0;
@@ -906,9 +969,9 @@ __device__ __forceinline__ float hausdorff_block(
     // BVH for B's samples (if need_bvh_b): used for A->B direction.
     // BVH for A's samples (if need_bvh_a): used for B->A direction.
 
-    if (need_bvh_b && n_sb > 1) {
-        int bvh_nodes_count = 2 * n_sb - 1;
-        int counter_count   = n_sb - 1;
+    if (need_bvh_b && b->nt > 1) {
+        int bvh_nodes_count = 2 * b->nt - 1;
+        int counter_count   = b->nt - 1;
 
         if (tid == 0) {
             void *p1 = NULL, *p2 = NULL;
@@ -926,7 +989,12 @@ __device__ __forceinline__ float hausdorff_block(
             return 0.0f;
         }
 
-        int n = n_sb;
+#ifdef COACD_BEAM_DEBUG
+        long long clk_build_b0 = 0;
+        if (tid == 0) clk_build_b0 = clock64();
+#endif
+
+        int n = b->nt;
         BVHNode* bvh = s_bvh_b;
         MortonPoint* morton = s_morton_b;
         int* counters = s_bvh_counters;
@@ -947,7 +1015,7 @@ __device__ __forceinline__ float hausdorff_block(
         // Step A: Initialize leaf AABBs.
         for (int i = tid; i < n; i += HD_BLOCK) {
             int leaf_idx = (n - 1) + i;
-            int tri = tri_ids_b[morton[i].index];
+            int tri = morton[i].index;
             int ia = bt[tri * 3 + 0], ib_t = bt[tri * 3 + 1], ic = bt[tri * 3 + 2];
             float ax = bv[ia*3], ay = bv[ia*3+1], az = bv[ia*3+2];
             float bx = bv[ib_t*3], by = bv[ib_t*3+1], bz = bv[ib_t*3+2];
@@ -1029,14 +1097,17 @@ __device__ __forceinline__ float hausdorff_block(
         // Free counters.
         if (tid == 0) {
             heap_free(scratch_heap, (void*)s_bvh_counters); s_bvh_counters = NULL;
+#ifdef COACD_BEAM_DEBUG
+            s_hd_clk_build_b = clock64() - clk_build_b0;
+#endif
         }
         __syncthreads();
 
     }
 
-    if (need_bvh_a && n_sa > 1) {
-        int bvh_nodes_count = 2 * n_sa - 1;
-        int counter_count   = n_sa - 1;
+    if (need_bvh_a && a->nt > 1) {
+        int bvh_nodes_count = 2 * a->nt - 1;
+        int counter_count   = a->nt - 1;
 
         if (tid == 0) {
             void *p1 = NULL, *p2 = NULL;
@@ -1054,7 +1125,12 @@ __device__ __forceinline__ float hausdorff_block(
             return 0.0f;
         }
 
-        int n = n_sa;
+#ifdef COACD_BEAM_DEBUG
+        long long clk_build_a0 = 0;
+        if (tid == 0) clk_build_a0 = clock64();
+#endif
+
+        int n = a->nt;
         BVHNode* bvh = s_bvh_a;
         MortonPoint* morton = s_morton_a;
         int* counters = s_bvh_counters;
@@ -1073,7 +1149,7 @@ __device__ __forceinline__ float hausdorff_block(
         // Leaf AABBs — from mesh A's triangles.
         for (int i = tid; i < n; i += HD_BLOCK) {
             int leaf_idx = (n - 1) + i;
-            int tri = tri_ids_a[morton[i].index];
+            int tri = morton[i].index;
             int ia = at[tri * 3 + 0], ib_t = at[tri * 3 + 1], ic = at[tri * 3 + 2];
             float ax = av[ia*3], ay = av[ia*3+1], az = av[ia*3+2];
             float bx = av[ib_t*3], by = av[ib_t*3+1], bz = av[ib_t*3+2];
@@ -1153,16 +1229,18 @@ __device__ __forceinline__ float hausdorff_block(
 
         if (tid == 0) {
             heap_free(scratch_heap, (void*)s_bvh_counters); s_bvh_counters = NULL;
+#ifdef COACD_BEAM_DEBUG
+            s_hd_clk_build_a = clock64() - clk_build_a0;
+#endif
         }
         __syncthreads();
 
     }
 
-    // Free morton arrays and tri_ids — no longer needed.
+    // Free morton arrays — no longer needed.
     if (tid == 0) {
         heap_free(scratch_heap, (void*)s_morton_a); s_morton_a = NULL;
         heap_free(scratch_heap, (void*)s_morton_b); s_morton_b = NULL;
-        // s_tri_ids_a/b are part of the single samples allocation — not freed separately
     }
     __syncthreads();
 
@@ -1170,8 +1248,14 @@ __device__ __forceinline__ float hausdorff_block(
     // Phase 7: BVH traversal — nearest-neighbor queries.
     // =================================================================
 
-    // Direction A->B (query samples_a against BVH built on B's samples).
-    if (need_bvh_b && n_sb > 1) {
+    // Direction A->B (query samples_a against BVH built on B's triangles).
+    if (need_bvh_b && b->nt > 1) {
+#ifdef COACD_BEAM_DEBUG
+        long long clk_q_ab0 = 0;
+        if (tid == 0) { clk_q_ab0 = clock64(); s_hd_path_ab = 2; }
+        __syncthreads();
+        unsigned long long tl_nodes = 0, tl_leaves = 0;
+#endif
         BVHNode* bvh = s_bvh_b;
         float local_max = 0.0f;
 
@@ -1186,12 +1270,18 @@ __device__ __forceinline__ float hausdorff_block(
             while (sp > 0) {
                 int idx = stack[--sp];
                 BVHNode* nd = &bvh[idx];
+#ifdef COACD_BEAM_DEBUG
+                tl_nodes++;
+#endif
 
                 float aabb_d = hd_pt_aabb_dist_sq(qx, qy, qz, nd->bmin, nd->bmax);
                 if (aabb_d >= best_sq) continue;
 
                 if (nd->left == -1) {
                     // Leaf: exact distance to source triangle.
+#ifdef COACD_BEAM_DEBUG
+                    tl_leaves++;
+#endif
                     int ti = nd->tri_idx;
                     int i0 = bt[ti*3+0], i1 = bt[ti*3+1], i2 = bt[ti*3+2];
                     float d = hd_dist_pt_tri_sq(qx,qy,qz,
@@ -1215,11 +1305,23 @@ __device__ __forceinline__ float hausdorff_block(
             local_max = fmaxf(local_max, best_sq);
         }
 
+#ifdef COACD_BEAM_DEBUG
+        atomicAdd(&s_hd_nodes_ab,  tl_nodes);
+        atomicAdd(&s_hd_leaves_ab, tl_leaves);
+#endif
         float dir_ab = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ab = dir_ab;
         __syncthreads();
-    } else if (need_bvh_b && n_sb <= 1) {
-        // Too few samples for BVH — brute force against all target triangles.
+#ifdef COACD_BEAM_DEBUG
+        if (tid == 0) s_hd_clk_query_ab = clock64() - clk_q_ab0;
+        __syncthreads();
+#endif
+    } else if (need_bvh_b && b->nt <= 1) {
+        // Too few target triangles for BVH — brute force against all target triangles.
+#ifdef COACD_BEAM_DEBUG
+        long long clk0 = 0;
+        if (tid == 0) { clk0 = clock64(); s_hd_path_ab = 1; }
+#endif
         float local_max = 0.0f;
         for (int i = tid; i < n_sa; i += HD_BLOCK) {
             float qx = samples_a[i * 3], qy = samples_a[i * 3 + 1], qz = samples_a[i * 3 + 2];
@@ -1236,11 +1338,24 @@ __device__ __forceinline__ float hausdorff_block(
         }
         float dir_ab = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ab = dir_ab;
+#ifdef COACD_BEAM_DEBUG
+        __syncthreads();
+        if (tid == 0) {
+            s_hd_clk_query_ab = clock64() - clk0;
+            s_hd_brute_ab = (unsigned long long)n_sa * (unsigned long long)b->nt;
+        }
+#endif
         __syncthreads();
     }
 
-    // Direction B->A (query samples_b against BVH built on A's samples).
-    if (need_bvh_a && n_sa > 1) {
+    // Direction B->A (query samples_b against BVH built on A's triangles).
+    if (need_bvh_a && a->nt > 1) {
+#ifdef COACD_BEAM_DEBUG
+        long long clk_q_ba0 = 0;
+        if (tid == 0) { clk_q_ba0 = clock64(); s_hd_path_ba = 2; }
+        __syncthreads();
+        unsigned long long tl_nodes = 0, tl_leaves = 0;
+#endif
         BVHNode* bvh = s_bvh_a;
         float local_max = 0.0f;
 
@@ -1255,11 +1370,17 @@ __device__ __forceinline__ float hausdorff_block(
             while (sp > 0) {
                 int idx = stack[--sp];
                 BVHNode* nd = &bvh[idx];
+#ifdef COACD_BEAM_DEBUG
+                tl_nodes++;
+#endif
 
                 float aabb_d = hd_pt_aabb_dist_sq(qx, qy, qz, nd->bmin, nd->bmax);
                 if (aabb_d >= best_sq) continue;
 
                 if (nd->left == -1) {
+#ifdef COACD_BEAM_DEBUG
+                    tl_leaves++;
+#endif
                     int ti = nd->tri_idx;
                     int i0 = at[ti*3+0], i1 = at[ti*3+1], i2 = at[ti*3+2];
                     float d = hd_dist_pt_tri_sq(qx,qy,qz,
@@ -1282,11 +1403,23 @@ __device__ __forceinline__ float hausdorff_block(
             local_max = fmaxf(local_max, best_sq);
         }
 
+#ifdef COACD_BEAM_DEBUG
+        atomicAdd(&s_hd_nodes_ba,  tl_nodes);
+        atomicAdd(&s_hd_leaves_ba, tl_leaves);
+#endif
         float dir_ba = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ba = dir_ba;
         __syncthreads();
-    } else if (need_bvh_a && n_sa <= 1) {
-        // Too few samples for BVH — brute force against all target triangles.
+#ifdef COACD_BEAM_DEBUG
+        if (tid == 0) s_hd_clk_query_ba = clock64() - clk_q_ba0;
+        __syncthreads();
+#endif
+    } else if (need_bvh_a && a->nt <= 1) {
+        // Too few target triangles for BVH — brute force against all target triangles.
+#ifdef COACD_BEAM_DEBUG
+        long long clk0 = 0;
+        if (tid == 0) { clk0 = clock64(); s_hd_path_ba = 1; }
+#endif
         float local_max = 0.0f;
         for (int i = tid; i < n_sb; i += HD_BLOCK) {
             float qx = samples_b[i * 3], qy = samples_b[i * 3 + 1], qz = samples_b[i * 3 + 2];
@@ -1303,6 +1436,13 @@ __device__ __forceinline__ float hausdorff_block(
         }
         float dir_ba = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ba = dir_ba;
+#ifdef COACD_BEAM_DEBUG
+        __syncthreads();
+        if (tid == 0) {
+            s_hd_clk_query_ba = clock64() - clk0;
+            s_hd_brute_ba = (unsigned long long)n_sb * (unsigned long long)a->nt;
+        }
+#endif
         __syncthreads();
     }
 
@@ -1313,6 +1453,24 @@ __device__ __forceinline__ float hausdorff_block(
     float result = sqrtf(fmaxf(s_dir_ab, s_dir_ba));
 
     if (tid == 0) {
+#ifdef COACD_BEAM_DEBUG
+        // One line per block: sizes, path taken, timings, BVH stats.
+        // path: 0=skip, 1=brute, 2=bvh. brute counts = n_q * n_tri equivalent.
+        DPRINTF("[HD] blk=%d a=(v=%d t=%d) b=(v=%d t=%d) sa=%d sb=%d "
+                "AB(path=%d clk=%lld nodes=%llu leaves=%llu brute=%llu build_b_clk=%lld) "
+                "BA(path=%d clk=%lld nodes=%llu leaves=%llu brute=%llu build_a_clk=%lld)\n",
+                blockIdx.x, a->nv, a->nt, b->nv, b->nt, n_sa, n_sb,
+                s_hd_path_ab, s_hd_clk_query_ab,
+                (unsigned long long)s_hd_nodes_ab,
+                (unsigned long long)s_hd_leaves_ab,
+                (unsigned long long)s_hd_brute_ab,
+                s_hd_clk_build_b,
+                s_hd_path_ba, s_hd_clk_query_ba,
+                (unsigned long long)s_hd_nodes_ba,
+                (unsigned long long)s_hd_leaves_ba,
+                (unsigned long long)s_hd_brute_ba,
+                s_hd_clk_build_a);
+#endif
         HD_FREE_ALL_SCRATCH();
     }
 

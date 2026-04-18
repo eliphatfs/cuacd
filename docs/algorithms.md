@@ -16,7 +16,7 @@ Single-warp (32 threads). Fast path: direct D&C hull for nv ≤ 1024. Main path:
 
 ## Hausdorff Distance (`hausdorff.cuh`)
 
-Block-level (256 threads, 8 warps). Computes bidirectional Hausdorff distance between two meshes via sampling + linear BVH. CoACD-matching area-proportional sampling with Wang hash pseudo-random barycentric coordinates. Brute-force path for ≤64 target triangles; linear BVH (Karras 2012 radix tree) for larger meshes with cooperative 4-warp Morton code sort. Used by `la_hausdorff_parts` kernel to fill `Part.hausdorff`.
+Block-level (256 threads, 8 warps). Computes bidirectional Hausdorff distance between two meshes via sampling + linear BVH. CoACD-matching area-proportional sampling with Wang hash pseudo-random barycentric coordinates. Brute-force path for ≤128 target triangles; for larger meshes, builds a linear BVH (Karras 2012 radix tree) with one leaf per unique target triangle, Morton-sorted by triangle centroid via a cooperative 4-warp sort, then queries the sample points against it. Used by `la_hausdorff_parts` kernel to fill `Part.hausdorff`.
 
 ## Lookahead Search Decomposition
 
