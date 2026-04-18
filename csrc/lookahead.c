@@ -836,9 +836,6 @@ int lookahead_decompose(
             goto cleanup;
         }
 
-        // Reset error for next iteration
-        LCHECK(cuMemsetD32Async(d_err, 0, 1, s));
-
         TSTAMP(_t1);
         if (verbose)
             fprintf(stderr, "[la] iter %d: %.1f ms\n", iter, TELAPSED_MS(_t0, _t1));
