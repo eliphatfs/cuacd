@@ -32,7 +32,7 @@ Optional first-layer expansion supplement. When `n_concave_edges > 0`, the `la_f
 
 `la_count_cutting` deterministically selects highest-cost parts. `la_expand`/`la_expand_quick` place cuts evenly in the valid range `[lo+min_edge_dist, hi-min_edge_dist]` (min_edge_dist = min(threshold/4, 0.015)) to prevent degenerate thin slivers. Parts too small to cut in all axes (extent ≤ 2*min_edge_dist) are recorded as extra_leaves with zero cost for remaining levels — distinguishes genuinely solved parts from failed cuts (which get infinite cost).
 
-Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_items, la_record_level_cost, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree, la_free_decomp, la_decompose_components.
+Kernels: la_initialize, la_sort_parts, la_hausdorff_parts, la_count_cutting, la_seed_tree, la_expand, la_expand_quick, la_hull, la_sort_and_record, la_evaluate, la_apply_cuts, la_hull_decomp, la_cleanup_tree, la_free_decomp, la_decompose_components.
 
 ## Connected-Components Decomposition (`postprocess.cuh`)
 

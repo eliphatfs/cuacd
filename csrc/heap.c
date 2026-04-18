@@ -92,8 +92,7 @@ int gpu_init(gpu_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     cuModuleGetFunction(&ctx->fn_la_expand,            ctx->module, "la_expand");
     cuModuleGetFunction(&ctx->fn_la_expand_quick,      ctx->module, "la_expand_quick");
     cuModuleGetFunction(&ctx->fn_la_hull_la,           ctx->module, "la_hull");
-    cuModuleGetFunction(&ctx->fn_la_sort_items,        ctx->module, "la_sort_items");
-    cuModuleGetFunction(&ctx->fn_la_record_level_cost, ctx->module, "la_record_level_cost");
+    cuModuleGetFunction(&ctx->fn_la_sort_and_record,   ctx->module, "la_sort_and_record");
     cuModuleGetFunction(&ctx->fn_la_evaluate,          ctx->module, "la_evaluate");
     cuModuleGetFunction(&ctx->fn_la_apply_cuts,        ctx->module, "la_apply_cuts");
     cuModuleGetFunction(&ctx->fn_la_hull_decomp,       ctx->module, "la_hull_decomp");

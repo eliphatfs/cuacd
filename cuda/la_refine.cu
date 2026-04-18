@@ -1,5 +1,5 @@
 // la_refine.cu — refinement and quality kernels: la_expand_quick,
-// la_hausdorff_parts, la_evaluate, la_sort_items, la_record_level_cost.
+// la_hausdorff_parts, la_evaluate, la_sort_and_record.
 //
 // Heavy includes: plane_cut.cuh, hausdorff.cuh, mesh_volume.cuh
 
@@ -347,13 +347,14 @@ extern "C" __global__ void la_expand_quick(
 }
 
 // ============================================================================
-// la_sort_items: <<<nitems, 32>>>
-// Sort parts within each LaWorkItem by part_cost ascending.
+// la_sort_and_record: <<<nitems, 32>>>
+// Sort parts within each LaWorkItem by rv cost ascending, then record the
+// worst-part cost at the current expansion level. Fused from la_sort_items
+// and la_record_level_cost — both ran on lane 0 with identical launch config.
 // ============================================================================
-extern "C" __global__ void la_sort_items(
+extern "C" __global__ void la_sort_and_record(
     LaWorkItem* items,
     int         nitems,
-    DevicePool* pool,
     int*        err)
 {
     if (*err) return;
@@ -364,10 +365,9 @@ extern "C" __global__ void la_sort_items(
 
     LaWorkItem* wi = &items[item_idx];
     int np = wi->nparts;
-    if (np <= 1) return;
 
-    // Simple insertion sort by rv cost ascending.
-    if (lane == 0) {
+    // Insertion sort by rv cost ascending.
+    if (np > 1 && lane == 0) {
         for (int i = 1; i < np; i++) {
             Part key = wi->parts[i];
             float kcost = la_part_cost_rv(key);
@@ -379,22 +379,10 @@ extern "C" __global__ void la_sort_items(
             wi->parts[j + 1] = key;
         }
     }
-}
+    __syncthreads();
 
-// ============================================================================
-// la_record_level_cost: <<<nitems, 32>>>
-// Record the worst-part cost at the current expansion level.
-// Called after la_sort_items so parts are sorted by cost ascending.
-// ============================================================================
-extern "C" __global__ void la_record_level_cost(
-    LaWorkItem* items,
-    int         nitems)
-{
-    int i = blockIdx.x;
-    if (i >= nitems) return;
-
-    LaWorkItem* wi = &items[i];
-    if (threadIdx.x == 0 && wi->nparts > 0 && wi->n_levels < LA_MAX_LEVELS) {
+    // Record worst-part cost (last entry after sort).
+    if (lane == 0 && wi->nparts > 0 && wi->n_levels < LA_MAX_LEVELS) {
         float worst_cost = la_part_cost_rv(wi->parts[wi->nparts - 1]);
         wi->level_costs[wi->n_levels] = worst_cost;
         wi->n_levels++;

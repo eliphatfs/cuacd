@@ -482,18 +482,10 @@ int lookahead_decompose(
             }
             LA_SYNC_CHECK("hull");
 
-            // Sort parts within items
+            // Sort parts within items + record level cost (fused)
             {
-                void* args[] = { &d_next, &next_n, &ctx->d_pool_struct, &d_err };
-                LCHECK(cuLaunchKernel(ctx->fn_la_sort_items,
-                                       next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
-            }
-            LA_SYNC_CHECK("sort_items");
-
-            // Record level cost
-            {
-                void* args[] = { &d_next, &next_n };
-                LCHECK(cuLaunchKernel(ctx->fn_la_record_level_cost,
+                void* args[] = { &d_next, &next_n, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_sort_and_record,
                                        next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
 
@@ -569,15 +561,8 @@ int lookahead_decompose(
             LA_SYNC_CHECK("hull_quick");
 
             {
-                void* args[] = { &d_next, &next_n, &ctx->d_pool_struct, &d_err };
-                LCHECK(cuLaunchKernel(ctx->fn_la_sort_items,
-                                       next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
-            }
-            LA_SYNC_CHECK("sort_items_quick");
-
-            {
-                void* args[] = { &d_next, &next_n };
-                LCHECK(cuLaunchKernel(ctx->fn_la_record_level_cost,
+                void* args[] = { &d_next, &next_n, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_sort_and_record,
                                        next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
 
