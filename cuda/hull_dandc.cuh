@@ -431,6 +431,12 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVIndex sta
     int count = 0;
     do {
         count++;
+        // Read the whole BtEdge struct (32 B) via two 16-B loads. e->next sits
+        // in the first 16 B alongside prev/reverse — issuing its load now lets
+        // the compiler overlap it with the body's vblock load latency. Without
+        // this hint nvcc schedules e->next at the end of the body, which
+        // serializes the ring-traversal dependency chain.
+        BtEdge* e_next = e->next;
         if (e->copy > mergeStamp) {
             BtPoint32 t = bp32_sub(vblock[e->target].point, start_point);
             BtRational64 cot = br64_make(bp32_dot64(t, sxrxs), bp32_dot64_32(t, rxs));
@@ -449,7 +455,7 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVIndex sta
                 }
             }
         }
-        e = e->next;
+        e = e_next;
         if (!e) {
             DPRINTF("[BUG] bt_findMaxAngle: NULL edge->next after %d edges, "
                     "blk=%d lane=%d start=%d mergeStamp=%d\n",
@@ -479,17 +485,20 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
     long long dist = bp32_dot64_32(vblock[c0].point, normal);
     BtPoint64 perp = bp32_cross(s_dir, normal);
 
+    // Hoist the per-iteration `vblock[e->target].point` load into a local so
+    // the compiler can't pessimistically reload it for each downstream use.
     long long maxDot0 = bp32_dot64(et0, perp);
     if (*e0) {
         while ((*e0)->target != stop0) {
             BtEdge* e = (*e0)->reverse->prev;
-            if (bp32_dot64_32(vblock[e->target].point, normal) < dist) break;
+            BtPoint32 ep = vblock[e->target].point;
+            if (bp32_dot64_32(ep, normal) < dist) break;
             if (e->copy == mergeStamp) break;
-            long long dot = bp32_dot64(vblock[e->target].point, perp);
+            long long dot = bp32_dot64(ep, perp);
             if (dot <= maxDot0) break;
             maxDot0 = dot;
             *e0 = e;
-            et0 = vblock[e->target].point;
+            et0 = ep;
         }
     }
 
@@ -497,13 +506,14 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
     if (*e1) {
         while ((*e1)->target != stop1) {
             BtEdge* e = (*e1)->reverse->next;
-            if (bp32_dot64_32(vblock[e->target].point, normal) < dist) break;
+            BtPoint32 ep = vblock[e->target].point;
+            if (bp32_dot64_32(ep, normal) < dist) break;
             if (e->copy == mergeStamp) break;
-            long long dot = bp32_dot64(vblock[e->target].point, perp);
+            long long dot = bp32_dot64(ep, perp);
             if (dot <= maxDot1) break;
             maxDot1 = dot;
             *e1 = e;
-            et1 = vblock[e->target].point;
+            et1 = ep;
         }
     }
 

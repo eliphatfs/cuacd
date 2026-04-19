@@ -110,3 +110,4 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto 
 | `docs/api_kdop_hull.md` | `kdop_hull_block` algorithm and API |
 | `docs/api_heap_allocator.md` | Heap arena allocator design and benchmarks |
 | `docs/arena_sweep.md` | Arena count sweep benchmark results |
+| `docs/dev_log_la_perf.md` | Lookahead/`la_hull` perf optimization log: each attempt, outcome, kept/reverted |
