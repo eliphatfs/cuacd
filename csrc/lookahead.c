@@ -277,14 +277,18 @@ int lookahead_decompose(
         }
         LA_SYNC_CHECK("hausdorff_parts");
 
-        // Sort by full cost (rv + hausdorff) for la_count_cutting downstream.
+        // Fused: sort by full cost (rv + hausdorff) ascending, then count
+        // above-threshold parts and record their indices.
+        LCHECK(cuMemsetD32Async(d_n_cutting, 0, 1, s));
         {
-            void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
-            LCHECK(cuLaunchKernel(ctx->fn_la_sort_parts, 1, 1, 1, 32, 1, 1, 0, s, args, NULL));
+            void* args[] = { &d_decomp, &threshold, &d_n_cutting,
+                             &d_cutting_idx, &max_n_cutting, &d_err };
+            LCHECK(cuLaunchKernel(ctx->fn_la_sort_and_count_cutting,
+                                   1, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
-        LA_SYNC_CHECK("sort_parts");
+        LA_SYNC_CHECK("sort_and_count_cutting");
 
-        // Diagnostic: print per-part cost breakdown
+        // Diagnostic: print per-part cost breakdown (parts now sorted ascending)
         if (verbose) {
             struct LaDecompState_h h_diag;
             CUresult _dr = cuMemcpyDtoH(&h_diag, d_decomp, sizeof(h_diag));
@@ -303,14 +307,6 @@ int lookahead_decompose(
                             full_cost >= threshold ? " *" : "");
                 }
             }
-        }
-
-        // Count cutting parts
-        LCHECK(cuMemsetD32Async(d_n_cutting, 0, 1, s));
-        {
-            void* args[] = { &d_decomp, &threshold, &d_n_cutting,
-                             &d_cutting_idx, &max_n_cutting, &d_err };
-            LCHECK(cuLaunchKernel(ctx->fn_la_count_cutting, 1, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
 
         // Read back n_cutting
@@ -781,32 +777,20 @@ int lookahead_decompose(
             LA_SYNC_CHECK("hull_decomp");
         }
 
-        // Cleanup tree: free meshes from level-0 items
+        // Fused cleanup: level-0 items (d_level0), leaf items (d_cur), and
+        // the other expansion buffer (d_next, mostly nparts=0 no-ops).
         {
-            int n_l0 = n_cutting * iter_total_width;
-            void* args[] = { &d_level0, &n_l0, &ctx->d_pool_struct };
-            LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree,
-                                   n_l0, 1, 1, 32, 1, 1, 0, s, args, NULL));
-        }
-        LA_SYNC_CHECK("cleanup_level0");
-
-        // Cleanup tree: free meshes from leaf items (d_cur)
-        {
-            void* args[] = { &d_cur, &cur_n, &ctx->d_pool_struct };
-            LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree,
-                                   cur_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
-        }
-        LA_SYNC_CHECK("cleanup_leaves");
-
-        // Also cleanup the other buffer (may have intermediate level items)
-        {
-            int other_n = max_leaf_items;  // over-provisioned; nparts=0 → no-op
-            void* args[] = { &d_next, &other_n, &ctx->d_pool_struct };
-            LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree,
-                                   other_n > 1024 ? 1024 : other_n, 1, 1, 32, 1, 1,
+            int n_l0    = n_cutting * iter_total_width;
+            int other_n = max_leaf_items > 1024 ? 1024 : max_leaf_items;
+            void* args[] = { &d_level0, &n_l0,
+                             &d_cur,    &cur_n,
+                             &d_next,   &other_n,
+                             &ctx->d_pool_struct };
+            LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree3,
+                                   n_l0 + cur_n + other_n, 1, 1, 32, 1, 1,
                                    0, s, args, NULL));
         }
-        LA_SYNC_CHECK("cleanup_other");
+        LA_SYNC_CHECK("cleanup_tree3");
 
         *h_err_p = 0;
         LCHECK(cuMemcpyDtoHAsync(h_err_p, d_err, sizeof(int), s));

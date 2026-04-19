@@ -85,9 +85,8 @@ int gpu_init(gpu_ctx_t* out, int device_ordinal, size_t pool_bytes) {
 
     // Resolve lookahead kernels
     cuModuleGetFunction(&ctx->fn_la_init,              ctx->module, "la_initialize");
-    cuModuleGetFunction(&ctx->fn_la_sort_parts,        ctx->module, "la_sort_parts");
     cuModuleGetFunction(&ctx->fn_la_hausdorff_parts,   ctx->module, "la_hausdorff_parts");
-    cuModuleGetFunction(&ctx->fn_la_count_cutting,     ctx->module, "la_count_cutting");
+    cuModuleGetFunction(&ctx->fn_la_sort_and_count_cutting, ctx->module, "la_sort_and_count_cutting");
     cuModuleGetFunction(&ctx->fn_la_seed_tree,         ctx->module, "la_seed_tree");
     cuModuleGetFunction(&ctx->fn_la_expand,            ctx->module, "la_expand");
     cuModuleGetFunction(&ctx->fn_la_expand_quick,      ctx->module, "la_expand_quick");
@@ -97,6 +96,7 @@ int gpu_init(gpu_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     cuModuleGetFunction(&ctx->fn_la_apply_cuts,        ctx->module, "la_apply_cuts");
     cuModuleGetFunction(&ctx->fn_la_hull_decomp,       ctx->module, "la_hull_decomp");
     cuModuleGetFunction(&ctx->fn_la_cleanup_tree,      ctx->module, "la_cleanup_tree");
+    cuModuleGetFunction(&ctx->fn_la_cleanup_tree3,     ctx->module, "la_cleanup_tree3");
     cuModuleGetFunction(&ctx->fn_la_free_decomp,       ctx->module, "la_free_decomp");
     cuModuleGetFunction(&ctx->fn_la_decompose_components, ctx->module, "la_decompose_components");
     cuModuleGetFunction(&ctx->fn_la_find_concave_edges,   ctx->module, "la_find_concave_edges");

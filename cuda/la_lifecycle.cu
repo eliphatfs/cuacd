@@ -1,5 +1,5 @@
 // la_lifecycle.cu — init, apply, and finalize kernels: la_initialize,
-// la_sort_parts, la_count_cutting, la_apply_cuts, la_hull_decomp,
+// la_sort_and_count_cutting, la_apply_cuts, la_hull_decomp,
 // la_decompose_components, la_free_decomp.
 //
 // Heavy includes: kdop_hull.cuh, postprocess.cuh, mesh_volume.cuh
@@ -79,24 +79,27 @@ extern "C" __global__ void la_initialize(
 }
 
 // ============================================================================
-// la_sort_parts: <<<1, 32>>>
-// Sort the persistent decomposition's parts array by part_cost ascending.
-// Single warp handles up to LA_MAX_DECOMP=256 parts.
+// la_sort_and_count_cutting: <<<1, 32>>>
+// Phase 1 (lane 0): insertion sort the decomposition's parts array by full
+// part cost ascending.  Phase 2 (lane 0, after __syncthreads): count parts
+// with cost >= threshold and record their indices (highest-cost first).
+// Single warp; both phases are sequential on lane 0 — fine for LA_MAX_DECOMP.
 // ============================================================================
-extern "C" __global__ void la_sort_parts(
+extern "C" __global__ void la_sort_and_count_cutting(
     LaDecompState* decomp,
-    DevicePool*    pool,
+    float          threshold,
+    int*           n_cutting,
+    int*           cutting_indices,
+    int            max_cutting,
     int*           err)
 {
     if (*err) return;
 
     int lane = threadIdx.x;
     int np   = decomp->nparts;
-    if (np <= 1) return;
 
-    // Insertion sort by full cost (rv + hausdorff) ascending.
-    // Single-threaded (lane 0) — fine for LA_MAX_DECOMP <= 1024.
-    if (lane == 0) {
+    // Phase 1: insertion sort by full cost (rv + hausdorff) ascending.
+    if (lane == 0 && np > 1) {
         for (int i = 1; i < np; i++) {
             Part key = decomp->parts[i];
             float kcost = la_part_cost(key);
@@ -108,32 +111,14 @@ extern "C" __global__ void la_sort_parts(
             decomp->parts[j + 1] = key;
         }
     }
-}
 
-// ============================================================================
-// la_count_cutting: <<<1, 32>>>
-// Count parts with cost >= threshold and record their indices.
-// ============================================================================
-extern "C" __global__ void la_count_cutting(
-    LaDecompState* decomp,
-    float          threshold,
-    int*           n_cutting,
-    int*           cutting_indices,
-    int            max_cutting,
-    int*           err)
-{
-    // Parts are sorted by cost ascending (la_sort_parts runs before this).
-    // Above-threshold parts form a contiguous suffix.  We want the LAST
-    // max_cutting of them (highest cost = most in need of cutting).
-    //
-    // Lane 0 does a sequential scan to find the first above-threshold index,
-    // then fills cutting_indices deterministically.
-    if (threadIdx.x != 0) return;
+    __syncthreads();
 
-    int np = decomp->nparts;
+    // Phase 2: count cutting parts.  Above-threshold parts form a contiguous
+    // suffix; take the LAST max_cutting (highest cost).
+    if (lane != 0) return;
 
-    // Find first part above threshold (binary-search-like, but np ≤ 1024)
-    int first_above = np;  // default: none above
+    int first_above = np;
     for (int i = 0; i < np; i++) {
         if (la_part_cost(decomp->parts[i]) >= threshold) {
             first_above = i;
@@ -142,7 +127,6 @@ extern "C" __global__ void la_count_cutting(
     }
 
     int n_above = np - first_above;
-    // Skip the lowest-cost above-threshold parts if there are too many
     int start = first_above;
     if (n_above > max_cutting)
         start = np - max_cutting;

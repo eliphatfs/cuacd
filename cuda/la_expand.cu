@@ -373,20 +373,11 @@ extern "C" __global__ void la_hull(
 }
 
 // ============================================================================
-// la_cleanup_tree: <<<nitems, 32>>>
-// Decrement refcounts and free meshes for all parts in each LaWorkItem.
-// Items with nparts=0 are no-ops (already cleaned up or never used).
+// la_cleanup_tree_item: shared per-block body for cleanup kernels.
 // ============================================================================
-extern "C" __global__ void la_cleanup_tree(
-    LaWorkItem* items,
-    int         nitems,
-    DevicePool* pool)
+static __device__ __forceinline__ void la_cleanup_tree_item(
+    LaWorkItem* wi, DevicePool* pool, int tid)
 {
-    int tid = threadIdx.x;
-    int i   = blockIdx.x;
-    if (i >= nitems) return;
-
-    LaWorkItem* wi = &items[i];
     int np = wi->nparts;
 
     for (int p = tid; p < np; p += WARP_SIZE) {
@@ -405,4 +396,41 @@ extern "C" __global__ void la_cleanup_tree(
         }
     }
     if (tid == 0) wi->nparts = 0;
+}
+
+// ============================================================================
+// la_cleanup_tree: <<<nitems, 32>>>
+// Decrement refcounts and free meshes for all parts in each LaWorkItem.
+// Items with nparts=0 are no-ops (already cleaned up or never used).
+// ============================================================================
+extern "C" __global__ void la_cleanup_tree(
+    LaWorkItem* items,
+    int         nitems,
+    DevicePool* pool)
+{
+    int i = blockIdx.x;
+    if (i >= nitems) return;
+    la_cleanup_tree_item(&items[i], pool, threadIdx.x);
+}
+
+// ============================================================================
+// la_cleanup_tree3: <<<na + nb + nc, 32>>>
+// Fused cleanup across three buffers. Dispatches each block to the appropriate
+// buffer based on blockIdx.x. Pass nb=nc=0 (and NULL) to skip a buffer.
+// ============================================================================
+extern "C" __global__ void la_cleanup_tree3(
+    LaWorkItem* items_a, int na,
+    LaWorkItem* items_b, int nb,
+    LaWorkItem* items_c, int nc,
+    DevicePool* pool)
+{
+    int bi = blockIdx.x;
+    LaWorkItem* items;
+    int i;
+    if (bi < na)                { items = items_a; i = bi; }
+    else if (bi < na + nb)      { items = items_b; i = bi - na; }
+    else if (bi < na + nb + nc) { items = items_c; i = bi - na - nb; }
+    else return;
+
+    la_cleanup_tree_item(&items[i], pool, threadIdx.x);
 }
