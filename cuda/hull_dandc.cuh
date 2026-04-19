@@ -1615,20 +1615,25 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
     __shared__ BtPoint32*         s_points_scratch; // heap-allocated presort array, freed after vertex init
     __shared__ BtLanePoolCleanup  s_lane_cleanup;
     __shared__ BtHullState        s_state;
+    // Unified error word: 0 = success, otherwise a KERR_* code. Kept in shared
+    // memory (not a per-thread register) so it does not contribute to the
+    // kernel's per-thread register footprint. Only lane 0 writes; the final
+    // atomicOr to *err happens from lane 0.
+    __shared__ int                s_err;
 
-    // Use a local error variable to avoid racing on *err with other blocks.
-    // Only lane 0 writes; atomicOr to *err at the end.
 #ifdef COACD_BEAM_DEBUG
     long long t_start = clock64();
     long long t_sort = t_start, t_subhull = t_start, t_treemerge = t_start;
 #else
     long long t_subhull = 0, t_treemerge = 0;
 #endif
-    int local_err = 0;
-    if (lane == 0) s_lane_cleanup.nblocks = 0;
-    if (lane == 0) { s_result->verts = NULL; s_result->tris = NULL;
-                     s_result->nv = 0; s_result->nt = 0; s_result->refcount = NULL;
-                     s_pool.base = NULL; s_points_scratch = NULL; }
+    if (lane == 0) {
+        s_err = 0;
+        s_lane_cleanup.nblocks = 0;
+        s_result->verts = NULL; s_result->tris = NULL;
+        s_result->nv = 0; s_result->nt = 0; s_result->refcount = NULL;
+        s_pool.base = NULL; s_points_scratch = NULL;
+    }
 
     if (n < 4) { __syncwarp(); return; }
 
@@ -1642,13 +1647,12 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
             s_pool.capacity = sz;
             s_pool.error    = 0;
         } else {
-            local_err = KERR_BT_HEAP_TO_WARP;
+            s_err = KERR_BT_HEAP_TO_WARP;
         }
     }
     __syncwarp();
     if (!s_pool.base) {
-        local_err = __shfl_sync(WARP_MASK, local_err, 0);
-        if (lane == 0 && local_err) atomicOr(err, local_err);
+        if (lane == 0 && s_err) atomicOr(err, s_err);
         return;
     }
 
@@ -1670,7 +1674,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
     __syncwarp();
 
     BtPoint32* points = bt_compute_presort(state, pts, n, lane);
-    if (!points) { local_err = KERR_BT_WARP_OOM; goto done; }
+    if (!points) { if (lane == 0) s_err = KERR_BT_WARP_OOM; goto done; }
     if (lane == 0) s_points_scratch = points;
 
     {
@@ -1683,11 +1687,11 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
         }
         { long long sp = __shfl_sync(WARP_MASK, (long long)sort_scratch, 0);
           sort_scratch = (char*)sp; }
-        if (!sort_scratch) { local_err = KERR_BT_WARP_OOM; goto done; }
+        if (!sort_scratch) { if (lane == 0) s_err = KERR_BT_WARP_OOM; goto done; }
 
         int sort_err = warp_sort_bp32(points, sort_scratch, n, lane);
         __syncwarp();
-        if (sort_err) { local_err = KERR_BT_SORT_STACK; goto done; }
+        if (sort_err) { if (lane == 0) s_err = KERR_BT_SORT_STACK; goto done; }
 
         if (lane == 0) bt_rewind(&s_pool, pre_sort_offset);
         __syncwarp();
@@ -1699,22 +1703,18 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
         bt_compute_postsort(state, points, n, lane, &s_lane_cleanup, &s_points_scratch, &t_subhull, &t_treemerge);
 
         __shared__ int   s_pre_count;
-        __shared__ int   s_pre_ext;
         __shared__ int   s_nv_count;
         __shared__ int   s_nt_count;
         __shared__ int   s_nv_ext;
         __shared__ int   s_nt_ext;
-        __shared__ int   s_extract_err;
         __shared__ float* s_ov;
         __shared__ int*   s_ot;
         __shared__ int*   s_rc;
 
         if (lane == 0) {
-            s_extract_err = 0;
             s_ov = NULL; s_ot = NULL; s_rc = NULL;
             if (s_pool.error) {
-                local_err = s_pool.error;
-                s_extract_err = 1;
+                s_err = s_pool.error;
             } else {
                 DPRINTF("[hull] n=%d fma_calls=%d edges: total=%d avg=%.1f min=%d max=%d\n",
                     n, state->fma_calls, state->fma_total_edges,
@@ -1726,15 +1726,12 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
             }
         }
         __syncwarp();
-        if (s_extract_err) {
-            local_err = __shfl_sync(WARP_MASK, local_err, 0);
-            goto done;
-        }
+        if (s_err) goto done;
 
         // Count pass (warp-parallel)
         int rc_count = bt_extractMesh(state, lane, NULL, NULL, &s_nv_count, &s_nt_count);
         __syncwarp();
-        if (rc_count < 0) { local_err = KERR_BT_EXTRACT_FAIL; goto done; }
+        if (rc_count < 0) { if (lane == 0) s_err = KERR_BT_EXTRACT_FAIL; goto done; }
 
         if (lane == 0) {
             bt_rewind(&s_pool, s_pre_count);
@@ -1747,32 +1744,28 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
                 size_t rb = 16;
                 void* chunk = NULL;
                 if (heap_alloc(heap, (unsigned int)(va + ta + rb), &chunk) != HEAP_OK) {
-                    local_err = KERR_BT_HEAP_OUTPUT;
-                    s_extract_err = 1;
+                    s_err = KERR_BT_HEAP_OUTPUT;
                 } else {
                     s_ov = (float*)chunk;
                     s_ot = (int*)((char*)chunk + va);
                     s_rc = (int*)((char*)chunk + va + ta);
                     *s_rc = 1;
-                    s_pre_ext = s_pool.offset;
+                    s_pre_count = s_pool.offset;
                     s_nv_ext = 0; s_nt_ext = 0;
                 }
             }
         }
         __syncwarp();
-        if (s_extract_err) {
-            local_err = __shfl_sync(WARP_MASK, local_err, 0);
-            goto done;
-        }
+        if (s_err) goto done;
 
         if (s_nv_count > 0) {
             // Extract pass (warp-parallel)
             int rc_ext = bt_extractMesh(state, lane, s_ov, s_ot, &s_nv_ext, &s_nt_ext);
             __syncwarp();
-            if (rc_ext < 0) { local_err = KERR_BT_EXTRACT_FAIL; goto done; }
+            if (rc_ext < 0) { if (lane == 0) s_err = KERR_BT_EXTRACT_FAIL; goto done; }
 
             if (lane == 0) {
-                bt_rewind(&s_pool, s_pre_ext);
+                bt_rewind(&s_pool, s_pre_count);
                 s_result->verts = s_ov; s_result->tris = s_ot;
                 s_result->nv    = s_nv_count; s_result->nt = s_nt_count;
                 s_result->refcount = s_rc;
@@ -1795,6 +1788,5 @@ done:
     
 
     // Publish local error to the global error word (visible to host / other blocks).
-    local_err = __shfl_sync(WARP_MASK, local_err, 0);
-    if (lane == 0 && local_err) atomicOr(err, local_err);
+    if (lane == 0 && s_err) atomicOr(err, s_err);
 }
