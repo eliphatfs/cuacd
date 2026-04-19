@@ -36,18 +36,12 @@ __device__ inline int bt128_ucmp(BtInt128 a, BtInt128 b) {
     if (a.low > b.low) return 1;
     return 0;
 }
-// Unsigned 64x64 -> 128 multiply
+// Unsigned 64x64 -> 128 multiply. Uses __umul64hi (sm_53+) to keep only
+// two u64 temps live; manual 32-bit decomposition inflates register pressure.
 __device__ inline BtInt128 bt128_umul(unsigned long long a, unsigned long long b) {
-    unsigned long long a_lo = a & 0xffffffffULL, a_hi = a >> 32;
-    unsigned long long b_lo = b & 0xffffffffULL, b_hi = b >> 32;
-    unsigned long long p00 = a_lo * b_lo;
-    unsigned long long p01 = a_lo * b_hi;
-    unsigned long long p10 = a_hi * b_lo;
-    unsigned long long p11 = a_hi * b_hi;
-    unsigned long long mid = (p00 >> 32) + (p01 & 0xffffffffULL) + (p10 & 0xffffffffULL);
     BtInt128 r;
-    r.low = (p00 & 0xffffffffULL) | ((mid & 0xffffffffULL) << 32);
-    r.high = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+    r.low  = a * b;
+    r.high = __umul64hi(a, b);
     return r;
 }
 
@@ -136,7 +130,8 @@ __device__ inline bool br64_isNaN(BtRational64 r) { return (r.sign == 0) && (r.d
 
 __device__ inline int br64_cmp(BtRational64 a, BtRational64 b) {
     if (a.sign != b.sign) return a.sign - b.sign;
-    if (a.sign == 0) return 0;
+    // Same-sign path: if both signs are 0 the product below collapses to
+    // 0 * ucmp(...) = 0 anyway, so no explicit zero check is needed.
     return a.sign * bt128_ucmp(bt128_umul(a.num, b.den), bt128_umul(a.den, b.num));
 }
 

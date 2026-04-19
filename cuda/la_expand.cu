@@ -336,7 +336,10 @@ extern "C" __global__ void la_expand(
 // Compute k-DOP hull for the newest parts of each LaWorkItem.
 // n_new_parts = 2 for full/quick expansion (the two halves).
 // ============================================================================
-extern "C" __global__ void la_hull(
+// __launch_bounds__(32, 16) caps registers at 65536/(32*16) = 128 per thread
+// (forces small spill, ~52B stores/44B loads). Measured no meaningful speedup
+// vs. 140 regs on this workload, so left off.
+extern "C" __global__ /* __launch_bounds__(32, 16) */ void la_hull(
     LaWorkItem* items,
     int         nitems,
     int         n_new_parts,
