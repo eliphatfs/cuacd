@@ -223,8 +223,10 @@ __device__ __forceinline__ Mesh kdop_hull_block(
         __syncwarp();
         if (s_local_err) goto cleanup;
 
+        // Planes stored as float4 (nx,ny,nz,d) — 16B aligned, one LD/ST.E.128
+        // each. heap_alloc returns 16B-aligned pointers and t*4 floats == t*16B.
+        float4* pl4 = (float4*)s_planes;
         {
-            PC_BUF(float, pl, s_planes,         nt_ext * 4);
             for (int t = lane; t < nt_ext; t += WARP_SIZE) {
                 int ia = et[t*3+0], ib = et[t*3+1], ic = et[t*3+2];
                 float ax = ev[ia*3+0], ay = ev[ia*3+1], az = ev[ia*3+2];
@@ -235,12 +237,11 @@ __device__ __forceinline__ Mesh kdop_hull_block(
                 float pnz = e1x*e2y - e1y*e2x;
                 float pd  = pnx*ax + pny*ay + pnz*az;
                 if (pnx*rx + pny*ry + pnz*rz > pd) { pnx=-pnx; pny=-pny; pnz=-pnz; pd=-pd; }
-                pl[t*4+0] = pnx; pl[t*4+1] = pny; pl[t*4+2] = pnz; pl[t*4+3] = pd;
+                pl4[t] = make_float4(pnx, pny, pnz, pd);
             }
         }
         __syncwarp();
 
-        PC_BUF(float, pl, s_planes, nt_ext * 4);
         for (int i0 = 0; i0 < nv; i0 += WARP_SIZE) {
             int i = i0 + lane;
             bool keep = false;
@@ -248,10 +249,12 @@ __device__ __forceinline__ Mesh kdop_hull_block(
                 float px = vb[i*3+0];
                 float py = vb[i*3+1];
                 float pz = vb[i*3+2];
-                for (int t = 0; t < nt_ext && !keep; t++) {
-                    float pnx = pl[t*4+0], pny = pl[t*4+1], pnz = pl[t*4+2], pd = pl[t*4+3];
-                    if (pd == 0.0f) continue; // degenerate face, skip
-                    if (pnx*px + pny*py + pnz*pz > pd) keep = true;
+                // Degenerate triangles get pnx=pny=pnz=0 and pd=0 from the
+                // cross product, so 0 > 0 is false and they auto-fail the
+                // outward test below — no explicit skip needed.
+                for (int t = 0; t < nt_ext; t++) {
+                    float4 pl = pl4[t];
+                    if (pl.x*px + pl.y*py + pl.z*pz > pl.w) { keep = true; break; }
                 }
             }
             unsigned ballot = __ballot_sync(WARP_MASK, keep);

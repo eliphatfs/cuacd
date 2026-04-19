@@ -297,6 +297,43 @@ Reads:
 
 Net: A6 + A9 is the kept configuration; A5 is removed (replaced by A9).
 
+### A10. `kdop_hull_block` plane filter — float4 + drop redundant pd==0 (KEPT)
+
+The plane filter in `kdop_hull_block` step 5 runs `nv × nt_ext` plane checks
+per kdop call (≈ 5000 × 156 = 800K iterations on bunny). Two cheap edits:
+
+1. **Vectorize plane storage as `float4`**. Precompute writes `make_float4`
+   instead of four scalar stores; filter loop reads one `float4` instead of
+   four scalar `pl[t*4+k]` indexes. heap_alloc returns 16 B-aligned, and
+   `t*4` floats == `t*16` B, so the cast is safe. ptxas reg count unchanged
+   (compiler had already coalesced) but the source is shorter and the read
+   issues as a single LD.E.128.
+2. **Drop the `if (pd == 0.0f) continue;` early-out**. Degenerate triangles
+   give `pnx=pny=pnz=0` and `pd=0` from the cross product, so the outward
+   test `0 > 0` is naturally false — the explicit skip was redundant. It
+   was also subtly wrong: a *valid* face passing exactly through the origin
+   would have `pd ≈ 0` and would be incorrectly skipped. Removing it both
+   simplifies and slightly broadens correctness.
+
+Bench (`bench_la 100`, 5 runs, mean of medians):
+
+| | mean of medians (ms) |
+|---|---:|
+| A6+A9 baseline (V4) | 320.2 |
+| + A10               | 318.6 |
+
+≈ 0.5 %. Modest but every A10 run is below 322 ms vs V4's 315.8–325.1 spread.
+138/138 tests pass; `kdop_hull_kernel` regs unchanged at 142.
+
+A companion attempt (call it A10b): parallelize the 6 lane-0 random gathers
+in step 1 across lanes 0-5 (using the uniform `lmax_i / lmin_i` after the
+warp argmax/argmin reductions). Theoretically saves ~50 K cycles per kdop
+call, but bench was a wash (mean of medians 319.5 ms vs A10's 318.6 ms — a
+slight regression within noise). The 6-gather tail is dwarfed by the two
+inlined `hull_dandc_warp_mesh` calls. Reverted.
+
+Kept (A10 only).
+
 ## Candidates considered but not pursued
 
 - **Broadcast the merged point inside `bt_merge_pair`**: both primary and
