@@ -550,10 +550,12 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
             if (*e0 && ((*e0)->target != stop0)) {
                 BtEdge* f0 = (*e0)->next->reverse;
                 if (f0->copy > mergeStamp) {
-                    long long dx0 = bp32_dot64(bp32_sub(vblock[f0->target].point, et0), perp);
-                    long long dy0 = bp32_dot64_32(bp32_sub(vblock[f0->target].point, et0), s_dir);
+                    BtPoint32 f0_pt = vblock[f0->target].point;
+                    BtPoint32 d0 = bp32_sub(f0_pt, et0);
+                    long long dx0 = bp32_dot64(d0, perp);
+                    long long dy0 = bp32_dot64_32(d0, s_dir);
                     if ((dx0 == 0) ? (dy0 < 0) : ((dx0 < 0) && (br64_cmp(br64_make(dy0, dx0), br64_make(dy, dx)) >= 0))) {
-                        et0 = vblock[f0->target].point;
+                        et0 = f0_pt;
                         dx = bp32_dot64(bp32_sub(et1, et0), perp);
                         *e0 = (*e0 == start0) ? NULL : f0;
                         continue;
@@ -563,14 +565,15 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
             if (*e1 && ((*e1)->target != stop1)) {
                 BtEdge* f1 = (*e1)->reverse->next;
                 if (f1->copy > mergeStamp) {
-                    BtPoint32 d1 = bp32_sub(vblock[f1->target].point, et1);
+                    BtPoint32 f1_pt = vblock[f1->target].point;
+                    BtPoint32 d1 = bp32_sub(f1_pt, et1);
                     if (bp32_dot64_32(d1, normal) == 0) {
                         long long dx1 = bp32_dot64(d1, perp);
                         long long dy1 = bp32_dot64_32(d1, s_dir);
-                        long long dxn = bp32_dot64(bp32_sub(vblock[f1->target].point, et0), perp);
+                        long long dxn = bp32_dot64(bp32_sub(f1_pt, et0), perp);
                         if ((dxn > 0) && ((dx1 == 0) ? (dy1 < 0) : ((dx1 < 0) && (br64_cmp(br64_make(dy1, dx1), br64_make(dy, dx)) > 0)))) {
                             *e1 = f1;
-                            et1 = vblock[(*e1)->target].point;
+                            et1 = f1_pt;
                             dx = dxn;
                             continue;
                         }
@@ -585,10 +588,12 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
             if (*e1 && ((*e1)->target != stop1)) {
                 BtEdge* f1 = (*e1)->prev->reverse;
                 if (f1->copy > mergeStamp) {
-                    long long dx1 = bp32_dot64(bp32_sub(vblock[f1->target].point, et1), perp);
-                    long long dy1 = bp32_dot64_32(bp32_sub(vblock[f1->target].point, et1), s_dir);
+                    BtPoint32 f1_pt = vblock[f1->target].point;
+                    BtPoint32 d1 = bp32_sub(f1_pt, et1);
+                    long long dx1 = bp32_dot64(d1, perp);
+                    long long dy1 = bp32_dot64_32(d1, s_dir);
                     if ((dx1 == 0) ? (dy1 > 0) : ((dx1 < 0) && (br64_cmp(br64_make(dy1, dx1), br64_make(dy, dx)) <= 0))) {
-                        et1 = vblock[f1->target].point;
+                        et1 = f1_pt;
                         dx = bp32_dot64(bp32_sub(et1, et0), perp);
                         *e1 = (*e1 == start1) ? NULL : f1;
                         continue;
@@ -598,14 +603,15 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
             if (*e0 && ((*e0)->target != stop0)) {
                 BtEdge* f0 = (*e0)->reverse->prev;
                 if (f0->copy > mergeStamp) {
-                    BtPoint32 d0 = bp32_sub(vblock[f0->target].point, et0);
+                    BtPoint32 f0_pt = vblock[f0->target].point;
+                    BtPoint32 d0 = bp32_sub(f0_pt, et0);
                     if (bp32_dot64_32(d0, normal) == 0) {
                         long long dx0 = bp32_dot64(d0, perp);
                         long long dy0 = bp32_dot64_32(d0, s_dir);
-                        long long dxn = bp32_dot64(bp32_sub(et1, vblock[f0->target].point), perp);
+                        long long dxn = bp32_dot64(bp32_sub(et1, f0_pt), perp);
                         if ((dxn < 0) && ((dx0 == 0) ? (dy0 > 0) : ((dx0 < 0) && (br64_cmp(br64_make(dy0, dx0), br64_make(dy, dx)) < 0)))) {
                             *e0 = f0;
-                            et0 = vblock[(*e0)->target].point;
+                            et0 = f0_pt;
                             dx = dxn;
                             continue;
                         }
@@ -620,7 +626,9 @@ __device__ inline void bt_findEdgeForCoplanarFaces(int mergeStamp, BtVIndex c0, 
 __device__ inline bool bt_mergeProjection(BtIntermediateHull* __restrict__ h0, BtIntermediateHull* __restrict__ h1, BtVIndex* __restrict__ c0, BtVIndex* __restrict__ c1, BtVertex* __restrict__ vblock) {
     BtVIndex v0 = h0->maxYx;
     BtVIndex v1 = h1->minYx;
-    if ((vblock[v0].point.x == vblock[v1].point.x) && (vblock[v0].point.y == vblock[v1].point.y)) {
+    BtPoint32 v0_pt = vblock[v0].point;
+    BtPoint32 v1_pt = vblock[v1].point;
+    if ((v0_pt.x == v1_pt.x) && (v0_pt.y == v1_pt.y)) {
         BtVIndex v1p = vblock[v1].prev;
         if (v1p == v1) {
             *c0 = v0;
@@ -633,11 +641,13 @@ __device__ inline bool bt_mergeProjection(BtIntermediateHull* __restrict__ h0, B
         BtVIndex v1n = vblock[v1].next;
         vblock[v1p].next = v1n;
         vblock[v1n].prev = v1p;
+        BtPoint32 v1n_pt = vblock[v1n].point;
+        BtPoint32 v1p_pt = vblock[v1p].point;
         if (v1 == h1->minXy) {
-            h1->minXy = ((vblock[v1n].point.x < vblock[v1p].point.x) || ((vblock[v1n].point.x == vblock[v1p].point.x) && (vblock[v1n].point.y < vblock[v1p].point.y))) ? v1n : v1p;
+            h1->minXy = ((v1n_pt.x < v1p_pt.x) || ((v1n_pt.x == v1p_pt.x) && (v1n_pt.y < v1p_pt.y))) ? v1n : v1p;
         }
         if (v1 == h1->maxXy) {
-            h1->maxXy = ((vblock[v1n].point.x > vblock[v1p].point.x) || ((vblock[v1n].point.x == vblock[v1p].point.x) && (vblock[v1n].point.y > vblock[v1p].point.y))) ? v1n : v1p;
+            h1->maxXy = ((v1n_pt.x > v1p_pt.x) || ((v1n_pt.x == v1p_pt.x) && (v1n_pt.y > v1p_pt.y))) ? v1n : v1p;
         }
     }
 
@@ -648,64 +658,78 @@ __device__ inline bool bt_mergeProjection(BtIntermediateHull* __restrict__ h0, B
     int sign = 1;
 
     for (int side = 0; side <= 1; side++) {
-        int dx = (vblock[v1].point.x - vblock[v0].point.x) * sign;
+        v0_pt = vblock[v0].point;
+        v1_pt = vblock[v1].point;
+        int dx = (v1_pt.x - v0_pt.x) * sign;
         if (dx > 0) {
             while (true) {
-                int dy = vblock[v1].point.y - vblock[v0].point.y;
+                int dy = v1_pt.y - v0_pt.y;
                 BtVIndex w0 = side ? vblock[v0].next : vblock[v0].prev;
                 if (w0 != v0) {
-                    int dx0 = (vblock[w0].point.x - vblock[v0].point.x) * sign;
-                    int dy0 = vblock[w0].point.y - vblock[v0].point.y;
+                    BtPoint32 w0_pt = vblock[w0].point;
+                    int dx0 = (w0_pt.x - v0_pt.x) * sign;
+                    int dy0 = w0_pt.y - v0_pt.y;
                     if ((dy0 <= 0) && ((dx0 == 0) || ((dx0 < 0) && ((long long)dy0 * dx <= (long long)dy * dx0)))) {
-                        v0 = w0; dx = (vblock[v1].point.x - vblock[v0].point.x) * sign; continue;
+                        v0 = w0; v0_pt = w0_pt; dx = (v1_pt.x - v0_pt.x) * sign; continue;
                     }
                 }
                 BtVIndex w1 = side ? vblock[v1].next : vblock[v1].prev;
                 if (w1 != v1) {
-                    int dx1 = (vblock[w1].point.x - vblock[v1].point.x) * sign;
-                    int dy1 = vblock[w1].point.y - vblock[v1].point.y;
-                    int dxn = (vblock[w1].point.x - vblock[v0].point.x) * sign;
+                    BtPoint32 w1_pt = vblock[w1].point;
+                    int dx1 = (w1_pt.x - v1_pt.x) * sign;
+                    int dy1 = w1_pt.y - v1_pt.y;
+                    int dxn = (w1_pt.x - v0_pt.x) * sign;
                     if ((dxn > 0) && (dy1 < 0) && ((dx1 == 0) || ((dx1 < 0) && ((long long)dy1 * dx < (long long)dy * dx1)))) {
-                        v1 = w1; dx = dxn; continue;
+                        v1 = w1; v1_pt = w1_pt; dx = dxn; continue;
                     }
                 }
                 break;
             }
         } else if (dx < 0) {
             while (true) {
-                int dy = vblock[v1].point.y - vblock[v0].point.y;
+                int dy = v1_pt.y - v0_pt.y;
                 BtVIndex w1 = side ? vblock[v1].prev : vblock[v1].next;
                 if (w1 != v1) {
-                    int dx1 = (vblock[w1].point.x - vblock[v1].point.x) * sign;
-                    int dy1 = vblock[w1].point.y - vblock[v1].point.y;
+                    BtPoint32 w1_pt = vblock[w1].point;
+                    int dx1 = (w1_pt.x - v1_pt.x) * sign;
+                    int dy1 = w1_pt.y - v1_pt.y;
                     if ((dy1 >= 0) && ((dx1 == 0) || ((dx1 < 0) && ((long long)dy1 * dx <= (long long)dy * dx1)))) {
-                        v1 = w1; dx = (vblock[v1].point.x - vblock[v0].point.x) * sign; continue;
+                        v1 = w1; v1_pt = w1_pt; dx = (v1_pt.x - v0_pt.x) * sign; continue;
                     }
                 }
                 BtVIndex w0 = side ? vblock[v0].prev : vblock[v0].next;
                 if (w0 != v0) {
-                    int dx0 = (vblock[w0].point.x - vblock[v0].point.x) * sign;
-                    int dy0 = vblock[w0].point.y - vblock[v0].point.y;
-                    int dxn = (vblock[v1].point.x - vblock[w0].point.x) * sign;
+                    BtPoint32 w0_pt = vblock[w0].point;
+                    int dx0 = (w0_pt.x - v0_pt.x) * sign;
+                    int dy0 = w0_pt.y - v0_pt.y;
+                    int dxn = (v1_pt.x - w0_pt.x) * sign;
                     if ((dxn < 0) && (dy0 > 0) && ((dx0 == 0) || ((dx0 < 0) && ((long long)dy0 * dx < (long long)dy * dx0)))) {
-                        v0 = w0; dx = dxn; continue;
+                        v0 = w0; v0_pt = w0_pt; dx = dxn; continue;
                     }
                 }
                 break;
             }
         } else {
-            int x = vblock[v0].point.x;
-            int y0 = vblock[v0].point.y;
+            int x = v0_pt.x;
+            int y0 = v0_pt.y;
             BtVIndex w0 = v0;
             BtVIndex t;
-            while (((t = side ? vblock[w0].next : vblock[w0].prev) != v0) && (vblock[t].point.x == x) && (vblock[t].point.y <= y0)) {
-                w0 = t; y0 = vblock[t].point.y;
+            while (true) {
+                t = side ? vblock[w0].next : vblock[w0].prev;
+                if (t == v0) break;
+                BtPoint32 t_pt = vblock[t].point;
+                if (t_pt.x != x || t_pt.y > y0) break;
+                w0 = t; y0 = t_pt.y;
             }
             v0 = w0;
-            int y1 = vblock[v1].point.y;
+            int y1 = v1_pt.y;
             BtVIndex w1 = v1;
-            while (((t = side ? vblock[w1].prev : vblock[w1].next) != v1) && (vblock[t].point.x == x) && (vblock[t].point.y >= y1)) {
-                w1 = t; y1 = vblock[t].point.y;
+            while (true) {
+                t = side ? vblock[w1].prev : vblock[w1].next;
+                if (t == v1) break;
+                BtPoint32 t_pt = vblock[t].point;
+                if (t_pt.x != x || t_pt.y < y1) break;
+                w1 = t; y1 = t_pt.y;
             }
             v1 = w1;
         }

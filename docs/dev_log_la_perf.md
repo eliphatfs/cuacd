@@ -193,6 +193,19 @@ final kept configuration is **A6 + A9** (no A5):
 A9 compose additively (different functions, no shared state). No regressions;
 138/138 tests pass.
 
+**Update after A12 + A13** (vblock hoists in `bt_mergeProjection` and
+`bt_findEdgeForCoplanarFaces`), 5×100 bench, mean of medians:
+
+| Variant | mean of medians (ms) | vs NONE |
+|---|---:|---:|
+| NONE (pre-perf)         | 339.0  |     —  |
+| A6 + A9 + A10           | 322.9  | −4.8 % |
+| **A6 + A9 + A10 + A12 + A13** | **317.6** | **−6.3 %** |
+
+A12 gives the material win (~6 ms / ~2 %); A13 is noise-level but kept
+for code-style consistency with A12. A14/A15 (la_expand barrier /
+metadata parallelization) were tried and reverted — no measurable win.
+
 ### A7. Warp-cooperative kdop centroid (REVERTED)
 
 `kdop_hull_block` step 5 has lane 0 sum the rough-hull vertex coordinates
@@ -360,6 +373,128 @@ swamped by the two inlined `hull_dandc_warp_mesh` calls in steps 3 and 7.
 
 Reverted. Worth revisiting only if step 1 ever shows up as a hot region in a
 profile, or if `nv` regularly exceeds the L1 capacity (~10K+ verts).
+
+### A12. Hoist `vblock[v].point` in `bt_mergeProjection` (KEPT)
+
+Ncu 2026.1 source-page analysis (summed across all invocations of `la_hull`
+over one bunny end-to-end run):
+
+| Top SASS site in `la_hull` | Samples | Stall class |
+|---|---:|---|
+| `IMAD.WIDE R*, R*, 0x28, R*`  @ 0x50efe0 | 1.82 M | long_sb (vblock gather) |
+| `IMAD.WIDE R*, R*, 0x28, R*`  @ 0x52bee0 | 1.80 M | long_sb |
+| `LDG.E.128 R*, [R*]`          @ 0x52bee8 | 1.25 M | long_sb |
+
+The `0x28` (=40) stride is `sizeof(BtVertex)`. These are still the same kind
+of random gather A5/A6/A9 were chasing — but the top two PCs localize to
+`bt_mergeProjection`'s side-walking while loops (primary/secondary walk two
+chains of `vblock[v].point` advancing by `.next` / `.prev`).
+
+In the loop, every iteration reloads `vblock[v0].point`, `vblock[v1].point`,
+`vblock[w0].point`, `vblock[w1].point` to compute `dx`, `dy`, candidates, and
+advance. The compiler doesn't CSE across iterations because `v0/v1/w0/w1`
+change every iteration. But when `v0 = w0`, the "new" `v0_pt` is literally
+the `w0_pt` we just loaded.
+
+Implementation: hoist `v0_pt`, `v1_pt` at the top of each `for (side)`
+iteration. Inside the while loop, load `w0_pt = vblock[w0].point` /
+`w1_pt = vblock[w1].point` once per iteration, reuse for dx0/dy0/dxn/dyn
+tests, and on the `v0 = w0` / `v1 = w1` advance, also carry `v0_pt = w0_pt`
+(skipping the reload). Same pattern in the `dx==0` inner loops (new
+`t_pt = vblock[t].point` local).
+
+Result: `bench_la 100`, 5 runs each, mean of medians:
+
+| Variant | mean of medians (ms) | vs prior |
+|---|---:|---:|
+| Prior baseline (A6+A9+A10)   | 322.9 | — |
+| + A12                         | 316.8 | −1.9 % |
+
+138/138 tests pass. `la_hull` register count unchanged at 142 (compiler
+reused the registers that previously held temp `bp32` fields).
+
+Kept.
+
+### A13. Hoist `vblock[f].point` in `bt_findEdgeForCoplanarFaces` (KEPT)
+
+Companion to A12, targeting the two "slide along coplanar boundary" loops at
+the top of `bt_findEdgeForCoplanarFaces`. A6 already hoisted the per-body
+copy, but each iteration re-evaluates `vblock[f0->target].point` and
+`vblock[f1->target].point` for both the `dy`/`dxn` test and the `et0 = ...`
+assignment — reading the same gather twice per iteration.
+
+Implementation: inside the dx>0 and dx<0 while loops, load `f0_pt` /
+`f1_pt` once per iteration, share across the test and the `et0 = f0_pt;` /
+`et1 = f1_pt;` update. Also share the `d0 = bp32_sub(f0_pt, et0)` compute
+feeding both `dxn` and the angle test.
+
+Result: `bench_la 100`, 5 runs, mean of medians:
+
+| Variant | mean of medians (ms) | vs A12 |
+|---|---:|---:|
+| A12 alone                     | 316.8 |     — |
+| + A13                         | 317.6 | +0.2 % |
+
+Noise-level (Δ ≈ 0.8 ms within a run-to-run std of ~30 ms). The compiler
+was already doing most of the CSE A13 forces by hand, so the code-level
+change is a wash. Kept for consistency with A12's style (explicit hoist),
+no regression, 138/138 tests pass, `la_hull` regs still 142.
+
+### A14. Parallelize `tid==0` metadata write in `la_expand` (REVERTED)
+
+The 24-line `if (tid == 0)` block at la_expand.cu:250 serializes on tid 0:
+two full `Part` struct copies (`wo->parts[np-1] = pp.pos;`
+`wo->parts[np] = pp.neg;`), scalar metadata writes, and a short
+`level_costs` copy loop. Each `Part` is 76 B (20 ints), so striped int
+writes across 64 threads could do 1 ST/thread instead of 40 ST/thread for
+both copies.
+
+Implementation: treat `(int*)&pp.pos`, `(int*)&wo->parts[np-1]` as int
+arrays and stride the copy across `tid`. The `pp` returned by
+`plane_cut_block` is thread-local but identical across threads
+(`plane_cut_block` returns from shared `s_result`), so striped writes from
+different threads reconstruct the struct consistently. Move `level_costs`
+copy out into its own parallel loop; keep the 4 scalar metadata writes on
+tid 0.
+
+Result: A12+A13 + A14 + A15 bench, 5 runs, mean of medians:
+
+| Variant | mean of medians (ms) | vs A12+A13 |
+|---|---:|---:|
+| A12+A13                 | 317.6 |     — |
+| + A14 + A15             | 319.4 | +0.6 % |
+| + A15 only              | 321.2 | +1.1 % |
+
+All values within run-to-run std (~30 ms) but trending neutral/slightly
+worse, not better. Hypothesis for why A14 doesn't win: taking `&pp.pos`
+forces `pp` into addressable (local) memory, so the "serial" struct copy
+the compiler previously emitted from registers now becomes a local-memory
+load → global store. The issue-rate savings from parallelizing 40 STs
+across 64 threads is smaller than the added local-memory-read latency.
+
+138/138 tests pass under A14+A15. Reverted both to keep A12+A13 as the
+final kept state.
+
+### A15. Remove redundant `__syncthreads()` after `plane_cut_block` (REVERTED)
+
+`plane_cut_block` ends with `__syncthreads()` at plane_cut.cuh:1491 before
+`return s_result;`. The following `__syncthreads()` at la_expand.cu:201
+immediately after `pp = plane_cut_block(...)` is semantically redundant —
+all threads already synced before reading s_result.
+
+Implementation: replaced the redundant barrier with a comment.
+
+Result: 5×100 bench (above). Solo A15 mean of medians 321.2 ms vs A12+A13
+baseline 317.6 ms — within noise but trending slightly worse. Unclear why
+a provably redundant barrier would be anything but free; likely the sync
+has a secondary scheduler benefit (e.g., biasing the issue order of the
+subsequent empty-mesh check against in-flight loads), which is lost when
+removed.
+
+Reverted. 138/138 tests pass under A15 alone; kept configuration remains
+A12+A13.
+
+---
 
 ## Candidates considered but not pursued
 
