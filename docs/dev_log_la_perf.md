@@ -334,6 +334,33 @@ inlined `hull_dandc_warp_mesh` calls. Reverted.
 
 Kept (A10 only).
 
+### A11. `kdop_hull_block` step 1 — 2x axis tiling (REVERTED)
+
+Hypothesis: process two axes per outer iteration so each `verts[i*3+{0,1,2}]`
+load feeds two dot products. Halves the number of address calculations and
+load instructions issued, and pairs naturally with `KDOP_N_AXES = 40`.
+
+Implementation: carry two sets of `(dx,dy,dz)` and two sets of
+`(lmax,lmax_i,lmin,lmin_i)`; one inner-loop iteration computes both `d0` and
+`d1` from the same `(vx,vy,vz)`; followed by four (instead of two) interleaved
+warp argmax/argmin reductions per outer iter; lane-0 stores write 12 floats
+(instead of 6).
+
+Result: `bench_la 100`, 5 runs, mean of medians **319.0 ms** vs A10's
+**318.6 ms** — within noise (Δ ≈ 0.4 ms, < 0.15 %). `kdop_hull_kernel` reg
+count unchanged at 142 (compiler reused regs across the carried state, since
+total kernel reg count is dominated by the inlined `hull_dandc_warp_mesh`).
+
+Why the predicted ~1 ms/call savings did not materialize: at typical
+`nv ≈ 5000`, the entire `verts[]` buffer is ~60 KB and fits in L1 (128 KB on
+sm_89). After the first axis primes the cache, every subsequent axis hits L1
+— so the "halved memory accesses" were already cache hits, not DRAM round-
+trips. The remaining savings (halved address compute + load issue rate) are
+swamped by the two inlined `hull_dandc_warp_mesh` calls in steps 3 and 7.
+
+Reverted. Worth revisiting only if step 1 ever shows up as a hot region in a
+profile, or if `nv` regularly exceeds the L1 capacity (~10K+ verts).
+
 ## Candidates considered but not pursued
 
 - **Broadcast the merged point inside `bt_merge_pair`**: both primary and
