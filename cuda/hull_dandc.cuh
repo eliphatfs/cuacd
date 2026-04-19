@@ -426,19 +426,40 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVIndex sta
     BtEdge* minEdge = NULL;
     BtEdge* const start_edges = vblock[start].edges;
     const BtPoint32 start_point = vblock[start].point;
-    BtEdge* e = start_edges;
-    if (!e) { if (edge_count) *edge_count = 0; return NULL; }
+    if (!start_edges) { if (edge_count) *edge_count = 0; return NULL; }
+
+    // Single-stage software pipeline: the dependent gather
+    // vblock[e->target].point dominates per-iteration latency. Each iteration
+    // issues the *next* iteration's edge fields and vblock load early so they
+    // are in flight while this iteration's body (br64_make / dot products /
+    // br64_cmp) executes. Without pipelining the ring walk serializes on
+    // e_next -> e->target -> vblock load before each body.
+    BtEdge*  e        = start_edges;
+    BtEdge*  e_next   = e->next;
+    int      e_copy   = e->copy;
+    BtVIndex e_target = e->target;
+    BtPoint32 e_pt    = vblock[e_target].point;
     int count = 0;
+
     do {
         count++;
-        // Read the whole BtEdge struct (32 B) via two 16-B loads. e->next sits
-        // in the first 16 B alongside prev/reverse — issuing its load now lets
-        // the compiler overlap it with the body's vblock load latency. Without
-        // this hint nvcc schedules e->next at the end of the body, which
-        // serializes the ring-traversal dependency chain.
-        BtEdge* e_next = e->next;
-        if (e->copy > mergeStamp) {
-            BtPoint32 t = bp32_sub(vblock[e->target].point, start_point);
+
+        // Prefetch next iteration's data. Conditional on e_next being non-NULL
+        // (defensive: the ring should be closed). Compiler typically predicates
+        // these loads so they issue regardless and are discarded if e_next is NULL.
+        BtEdge*  e_next_next = NULL;
+        int      next_copy   = 0;
+        BtVIndex next_target = 0;
+        BtPoint32 next_pt;
+        if (e_next) {
+            e_next_next = e_next->next;
+            next_copy   = e_next->copy;
+            next_target = e_next->target;
+            next_pt     = vblock[next_target].point;
+        }
+
+        if (e_copy > mergeStamp) {
+            BtPoint32 t = bp32_sub(e_pt, start_point);
             BtRational64 cot = br64_make(bp32_dot64(t, sxrxs), bp32_dot64_32(t, rxs));
             if (!br64_isNaN(cot)) {
                 if (minEdge == NULL) {
@@ -455,14 +476,19 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVIndex sta
                 }
             }
         }
-        e = e_next;
-        if (!e) {
+
+        if (!e_next) {
             DPRINTF("[BUG] bt_findMaxAngle: NULL edge->next after %d edges, "
                     "blk=%d lane=%d start=%d mergeStamp=%d\n",
                     count, blockIdx.x, threadIdx.x, start, mergeStamp);
             if (edge_count) *edge_count = count;
-            return minEdge;  // bail out instead of crashing
+            return minEdge;
         }
+        e        = e_next;
+        e_next   = e_next_next;
+        e_copy   = next_copy;
+        e_target = next_target;
+        e_pt     = next_pt;
     } while (e != start_edges);
     if (edge_count) *edge_count = count;
     return minEdge;

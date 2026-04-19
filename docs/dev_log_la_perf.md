@@ -175,9 +175,127 @@ In-process timer (`bench_la 100`, mean/median in ms):
 | Baseline               | 347.1 | 340.9 |
 | + A5                   | 333.3 | 323.4 |
 | + A5 + A6              | 329.7 | 323.8 |
+| + A5 + A6 + A9 (5-run avg) | 326.4 | 321.9 |
 
-≈ 5% on the in-process measurement, ≈ 8% on the CLI measurement. No
-regressions; 138/138 tests pass.
+A later 4-cell compositional sweep (5 runs × 100 samples each, fresh build per
+cell) refined this picture: A9's pipelined prologue + carried-state loop
+inherently contains A5's `e->next` hoist, so A5 is strictly subsumed. The
+final kept configuration is **A6 + A9** (no A5):
+
+| Variant | mean of medians (ms) | vs NONE |
+|---|---:|---:|
+| NONE          | 339.0 |     —  |
+| A5 + A6       | 325.5 | −4.0 % |
+| A9 only       | 323.7 | −4.5 % |
+| **A6 + A9**   | **320.2** | **−5.5 %** |
+
+≈ 5–6 % on the in-process measurement, ≈ 8 % on the CLI measurement. A6 and
+A9 compose additively (different functions, no shared state). No regressions;
+138/138 tests pass.
+
+### A7. Warp-cooperative kdop centroid (REVERTED)
+
+`kdop_hull_block` step 5 has lane 0 sum the rough-hull vertex coordinates
+(up to 80 floats) for a face-orientation reference point, broadcasting via
+shared memory. Replaced with warp-strided sum + 5-step `__shfl_xor_sync`
+reduction.
+
+Result: `bench_la 100` two runs → 335.0 / 327.0 ms, 336.6 / 331.6 ms, vs the
+A5+A6 baseline of 329.7 / 323.8 ms. Within run-to-run noise (std ~30–50 ms),
+or marginally worse. The loop runs once per kdop_hull invocation and `nv_ext`
+is small (≤ 80), so the warp version's extra shuffle overhead (~30 inst.) is
+not amortized.
+
+Reverted.
+
+### A8. Reorder `BtEdge` fields to single-sector hot loop (REVERTED)
+
+`bt_findMaxAngle`'s inner ring loop reads only `e->next` (offset 0–7),
+`e->target` (24–27), `e->copy` (28–31). With the original Bullet field order
+(next, prev, reverse, target, copy) those reads span both 16 B sectors of
+the 32 B struct. Reordering to (next, target, copy, prev, reverse) +
+`__align__(16)` puts the three hot fields in a single 16 B sector, which
+should let the ring walk issue one LD.E.128 per edge instead of two.
+
+Result: `bench_la 100` two runs → 338.6 / 333.3 ms, 336.3 / 329.4 ms, vs A5+A6
+baseline 329.7 / 323.8 ms. Neutral within noise. Register pressure shifted:
+`la_hull_decomp` 144 → 140, `kdop_hull_kernel` 142 → 140, but
+`hull_dandc_kernel` 128 → 132 (worse). `la_hull` itself stayed at 142.
+
+Why no win: the dominant cost in this loop is the dependent random gather
+`vblock[e->target].point`, not the BtEdge fetch itself. Whether the BtEdge
+read takes 1 or 2 LD.E.128 makes ~8 cycles of difference per iteration,
+dwarfed by the 200–300 cycles for the random vblock load (which A5 already
+overlaps with body work).
+
+Reverted to keep the field order consistent with the upstream Bullet port.
+
+### A9. Software-pipeline `bt_findMaxAngle` ring walk (KEPT)
+
+A5 hoists `e->next` early so its load overlaps the body, but the inner-loop
+body still serializes on `vblock[e->target].point` — a random gather whose
+~200–300-cycle latency is much longer than the ~30–50 cycles of body work
+(`bp32_sub` / `bp32_dot64` / `br64_make` / `br64_cmp`). Single-stage software
+pipelining issues the *next* iteration's `e_next->next`, `->target`, `->copy`,
+and the dependent `vblock[next_target].point` at the top of the body, so they
+are in flight while this iteration's body executes.
+
+Implementation: prologue loads iter 0's edge fields and `vblock[e->target].point`
+into carried registers; each loop body issues iter N+1's prefetch, processes
+iter N from the carried registers, then advances the pipeline. The defensive
+`!e_next` bug bailout is preserved (predicates the prefetch on non-NULL).
+
+Result: `bench_la 100`, fresh side-by-side with `git stash` for parity (5
+runs each):
+
+| | mean (ms) | median (ms) |
+|---|---:|---:|
+| A5+A6 baseline           | 333.0 | 324.8 |
+| A5+A6 + A9 pipeline      | 326.4 | 321.9 |
+
+≈ 2 % on mean, ≈ 1 % on median. Modest but consistent — every one of the 5
+pipelined runs has a lower median than the *highest* baseline median. ptxas
+shows `la_hull` register count unchanged at 142 (compiler reuses regs across
+the carried state); `hull_dandc_kernel` 128 → 130. No spills. 138/138 tests
+pass.
+
+Why the win is small: a single pipeline stage hides one load latency behind
+one body's worth of compute (~30–50 cycles compute against ~200–300 cycles
+of latency), so steady-state still spends most of its time waiting. A 2- or
+3-stage pipeline would hide more, but each extra stage costs ~6 carried
+registers (BtEdge*, target, copy, BtPoint32) and `la_hull` is already at 142
+— risk of occupancy regression outweighs the projected gain. Single stage is
+the risk-adjusted sweet spot.
+
+Kept.
+
+### A5 / A6 / A9 compositional bench
+
+To verify A6 and A9 compose additively (and that A9 truly subsumes A5 — A9's
+prologue + carried-state loop *contains* the `e->next` hoist that A5 added),
+ran a 4-cell sweep. Each cell: rebuild from scratch, `bench_la 100` × 5 runs.
+
+| Variant | median range (ms) | mean of medians | vs NONE |
+|---|---:|---:|---:|
+| V1 NONE (no A5/A6/A9)   | 336.5 – 345.5 | 339.0 |    —    |
+| V2 A5 + A6              | 323.4 – 327.7 | 325.5 | −4.0 % |
+| V3 A9 only              | 319.0 – 326.9 | 323.7 | −4.5 % |
+| V4 **A6 + A9** (kept)   | **315.8 – 325.1** | **320.2** | **−5.5 %** |
+
+Reads:
+
+- **A9 alone ≥ A5+A6**: A9's prologue + carried `e_next` give the same overlap
+  A5 was buying, plus the extra latency-hiding from prefetched `e_next->target`
+  and `vblock[next_target].point`. So A5 is strictly subsumed.
+- **A6 composes additively on top of A9**: V4 (A6+A9) is consistently ~3 ms
+  median below V3 (A9 only). A6 hoists `vblock[e->target].point` in
+  `bt_findEdgeForCoplanarFaces`'s two slide loops — a different function from
+  A9, so no interference is expected and none is observed.
+- **Repeatability**: within-variant median spread is ~5–10 ms. The V4
+  distribution sits below all V1 runs and below all but one V2 run. Signal
+  is small (~5 ms = ~1.5 %) but consistent across 5 reps.
+
+Net: A6 + A9 is the kept configuration; A5 is removed (replaced by A9).
 
 ## Candidates considered but not pursued
 
@@ -186,6 +304,10 @@ regressions; 138/138 tests pass.
   loop iteration after a __shfl_sync broadcast of the indices — 4 random
   loads that could collapse to 2 + a shuffle. Material refactor, left for a
   follow-up.
+- **Multi-stage (2–3 stage) software pipeline for `bt_findMaxAngle`**: A9
+  is single-stage. Each extra stage hides another ~30–50 cycles of latency
+  but adds ~6 carried registers to a 142-reg kernel. Worth revisiting if
+  ptxas headroom opens up elsewhere.
 - **Reduce heap_alloc/free frequency in `kdop_hull_block`**: fast path does
   ~5 allocs/frees per block; could be fused into a single up-front scratch
   reservation. Significant rewrite of the allocation protocol; deferred.
