@@ -429,13 +429,15 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVIndex sta
     int* __restrict__ edge_count, BtVertex* __restrict__ vblock)
 {
     BtEdge* minEdge = NULL;
-    BtEdge* e = vblock[start].edges;
+    BtEdge* const start_edges = vblock[start].edges;
+    const BtPoint32 start_point = vblock[start].point;
+    BtEdge* e = start_edges;
     if (!e) { if (edge_count) *edge_count = 0; return NULL; }
     int count = 0;
     do {
         count++;
         if (e->copy > mergeStamp) {
-            BtPoint32 t = bp32_sub(vblock[e->target].point, vblock[start].point);
+            BtPoint32 t = bp32_sub(vblock[e->target].point, start_point);
             BtRational64 cot = br64_make(bp32_dot64(t, sxrxs), bp32_dot64_32(t, rxs));
             if (!br64_isNaN(cot)) {
                 if (minEdge == NULL) {
@@ -460,7 +462,7 @@ __device__ inline BtEdge* bt_findMaxAngle(int mergeStamp, bool ccw, BtVIndex sta
             if (edge_count) *edge_count = count;
             return minEdge;  // bail out instead of crashing
         }
-    } while (e != vblock[start].edges);
+    } while (e != start_edges);
     if (edge_count) *edge_count = count;
     return minEdge;
 }
