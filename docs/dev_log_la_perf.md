@@ -484,12 +484,27 @@ all threads already synced before reading s_result.
 
 Implementation: replaced the redundant barrier with a comment.
 
-Result: 5×100 bench (above). Solo A15 mean of medians 321.2 ms vs A12+A13
-baseline 317.6 ms — within noise but trending slightly worse. Unclear why
-a provably redundant barrier would be anything but free; likely the sync
-has a secondary scheduler benefit (e.g., biasing the issue order of the
-subsequent empty-mesh check against in-flight loads), which is lost when
-removed.
+Result: 5×100 bench first pass put solo A15 at 321.2 ms vs A12+A13 baseline
+317.6 ms, suggesting a slight regression. Because the 5-run delta was
+inside the run-to-run std (~30 ms), re-ran head-to-head 10×100:
+
+| Variant | medians (10 runs, ms) | mean of medians | median of medians |
+|---|---|---:|---:|
+| A12+A13 baseline | 318.7 321.5 315.0 316.2 317.3 320.4 315.8 316.0 319.9 314.9 | **317.57** | 316.75 |
+| + A15            | 320.9 320.2 319.1 321.5 309.7 312.7 320.4 323.2 315.0 316.3 | **317.90** | 319.65 |
+
+Mean-of-medians Δ = 0.33 ms — indistinguishable from zero over a per-sample
+std of ~35 ms. Median-of-medians leans baseline-ward by ~3 ms but the
+ten-run sets overlap heavily. So A15 is zero-to-slightly-negative at the
+noise floor, not a win.
+
+Hypothesis for why the "redundant" barrier isn't free when removed: the
+subsequent empty-mesh branch reads `pp.pos.mesh.nv` / `pp.neg.mesh.nv`
+(local registers populated from the shared `s_result` inside
+`plane_cut_block`). Without the outer sync the two warps may drift out of
+phase at this branch, increasing divergence-related scheduler overhead in
+the tid==0 heap_free path that follows. Whatever the micro-reason, the
+measurement does not justify the change.
 
 Reverted. 138/138 tests pass under A15 alone; kept configuration remains
 A12+A13.
