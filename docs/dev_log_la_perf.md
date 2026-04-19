@@ -509,6 +509,56 @@ measurement does not justify the change.
 Reverted. 138/138 tests pass under A15 alone; kept configuration remains
 A12+A13.
 
+### A16. Branch-and-bound pruning of lookahead paths (REVERTED)
+
+Each lookahead leaf's path cost is `sum(level_costs[0..total_levels-1]) /
+total_levels` (averaged with a fixed divisor — `all_small` early-exits pad
+the rest with 0). Between expansion levels we now know `level_costs[0..k-1]`
+for each item. For each item at level k:
+
+- **LB**: `sum_i = Σ level_costs[0..k-1]` (future costs ≥ 0).
+- **UB**: `sum_i + worst_i * (total - k)`, where `worst_i =
+  level_costs[k-1]`. Valid because `sort_and_record` records the max-rv
+  part, and cutting that worst part into two halves plus retaining
+  inherited parts (all ≤ worst by sort order) can only keep or decrease
+  the next level's worst — so `level_costs` is non-increasing.
+
+If `LB_i > min_j UB_j` over siblings sharing the same `src_part_idx`,
+item i cannot beat some cousin even under best-case completion → mark
+`src_part_idx = -1`. `la_expand`/`la_expand_quick` then early-return on
+pruned parents; `la_evaluate` naturally skips items whose src doesn't
+match the active block (via `src != my_idx`).
+
+Implementation: two new single-warp kernels `la_prune_reduce` (reduce min
+UB per src via atomicMinF) and `la_prune_apply` (mark prunes). Invoked
+after each `la_sort_and_record` in the full- and quick-expansion loops,
+guarded to skip the last level (where `k == total_levels` would be a
+no-op).
+
+Result at default `depth=2, quick_depth=1` (total_levels=3): **0 prunes
+out of 6541 candidate items** on the bunny workload. The UB is too loose
+at low total depth:
+
+- k=1: UB_i = `level_costs_i[0] * 3`, prune needs
+  `level_costs_i[0] > 3 × min_j level_costs_j[0]` → requires 3× spread
+  across (cut × src) pairs, which initial cuts don't produce (they give
+  narrowly clustered rv costs).
+- k=2: UB_i = `level_costs_i[0] + 2 × level_costs_i[1]`, needs similarly
+  large spread that doesn't materialize.
+- k=3 (last level before evaluate): guard skips — no pruning opportunity.
+
+5×100 bench with pruning: mean of medians **318.9 ms** vs **318.6 ms**
+baseline — the reduce+apply launch overhead is within noise (~0.3 ms),
+but there is no offsetting win.
+
+Conclusion: algorithm is correct, infrastructure works, but the BnB bound
+is too weak at shallow search depth. Reverted. Potentially worth
+revisiting if the default depth grows (k ≥ 3 with total_levels ≥ 5 would
+have tight UBs), or paired with a second-worst tracker to tighten the
+projection.
+
+138/138 tests passed under A16 before revert.
+
 ---
 
 ## Candidates considered but not pursued
