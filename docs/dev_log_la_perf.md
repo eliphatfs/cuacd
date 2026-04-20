@@ -872,13 +872,42 @@ the snaps wasn't recognized as producing heap allocs."
 
 ---
 
+### A19. Broadcast merged points (not indices) in `bt_merge_pair` (REVERTED)
+
+Per-iter the loop at `cuda/hull_dandc.cuh:865` broadcasts `c0`, `c1`,
+`prevPoint` to the secondary lane, then both threads do two global loads
+`vblock[c0].point` / `vblock[c1].point` to compute `sd` and `r`. Tried
+moving those loads to primary-only and broadcasting the points (6 int
+shuffles) instead of the indices (2 int shuffles + 2 loads per lane). Also
+dropped the now-unused `c0` shuffle (secondary uses `c1` as `my_start`,
+never `c0`).
+
+Net per iter: +5 register shuffles in exchange for 2 fewer global loads on
+the secondary lane.
+
+Result (`bench_la 100`, 5 runs, mean-of-medians):
+
+| Variant | mean (ms) | median (ms) |
+|---------|----------:|------------:|
+| Baseline (pre-A19) | 309.9 | 306.5 |
+| A19 (broadcast points) | 314.0 | 310.6 |
+
++1.3% regression — consistent across all 5 runs. The 2 saved global loads
+must have been L1 hits (adjacent hull vertices land in warm sectors during
+merge), so trading them for 5 extra cross-lane shuffles costs more than it
+saves. `bt_merge_pair`'s vblock locality is better than the
+"scattered random loads" framing of the original candidate suggested.
+
+Reverted. Points-broadcast variant is a dead end; revisit only if vblock
+layout changes (e.g. SoA split of `.point` away from `.edges`/`.next`/
+`.prev`) makes the loads miss more often.
+
+138/138 tests pass.
+
+---
+
 ## Candidates considered but not pursued
 
-- **Broadcast the merged point inside `bt_merge_pair`**: both primary and
-  secondary independently load `vblock[c0].point` / `vblock[c1].point` each
-  loop iteration after a __shfl_sync broadcast of the indices — 4 random
-  loads that could collapse to 2 + a shuffle. Material refactor, left for a
-  follow-up.
 - **Multi-stage (2–3 stage) software pipeline for `bt_findMaxAngle`**: A9
   is single-stage. Each extra stage hides another ~30–50 cycles of latency
   but adds ~6 carried registers to a 142-reg kernel. Worth revisiting if
