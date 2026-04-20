@@ -96,7 +96,7 @@ def plot_all(data, filename):
             ax.set_xscale("log", base=2)
             ax.set_xticks(WIDTHS)
             ax.set_xticklabels([str(w) for w in WIDTHS])
-            dc_label = "decompose-components-per-iter" if dc else "no decompose-components-per-iter"
+            dc_label = "no decompose-components-per-iter" if dc else "decompose-components-per-iter"
             ax.set_title(f"{ylabel} — {dc_label}")
             ax.legend(fontsize=8, ncol=2, loc="best")
             ax.grid(True, alpha=0.3)
