@@ -210,8 +210,8 @@ def main():
                         help='Dihedral angle threshold in radians for concavity (default: 3.49 ~200deg).')
     parser.add_argument('--concave-iters', type=int, default=10,
                         help='Number of first iterations to include concave edge sampling (default: 10).')
-    parser.add_argument('--merge-hulls', action='store_true', default=False,
-                        help='Run greedy merge-hulls post-processing pass (default: off).')
+    parser.add_argument('--no-merge-hulls', dest='merge_hulls', action='store_false', default=True,
+                        help='Disable greedy merge-hulls post-processing pass (default: on).')
     parser.add_argument('--serial', action='store_true', default=False,
                         help='Serial load-process-save instead of pipelined workers (easier debugging).')
     args = parser.parse_args()
