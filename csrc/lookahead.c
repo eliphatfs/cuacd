@@ -21,7 +21,7 @@
 #define TELAPSED_MS(a,b) 0.0
 #endif
 
-#define LA_MAX_PARTS_H     16
+#define LA_MAX_PARTS_H     8
 #define LA_MAX_CUTTING_H   16
 #define LA_MAX_DECOMP_H    1024
 #define LA_MAX_LEVELS_H    4

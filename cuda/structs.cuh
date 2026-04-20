@@ -52,7 +52,7 @@ struct AlgoState {
 // ============================================================================
 // Lookahead search structs
 // ============================================================================
-#define LA_MAX_PARTS     16
+#define LA_MAX_PARTS     8
 #define LA_MAX_CUTTING   16
 #define LA_MAX_DECOMP    1024
 #define LA_MAX_LEVELS    4

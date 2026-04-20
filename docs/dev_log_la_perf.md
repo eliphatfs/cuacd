@@ -906,6 +906,45 @@ layout changes (e.g. SoA split of `.point` away from `.edges`/`.next`/
 
 ---
 
+### A20. Shrink `LA_MAX_PARTS` 16 → 8 (KEPT)
+
+`LA_MAX_PARTS` caps the parts array inside each `LaWorkItem`. `la_seed_tree`
+inits `nparts=1`; every `la_expand` / `la_expand_quick` call grows `nparts`
+by +1 (replaces one part with its plane-cut halves). So the tight bound is
+`nparts ≤ 1 + depth + quick_depth`. Default config (`depth=2, quick_depth=0`)
+tops out at `nparts=3`; 16 was ~5× oversized. Reduced to 8 — still leaves
+room for `depth=7` which is well beyond any realistic use.
+
+Changes: `cuda/structs.cuh:55` and mirror `LA_MAX_PARTS_H` in
+`csrc/lookahead.c:24`.
+
+**No shared-memory change.** `LaWorkItem` lives in global memory
+(`cuMemAlloc`-backed). The lookahead kernels' `__shared__` usage is
+independent of `LA_MAX_PARTS` (largest: `s_cut_best[512]` in `la_evaluate`
+at 2 KB, `s_parts[DC_MAX_OUT=32]` in `decompose_components_block` at
+~2.5 KB).
+
+**Global-memory savings.** `sizeof(LaWorkItem)` drops 1320 → 680 B.
+Across `cur_items + next_items + level0_items + extra_leaves` for bunny
+config (max_leaf_items ≈ 7360, level0 = n_cutting × total_width = 16×92
+at most), total allocation drops from ~29 MB → ~15 MB per
+`lookahead_decompose` call.
+
+**Perf.** `bench_la 100`, 5 runs, mean-of-medians:
+
+| Variant | mean (ms) | median-of-medians (ms) |
+|---------|----------:|------:|
+| Baseline (LA_MAX_PARTS=16) | 309.9 | 308.3 |
+| A20 (LA_MAX_PARTS=8) | 309.4 | 307.6 |
+
+Within noise — neutral. No occupancy or L1 gain (buffers aren't shared
+memory), but less pressure on `cuMemAlloc`-backed global and slightly less
+work in the `memcpy`-style parent-part copy inside `la_expand`. Kept.
+
+138/138 tests pass.
+
+---
+
 ## Candidates considered but not pursued
 
 - **Multi-stage (2–3 stage) software pipeline for `bt_findMaxAngle`**: A9
