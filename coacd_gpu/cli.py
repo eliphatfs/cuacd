@@ -176,8 +176,8 @@ def main():
     parser.add_argument('output', help='Output directory.')
     parser.add_argument('-r', '--recursive', action='store_true', default=False,
                         help='Recurse into subdirectories (default: false).')
-    parser.add_argument('--width', type=int, default=60,
-                        help='Number of candidate cuts per expansion level (default: 60).')
+    parser.add_argument('--width', type=int, default=30,
+                        help='Number of candidate cuts per expansion level (default: 30).')
     parser.add_argument('--width2', type=int, default=5,
                         help='Cuts at deeper expansion levels (default: 5).')
     parser.add_argument('--depth', type=int, default=2,
@@ -202,8 +202,8 @@ def main():
                         help='Skip connected components decomposition (default: enabled).')
     parser.add_argument('--no-decompose-components-per-iter', action='store_true', default=False,
                         help='Disable per-iteration connected components decomposition (default: on).')
-    parser.add_argument('--n-concave-edges', type=int, default=32,
-                        help='Max concave edges to sample per cutting part (default: 32).')
+    parser.add_argument('--n-concave-edges', type=int, default=16,
+                        help='Max concave edges to sample per cutting part (default: 16).')
     parser.add_argument('--concave-eps', type=float, default=0.005,
                         help='Epsilon offset for edge-based planes (default: 0.005).')
     parser.add_argument('--concave-threshold', type=float, default=3.49,
