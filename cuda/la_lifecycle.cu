@@ -186,6 +186,12 @@ extern "C" __global__ void la_apply_cuts(
         // Free the old part's mesh and hull (being replaced)
         Part* old = &decomp->parts[part_idx];
         int free_err = 0;
+#ifdef COACD_LEAK_PROBE
+        printf("[apply_cuts[%d]] old.mesh.rc=%p(*=%d) old.hull.rc=%p mesh_vol=%.6f hull_vol=%.6f\n",
+               i, old->mesh.refcount,
+               old->mesh.refcount ? *old->mesh.refcount : -1,
+               old->hull.refcount, old->mesh_vol, old->hull_vol);
+#endif
         if (old->mesh.refcount) {
             int om = atomicAdd(old->mesh.refcount, -1);
             if (om == 1) {

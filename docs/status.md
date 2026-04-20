@@ -10,10 +10,6 @@
 - `la_find_concave_edges` — concave edge detection kernel. Generates cutting planes from concave mesh edges for first-layer expansion. Exposed via `n_concave_edges` parameter (default 32). Uses `heap_alloc`/`heap_free` from scratch heap for sort+reservoir scratch. 9 tests pass.
 - **Merge-hulls postprocess pass** — port of CoACD's greedy hull merging. Optional (`merge_hulls=True` on `lookahead_decompose`, or `--merge-hulls` on the CLI). Six device kernels in `postprocess_merge.cu`: per-pair cost (rv quick-reject → bbox reject → concat + k-DOP hull → rv cost), separate Hausdorff pass on the filtered-concat mesh (coplanar tris dropped along the shared separating plane) against the merged hull, block-level greedy min-cost matching, apply kernel that builds merged mesh + adopts cached hull, and a single-block in-place compaction. All state lives on the GPU. Bench on bunny (5 runs × 20 iters): parts-mean 44.55–45.80 off → 37.20–38.55 on (~16% reduction); time median 302.8–314.1 ms off → 312.0–321.9 ms on (~1–3% overhead).
 
-## Known Limitations
-
-- **Lookahead residual pool growth (~1 MB/call)**: After fixing two confirmed leaks (final decomp meshes never freed; seed buffer overwritten without refcount decrement before swap), pool usage still grows ~1 MB/call over 100 repeated calls. Cause unconfirmed — may be allocator bin fragmentation (varying chunk sizes → new slabs) or a remaining minor leak. Not yet experimentally distinguished.
-
 ## Not Yet Implemented
 
 - `__cuda_array_interface__` support for GPU tensor input

@@ -29,23 +29,23 @@ extern "C" __global__ void la_seed_tree(
     Part* src    = &decomp->parts[part_idx];
     LaWorkItem* wi = &level0_items[i];
 
-    // Copy the part
-    wi->parts[0] = *src;
-
-    // Increment mesh refcount (the source part is still in the decomposition)
-    if (src->mesh.refcount) atomicAdd(src->mesh.refcount, 1);
-
-    // Null out hull mesh pointers in the copy — the decomp part still owns
-    // its hull, and sharing hull.verts with refcount=NULL → double-free.
-    // But preserve hull_vol so the seed item's rv cost is accurate.
-    wi->parts[0].hull.verts    = NULL;
-    wi->parts[0].hull.tris     = NULL;
-    wi->parts[0].hull.nv       = 0;
-    wi->parts[0].hull.nt       = 0;
-    wi->parts[0].hull.refcount = NULL;
-    // hull_vol preserved — inherited from decomp part
-
     if (threadIdx.x == 0) {
+        // Copy the part
+        wi->parts[0] = *src;
+
+        // Increment mesh refcount (the source part is still in the decomposition)
+        if (src->mesh.refcount) atomicAdd(src->mesh.refcount, 1);
+
+        // Null out hull mesh pointers in the copy — the decomp part still owns
+        // its hull, and sharing hull.verts with refcount=NULL → double-free.
+        // But preserve hull_vol so the seed item's rv cost is accurate.
+        wi->parts[0].hull.verts    = NULL;
+        wi->parts[0].hull.tris     = NULL;
+        wi->parts[0].hull.nv       = 0;
+        wi->parts[0].hull.nt       = 0;
+        wi->parts[0].hull.refcount = NULL;
+        // hull_vol preserved — inherited from decomp part
+
         wi->nparts         = 1;
         wi->src_part_idx   = i;  // index into cutting list
         wi->initial_cut_idx = 0; // will be overwritten by la_expand

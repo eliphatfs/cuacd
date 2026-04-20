@@ -1,5 +1,16 @@
 # Implementation Notes
 
+## la_seed_tree: Unguarded atomicAdd Bumped Refcount 32×
+
+`la_seed_tree` launched with 32 threads per block but bumped the source part's `mesh.refcount` without a `threadIdx.x == 0` guard:
+
+```cuda
+// Every thread executed this — 32× bump per seed
+if (src->mesh.refcount) atomicAdd(src->mesh.refcount, 1);
+```
+
+Symptom: `lookahead_decompose` leaked ~70 heap chunks per 100-iter bunny run. At `la_apply_cuts` time, `old.mesh.refcount` dereferenced to 32 (not 1 or 2), so `atomicAdd(rc, -1)` returned 32 and the `if (om == 1)` free path never ran — the old mesh chunk was orphaned on every cut. Fix: move `wi->parts[0] = *src`, the `atomicAdd`, the hull null-outs, and the metadata init under a single `if (threadIdx.x == 0)` block. The shallow struct copy and the NULL stores were idempotent across threads so they were harmless (though redundant), but the atomic bump must fire exactly once.
+
 ## Avoid Local Arrays with Runtime-Variable Indices in Warp Code
 
 In `hull_dandc_warp_mesh`, point conversion originally used a local `float p[3]` array indexed by runtime variables (`medAx`, `maxAx`, `minAx`). Because the compiler cannot prove the indices are compile-time constants, it cannot keep `p` in registers and must spill to local (per-thread stack) memory, adding load/store traffic. Fix: unroll to three direct inline expressions, eliminating the array entirely.

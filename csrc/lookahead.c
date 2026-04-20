@@ -309,10 +309,12 @@ int lookahead_decompose(
                 LCHECK(cuLaunchKernel(ctx->fn_la_decompose_components,
                     cur_np, 1, 1, 128, 1, 1, 0, s, dc_args, NULL));
                 LA_SYNC_CHECK("dc_pre_eval");
+                LA_BISECT_SNAP("dc_pre_eval");
                 void* hull_args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
                 LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
                     LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, hull_args, NULL));
                 LA_SYNC_CHECK("hull_decomp_pre_eval");
+                LA_BISECT_SNAP("hull_decomp_pre_eval");
             }
         }
 
@@ -831,10 +833,12 @@ int lookahead_decompose(
                 LCHECK(cuLaunchKernel(ctx->fn_la_decompose_components,
                     cur_np, 1, 1, 128, 1, 1, 0, s, dc_args, NULL));
                 LA_SYNC_CHECK("dc_post_cuts");
+                LA_BISECT_SNAP("dc_post_cuts");
                 void* hull_args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
                 LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
                     LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, hull_args, NULL));
                 LA_SYNC_CHECK("hull_decomp_post_dc");
+                LA_BISECT_SNAP("hull_decomp_post_dc");
             }
         } else {
             void* args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
