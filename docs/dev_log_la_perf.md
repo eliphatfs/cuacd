@@ -805,22 +805,41 @@ semantics. No new code path; just a deletion.
 
 ### Measured impact
 
-| Run | Live heap chunks after `la_free_decomp` |
-|-----|---------------------------------------:|
-| 1 iter                             | 1 |
-| 100 iter (default, n_concave_edges=32) | 68 |
-| 100 iter (n_concave_edges=0)       | 71 |
+| Iters | Live heap chunks after `la_free_decomp` |
+|-------|---------------------------------------:|
+|   1   |  1 |
+|   2   |  3 |
+|   5   | 16 |
+|  10   | 33 |
+|  20   | 68 |
+|  50   | 71 |
+| 100   | 69 |
 
 Prior to the fix, the 100-iter default run leaked ~141 chunks; after the
 fix, 68 — roughly a 50% reduction. Scratch heap is clean (0 live) in all
-runs, confirming the scratch-vs-main separation is airtight. Bunny
-converges around iter ~20 (n_cutting=0 from then on), so the residual is
-spread across the ~20 iters of actual work, amortizing to ~3.5 unfreed
-chunks per productive iter.
+runs, confirming the scratch-vs-main separation is airtight. **The leak
+is bounded and self-terminating**: bunny converges near iter ~20
+(`n_cutting` drops to 0) and the live count stops growing — indeed at
+iter 50 it's 71 and at iter 100 it's 69, within noise. During productive
+iters the leak grows at ~3.5 chunks per iter; once no more cutting
+happens per-iter, it flattens.
 
-### Residual leak: not pinned
+A follow-up bisect run with
+`lookahead_decompose(..., no_decompose_components_per_iter=True)` showed
+**0 live chunks after `la_free_decomp`** for 1 iter. The residual leak
+is therefore confined to the `la_decompose_components` + post-iter
+`la_hull_decomp` path that runs when
+`decompose_components_per_iter=True` (the default). With multi-component
+splitting disabled, the tree-search core is completely balanced.
 
-Per-kernel bisect on iter 19 shows allocs/frees balance to within +12/iter:
+### Residual leak: localized but not fully pinned
+
+Per-kernel bisect on iter 19 shows allocs/frees balance to within +3-4/iter
+while cutting, and 0/iter after convergence. The localization is now tight:
+the leak ONLY happens when `decompose_components_per_iter` is on (default).
+A 1-iter bisect with the flag off shows 0 live chunks after `la_free_decomp`.
+The per-kernel alloc/free flow during iter 19 (after convergence this will
+not run, but during productive iters it looks like):
 
 | phase (iter 19) | alloc delta | free delta | net |
 |-----------------|-----:|-----:|-----:|
@@ -842,11 +861,18 @@ kernel would likely pin it, but the impact is small (68 live blocks /
 ~7 GB pool) and non-fatal — pool_usage tracks HWM so fragmentation is
 bounded. Deferred.
 
-One unresolved oddity: at iter 0, `heap_diff` jumps from 0 → 2 between
-`iter_start` and `pre_hausdorff` with no kernel launched between the
-snaps and `cuStreamSynchronize` in between. The +2 pattern (ha=3 hf=1)
-matches exactly one `hausdorff_block` run on scratch, but it appears on
-main heap. Not yet understood; left as a note for future investigation.
+The "mystery +2 at `pre_hausdorff` at iter 0" from earlier notes is not
+actually mysterious: `la_decompose_components` + `la_hull_decomp` are
+launched inside the per-iter block (guarded by
+`decompose_components_per_iter`, default on) between `iter_start` and
+`pre_hausdorff`. For bunny (which trimesh splits into 2 components,
+confirmed via `mesh.split(only_watertight=False)`), the flow is:
+Phase 8 allocates 2 output meshes (+2), Phase 11 detects one inner shell
+and frees it (-1), Phase 12 skips freeing the input (refcount=NULL,
+owned externally), then `la_hull_decomp` allocates 1 hull for the
+surviving outer shell (+1). Total `+3 allocs, +1 free, net +2` — matches
+the bisector exactly. No bug there; just a case of "the kernel between
+the snaps wasn't recognized as producing heap allocs."
 
 ---
 
