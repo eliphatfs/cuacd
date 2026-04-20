@@ -100,6 +100,14 @@ struct gpu_ctx {
     CUfunction fn_la_find_concave_edges;
     CUfunction fn_la_compute_best_ub;
 
+    // Merge-hulls postprocess kernels
+    CUfunction fn_la_merge_cost_matrix;
+    CUfunction fn_la_merge_hausdorff;
+    CUfunction fn_la_merge_match;
+    CUfunction fn_la_merge_apply;
+    CUfunction fn_la_merge_free_unused;
+    CUfunction fn_la_merge_compact;
+
     CUfunction fn_test_postprocess_dc;   // test kernel
 
     CUdeviceptr d_pool_mem;       // pool backing memory (user allocations)

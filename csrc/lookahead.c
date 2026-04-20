@@ -52,6 +52,14 @@ struct ConcaveEdgePlane_h {
     float pa, pb, pc, pd;
 };
 
+// Merge-hulls pair state — host-side mirror of cuda/structs.cuh LaMergePair.
+struct LaMergePair_h {
+    struct Mesh_h merged_hull;
+    float hull_vol;
+    float mesh_vol_sum;
+    float _pad[2];
+};
+
 // Read back the decomposition from device into host result.
 static int la_read_result(
     gpu_ctx_t ctx, CUdeviceptr d_decomp, struct gpu_result* out, CUstream s)
@@ -125,6 +133,7 @@ int lookahead_decompose(
     float concave_eps,
     float concave_threshold,
     int concave_iters,
+    int merge_hulls,
     struct gpu_result* out)
 {
 #define LCHECK(call) do { \
@@ -901,6 +910,88 @@ int lookahead_decompose(
             LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
                 LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, hull_args, NULL));
             LA_SYNC_CHECK("hull_decomp_post_dc");
+        }
+    }
+
+    // Post-processing: greedy merge-hulls pass (single round).
+    if (merge_hulls) {
+        int cur_np = 0;
+        LCHECK(cuMemcpyDtoHAsync(&cur_np,
+            d_decomp + offsetof(struct LaDecompState_h, nparts),
+            sizeof(int), s));
+        LCHECK(cuStreamSynchronize(s));
+        int P = cur_np;
+        if (P >= 2) {
+            int pair_count = P * (P - 1) / 2;
+            CUdeviceptr d_cost = 0, d_pair_state = 0, d_matches = 0, d_nmatches = 0;
+            LCHECK(cuMemAllocAsync(&d_cost,       (size_t)pair_count * sizeof(float), s));
+            size_t ps_bytes = (size_t)pair_count * sizeof(struct LaMergePair_h);
+            LCHECK(cuMemAllocAsync(&d_pair_state, ps_bytes, s));
+            LCHECK(cuMemsetD8Async(d_pair_state, 0, ps_bytes, s));
+            LCHECK(cuMemAllocAsync(&d_matches,   (size_t)(P/2 + 1) * sizeof(int), s));
+            LCHECK(cuMemAllocAsync(&d_nmatches,  sizeof(int), s));
+
+            // 1. cost_matrix kernel (32 threads/block)
+            {
+                void* args[] = { &d_decomp, &P, &threshold,
+                                 &d_cost, &d_pair_state,
+                                 &ctx->d_pool_struct, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_merge_cost_matrix,
+                    pair_count, 1, 1, 32, 1, 1, 0, s, args, NULL));
+            }
+            LA_SYNC_CHECK("merge_cost_matrix");
+
+            // 2. hausdorff kernel (256 threads/block)
+            {
+                void* args[] = { &d_decomp, &P, &threshold,
+                                 &d_cost, &d_pair_state,
+                                 &ctx->d_pool_struct, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_merge_hausdorff,
+                    pair_count, 1, 1, 256, 1, 1, 0, s, args, NULL));
+            }
+            LA_SYNC_CHECK("merge_hausdorff");
+
+            // 3. greedy matching (1 block, 256 threads)
+            {
+                void* args[] = { &P, &threshold, &d_cost,
+                                 &d_matches, &d_nmatches, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_merge_match,
+                    1, 1, 1, 256, 1, 1, 0, s, args, NULL));
+            }
+            LA_SYNC_CHECK("merge_match");
+
+            // 4. apply
+            int h_nm = 0;
+            LCHECK(cuMemcpyDtoHAsync(&h_nm, d_nmatches, sizeof(int), s));
+            LCHECK(cuStreamSynchronize(s));
+            if (h_nm > 0) {
+                void* args[] = { &d_decomp, &P, &d_matches, &h_nm,
+                                 &d_pair_state, &ctx->d_pool_struct, &d_err };
+                LCHECK(cuLaunchKernel(ctx->fn_la_merge_apply,
+                    h_nm, 1, 1, 32, 1, 1, 0, s, args, NULL));
+                LA_SYNC_CHECK("merge_apply");
+            }
+
+            // 5. free unused cached hulls (for pairs not chosen)
+            {
+                void* args[] = { &P, &d_pair_state, &ctx->d_pool_struct };
+                LCHECK(cuLaunchKernel(ctx->fn_la_merge_free_unused,
+                    pair_count, 1, 1, 32, 1, 1, 0, s, args, NULL));
+            }
+
+            // 6. compact
+            {
+                void* args[] = { &d_decomp };
+                LCHECK(cuLaunchKernel(ctx->fn_la_merge_compact,
+                    1, 1, 1, 128, 1, 1, 0, s, args, NULL));
+            }
+            LA_SYNC_CHECK("merge_compact");
+
+            if (d_cost)       cuMemFreeAsync(d_cost,       s);
+            if (d_pair_state) cuMemFreeAsync(d_pair_state, s);
+            if (d_matches)    cuMemFreeAsync(d_matches,    s);
+            if (d_nmatches)   cuMemFreeAsync(d_nmatches,   s);
+            LCHECK(cuStreamSynchronize(s));
         }
     }
 

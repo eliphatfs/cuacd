@@ -282,7 +282,8 @@ class Context:
                             verbose=0, debug=0, decompose_components=False,
                             no_decompose_components_per_iter=False,
                             n_concave_edges=32, concave_eps=0.005,
-                            concave_threshold=3.49, concave_iters=10):
+                            concave_threshold=3.49, concave_iters=10,
+                            merge_hulls=False):
         """Decompose a mesh into convex parts using lookahead tree search.
 
         Parameters
@@ -348,7 +349,8 @@ class Context:
             n_concave_edges=n_concave_edges,
             concave_eps=concave_eps,
             concave_threshold=concave_threshold,
-            concave_iters=concave_iters)
+            concave_iters=concave_iters,
+            merge_hulls=int(merge_hulls))
 
         results = []
         for vb, tb, nv, nt, hvb, htb, hnv, hnt, mv, hv in raw:

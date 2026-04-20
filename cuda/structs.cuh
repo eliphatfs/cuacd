@@ -85,3 +85,24 @@ struct LaEvalResult {
 struct ConcaveEdgePlane {
     float pa, pb, pc, pd;
 };
+
+// ============================================================================
+// Merge-hulls pass (postprocess_merge.cu)
+// ============================================================================
+// Sentinel cost values: rv quick-reject (no bbox proximity / over-gap), bbox
+// reject, and post-rv-over-threshold (real rv computed, skip Hausdorff).
+#define LA_MERGE_COST_RV_REJECT   1e10f
+#define LA_MERGE_COST_BBOX_REJECT 1e9f
+#define LA_MERGE_COST_INVALID     1e20f   // pair already merged or out of range
+
+// Per-pair state used between cost_matrix and hausdorff kernels:
+//   merged_hull: Mesh allocated on heap (refcount = LA_REFCOUNT_HEAP) if the
+//       pair passed the rv gate; otherwise {NULL,...}. hausdorff kernel frees it.
+//   hull_vol:    cached merged hull volume (for match kernel; reuse).
+//   mesh_vol_sum: sum of the two parts' mesh volumes (for kdop pruning).
+struct LaMergePair {
+    Mesh  merged_hull;
+    float hull_vol;
+    float mesh_vol_sum;
+    float _pad[2];
+};

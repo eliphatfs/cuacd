@@ -70,7 +70,8 @@ def _decompose_mesh(ctx, verts, tris, args):
         n_concave_edges=args.n_concave_edges,
         concave_eps=args.concave_eps,
         concave_threshold=args.concave_threshold,
-        concave_iters=args.concave_iters)
+        concave_iters=args.concave_iters,
+        merge_hulls=args.merge_hulls)
 
     if not args.parts:
         return [(hv * scale + center, ht) for _, _, hv, ht in parts]
@@ -209,6 +210,8 @@ def main():
                         help='Dihedral angle threshold in radians for concavity (default: 3.49 ~200deg).')
     parser.add_argument('--concave-iters', type=int, default=10,
                         help='Number of first iterations to include concave edge sampling (default: 10).')
+    parser.add_argument('--merge-hulls', action='store_true', default=False,
+                        help='Run greedy merge-hulls post-processing pass (default: off).')
     parser.add_argument('--serial', action='store_true', default=False,
                         help='Serial load-process-save instead of pipelined workers (easier debugging).')
     args = parser.parse_args()

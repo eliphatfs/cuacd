@@ -39,6 +39,7 @@ int lookahead_decompose(
     float concave_eps,
     float concave_threshold,
     int concave_iters,
+    int merge_hulls,
     struct gpu_result* out);
 
 #ifdef __cplusplus

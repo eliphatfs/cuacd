@@ -24,6 +24,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   mesh_volume.cuh     #   mesh_volume_warp: per-warp divergence theorem volume
   hausdorff.cuh       #   hausdorff_block: block-level bidirectional Hausdorff via sampling + linear BVH
   postprocess.cuh     #   decompose_components_block: block-level connected-components via union-find
+  merge.cuh           #   Merge-hulls helpers: flat upper-tri pair index, AABB gap, warp concat, shared-plane finder
   structs.cuh         #   Device-side: Mesh, Part, PartPair, LaWorkItem, LaDecompState, LaEvalResult, ConcaveEdgePlane
   error_codes.cuh     #   Centralized GPU kernel error flags (KERR_*)
   la_common.cuh       #   Shared lookahead constants + la_part_cost/la_part_cost_rv inline functions
@@ -33,6 +34,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   la_refine.cu        #   la_expand_quick, la_hausdorff_parts, la_evaluate, la_sort_and_record
   la_lifecycle.cu     #   la_initialize, la_sort_and_count_cutting, la_apply_cuts, la_hull_decomp, la_decompose_components, la_free_decomp
   la_concave.cu       #   la_find_concave_edges: concave edge detection + plane generation
+  postprocess_merge.cu #   Merge-hulls pass: la_merge_cost_matrix, la_merge_hausdorff, la_merge_match, la_merge_apply, la_merge_free_unused, la_merge_compact
   test_*.cu           #   Test kernels
 csrc/                 # C host code
   structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, gpu_ctx
@@ -94,7 +96,8 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto 
                                      decompose_components=False,
                                      no_decompose_components_per_iter=False,
                                      n_concave_edges=32, concave_eps=0.005,
-                                     concave_threshold=3.49, concave_iters=10)  # list of (verts, tris, hull_verts, hull_tris)
+                                     concave_threshold=3.49, concave_iters=10,
+                                     merge_hulls=False)  # list of (verts, tris, hull_verts, hull_tris)
     used = ctx.pool_usage()     # bytes consumed from pool (monotonic high-water mark)
     ctx.heap_compact()          # no-op (coalescing handled by heap_free)
     ho, ha, hf, so, sa, sf = ctx.heap_stats()  # diag: (live_bytes, allocs, frees) × (heap, scratch)

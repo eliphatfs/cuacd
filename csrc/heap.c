@@ -101,6 +101,15 @@ int gpu_init(gpu_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     cuModuleGetFunction(&ctx->fn_la_decompose_components, ctx->module, "la_decompose_components");
     cuModuleGetFunction(&ctx->fn_la_find_concave_edges,   ctx->module, "la_find_concave_edges");
     cuModuleGetFunction(&ctx->fn_la_compute_best_ub,      ctx->module, "la_compute_best_ub");
+
+    // Merge-hulls postprocess
+    cuModuleGetFunction(&ctx->fn_la_merge_cost_matrix, ctx->module, "la_merge_cost_matrix");
+    cuModuleGetFunction(&ctx->fn_la_merge_hausdorff,   ctx->module, "la_merge_hausdorff");
+    cuModuleGetFunction(&ctx->fn_la_merge_match,       ctx->module, "la_merge_match");
+    cuModuleGetFunction(&ctx->fn_la_merge_apply,       ctx->module, "la_merge_apply");
+    cuModuleGetFunction(&ctx->fn_la_merge_free_unused, ctx->module, "la_merge_free_unused");
+    cuModuleGetFunction(&ctx->fn_la_merge_compact,     ctx->module, "la_merge_compact");
+
     cuModuleGetFunction(&ctx->fn_test_postprocess_dc, ctx->module, "test_postprocess_dc_kernel");
 
     // Determine pool size: default to 80% of free device memory
