@@ -834,32 +834,28 @@ splitting disabled, the tree-search core is completely balanced.
 
 ### Residual leak: localized but not fully pinned
 
-Per-kernel bisect on iter 19 shows allocs/frees balance to within +3-4/iter
-while cutting, and 0/iter after convergence. The localization is now tight:
-the leak ONLY happens when `decompose_components_per_iter` is on (default).
-A 1-iter bisect with the flag off shows 0 live chunks after `la_free_decomp`.
-The per-kernel alloc/free flow during iter 19 (after convergence this will
-not run, but during productive iters it looks like):
+Localization is now tight: the leak happens **only** when
+`decompose_components_per_iter` is on (default). A 1-iter bisect with the
+flag off shows 0 live chunks after `la_free_decomp`. With the flag on, a
+1-iter run leaks 1 chunk, grows ~3.5/iter during productive iters, and
+flattens at ~70 once cutting stops.
 
-| phase (iter 19) | alloc delta | free delta | net |
-|-----------------|-----:|-----:|-----:|
-| expand_d0       | +480 |      |      |
-| hull_d0         | +480 |      |      |
-| expand_d1       | +1437 | -5 |      |
-| hull_d1         | +1371 |     |      |
-| cleanup_tree_d1 |       | -480 |     |
-| apply_cuts      |       | -4 |      |
-| hull_decomp     | +8   |     |      |
-| cleanup_tree3   |       | -3275 | +12 |
+Candidate sources for the per-iter leak:
+- **Post-apply_cuts `la_decompose_components` interaction**: when a new
+  part from `apply_cuts` has multi-component geometry (rare but possible
+  from plane cuts that produce disjoint halves), Phase 8 allocates new
+  meshes and Phase 12 decrements the input refcount — but the input at
+  that point has refcount=1 (owned by decomp from `apply_cuts` copy);
+  old part's hull refcount handling may also be off.
+- **Hull re-allocation**: when `la_hull_decomp` runs post-dc, any part
+  whose hull was freed by Phase 12 inside `la_decompose_components` gets
+  a new hull — but the old hull chunk's refcount may not have been fully
+  drained in all paths.
 
-All kernels are accounted for — no hidden launch — but the net is +12 not
-0. Candidates: non-chosen cuts whose hulls never get swept by
-cleanup_tree3; inherited-part refcount asymmetry between `la_expand` and
-`la_cleanup_tree_item`; `la_hull_decomp` allocating without a matching
-free path. A rigorous re-derivation of the refcount invariants per
-kernel would likely pin it, but the impact is small (68 live blocks /
-~7 GB pool) and non-fatal — pool_usage tracks HWM so fragmentation is
-bounded. Deferred.
+Pinning these requires a per-iter-1 bisect with `decompose_components_per_iter=True`
+plus a probe **inside** `la_decompose_components` reporting the phase 8
+alloc and phase 12 free pointer values. Impact is small (~70 live
+blocks, bounded, self-terminating), so deferred.
 
 The "mystery +2 at `pre_hausdorff` at iter 0" from earlier notes is not
 actually mysterious: `la_decompose_components` + `la_hull_decomp` are
