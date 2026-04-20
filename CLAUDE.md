@@ -48,6 +48,9 @@ coacd_gpu/            # Python package
   __init__.py         #   Context class
   cli.py              #   coacd-gpu console entry point
 tests/                # All tests + benchmarks
+bench/                # Standalone perf experiments (not built by setup.py)
+  warp_sort_bench.cu  #   std::sort vs warp_sort vs cub BlockMergeSort/BlockRadixSort
+  Makefile            #   nvcc build (ARCH=89 default)
 docs/                 # Documentation (see below)
 CoACD/                # Reference C++ CoACD (embedded repo, not a submodule)
 ```
