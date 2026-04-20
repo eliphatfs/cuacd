@@ -155,6 +155,7 @@ int lookahead_decompose(
     CUdeviceptr d_nitems     = 0;
     CUdeviceptr d_extra_leaves = 0, d_n_extra   = 0;
     CUdeviceptr d_edge_planes  = 0, d_n_edge_cuts = 0;
+    CUdeviceptr d_best_ub      = 0;
 
     // Pinned host memory for async D2H
     void* h_pinned = NULL;
@@ -216,6 +217,7 @@ int lookahead_decompose(
     LCHECK(cuMemAllocAsync(&d_cutting_idx,  (size_t)max_n_cutting * sizeof(int), s));
     LCHECK(cuMemAllocAsync(&d_results,      (size_t)max_n_cutting * sizeof(struct LaEvalResult_h), s));
     LCHECK(cuMemAllocAsync(&d_nitems,       sizeof(int), s));
+    LCHECK(cuMemAllocAsync(&d_best_ub,      sizeof(float), s));
     LCHECK(cuMemsetD32Async(d_err,       0, 1, s));
     LCHECK(cuMemsetD32Async(d_n_cutting, 0, 1, s));
 
@@ -468,11 +470,27 @@ int lookahead_decompose(
 
             if (next_n == 0) break;  // all cuts produced empty halves
 
+            // Branch-and-bound pruning: the LAST la_hull across the whole
+            // search is the only place it is sound to record rv_LB (under-
+            // estimate) as hull_vol. When quick_depth==0, the last la_hull
+            // is the one in the full loop at d == depth-1.
+            int is_last_la_hull_full = (quick_depth == 0) && (d == depth - 1);
+            CUdeviceptr d_best_ub_arg = (CUdeviceptr)0;
+            if (is_last_la_hull_full) {
+                // Compute min UB across d_cur items (n_levels==d here).
+                // Used by la_hull on d_next, whose items inherit level_costs.
+                void* ub_args[] = { &d_cur, &cur_n, &total_levels, &d_best_ub };
+                LCHECK(cuLaunchKernel(ctx->fn_la_compute_best_ub,
+                                       1, 1, 1, 32, 1, 1, 0, s, ub_args, NULL));
+                d_best_ub_arg = d_best_ub;
+            }
+
             // Hull for 2 new parts per item
             {
                 int two = 2;
                 void* args[] = { &d_next, &next_n, &two,
-                                 &ctx->d_pool_struct, &d_err };
+                                 &ctx->d_pool_struct, &d_err,
+                                 &d_best_ub_arg, &total_levels };
                 LCHECK(cuLaunchKernel(ctx->fn_la_hull_la,
                                        2 * next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
@@ -547,10 +565,21 @@ int lookahead_decompose(
 
             if (next_n == 0) break;
 
+            // Last la_hull globally = last quick iter when quick_depth>0.
+            int is_last_la_hull_quick = (q == quick_depth - 1);
+            CUdeviceptr d_best_ub_arg_q = (CUdeviceptr)0;
+            if (is_last_la_hull_quick) {
+                void* ub_args[] = { &d_cur, &cur_n, &total_levels, &d_best_ub };
+                LCHECK(cuLaunchKernel(ctx->fn_la_compute_best_ub,
+                                       1, 1, 1, 32, 1, 1, 0, s, ub_args, NULL));
+                d_best_ub_arg_q = d_best_ub;
+            }
+
             {
                 int two = 2;
                 void* args[] = { &d_next, &next_n, &two,
-                                 &ctx->d_pool_struct, &d_err };
+                                 &ctx->d_pool_struct, &d_err,
+                                 &d_best_ub_arg_q, &total_levels };
                 LCHECK(cuLaunchKernel(ctx->fn_la_hull_la,
                                        2 * next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
@@ -858,6 +887,7 @@ cleanup:
     if (d_n_extra)      cuMemFreeAsync(d_n_extra,      s);
     if (d_edge_planes)  cuMemFreeAsync(d_edge_planes,  s);
     if (d_n_edge_cuts)  cuMemFreeAsync(d_n_edge_cuts,  s);
+    if (d_best_ub)      cuMemFreeAsync(d_best_ub,      s);
     cuStreamSynchronize(s);
     if (h_pinned) cuMemFreeHost(h_pinned);
     cuStreamDestroy(s);

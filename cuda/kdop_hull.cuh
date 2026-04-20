@@ -34,12 +34,26 @@ extern __constant__ float KDOP_AXES[KDOP_N_AXES][3];
 // All KDOP_BLOCK (= 32) threads in the block must call with identical arguments.
 // Returns Mesh (heap-allocated) and volume via out_volume.
 // On error, returns {NULL,NULL,0,0} and sets *kernel_error.
+//
+// Optional rough-hull LB pruning (slow path only): pass mesh_vol and
+// prune_vol_gap_threshold (an upper bound on the allowable
+// max(hull_vol - mesh_vol, 0)). After the rough inner hull is built
+// (step 3 on extreme points), its volume V_rough satisfies V_rough ≤
+// V_exact (rough hull ⊂ exact hull), so max(V_rough - mesh_vol, 0) is a
+// lower bound on the exact volume gap. If that LB exceeds the threshold,
+// the exact D&C hull is skipped; *out_volume receives V_rough and the
+// returned Mesh has verts=NULL. Caller writing hull_vol=V_rough yields
+// la_part_cost_rv = 0.3 * cbrt(3/(4π) * (V_rough - mesh_vol)). Pass
+// prune_vol_gap_threshold = +inf (1e30f) to disable; mesh_vol is unused
+// when disabled.
 __device__ __forceinline__ Mesh kdop_hull_block(
     const float* verts, int nv,
     DeviceHeap*  heap,
     DeviceHeap*  scratch_heap,
     float*       out_volume,
-    int*         kernel_error)
+    int*         kernel_error,
+    float        prune_vol_gap_threshold = 1e30f,
+    float        mesh_vol = 0.0f)
 {
     int lane = threadIdx.x & (WARP_SIZE - 1);
 
@@ -165,6 +179,38 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     }
     __syncwarp();
     if (s_local_err) goto cleanup;
+
+    // ========================================================================
+    // Step 3b (optional): rough-hull LB pruning against caller's volume-gap
+    // threshold. rough hull ⊂ exact hull ⇒ rough_vol ≤ exact_vol, so
+    // max(rough_vol - mesh_vol, 0) is a lower bound on the exact volume gap.
+    // If that LB exceeds the caller-supplied threshold, skip steps 4-8 and
+    // return {verts=NULL} with hull_vol=rough_vol.
+    // ========================================================================
+    if (prune_vol_gap_threshold < 1e29f && s_ext_hull.verts) {
+        float rough_vol = mesh_volume_warp(&s_ext_hull, lane);
+        __shared__ int s_pruned;
+        if (lane == 0) {
+            s_pruned = 0;
+            float vol_gap = fmaxf(rough_vol - mesh_vol, 0.0f);
+            if (vol_gap > prune_vol_gap_threshold) {
+                s_volume = rough_vol;
+                s_pruned = 1;
+            }
+        }
+        __syncwarp();
+        if (s_pruned) {
+            if (lane == 0) {
+                if (s_ext_hull.verts) heap_free(scratch_heap, s_ext_hull.verts);
+                s_ext_hull.verts = NULL;
+                if (s_extreme_pts) heap_free(scratch_heap, s_extreme_pts);
+                s_extreme_pts = NULL;
+            }
+            __syncwarp();
+            *out_volume = s_volume;
+            return s_result;
+        }
+    }
 
     // ========================================================================
     // Step 4: Allocate filtered vertex buffer (worst case: nv + ext_hull.nv)

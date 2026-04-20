@@ -335,6 +335,13 @@ extern "C" __global__ void la_expand(
 // la_hull: <<<n_new_parts * nitems, KDOP_BLOCK=32>>>
 // Compute k-DOP hull for the newest parts of each LaWorkItem.
 // n_new_parts = 2 for full/quick expansion (the two halves).
+//
+// Optional branch-and-bound pruning: if *best_ub_sum_d is finite, compute a
+// rough-hull rv LB inside kdop_hull_block and skip the exact D&C hull when
+// partial_sum(level_costs) + rv_LB > *best_ub_sum_d. Only sound at the LAST
+// la_hull call (pruning records rv_LB as hull_vol; using an underestimate
+// as UB on deeper levels via the non-increasing invariant is unsound).
+// Pass a device pointer holding +inf (or total_levels<=n_levels) to disable.
 // ============================================================================
 // __launch_bounds__(32, 16) caps registers at 65536/(32*16) = 128 per thread
 // (forces small spill, ~52B stores/44B loads). Measured no meaningful speedup
@@ -344,7 +351,9 @@ extern "C" __global__ /* __launch_bounds__(32, 16) */ void la_hull(
     int         nitems,
     int         n_new_parts,
     DevicePool* pool,
-    int*        err)
+    int*        err,
+    const float* best_ub_sum_d,   // device scalar; NULL or *=+inf disables pruning
+    int         total_levels)
 {
     if (*err) return;
 
@@ -362,17 +371,81 @@ extern "C" __global__ /* __launch_bounds__(32, 16) */ void la_hull(
     Part* p = &wi->parts[part_idx];
     if (p->hull.verts != NULL) return;
 
+    // Derive rough-hull volume-gap threshold from the upper bound.
+    float prune_vol_gap_threshold = 1e30f;
+    float mesh_vol_for_prune = 0.0f;
+    if (best_ub_sum_d != NULL) {
+        float best_ub_sum = *best_ub_sum_d;
+        int nl = wi->n_levels;
+        if (best_ub_sum < 1e29f && nl > 0 && nl < total_levels) {
+            float partial_sum = 0.0f;
+            for (int l = 0; l < nl; l++) partial_sum += wi->level_costs[l];
+            float rv_threshold = best_ub_sum - partial_sum;
+            if (rv_threshold <= 0.0f) {
+                prune_vol_gap_threshold = -1.0f;  // always prune
+            } else {
+                const float pi = 3.14159265358979f;
+                float r = rv_threshold / LA_PART_COST_K_RV;
+                prune_vol_gap_threshold = r * r * r * (4.0f * pi / 3.0f);
+            }
+            mesh_vol_for_prune = p->mesh_vol;
+        }
+    }
+
     float hvol = 0.0f;
     Mesh hull = kdop_hull_block(
         p->mesh.verts, p->mesh.nv,
         &pool->heap, &pool->scratch,
-        &hvol, err);
+        &hvol, err,
+        prune_vol_gap_threshold, mesh_vol_for_prune);
 
     if (tid == 0) {
         p->hull     = hull;
         p->hull_vol = hvol;
-        p->hull.refcount = LA_REFCOUNT_HEAP;
+        if (hull.verts != NULL) {
+            p->hull.refcount = LA_REFCOUNT_HEAP;
+        } else {
+            // Pruned (verts=NULL). refcount stays NULL → la_cleanup_tree
+            // skips heap_free. hull_vol = rough_vol (LB) feeds la_sort_and_record
+            // to record a level_cost UNDERESTIMATE — so mark src_part_idx = -1
+            // to make la_evaluate skip this item (otherwise the LB would make
+            // a provably-dominated item appear to beat its true cost).
+            wi->src_part_idx = -1;
+        }
     }
+}
+
+// ============================================================================
+// la_compute_best_ub: <<<1, 32>>>
+// Reduce min UB over items. UB_j = partial_sum_j + worst_j * (total - n_levels)
+// where partial_sum_j = Σ level_costs_j[0..n_levels-1] and worst_j =
+// level_costs_j[n_levels-1]. Relies on non-increasing invariant so future
+// level_costs ≤ worst_j. Items with n_levels==0 contribute no bound.
+// Writes result to *out_best_ub (should be initialized to +inf by caller).
+// ============================================================================
+extern "C" __global__ void la_compute_best_ub(
+    LaWorkItem* items,
+    int         nitems,
+    int         total_levels,
+    float*      out_best_ub)
+{
+    int lane = threadIdx.x & 31;
+    float local_min = 1e30f;
+    for (int i = lane; i < nitems; i += 32) {
+        LaWorkItem* wi = &items[i];
+        int nl = wi->n_levels;
+        if (nl <= 0) continue;
+        float partial_sum = 0.0f;
+        for (int l = 0; l < nl; l++) partial_sum += wi->level_costs[l];
+        float worst = wi->level_costs[nl - 1];
+        float ub_j = partial_sum + worst * (float)(total_levels - nl);
+        if (ub_j < local_min) local_min = ub_j;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        float om = __shfl_xor_sync(0xFFFFFFFFu, local_min, off);
+        if (om < local_min) local_min = om;
+    }
+    if (lane == 0) *out_best_ub = local_min;
 }
 
 // ============================================================================

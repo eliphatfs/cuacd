@@ -29,7 +29,7 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   la_common.cuh       #   Shared lookahead constants + la_part_cost/la_part_cost_rv inline functions
   mm.cu               #   heap_init_kernel
   kdop_const.cu       #   __constant__ KDOP_AXES[40][3] (icosphere axes)
-  la_expand.cu        #   la_expand, la_hull, la_seed_tree, la_cleanup_tree, la_cleanup_tree3
+  la_expand.cu        #   la_expand, la_hull, la_compute_best_ub, la_seed_tree, la_cleanup_tree, la_cleanup_tree3
   la_refine.cu        #   la_expand_quick, la_hausdorff_parts, la_evaluate, la_sort_and_record
   la_lifecycle.cu     #   la_initialize, la_sort_and_count_cutting, la_apply_cuts, la_hull_decomp, la_decompose_components, la_free_decomp
   la_concave.cu       #   la_find_concave_edges: concave edge detection + plane generation

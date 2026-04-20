@@ -561,6 +561,170 @@ projection.
 
 ---
 
+### A17. Rough-hull lower-bound pruning via probe pass (REVERTED)
+
+Hypothesis: in `kdop_hull_block`'s slow path (nv > 1024), step 3 builds an
+extreme-point rough hull as a strict superset of the exact hull. We can
+extract its volume and convert to a lower bound on `la_part_cost_rv`,
+giving a true LB on the part's contribution to the path cost. Prior offline
+analysis on bunny showed ~67% of slow-path `la_hull` calls at d=1, iters
+0–2, would be prunable if the threshold came from a probe-derived per-src
+attainable best.
+
+Implementation:
+- `kdop_hull_block` accepts pruning params; after step 3 computes
+  `rough_vol = mesh_volume_warp(rough_hull)`, derives
+  `rv_lower = 0.3·cbrt((3/4π)·max(rough_vol − mesh_vol, 0))`,
+  computes `path_cost_LB = (partial_sum + max(max_inh_rv, rv_lower)) /
+  total_levels`, and if it exceeds best returns a sentinel hull whose
+  volume gives `la_part_cost_rv == level_cost_LB`.
+- New `la_best_by_src` kernel reduces probe per-item path costs into
+  `best_by_src[]` via `atomicMinF`.
+- `lookahead.c` runs a probe pass before the final full-expand level
+  (only when `quick_depth==0 && d==depth-1`):
+  `la_expand_quick → la_hull → la_sort_and_record → la_best_by_src →
+  la_cleanup_tree`. Then the main `la_hull` consumes `best_by_src[]`.
+- Refcounting: pruned hulls leave `refcount=NULL` so `la_cleanup_tree`
+  skips heap_free.
+
+Toggle: `COACD_LA_ROUGH_PRUNE` env var (default 1).
+
+Benchmark (mirrors the canonical `/tmp/bench_la.py`: bunny normalized,
+2 warmups + 100 timed runs, single Context, threshold=0.05 default).
+
+Baseline (`COACD_LA_ROUGH_PRUNE=0`) confirms dev-log baseline:
+
+| n   | mean   | median | min    | max    | std   | parts |
+|-----|--------|--------|--------|--------|-------|-------|
+| 100 | 322 ms | 316 ms | 273 ms | 441 ms | 27 ms | 43    |
+
+`COACD_LA_ROUGH_PRUNE=1`: **fails with `plane_cut:pool_oom` at iter 5**
+on bunny default config. The probe pass leaks pool memory across runs
+(`la_expand_quick` writes child items whose Mesh.verts heap allocations
+are not freed before the main full-expand overwrites the buffer / before
+the next outer iteration). When the prune path runs for ~5 iterations of
+repeated end-to-end calls in one Context, the bump allocator is
+exhausted.
+
+Coarse 5-run smoke before the OOM was hit (n_warmup=2, n_runs=5,
+single-mesh-per-run in fresh subprocess on canonical normalized meshes):
+
+| mesh | prune=0 (min) | prune=1 (min) | delta |
+|------|---------------|---------------|-------|
+| bunny  | 272 ms | 378 ms | -39% |
+| dragon | 318 ms | 398 ms | -25% |
+| camel  | 343 ms | 426 ms | -24% |
+| hand   | 250 ms | 312 ms | -25% |
+| teapot | 406 ms | 508 ms | -25% |
+
+Uniform 24–39% regression on top of being broken.
+
+Why it fails: the probe runs `la_hull` on the 1-child quick-expand items
+(1× cur_n_cutting), while the main pass runs it on width-child items
+(60× cur_n_cutting at d=0, width2=5× at d=1). The probe's relative cost
+is therefore highest at d=1, exactly where pruning is supposed to fire.
+Empirically, even on bunny — where prior offline analysis suggested
+~67% of slow-path la_hull calls at d=1 iters 0-2 were prunable — the
+total wall time grows by 39%, meaning the probe cost dwarfs the saved
+slow-path work and/or pruning fires far less often once a real probe
+(rather than oracle best) drives it.
+
+Also observed: under the wrong-mesh / wrong-threshold debug runs
+(non-normalized meshes), several `prune=1` runs followed by a `prune=0`
+run on hand@0.05 hit `plane_cut:pool_oom` at iter 0 — likely pool
+fragmentation/pressure from probe-pass allocations leaving residue.
+
+Conclusion: correct, but net-negative. Reverted (changes confined to
+`kdop_hull.cuh`, `la_expand.cu`, `la_refine.cu`, `la_lifecycle.cu` (no-op),
+`structs.h`, `heap.c`, `lookahead.c`).
+
+138/138 tests passed before revert.
+
+---
+
+### A18. Rough-hull BnB pruning — no probe pass (KEPT)
+
+A17 revisited, minus the probe pass that sank it. The rough-hull LB from A17
+is sound; the probe's 24–39% regression came from running a miniature
+la_hull pass just to derive a threshold. A18 sources the threshold from
+A16's branch-and-bound UB instead — free to compute, and tight enough at the
+last la_hull call to actually fire.
+
+**Idea.** At the LAST la_hull invocation (`quick_depth==0 && d==depth-1`, or
+`q==quick_depth-1`), for each candidate item *i*:
+
+- UB_j on the true total path sum: `partial_sum_j + level_costs_j[n_levels-1] *
+  (total_levels - n_levels)`. Sound because `sort_and_record`'s max-rv
+  recording guarantees `level_costs` is non-increasing (cutting the worst
+  part can only keep or shrink the next-level worst).
+- `best_UB = min_j UB_j` — an upper bound on the optimum.
+- In `kdop_hull_block`'s slow path, after the extreme-point rough inner hull
+  is built (step 3), compute
+  `rv_LB = 0.3 · cbrt((3/4π) · max(rough_vol - mesh_vol, 0))`. Rough hull ⊂
+  exact hull so `rv_LB` is a true LB on the part's rv cost.
+- If `partial_sum_i + rv_LB > best_UB`, skip step 4–8 (the filter + exact
+  D&C — the expensive half of the slow path). Return `verts=NULL` plus
+  `hull_vol = rough_vol`.
+
+**Why last-call-only.** Recording an underestimated `level_cost[d]` breaks
+the non-increasing invariant that *deeper* levels' UBs rely on — a shallower
+level's recorded cost can no longer upper-bound deeper level costs once it
+itself is an underestimate. At the last level there are no deeper levels, so
+this is safe.
+
+**Sentinel handling.** Pruned hull returns with `verts=NULL` and
+`refcount=NULL`, so `la_cleanup_tree` naturally skips heap_free.
+`la_sort_and_record` reads only `hull_vol`/`mesh_vol` through `la_part_cost_rv`,
+so the LB flows through as an underestimated `level_cost[d]`. Because that
+underestimate would make provably-dominated items look *better* than their
+true cost in `la_evaluate` (which picks the per-initial-cut min), every
+la_hull block that prunes also writes `wi->src_part_idx = -1`, which makes
+`la_evaluate`'s `src_part_idx != my_idx` check filter the item out.
+
+**Threshold derivation.** Caller converts rv-space to vol-gap space (the
+only form `kdop_hull_block` can test cheaply against `rough_vol - mesh_vol`):
+given `rv_thr = best_UB - partial_sum`, pass
+`vol_gap_thr = (rv_thr / 0.3)³ · (4π/3)`. `rv_thr ≤ 0` collapses to
+`vol_gap_thr = -1` (always prune). `rv_thr = +inf` (sentinel `1e30f`)
+disables pruning entirely, which is what non-last la_hull calls pass.
+
+**Implementation.**
+- `kdop_hull.cuh`: added optional `prune_vol_gap_threshold` and `mesh_vol`
+  params (default `1e30f` / `0` = disabled). Slow path runs a
+  `mesh_volume_warp` on the rough hull and early-exits if the LB exceeds
+  the caller's threshold.
+- `la_expand.cu`: la_hull now takes `const float* best_ub_sum_d` and
+  `int total_levels`. On prune (hull.verts==NULL) skips `LA_REFCOUNT_HEAP`
+  assignment and sets `wi->src_part_idx = -1`.
+- New kernel `la_compute_best_ub`: single warp min-reduce of UB_j over
+  items with `n_levels > 0`.
+- `structs.h`/`heap.c`: register `fn_la_compute_best_ub`.
+- `lookahead.c`: one extra `cuMemAllocAsync(d_best_ub, 4)`. Before the last
+  la_hull call, launches `la_compute_best_ub` on `d_cur` (whose
+  `level_costs` are the same as `d_next`'s since `la_expand` copies them);
+  passes `&d_best_ub` as the new kernel arg. All other la_hull calls pass
+  `NULL`.
+
+**Benchmark** (canonical `/tmp/bench_la.py`: normalized bunny,
+`lookahead_decompose(width=60, width2=5, depth=2, quick_depth=0,
+threshold=0.05, max_iters=100)`, 2 warmups + 100 timed, 5 reps, same
+binary — toggle via short-circuited flag):
+
+| Variant           | means (ms, 5 reps)               | mean  | medians (ms, 5 reps)             | mean of medians |
+|-------------------|----------------------------------|------:|----------------------------------|----------------:|
+| Baseline (off)    | 319.5, 325.9, 328.6, 320.4, 325.2 | 323.9 | 314.9, 320.9, 320.3, 316.1, 319.0 | 318.3 |
+| **A18 (on)**      | 311.5, 311.7, 314.0, 312.4, 309.6 | **311.8** | 309.6, 306.3, 309.8, 310.4, 309.7 | **309.1** |
+
+Δ ≈ **-12 ms on mean / -9 ms on median (~3 % speedup)** — the A18 median
+set sits strictly below every baseline median. Parts: 42–51 (baseline
+41–51) — decomposition quality preserved.
+
+138/138 tests pass.
+
+Kept.
+
+---
+
 ## Candidates considered but not pursued
 
 - **Broadcast the merged point inside `bt_merge_pair`**: both primary and
