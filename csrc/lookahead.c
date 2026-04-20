@@ -390,26 +390,9 @@ int lookahead_decompose(
         }
 
         if (n_cutting == 0) {
-            // All parts converged
-            if (decompose_components) {
-                int cur_np = 0;
-                LCHECK(cuMemcpyDtoHAsync(&cur_np,
-                    d_decomp + offsetof(struct LaDecompState_h, nparts),
-                    sizeof(int), s));
-                LCHECK(cuStreamSynchronize(s));
-                if (cur_np > 0) {
-                    void* dc_args[] = { &d_decomp, &cur_np, &ctx->d_pool_struct, &d_err };
-                    LCHECK(cuLaunchKernel(ctx->fn_la_decompose_components,
-                        cur_np, 1, 1, 128, 1, 1, 0, s, dc_args, NULL));
-                    LA_SYNC_CHECK("decompose_components");
-                    void* hull_args[] = { &d_decomp, &ctx->d_pool_struct, &d_err };
-                    LCHECK(cuLaunchKernel(ctx->fn_la_hull_decomp,
-                        LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, hull_args, NULL));
-                    LA_SYNC_CHECK("hull_decomp_post_dc");
-                }
-            }
-            result_code = la_read_result(ctx, d_decomp, out, s);
-            goto cleanup;
+            // All parts converged — exit loop so post-processing
+            // (decompose_components, merge_hulls) and la_read_result run uniformly.
+            break;
         }
 
         // Check error
