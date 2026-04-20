@@ -46,6 +46,9 @@ struct DevicePool;
 // ---------------------------------------------------------------------------
 struct DeviceHeap {
     struct DevicePool* pool;                     // back-pointer set by heap_init_kernel
+    unsigned long long outstanding_bytes;        // diagnostic: live alloc user-bytes
+    unsigned long long alloc_count;              // diagnostic: cumulative alloc calls
+    unsigned long long free_count;               // diagnostic: cumulative free calls
     struct HeapArena   arenas[HEAP_NUM_ARENAS];  // 64 * 1040 = 66560 bytes
 };
 

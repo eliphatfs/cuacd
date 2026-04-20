@@ -27,6 +27,11 @@ extern "C" __global__ void heap_init_kernel(DevicePool* pool) {
         arena->bitmap = 0;
         arena->lock   = 0;
         arena->_pad   = 0;
+        if (arena_idx == 0) {
+            h->outstanding_bytes = 0;
+            h->alloc_count       = 0;
+            h->free_count        = 0;
+        }
     }
 
     // All lanes cooperatively zero heads[] and tails[] (64 entries each).

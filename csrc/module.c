@@ -100,6 +100,22 @@ static PyObject* py_pool_usage(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+// heap_stats() -> (heap_outstanding, heap_allocs, heap_frees,
+//                  scratch_outstanding, scratch_allocs, scratch_frees)
+// ---------------------------------------------------------------------------
+
+static PyObject* py_heap_stats(PyObject* self, PyObject* args) {
+    REQUIRE_CTX();
+    unsigned long long s[6] = {0};
+    int rc = gpu_heap_stats(g_state.ctx, s);
+    if (rc != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "gpu_heap_stats failed");
+        return NULL;
+    }
+    return Py_BuildValue("(KKKKKK)", s[0], s[1], s[2], s[3], s[4], s[5]);
+}
+
+// ---------------------------------------------------------------------------
 // test_warp_sort(pts_ptr, total_pts, offsets_ptr, n_arrays) -> None
 // ---------------------------------------------------------------------------
 
@@ -441,6 +457,8 @@ static PyMethodDef gpu_methods[] = {
       "Call periodically to coalesce fragmented free blocks." },
     { "pool_usage",         py_pool_usage,         METH_NOARGS,
       "Return bytes consumed from the shared device pool (peak usage, monotonic)." },
+    { "heap_stats",         py_heap_stats,         METH_NOARGS,
+      "Return (heap_outstanding, heap_allocs, heap_frees, scratch_outstanding, scratch_allocs, scratch_frees)." },
     { "test_warp_sort",     py_test_warp_sort,     METH_VARARGS, "Test warp sort BtPoint32." },
     { "hull_dandc",         py_hull_dandc,         METH_VARARGS, "D&C convex hull mesh extraction." },
     { "test_mesh_volume",   py_test_mesh_volume,   METH_VARARGS, "Mesh volume (single mesh)." },

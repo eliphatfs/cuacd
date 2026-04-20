@@ -185,6 +185,21 @@ size_t gpu_pool_usage(gpu_ctx_t ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// gpu_heap_stats — read outstanding/alloc/free counters for both heaps
+// ---------------------------------------------------------------------------
+
+int gpu_heap_stats(gpu_ctx_t ctx, unsigned long long out[6]) {
+    if (!ctx || !ctx->d_pool_struct) return -1;
+    CUdeviceptr base = ctx->d_pool_struct;
+    size_t off_h = offsetof(struct DevicePool, heap)    + offsetof(struct DeviceHeap, outstanding_bytes);
+    size_t off_s = offsetof(struct DevicePool, scratch) + offsetof(struct DeviceHeap, outstanding_bytes);
+    // Three consecutive ull: outstanding_bytes, alloc_count, free_count.
+    if (cuMemcpyDtoH(&out[0], base + off_h, 3 * sizeof(unsigned long long)) != CUDA_SUCCESS) return -1;
+    if (cuMemcpyDtoH(&out[3], base + off_s, 3 * sizeof(unsigned long long)) != CUDA_SUCCESS) return -1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // gpu_heap_compact — no-op (coalescing now happens in-place on free)
 // ---------------------------------------------------------------------------
 // The binned heap with boundary sentinels performs O(1) coalescing in heap_free,

@@ -34,6 +34,11 @@ int  gpu_heap_compact(gpu_ctx_t ctx);
 // to the pool. Returns 0 on error.
 size_t gpu_pool_usage(gpu_ctx_t ctx);
 
+// gpu_heap_stats — read back per-heap live-alloc counters.
+// Writes 6 values into *out (order: heap_outstanding, heap_allocs, heap_frees,
+// scratch_outstanding, scratch_allocs, scratch_frees). Returns 0 on success.
+int gpu_heap_stats(gpu_ctx_t ctx, unsigned long long out[6]);
+
 // Host-side mirrors of CUDA device structs.
 // Pointer fields use CUdeviceptr (uint64) to match 64-bit device pointers.
 struct Mesh_h {

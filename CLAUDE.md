@@ -60,6 +60,8 @@ COACD_DEBUG=1 pip install -e .                      # Host-side debug output
 COACD_BEAM_DEBUG=1 pip install -e .                 # Device-side DPRINTF + CheckedBuf OOB detection
 COACD_GPU_ARENAS=32 pip install -e .                # Override arena count (default 64)
 COACD_MEMCHECK=1 pip install -e .                    # Device-side memory sanitizer (-fdevice-sanitize=memcheck)
+COACD_LEAK_PROBE=1 pip install -e .                 # Device-side refcount-mismatch probe in la_free_decomp
+COACD_LEAK_BISECT=1 python your_bench.py            # Runtime: per-phase heap_stats deltas around each kernel
 COACD_PARALLEL=4 pip install -e .                   # Limit parallel nvcc processes
 pip install -ve .                                   # Verbose build (see ptxas register usage)
 ```
@@ -95,6 +97,7 @@ with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto 
                                      concave_threshold=3.49, concave_iters=10)  # list of (verts, tris, hull_verts, hull_tris)
     used = ctx.pool_usage()     # bytes consumed from pool (monotonic high-water mark)
     ctx.heap_compact()          # no-op (coalescing handled by heap_free)
+    ho, ha, hf, so, sa, sf = ctx.heap_stats()  # diag: (live_bytes, allocs, frees) × (heap, scratch)
 ```
 
 ## Documentation

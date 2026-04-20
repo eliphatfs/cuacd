@@ -70,6 +70,17 @@ class Context:
         """
         return _gpu.pool_usage()
 
+    def heap_stats(self):
+        """Return (heap_outstanding, heap_allocs, heap_frees,
+        scratch_outstanding, scratch_allocs, scratch_frees).
+
+        outstanding = live (allocated-not-freed) user bytes in that heap.
+        A growing outstanding across iterations indicates a true leak
+        (missing heap_free). A stable outstanding with growing pool_usage
+        indicates fragmentation.
+        """
+        return _gpu.heap_stats()
+
     def __del__(self):
         self.close()
 

@@ -244,9 +244,47 @@ int lookahead_decompose(
         if (verbose) fprintf(stderr, "[la] %s OK\n", label); \
     } } while(0)
 
+    // LEAK BISECT instrumentation: gated by env COACD_LEAK_BISECT=1.
+    // Reports per-phase (alloc-free) diff delta on the output heap, which
+    // localizes which kernel launch leaves allocations unfreed.
+    const char* _bisect_env = getenv("COACD_LEAK_BISECT");
+    int la_bisect = (_bisect_env && _bisect_env[0] && _bisect_env[0] != '0');
+    unsigned long long _prev_out_diff = 0;  // heap_allocs - heap_frees
+    unsigned long long _prev_scr_diff = 0;  // scratch_allocs - scratch_frees
+    // Absolute offsets into DevicePool for alloc_count / free_count fields.
+    size_t _off_h_ac = offsetof(struct DevicePool, heap)    + offsetof(struct DeviceHeap, alloc_count);
+    size_t _off_h_fc = offsetof(struct DevicePool, heap)    + offsetof(struct DeviceHeap, free_count);
+    size_t _off_s_ac = offsetof(struct DevicePool, scratch) + offsetof(struct DeviceHeap, alloc_count);
+    size_t _off_s_fc = offsetof(struct DevicePool, scratch) + offsetof(struct DeviceHeap, free_count);
+    if (la_bisect) {
+        fprintf(stderr, "[bisect-offsets] DevicePool_size=%zu DeviceHeap_size=%zu heap_off=%zu scratch_off=%zu h_ac=%zu h_fc=%zu s_ac=%zu s_fc=%zu\n",
+                sizeof(struct DevicePool), sizeof(struct DeviceHeap),
+                offsetof(struct DevicePool, heap), offsetof(struct DevicePool, scratch),
+                _off_h_ac, _off_h_fc, _off_s_ac, _off_s_fc);
+    }
+    #define LA_BISECT_SNAP(label) do { if (la_bisect) { \
+        cuStreamSynchronize(s); \
+        unsigned long long _ha=0,_hf=0,_sa=0,_sf=0; \
+        cuMemcpyDtoH(&_ha, ctx->d_pool_struct + _off_h_ac, sizeof(_ha)); \
+        cuMemcpyDtoH(&_hf, ctx->d_pool_struct + _off_h_fc, sizeof(_hf)); \
+        cuMemcpyDtoH(&_sa, ctx->d_pool_struct + _off_s_ac, sizeof(_sa)); \
+        cuMemcpyDtoH(&_sf, ctx->d_pool_struct + _off_s_fc, sizeof(_sf)); \
+        unsigned long long _hd = _ha - _hf, _sd = _sa - _sf; \
+        long long _dh = (long long)_hd - (long long)_prev_out_diff; \
+        long long _ds = (long long)_sd - (long long)_prev_scr_diff; \
+        fprintf(stderr, "[bisect iter=%d] %-24s heap_diff=%lld (%+lld) [ha=%llu hf=%llu]  scratch_diff=%lld (%+lld) [sa=%llu sf=%llu]\n", \
+                iter, label, (long long)_hd, _dh, _ha, _hf, (long long)_sd, _ds, _sa, _sf); \
+        _prev_out_diff = _hd; _prev_scr_diff = _sd; \
+    } } while(0)
+
+    // DIAGNOSTIC: snap before main loop to catch post-init state
+    { int iter = -1; LA_BISECT_SNAP("post_init"); }
+
     // Main loop
     for (int iter = 0; iter < max_iters; iter++) {
         TSTAMP(_t0);
+
+        LA_BISECT_SNAP("iter_start");
 
         // Per-iteration decompose components: split multi-component parts
         // before evaluation (meaningful on iter 0 for multi-component input;
@@ -269,6 +307,7 @@ int lookahead_decompose(
             }
         }
 
+        LA_BISECT_SNAP("pre_hausdorff");
         // Compute Hausdorff for parts with rv-cost below threshold.
         // Each block processes one part independently by blockIdx.x, so no
         // pre-sort is required — only the post-sort below matters.
@@ -278,6 +317,7 @@ int lookahead_decompose(
                                    LA_MAX_DECOMP_H, 1, 1, 256, 1, 1, 0, s, args, NULL));
         }
         LA_SYNC_CHECK("hausdorff_parts");
+        LA_BISECT_SNAP("hausdorff_parts");
 
         // Fused: sort by full cost (rv + hausdorff) ascending, then count
         // above-threshold parts and record their indices.
@@ -383,6 +423,7 @@ int lookahead_decompose(
                                    n_cutting, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
         LA_SYNC_CHECK("seed_tree");
+        LA_BISECT_SNAP("seed_tree");
 
         // Double-buffer expansion
         CUdeviceptr d_cur  = d_items_a;  // seeds already written here by la_seed_tree
@@ -419,6 +460,7 @@ int lookahead_decompose(
                                        n_cutting, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
             LA_SYNC_CHECK("find_concave_edges");
+            LA_BISECT_SNAP("find_concave_edges");
 
             // Read back per-part edge counts
             int* h_n_edge_cuts = (int*)malloc((size_t)n_cutting * sizeof(int));
@@ -462,6 +504,7 @@ int lookahead_decompose(
                                        nblocks, 1, 1, 64, 1, 1, 0, s, args, NULL));
             }
             LA_SYNC_CHECK("expand");
+            if (la_bisect) { char lbl[64]; snprintf(lbl,sizeof(lbl),"expand_d%d",d); LA_BISECT_SNAP(lbl); }
 
             // Read back next_nitems
             int next_n = 0;
@@ -495,6 +538,7 @@ int lookahead_decompose(
                                        2 * next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
             LA_SYNC_CHECK("hull");
+            if (la_bisect) { char lbl[64]; snprintf(lbl,sizeof(lbl),"hull_d%d",d); LA_BISECT_SNAP(lbl); }
 
             // Sort parts within items + record level cost (fused)
             {
@@ -520,12 +564,12 @@ int lookahead_decompose(
             // Free d_cur items before overwriting the buffer (swap will reuse it as d_next).
             // Seeds (depth=0) and intermediate items had their mesh refcounts incremented
             // when seeded/copied; failing to decrement here leaks those heap blocks.
-            {
-                int nblocks = cur_n < 1024 ? cur_n : 1024;
+            if (cur_n > 0) {
                 void* cargs[] = { &d_cur, &cur_n, &ctx->d_pool_struct };
                 LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree,
-                                      nblocks, 1, 1, 32, 1, 1, 0, s, cargs, NULL));
+                                      cur_n, 1, 1, 32, 1, 1, 0, s, cargs, NULL));
             }
+            if (la_bisect) { char lbl[64]; snprintf(lbl,sizeof(lbl),"cleanup_tree_d%d",d); LA_BISECT_SNAP(lbl); }
 
             // Swap buffers
             CUdeviceptr tmp = d_cur;
@@ -592,11 +636,10 @@ int lookahead_decompose(
             }
 
             // Free d_cur items before buffer reuse (same reason as full-expansion loop).
-            {
-                int nblocks = cur_n < 1024 ? cur_n : 1024;
+            if (cur_n > 0) {
                 void* cargs[] = { &d_cur, &cur_n, &ctx->d_pool_struct };
                 LCHECK(cuLaunchKernel(ctx->fn_la_cleanup_tree,
-                                      nblocks, 1, 1, 32, 1, 1, 0, s, cargs, NULL));
+                                      cur_n, 1, 1, 32, 1, 1, 0, s, cargs, NULL));
             }
 
             CUdeviceptr tmp = d_cur;
@@ -618,6 +661,7 @@ int lookahead_decompose(
                                    n_cutting, 1, 1, 32, 1, 1, 0, s, args, NULL));
         }
         LA_SYNC_CHECK("evaluate");
+        LA_BISECT_SNAP("evaluate");
 
         // Diagnostic: dump tree exploration info when verbose >= 2
         if (verbose >= 2) {
@@ -778,6 +822,7 @@ int lookahead_decompose(
                                    n_cutting, 1, 1, 64, 1, 1, 0, s, args, NULL));
         }
         LA_SYNC_CHECK("apply_cuts");
+        LA_BISECT_SNAP("apply_cuts");
 
         // Compute hulls for new parts (la_apply_cuts sets hull_vol=0).
         // When decompose_components_per_iter is on, skip this: decompose_components
@@ -805,6 +850,7 @@ int lookahead_decompose(
                                    LA_MAX_DECOMP_H, 1, 1, 32, 1, 1, 0, s, args, NULL));
             LA_SYNC_CHECK("hull_decomp");
         }
+        LA_BISECT_SNAP("hull_decomp");
 
         // Fused cleanup: level-0 items (d_level0), leaf items (d_cur), and
         // the other expansion buffer (d_next, mostly nparts=0 no-ops).
@@ -820,6 +866,7 @@ int lookahead_decompose(
                                    0, s, args, NULL));
         }
         LA_SYNC_CHECK("cleanup_tree3");
+        LA_BISECT_SNAP("cleanup_tree3");
 
         *h_err_p = 0;
         LCHECK(cuMemcpyDtoHAsync(h_err_p, d_err, sizeof(int), s));
@@ -867,12 +914,29 @@ cleanup:
     if (d_hverts)       cuMemFreeAsync(d_hverts,       s);
     if (d_htris)        cuMemFreeAsync(d_htris,        s);
     if (d_decomp) {
+        if (la_bisect) {
+            cuStreamSynchronize(s);
+            unsigned long long _ha=0,_hf=0;
+            cuMemcpyDtoH(&_ha, ctx->d_pool_struct + _off_h_ac, sizeof(_ha));
+            cuMemcpyDtoH(&_hf, ctx->d_pool_struct + _off_h_fc, sizeof(_hf));
+            int cur_np=0;
+            cuMemcpyDtoH(&cur_np, d_decomp + offsetof(struct LaDecompState_h, nparts), sizeof(int));
+            fprintf(stderr, "[bisect FINAL pre-free_decomp] heap_diff=%lld  decomp.nparts=%d (expected free=%d)\n",
+                    (long long)(_ha - _hf), cur_np, cur_np * 2);
+        }
         // Free heap-allocated mesh/hull data for all final parts before releasing struct.
         void* fargs[] = { &d_decomp, &ctx->d_pool_struct };
         cuLaunchKernel(ctx->fn_la_free_decomp,
                        LA_MAX_DECOMP_H, 1, 1,
                        32, 1, 1, 0, s, fargs, NULL);
         cuStreamSynchronize(s);
+        if (la_bisect) {
+            unsigned long long _ha=0,_hf=0;
+            cuMemcpyDtoH(&_ha, ctx->d_pool_struct + _off_h_ac, sizeof(_ha));
+            cuMemcpyDtoH(&_hf, ctx->d_pool_struct + _off_h_fc, sizeof(_hf));
+            fprintf(stderr, "[bisect FINAL post-free_decomp] heap_diff=%lld\n",
+                    (long long)(_ha - _hf));
+        }
         cuMemFreeAsync(d_decomp, s);
     }
     if (d_items_a)      cuMemFreeAsync(d_items_a,      s);

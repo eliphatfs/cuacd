@@ -83,10 +83,11 @@ struct HeapArena {
 };
 
 // Heap allocator: 64 arenas + back-pointer to parent DevicePool.
-// sizeof(DeviceHeap) == 8 + (padding to align arenas) + 64*1040.
-// Actual size computed by compiler; host must use sizeof(DeviceHeap).
 struct DeviceHeap {
     DevicePool* pool;                        // back-pointer set by heap_init_kernel
+    unsigned long long outstanding_bytes;    // live (alloc'd not freed) block user-bytes
+    unsigned long long alloc_count;          // total heap_alloc calls (cumulative)
+    unsigned long long free_count;           // total heap_free calls (cumulative)
     HeapArena   arenas[HEAP_NUM_ARENAS];     // 64 * 1040 = 66560 bytes
 };
 
@@ -287,7 +288,11 @@ __device__ inline int heap_alloc(DeviceHeap* h, unsigned int req_size, void** ou
         bf->is_free = 0;
     }
 
+    // Track live user-bytes using the final data_size of the block (matches what heap_free reads).
+    unsigned int alloc_ds = ((HeapBlockHdr*)blk)->data_size;
     arena_unlock(arena);
+    atomicAdd(&h->outstanding_bytes, (unsigned long long)alloc_ds);
+    atomicAdd(&h->alloc_count, 1ULL);
     *out = (void*)(blk + HEAP_HDR_SIZE);
     return HEAP_OK;
 }
@@ -305,6 +310,8 @@ __device__ inline int heap_free(DeviceHeap* h, void* ptr) {
     unsigned long long blk = (unsigned long long)ptr - HEAP_HDR_SIZE;
     unsigned int ds = ((HeapBlockHdr*)blk)->data_size;
     int        aidx  = (int)((HeapBlockHdr*)blk)->arena_idx;
+    atomicAdd(&h->outstanding_bytes, (unsigned long long)(0ULL - (unsigned long long)ds));
+    atomicAdd(&h->free_count, 1ULL);
 
     if (aidx < 0 || aidx >= HEAP_NUM_ARENAS) {
         return KERR_HEAP_CORRUPT;

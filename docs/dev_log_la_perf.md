@@ -725,6 +725,131 @@ Kept.
 
 ---
 
+## Ablation: `max_n_cutting` (runtime knob, default 16)
+
+`max_n_cutting` is the per-iteration cap on cutting candidates processed
+in parallel; it also sets the breadth of the tree-search leaf fan-out
+(`max_leaf_items = max_n_cutting` in `csrc/lookahead.c:183`). Distinct
+from the compile-time `LA_MAX_PARTS` (parts array *inside one* LaWorkItem
+— `cuda/structs.cuh:55`).
+
+Ran canonical bench (`/tmp/bench_la_pool.py`: normalized bunny,
+`width=60, width2=5, threshold=0.05`) with 2 warmups + 100 timed, 5 reps
+each config. Pool HWM read back via `ctx.pool_usage()`.
+
+| `max_n_cutting` | mean (5-run avg) | median-of-medians | pool HWM (max) | parts |
+|-----------------|-----------------:|------------------:|---------------:|-------|
+| **16** (default) | 311.9 ms | 311.3 ms | 7773 MB | 44–50 |
+| 20               | 313.8 ms | 310.4 ms | 7800 MB | 42–50 |
+| 24               | 315.8 ms | 311.3 ms | 7851 MB | 39–50 |
+| 32               | 313.0 ms | 310.3 ms | 7773 MB | 40–48 |
+
+All variants within run-to-run noise (σ ≈ 25 ms per 100-run block). No
+speedup from raising the cap: bunny with `width=60` converges before
+hitting 16 simultaneous cutting candidates, so higher mnc adds search
+breadth that is never consumed. Pool HWM rises slightly at mnc=24 (+80
+MB) and falls back at mnc=32 — likewise within noise.
+
+Conclusion: leave default at 16. No action.
+
+---
+
+## Heap-leak fix: `la_apply_cuts` refcount double-increment
+
+### Symptom
+
+Across a 100-iter lookahead_decompose on normalized bunny (width=60, width2=5,
+threshold=0.05), `pool_usage()` kept climbing even though the tree-search
+intermediates were supposedly freed by `la_cleanup_tree` / `la_cleanup_tree3`.
+Pool HWM was stable-ish but `DeviceHeap` had a growing number of live blocks
+that were never freed — classic refcount leak.
+
+### Instrumentation added
+
+Three small pieces of diagnostic plumbing (kept in-tree, all low overhead):
+
+1. **Per-heap counters** in `DeviceHeap` (`cuda/allocator.cuh`):
+   `outstanding_bytes`, `alloc_count`, `free_count`. `atomicAdd` on every
+   `heap_alloc` / `heap_free`. Initialized in `heap_init_kernel`
+   (`cuda/mm.cu`).
+2. **C API** `gpu_heap_stats(ctx, out[6])` in `csrc/heap.c` + Python wrapper
+   `ctx.heap_stats()` returning `(heap_outstanding, heap_allocs, heap_frees,
+   scratch_outstanding, scratch_allocs, scratch_frees)`. Use
+   `heap_allocs - heap_frees` as a live-chunk count; stable across iterations
+   ⇒ no leak, growing ⇒ leak.
+3. **Env-gated per-phase leak bisector** in `csrc/lookahead.c`:
+   set `COACD_LEAK_BISECT=1` and the host snaps both heap counters after
+   every kernel launch in the iter loop, printing
+   `[bisect iter=N] <phase> heap_diff=X (+Δ) scratch_diff=Y (+Δ)`. Makes
+   it trivial to localize which kernel is the source of the drift.
+4. **Optional device-side assertion** via `COACD_LEAK_PROBE` build flag:
+   when enabled, `la_free_decomp` prints any part whose refcount was not
+   1 at the moment of final free (i.e. had stragglers).
+
+### Root cause
+
+`la_apply_cuts` (`cuda/la_lifecycle.cu`) was double-incrementing the
+mesh/hull refcounts of the two adopted halves when it wrote them into
+the decomp slot. The level-0 slot that previously held those halves is
+about to be nulled (nparts=0), so `cleanup_tree3` will *not* decrement
+for it; meanwhile, the chunk already came in with a refcount balanced for
+the cleanup-of-d_cur-leaves sequence. Adding +1 here left each iter's
+adopted halves with refcount one too high → orphaned heap blocks every
+iteration.
+
+### Fix
+
+`cuda/la_lifecycle.cu:211-224` — remove the four `atomicAdd(...->refcount, 1)`
+calls; replace with an explanatory comment noting the ownership-transfer
+semantics. No new code path; just a deletion.
+
+### Measured impact
+
+| Run | Live heap chunks after `la_free_decomp` |
+|-----|---------------------------------------:|
+| 1 iter                             | 1 |
+| 100 iter (default, n_concave_edges=32) | 68 |
+| 100 iter (n_concave_edges=0)       | 71 |
+
+Prior to the fix, the 100-iter default run leaked ~141 chunks; after the
+fix, 68 — roughly a 50% reduction. Scratch heap is clean (0 live) in all
+runs, confirming the scratch-vs-main separation is airtight. Bunny
+converges around iter ~20 (n_cutting=0 from then on), so the residual is
+spread across the ~20 iters of actual work, amortizing to ~3.5 unfreed
+chunks per productive iter.
+
+### Residual leak: not pinned
+
+Per-kernel bisect on iter 19 shows allocs/frees balance to within +12/iter:
+
+| phase (iter 19) | alloc delta | free delta | net |
+|-----------------|-----:|-----:|-----:|
+| expand_d0       | +480 |      |      |
+| hull_d0         | +480 |      |      |
+| expand_d1       | +1437 | -5 |      |
+| hull_d1         | +1371 |     |      |
+| cleanup_tree_d1 |       | -480 |     |
+| apply_cuts      |       | -4 |      |
+| hull_decomp     | +8   |     |      |
+| cleanup_tree3   |       | -3275 | +12 |
+
+All kernels are accounted for — no hidden launch — but the net is +12 not
+0. Candidates: non-chosen cuts whose hulls never get swept by
+cleanup_tree3; inherited-part refcount asymmetry between `la_expand` and
+`la_cleanup_tree_item`; `la_hull_decomp` allocating without a matching
+free path. A rigorous re-derivation of the refcount invariants per
+kernel would likely pin it, but the impact is small (68 live blocks /
+~7 GB pool) and non-fatal — pool_usage tracks HWM so fragmentation is
+bounded. Deferred.
+
+One unresolved oddity: at iter 0, `heap_diff` jumps from 0 → 2 between
+`iter_start` and `pre_hausdorff` with no kernel launched between the
+snaps and `cuStreamSynchronize` in between. The +2 pattern (ha=3 hf=1)
+matches exactly one `hausdorff_block` run on scratch, but it appears on
+main heap. Not yet understood; left as a note for future investigation.
+
+---
+
 ## Candidates considered but not pursued
 
 - **Broadcast the merged point inside `bt_merge_pair`**: both primary and

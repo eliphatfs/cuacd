@@ -210,20 +210,18 @@ extern "C" __global__ void la_apply_cuts(
         }
         // Hull with refcount=NULL is owned externally (initial input) — do not free.
 
-        // Increment refcounts for the two adopted halves.
-        // Skip LA_REFCOUNT_HEAP sentinel — those hulls are owned directly
-        // (not refcounted) and will be freed via the sentinel check when
-        // this decomp part is eventually replaced.
-        if (best_wi->parts[0].mesh.refcount)
-            atomicAdd(best_wi->parts[0].mesh.refcount, 1);
-        if (best_wi->parts[0].hull.refcount &&
-            best_wi->parts[0].hull.refcount != LA_REFCOUNT_HEAP)
-            atomicAdd(best_wi->parts[0].hull.refcount, 1);
-        if (best_wi->parts[1].mesh.refcount)
-            atomicAdd(best_wi->parts[1].mesh.refcount, 1);
-        if (best_wi->parts[1].hull.refcount &&
-            best_wi->parts[1].hull.refcount != LA_REFCOUNT_HEAP)
-            atomicAdd(best_wi->parts[1].hull.refcount, 1);
+        // Transfer ownership of the adopted halves from the level-0 slot to
+        // the decomp slot. No refcount increment needed: the l0 slot is about
+        // to be NULL'd out (nparts=0), so cleanup_tree3 will not decrement
+        // for it. The mesh chunk's existing refcount was set up so that
+        // cleanup of the d_cur leaf items (d=1 output, plus their inherited
+        // references) will exactly balance the la_expand increments — leaving
+        // one ref that the decomp now owns. Adding +1 here would leave the
+        // refcount one too high → orphaned heap chunks every iter.
+        //
+        // Hull refcounts: new parts' hulls are not populated at l0-copy time
+        // (la_hull runs later, writing to d_next only), so they're NULL here
+        // — no-op. Adopted hulls come from la_hull_decomp after apply_cuts.
 
         // Write first half into the original slot
         decomp->parts[part_idx] = best_wi->parts[0];
@@ -373,12 +371,18 @@ extern "C" __global__ void la_free_decomp(
     if (threadIdx.x == 0) {
         if (pp->mesh.refcount) {
             int old = atomicAdd(pp->mesh.refcount, -1);
+#ifdef COACD_LEAK_PROBE
+            if (old != 1) printf("[la_free_decomp] part %d: mesh.refcount was %d (leaked=%d)\n", i, old, old-1);
+#endif
             if (old == 1) heap_free(&pool->heap, (void*)pp->mesh.verts);
         }
         if (pp->hull.refcount == LA_REFCOUNT_HEAP) {
             heap_free(&pool->heap, (void*)pp->hull.verts);
         } else if (pp->hull.refcount) {
             int old = atomicAdd(pp->hull.refcount, -1);
+#ifdef COACD_LEAK_PROBE
+            if (old != 1) printf("[la_free_decomp] part %d: hull.refcount was %d (leaked=%d)\n", i, old, old-1);
+#endif
             if (old == 1) heap_free(&pool->heap, (void*)pp->hull.verts);
         }
     }
