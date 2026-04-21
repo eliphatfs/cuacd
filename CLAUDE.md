@@ -55,7 +55,11 @@ bench/                # Standalone perf experiments (not built by setup.py)
   Makefile.hull       #   hull bench build (rdc=true; links mm.cu, kdop_const.cu, CoACD btConvexHull .cpp)
   malloc_test_bench.cu #  mstress-style alloc/free stress: coacd heap vs CUDA __device__ malloc; sweeps grid size for arena-contention curve
   Makefile.malloc     #   malloc bench build (rdc=true; links mm.cu)
-  plot_malloc.py      #   Small log-log Mops/s vs blocks PDF for the small-medium regime
+  plot_malloc_and_hausdorff.py  #   Two-panel figure: malloc throughput + Hausdorff CPU vs GPU bars
+  prepare_hausdorff_data.py     #   Load meshes, normalize, convex hull → hausdorff_data.h
+  hausdorff_bench.cu            #   GPU hausdorff_block benchmark (matches warp_sort_bench timing style)
+  bench_cpu_hausdorff.cpp       #   CPU CoACD face_hausdorff_distance wrapper (nanoflann, no openvdb)
+  Makefile.hausdorff            #   Build for hausdorff_bench (rdc=true; links mm.cu + CoACD shape.cpp)
   summarize.py        #   Pivot results.csv → text / Markdown tables (--md, --ptxas)
   parse_ptxas.py      #   Parse ptxas.log → per-kernel reg / smem / spill table
 docs/                 # Documentation (see below)

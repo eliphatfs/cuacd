@@ -1,0 +1,73 @@
+# Standalone benchmark build for hausdorff_bench.cu.
+# Not part of the Python extension build.
+#
+# Compares:
+#   CPU: CoACD face_hausdorff_distance (nanoflann KD-tree + point-to-triangle)
+#   GPU: hausdorff_block (sampling + linear BVH, 256 threads/block)
+#
+# Usage:
+#   make -f Makefile.hausdorff               # build with sm_89 (RTX 4090)
+#   make -f Makefile.hausdorff ARCH=86       # other arch
+#   make -f Makefile.hausdorff verbose       # with ptxas -v
+#   make -f Makefile.hausdorff run           # build + tee to results_hausdorff.csv
+#   make -f Makefile.hausdorff clean
+
+ARCH      ?= 89
+NVCC      ?= nvcc
+CXXSTD    ?= c++17
+OPT       ?= -O3
+
+CUDA_INC  ?= ../cuda
+COACD_SRC ?= ../CoACD/src
+
+NVCC_FLAGS := -std=$(CXXSTD) $(OPT) -arch=sm_$(ARCH) \
+              -I$(CUDA_INC) -I$(COACD_SRC) \
+              --expt-relaxed-constexpr \
+              -lineinfo \
+              -Xcompiler -Wno-unused-variable \
+              -Xcompiler -Wno-sign-compare
+
+# Device objects need -rdc=true for __constant__ / __global__ symbol resolution.
+RDC := -rdc=true
+
+BIN       := hausdorff_bench
+
+GPU_OBJS  := hausdorff_bench.o mm.o
+CPU_OBJS  := bench_cpu_hausdorff.o shape.o
+
+# ============================================================================
+# Build rules
+# ============================================================================
+all: $(BIN)
+
+# GPU-side objects (compiled with -rdc=true).
+hausdorff_bench.o: hausdorff_bench.cu hausdorff_data.h
+	$(NVCC) $(NVCC_FLAGS) $(RDC) -dc $< -o $@
+
+mm.o: $(CUDA_INC)/mm.cu
+	$(NVCC) $(NVCC_FLAGS) $(RDC) -dc $< -o $@
+
+# CPU-side objects (no device code; plain host compilation).
+bench_cpu_hausdorff.o: bench_cpu_hausdorff.cpp
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+shape.o: $(COACD_SRC)/shape.cpp
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+# Final link: nvcc handles device linking for -rdc objects + host objects.
+$(BIN): $(GPU_OBJS) $(CPU_OBJS)
+	$(NVCC) $(NVCC_FLAGS) $(RDC) $(GPU_OBJS) $(CPU_OBJS) -o $@
+
+# ptxas verbose (register / smem / spill per kernel).
+verbose: clean
+	$(MAKE) -f Makefile.hausdorff NVCC_FLAGS="$(NVCC_FLAGS) -Xptxas=-v" $(BIN) \
+	    2> ptxas_hausdorff.log
+	@echo "ptxas report written to ptxas_hausdorff.log"
+
+run: $(BIN)
+	./$(BIN) | tee results_hausdorff.csv
+
+clean:
+	rm -f $(BIN) $(GPU_OBJS) $(CPU_OBJS) results_hausdorff.csv ptxas_hausdorff.log
+
+.PHONY: all verbose run clean
