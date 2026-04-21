@@ -15,6 +15,7 @@ CUDA_INC ?= ../cuda
 NVCC_FLAGS := -std=$(CXXSTD) $(OPT) -arch=sm_$(ARCH) \
               -I$(CUDA_INC) \
               --expt-relaxed-constexpr \
+              -lineinfo \
               -Xcompiler -Wno-unused-variable
 
 BIN := warp_sort_bench

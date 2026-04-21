@@ -66,7 +66,7 @@ with PATH.open() as f:
 
 # Order
 DTYPES = ["float", "int", "int4"]
-BATCHES = [1, 100, 10000]
+BATCHES = [1, 100, 1000, 10000]
 SEQS = [100, 1000, 10000, 100000]
 
 ordered = []

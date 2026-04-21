@@ -359,13 +359,22 @@ bool launch_cub_merge(int bs, int batch, int seq, T* d_data) {
 }
 
 template<typename T, typename Cmp>
-bool supports_cub_merge(int bs, int seq) {
-    #define C(BS_, N_) if (bs == BS_ && seq == N_) return true;
-    C(32,  100);  C(32,  1000);
-    C(128, 100);  C(128, 1000);
-    if constexpr (sizeof(T) <= 4) { C(128, 10000); }
+const void* get_cub_merge_func(int bs, int seq) {
+    #define C(BS_, N_, IPT_) \
+        if (bs == BS_ && seq == N_) \
+            return (const void*)cub_merge_kernel<T, BS_, IPT_, Cmp>;
+    C(32,  100, 4);
+    C(32,  1000, 32);
+    C(128, 100, 1);
+    C(128, 1000, 8);
+    if constexpr (sizeof(T) <= 4) { C(128, 10000, 79); }
     #undef C
-    return false;
+    return nullptr;
+}
+
+template<typename T, typename Cmp>
+bool supports_cub_merge(int bs, int seq) {
+    return get_cub_merge_func<T, Cmp>(bs, seq) != nullptr;
 }
 
 template<typename T>
@@ -385,20 +394,34 @@ bool launch_cub_radix(int bs, int batch, int seq, T* d_data) {
 }
 
 template<typename T>
-bool supports_cub_radix(int bs, int seq) {
-    #define C(BS_, N_) if (bs == BS_ && seq == N_) return true;
-    C(32, 100);  C(32, 1000);
-    C(128, 100); C(128, 1000); C(128, 10000);
+const void* get_cub_radix_func(int bs, int seq) {
+    #define C(BS_, N_, IPT_) \
+        if (bs == BS_ && seq == N_) \
+            return (const void*)cub_radix_kernel<T, BS_, IPT_>;
+    C(32,  100, 4);
+    C(32,  1000, 32);
+    C(128, 100, 1);
+    C(128, 1000, 8);
+    C(128, 10000, 79);
     #undef C
-    return false;
+    return nullptr;
 }
+
+template<typename T>
+bool supports_cub_radix(int bs, int seq) {
+    return get_cub_radix_func<T>(bs, seq) != nullptr;
+}
+
 // int4 radix sort: CUB BlockRadixSort only supports arithmetic keys.
 template<> bool launch_cub_radix<int4>(int, int, int, int4*) { return false; }
+template<> const void* get_cub_radix_func<int4>(int, int) { return nullptr; }
 template<> bool supports_cub_radix<int4>(int, int) { return false; }
 
 // 4-pass radix: only meaningful for int4; generic template is a no-op.
 template<typename T>
 bool launch_cub_radix4(int, int, int, T*) { return false; }
+template<typename T>
+const void* get_cub_radix4_func(int, int) { return nullptr; }
 template<typename T>
 bool supports_cub_radix4(int, int) { return false; }
 
@@ -419,12 +442,37 @@ bool launch_cub_radix4<int4>(int bs, int batch, int seq, int4* d_data) {
 }
 
 template<>
-bool supports_cub_radix4<int4>(int bs, int seq) {
-    #define C(BS_, N_) if (bs == BS_ && seq == N_) return true;
-    C(32, 100);  C(32, 1000);
-    C(128, 100); C(128, 1000);
+const void* get_cub_radix4_func<int4>(int bs, int seq) {
+    #define C(BS_, N_, IPT_) \
+        if (bs == BS_ && seq == N_) \
+            return (const void*)cub_radix4_int4_kernel<BS_, IPT_>;
+    C(32,  100,  4);
+    C(32,  1000, 32);
+    C(128, 100,  1);
+    C(128, 1000, 8);
     #undef C
-    return false;
+    return nullptr;
+}
+
+template<>
+bool supports_cub_radix4<int4>(int bs, int seq) {
+    return get_cub_radix4_func<int4>(bs, seq) != nullptr;
+}
+
+template<typename T, typename Cmp>
+const void* get_our_sort_func(int bs) {
+    if (bs == 32)  return (const void*)our_sort_b32_kernel<T, Cmp>;
+    if (bs == 128) return (const void*)our_sort_b128_kernel<T, Cmp>;
+    return nullptr;
+}
+
+// Runtime introspection via cudaFuncGetAttributes: numRegs + static smem.
+struct KernelInfo { int regs; int smem; };
+static KernelInfo kinfo(const void* f) {
+    if (!f) return {-1, -1};
+    cudaFuncAttributes a{};
+    if (cudaFuncGetAttributes(&a, f) != cudaSuccess) return {-1, -1};
+    return {a.numRegs, (int)a.sharedSizeBytes};
 }
 
 // ============================================================================
@@ -503,14 +551,16 @@ static constexpr int HOST_WARMUP  = 1;
 static constexpr int HOST_MEASURE = 3;
 
 static void print_row(const char* algo, const char* dtype, const char* block,
-                      int batch, int seq, const TimingResult& r)
+                      int batch, int seq, const TimingResult& r,
+                      KernelInfo ki)
 {
     if (!r.ok) {
-        std::printf("%s,%s,%s,%d,%d,skip,skip\n",
-                    algo, dtype, block, batch, seq);
+        std::printf("%s,%s,%s,%d,%d,skip,skip,%d,%d\n",
+                    algo, dtype, block, batch, seq, ki.regs, ki.smem);
     } else {
-        std::printf("%s,%s,%s,%d,%d,%.4f,%.4f\n",
-                    algo, dtype, block, batch, seq, r.mean_ms, r.std_ms);
+        std::printf("%s,%s,%s,%d,%d,%.4f,%.4f,%d,%d\n",
+                    algo, dtype, block, batch, seq,
+                    r.mean_ms, r.std_ms, ki.regs, ki.smem);
     }
     std::fflush(stdout);
 }
@@ -540,7 +590,7 @@ void run_case(int batch, int seq, std::mt19937& rng,
             }
         };
         TimingResult r = time_host(setup, body, HOST_WARMUP, HOST_MEASURE);
-        print_row("std_sort", dt, "-", batch, seq, r);
+        print_row("std_sort", dt, "-", batch, seq, r, {-1, -1});
     }
 
     if (!run_cuda) return;
@@ -580,36 +630,49 @@ void run_case(int batch, int seq, std::mt19937& rng,
                 }
             };
             TimingResult r = time_cuda(reset, body, CUDA_WARMUP, CUDA_MEASURE);
-            print_row("warp_sort", dt, block_str, batch, seq, r);
+            KernelInfo ki = kinfo(get_our_sort_func<T, Cmp>(bs));
+            print_row("warp_sort", dt, block_str, batch, seq, r, ki);
 
             CK(cudaFree(d_scratch));
         }
 
         // ---- cub BlockMergeSort ----
-        if (supports_cub_merge<T, Cmp>(bs, seq)) {
-            auto body = [&] { launch_cub_merge<T, Cmp>(bs, batch, seq, d_work); };
-            TimingResult r = time_cuda(reset, body, CUDA_WARMUP, CUDA_MEASURE);
-            print_row("cub_merge", dt, block_str, batch, seq, r);
-        } else {
-            print_row("cub_merge", dt, block_str, batch, seq, {0, 0, false});
+        {
+            KernelInfo ki = kinfo(get_cub_merge_func<T, Cmp>(bs, seq));
+            if (supports_cub_merge<T, Cmp>(bs, seq)) {
+                auto body = [&] { launch_cub_merge<T, Cmp>(bs, batch, seq, d_work); };
+                TimingResult r = time_cuda(reset, body, CUDA_WARMUP, CUDA_MEASURE);
+                print_row("cub_merge", dt, block_str, batch, seq, r, ki);
+            } else {
+                print_row("cub_merge", dt, block_str, batch, seq,
+                          {0, 0, false}, ki);
+            }
         }
 
         // ---- cub BlockRadixSort ----
-        if (supports_cub_radix<T>(bs, seq)) {
-            auto body = [&] { launch_cub_radix<T>(bs, batch, seq, d_work); };
-            TimingResult r = time_cuda(reset, body, CUDA_WARMUP, CUDA_MEASURE);
-            print_row("cub_radix", dt, block_str, batch, seq, r);
-        } else {
-            print_row("cub_radix", dt, block_str, batch, seq, {0, 0, false});
+        {
+            KernelInfo ki = kinfo(get_cub_radix_func<T>(bs, seq));
+            if (supports_cub_radix<T>(bs, seq)) {
+                auto body = [&] { launch_cub_radix<T>(bs, batch, seq, d_work); };
+                TimingResult r = time_cuda(reset, body, CUDA_WARMUP, CUDA_MEASURE);
+                print_row("cub_radix", dt, block_str, batch, seq, r, ki);
+            } else {
+                print_row("cub_radix", dt, block_str, batch, seq,
+                          {0, 0, false}, ki);
+            }
         }
 
         // ---- cub BlockRadixSort 4-pass (int4 lex via key-value passes) ----
-        if (supports_cub_radix4<T>(bs, seq)) {
-            auto body = [&] { launch_cub_radix4<T>(bs, batch, seq, d_work); };
-            TimingResult r = time_cuda(reset, body, CUDA_WARMUP, CUDA_MEASURE);
-            print_row("cub_radix_4pass", dt, block_str, batch, seq, r);
-        } else {
-            print_row("cub_radix_4pass", dt, block_str, batch, seq, {0, 0, false});
+        {
+            KernelInfo ki = kinfo(get_cub_radix4_func<T>(bs, seq));
+            if (supports_cub_radix4<T>(bs, seq)) {
+                auto body = [&] { launch_cub_radix4<T>(bs, batch, seq, d_work); };
+                TimingResult r = time_cuda(reset, body, CUDA_WARMUP, CUDA_MEASURE);
+                print_row("cub_radix_4pass", dt, block_str, batch, seq, r, ki);
+            } else {
+                print_row("cub_radix_4pass", dt, block_str, batch, seq,
+                          {0, 0, false}, ki);
+            }
         }
     }
 
@@ -629,11 +692,11 @@ int main(int argc, char** argv) {
     }
     CK(cudaSetDevice(device));
 
-    std::printf("algorithm,dtype,block,batch,seq,mean_ms,std_ms\n");
+    std::printf("algorithm,dtype,block,batch,seq,mean_ms,std_ms,regs,smem\n");
 
     std::mt19937 rng(0xC0ACDu);
 
-    const int batches[] = {1, 100, 10000};
+    const int batches[] = {1, 100, 1000, 10000};
     const int seqs[]    = {100, 1000, 10000, 100000};
 
     auto run_all_dtypes = [&](int batch, int seq) {
