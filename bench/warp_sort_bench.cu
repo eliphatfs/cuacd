@@ -291,6 +291,50 @@ __global__ void cub_radix_kernel(T* data, int n) {
     }
 }
 
+// 4-pass stable key-value radix to sort int4 lexicographically on (x,y,z,w).
+// LSB-first field order: pass keys=w, z, y, x.  CUB's BlockRadixSort is stable,
+// so earlier-field orderings are preserved within later-field ties.
+template<int BS, int IPT>
+__global__ void cub_radix4_int4_kernel(int4* data, int n) {
+    using BRS = cub::BlockRadixSort<int, BS, IPT, int4>;
+    __shared__ typename BRS::TempStorage ts;
+    int bid = blockIdx.x;
+    int4* my = data + (size_t)bid * n;
+
+    int4 items[IPT];
+    int4 sent;
+    sent.x = sent.y = sent.z = sent.w = std::numeric_limits<int>::max();
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) {
+        int idx = threadIdx.x * IPT + i;
+        items[i] = (idx < n) ? my[idx] : sent;
+    }
+
+    int keys[IPT];
+
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) keys[i] = items[i].w;
+    BRS(ts).Sort(keys, items);
+
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) keys[i] = items[i].z;
+    BRS(ts).Sort(keys, items);
+
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) keys[i] = items[i].y;
+    BRS(ts).Sort(keys, items);
+
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) keys[i] = items[i].x;
+    BRS(ts).Sort(keys, items);
+
+    #pragma unroll
+    for (int i = 0; i < IPT; i++) {
+        int idx = threadIdx.x * IPT + i;
+        if (idx < n) my[idx] = items[i];
+    }
+}
+
 // CUB is register-expensive: IPT * sizeof(T) bytes sit in each thread's
 // register file.  We only instantiate (block, seq, IPT) combos that stay
 // within a sensible budget.  Everything else is reported as "skip".
@@ -351,6 +395,37 @@ bool supports_cub_radix(int bs, int seq) {
 // int4 radix sort: CUB BlockRadixSort only supports arithmetic keys.
 template<> bool launch_cub_radix<int4>(int, int, int, int4*) { return false; }
 template<> bool supports_cub_radix<int4>(int, int) { return false; }
+
+// 4-pass radix: only meaningful for int4; generic template is a no-op.
+template<typename T>
+bool launch_cub_radix4(int, int, int, T*) { return false; }
+template<typename T>
+bool supports_cub_radix4(int, int) { return false; }
+
+template<>
+bool launch_cub_radix4<int4>(int bs, int batch, int seq, int4* d_data) {
+    #define C(BS_, N_, IPT_) \
+        if (bs == BS_ && seq == N_) { \
+            cub_radix4_int4_kernel<BS_, IPT_><<<batch, BS_>>>(d_data, seq); \
+            return true; \
+        }
+    // Per-thread reg footprint ~ IPT * (sizeof(int4) + sizeof(int)) = 20*IPT B.
+    C(32,  100,  4);
+    C(32,  1000, 32);
+    C(128, 100,  1);
+    C(128, 1000, 8);
+    #undef C
+    return false;
+}
+
+template<>
+bool supports_cub_radix4<int4>(int bs, int seq) {
+    #define C(BS_, N_) if (bs == BS_ && seq == N_) return true;
+    C(32, 100);  C(32, 1000);
+    C(128, 100); C(128, 1000);
+    #undef C
+    return false;
+}
 
 // ============================================================================
 // Timing helpers -- pristine data is restored before every measured run.
@@ -526,6 +601,15 @@ void run_case(int batch, int seq, std::mt19937& rng,
             print_row("cub_radix", dt, block_str, batch, seq, r);
         } else {
             print_row("cub_radix", dt, block_str, batch, seq, {0, 0, false});
+        }
+
+        // ---- cub BlockRadixSort 4-pass (int4 lex via key-value passes) ----
+        if (supports_cub_radix4<T>(bs, seq)) {
+            auto body = [&] { launch_cub_radix4<T>(bs, batch, seq, d_work); };
+            TimingResult r = time_cuda(reset, body, CUDA_WARMUP, CUDA_MEASURE);
+            print_row("cub_radix_4pass", dt, block_str, batch, seq, r);
+        } else {
+            print_row("cub_radix_4pass", dt, block_str, batch, seq, {0, 0, false});
         }
     }
 

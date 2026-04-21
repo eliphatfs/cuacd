@@ -25,10 +25,16 @@ all: $(BIN)
 $(BIN): $(SRC)
 	$(NVCC) $(NVCC_FLAGS) $< -o $@
 
+# Build with ptxas verbose output (register / smem / spill per kernel).
+# Parse with: python3 parse_ptxas.py ptxas.log
+verbose: $(SRC)
+	$(NVCC) $(NVCC_FLAGS) -Xptxas=-v $< -o $(BIN) 2> ptxas.log
+	@echo "ptxas report written to ptxas.log"
+
 run: $(BIN)
 	./$(BIN) | tee results.csv
 
 clean:
-	rm -f $(BIN) results.csv
+	rm -f $(BIN) results.csv ptxas.log summary.md summary.txt
 
-.PHONY: all run clean
+.PHONY: all verbose run clean

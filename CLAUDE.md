@@ -49,8 +49,10 @@ coacd_gpu/            # Python package
   cli.py              #   coacd-gpu console entry point
 tests/                # All tests + benchmarks
 bench/                # Standalone perf experiments (not built by setup.py)
-  warp_sort_bench.cu  #   std::sort vs warp_sort vs cub BlockMergeSort/BlockRadixSort
-  Makefile            #   nvcc build (ARCH=89 default)
+  warp_sort_bench.cu  #   std::sort vs warp_sort vs cub BlockMergeSort/BlockRadixSort (+4-pass int4 radix)
+  Makefile            #   nvcc build (ARCH=89 default); `make verbose` for ptxas -v
+  summarize.py        #   Pivot results.csv → text / Markdown tables (--md, --ptxas)
+  parse_ptxas.py      #   Parse ptxas.log → per-kernel reg / smem / spill table
 docs/                 # Documentation (see below)
 CoACD/                # Reference C++ CoACD (embedded repo, not a submodule)
 ```
