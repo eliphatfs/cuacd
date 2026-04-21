@@ -50,7 +50,9 @@ coacd_gpu/            # Python package
 tests/                # All tests + benchmarks
 bench/                # Standalone perf experiments (not built by setup.py)
   warp_sort_bench.cu  #   std::sort vs warp_sort vs cub BlockMergeSort/BlockRadixSort (+4-pass int4 radix)
-  Makefile            #   nvcc build (ARCH=89 default); `make verbose` for ptxas -v
+  Makefile            #   warp_sort bench build (ARCH=89 default); `make verbose` for ptxas -v
+  hull_bench.cu       #   btConvexHull (CPU) vs hull_dandc vs kdop_hull (batch=256 × {512,2048,16384,65536} pts × gaussian/uniform_cube)
+  Makefile.hull       #   hull bench build (rdc=true; links mm.cu, kdop_const.cu, CoACD btConvexHull .cpp)
   summarize.py        #   Pivot results.csv → text / Markdown tables (--md, --ptxas)
   parse_ptxas.py      #   Parse ptxas.log → per-kernel reg / smem / spill table
 docs/                 # Documentation (see below)

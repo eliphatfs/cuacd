@@ -1,0 +1,67 @@
+# Standalone benchmark build for hull_bench.cu. Not part of the Python
+# extension build. Mirrors the style of the warp_sort Makefile.
+#
+# Usage:
+#   make -f Makefile.hull            # build with sm_89 (RTX 4090)
+#   make -f Makefile.hull ARCH=86    # other arch
+#   make -f Makefile.hull verbose    # with ptxas -v
+#   make -f Makefile.hull run        # build + tee to results_hull.csv
+#   make -f Makefile.hull clean
+
+ARCH   ?= 89
+NVCC   ?= nvcc
+CXXSTD ?= c++17
+OPT    ?= -O3
+
+CUDA_INC ?= ../cuda
+BT_DIR   ?= ../CoACD/src/btConvexHull
+
+NVCC_FLAGS := -std=$(CXXSTD) $(OPT) -arch=sm_$(ARCH) \
+              -I$(CUDA_INC) -I$(BT_DIR) \
+              --expt-relaxed-constexpr \
+              -lineinfo \
+              -Xcompiler -Wno-unused-variable \
+              -Xcompiler -Wno-sign-compare
+
+# All device-side code is compiled with -rdc=true so that __constant__ and
+# __global__ symbols (KDOP_AXES, heap_init_kernel) resolve across TUs.
+RDC := -rdc=true
+
+BIN := hull_bench
+
+HULL_OBJS := hull_bench.o mm.o kdop_const.o
+BT_OBJS   := btConvexHullComputer.o btAlignedAllocator.o
+
+all: $(BIN)
+
+hull_bench.o: hull_bench.cu
+	$(NVCC) $(NVCC_FLAGS) $(RDC) -dc $< -o $@
+
+mm.o: $(CUDA_INC)/mm.cu
+	$(NVCC) $(NVCC_FLAGS) $(RDC) -dc $< -o $@
+
+kdop_const.o: $(CUDA_INC)/kdop_const.cu
+	$(NVCC) $(NVCC_FLAGS) $(RDC) -dc $< -o $@
+
+btConvexHullComputer.o: $(BT_DIR)/btConvexHullComputer.cpp
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+btAlignedAllocator.o: $(BT_DIR)/btAlignedAllocator.cpp
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(BIN): $(HULL_OBJS) $(BT_OBJS)
+	$(NVCC) $(NVCC_FLAGS) $(RDC) $(HULL_OBJS) $(BT_OBJS) -o $@
+
+# ptxas verbose (register / smem / spill per kernel).
+verbose: clean
+	$(MAKE) -f Makefile.hull NVCC_FLAGS="$(NVCC_FLAGS) -Xptxas=-v" $(BIN) \
+	    2> ptxas_hull.log
+	@echo "ptxas report written to ptxas_hull.log"
+
+run: $(BIN)
+	./$(BIN) | tee results_hull.csv
+
+clean:
+	rm -f $(BIN) $(HULL_OBJS) $(BT_OBJS) results_hull.csv ptxas_hull.log
+
+.PHONY: all verbose run clean
