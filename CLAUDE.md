@@ -53,6 +53,9 @@ bench/                # Standalone perf experiments (not built by setup.py)
   Makefile            #   warp_sort bench build (ARCH=89 default); `make verbose` for ptxas -v
   hull_bench.cu       #   btConvexHull (CPU) vs hull_dandc vs kdop_hull (batch=256 × {512,2048,16384,65536} pts × gaussian/uniform_cube)
   Makefile.hull       #   hull bench build (rdc=true; links mm.cu, kdop_const.cu, CoACD btConvexHull .cpp)
+  malloc_test_bench.cu #  mstress-style alloc/free stress: coacd heap vs CUDA __device__ malloc; sweeps grid size for arena-contention curve
+  Makefile.malloc     #   malloc bench build (rdc=true; links mm.cu)
+  plot_malloc.py      #   Small log-log Mops/s vs blocks PDF for the small-medium regime
   summarize.py        #   Pivot results.csv → text / Markdown tables (--md, --ptxas)
   parse_ptxas.py      #   Parse ptxas.log → per-kernel reg / smem / spill table
 docs/                 # Documentation (see below)

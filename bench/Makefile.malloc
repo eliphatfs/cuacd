@@ -1,0 +1,51 @@
+# Standalone benchmark build for malloc_test_bench.cu. Not part of the Python
+# extension build. Mirrors the style of Makefile.hull.
+#
+# Usage:
+#   make -f Makefile.malloc            # build with sm_89 (RTX 4090)
+#   make -f Makefile.malloc ARCH=86    # other arch
+#   make -f Makefile.malloc verbose    # with ptxas -v
+#   make -f Makefile.malloc run        # build + tee to results_malloc.csv
+#   make -f Makefile.malloc clean
+
+ARCH   ?= 89
+NVCC   ?= nvcc
+CXXSTD ?= c++17
+OPT    ?= -O3
+
+CUDA_INC ?= ../cuda
+
+NVCC_FLAGS := -std=$(CXXSTD) $(OPT) -arch=sm_$(ARCH) \
+              -I$(CUDA_INC) \
+              --expt-relaxed-constexpr \
+              -lineinfo
+
+# rdc required so heap_init_kernel (in cuda/mm.cu) links across TUs.
+RDC := -rdc=true
+
+BIN  := malloc_test_bench
+OBJS := malloc_test_bench.o mm.o
+
+all: $(BIN)
+
+malloc_test_bench.o: malloc_test_bench.cu
+	$(NVCC) $(NVCC_FLAGS) $(RDC) -dc $< -o $@
+
+mm.o: $(CUDA_INC)/mm.cu
+	$(NVCC) $(NVCC_FLAGS) $(RDC) -dc $< -o $@
+
+$(BIN): $(OBJS)
+	$(NVCC) $(NVCC_FLAGS) $(RDC) $(OBJS) -o $@
+
+verbose: clean
+	$(MAKE) -f Makefile.malloc NVCC_FLAGS="$(NVCC_FLAGS) -Xptxas=-v" $(BIN) \
+	    2> ptxas_malloc.log
+	@echo "ptxas report written to ptxas_malloc.log"
+
+run: $(BIN)
+	./$(BIN) | tee results_malloc.csv
+
+clean:
+	rm -f $(BIN) $(OBJS) results_malloc.csv ptxas_malloc.log
+
+.PHONY: all verbose run clean
