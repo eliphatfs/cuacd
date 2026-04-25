@@ -214,6 +214,10 @@ def main():
                         help='Disable greedy merge-hulls post-processing pass (default: on).')
     parser.add_argument('--serial', action='store_true', default=False,
                         help='Serial load-process-save instead of pipelined workers (easier debugging).')
+    parser.add_argument('--bench', action='store_true', default=False,
+                        help='Benchmark mode: recreate context per object, '
+                             'measure heap memory high-water mark on a first run, '
+                             'then time a second run.')
     args = parser.parse_args()
 
     meshes = _find_meshes(args.input, args.recursive)
@@ -221,28 +225,53 @@ def main():
         print(f'No mesh files found in: {args.input}', file=sys.stderr)
         sys.exit(1)
 
-    if args.serial:
-        ctx = coacd_gpu.Context(device=args.device, pool_bytes=args.pool)
-        try:
-            for abs_path, rel_path in meshes:
-                try:
-                    verts, tris = _load_mesh(abs_path)
-                except Exception as e:
-                    print(f'{rel_path}: load error — {e}', file=sys.stderr, flush=True)
-                    continue
+    if args.bench or args.serial:
+        for abs_path, rel_path in meshes:
+            try:
+                verts, tris = _load_mesh(abs_path)
+            except Exception as e:
+                print(f'{rel_path}: load error — {e}', file=sys.stderr, flush=True)
+                continue
 
-                t0 = time.perf_counter()
-                try:
-                    out_parts = _decompose_mesh(ctx, verts, tris, args)
-                except Exception as e:
-                    print(f'{rel_path}: decompose error — {e}', file=sys.stderr, flush=True)
-                    continue
+            try:
+                ctx = coacd_gpu.Context(device=args.device, pool_bytes=args.pool)
+            except Exception as e:
+                print(f'{rel_path}: context init error — {e}', file=sys.stderr, flush=True)
+                continue
 
-                elapsed = time.perf_counter() - t0
-                _save_parts(out_parts, args.output, rel_path)
-                print(f'{rel_path}  {elapsed:.2f}s  {len(out_parts)} parts', flush=True)
-        finally:
-            ctx.close()
+            try:
+                if args.bench:
+                    # Warm-up run
+                    try:
+                        _decompose_mesh(ctx, verts, tris, args)
+                    except Exception as e:
+                        print(f'{rel_path}: decompose error — {e}', file=sys.stderr, flush=True)
+                        ctx.close()
+                        continue
+                    # Timed run
+                    t0 = time.perf_counter()
+                    try:
+                        out_parts = _decompose_mesh(ctx, verts, tris, args)
+                    except Exception as e:
+                        print(f'{rel_path}: decompose error — {e}', file=sys.stderr, flush=True)
+                        ctx.close()
+                        continue
+                    elapsed = time.perf_counter() - t0
+                    heap_mib = ctx.pool_usage() / (1024 * 1024)
+                    _save_parts(out_parts, args.output, rel_path)
+                    print(f'{rel_path}  {elapsed:.2f}s  {len(out_parts)} parts  {heap_mib:.1f} MiB', flush=True)
+                else:
+                    t0 = time.perf_counter()
+                    try:
+                        out_parts = _decompose_mesh(ctx, verts, tris, args)
+                    except Exception as e:
+                        print(f'{rel_path}: decompose error — {e}', file=sys.stderr, flush=True)
+                        continue
+                    elapsed = time.perf_counter() - t0
+                    _save_parts(out_parts, args.output, rel_path)
+                    print(f'{rel_path}  {elapsed:.2f}s  {len(out_parts)} parts', flush=True)
+            finally:
+                ctx.close()
         return
 
     mp_ctx = multiprocessing.get_context('spawn')
