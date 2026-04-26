@@ -342,22 +342,52 @@ int lookahead_decompose(
         LA_SYNC_CHECK("sort_and_count_cutting");
 
         // Diagnostic: print per-part cost breakdown (parts now sorted ascending)
-        if (verbose) {
+        const char* dump_dir = getenv("COACD_DUMP_PARTS_DIR");
+        if (verbose || dump_dir) {
             struct LaDecompState_h h_diag;
             CUresult _dr = cuMemcpyDtoH(&h_diag, d_decomp, sizeof(h_diag));
             if (_dr == CUDA_SUCCESS) {
                 const float pi = 3.14159265358979f;
-                fprintf(stderr, "[la]   part   nv   nt  mesh_vol  hull_vol    rv_cost  hausdorff  full_cost\n");
-                for (int _i = 0; _i < h_diag.nparts; _i++) {
-                    struct Part_h* _p = &h_diag.parts[_i];
-                    float rv = cbrtf((3.0f/(4.0f*pi)) * fmaxf(_p->hull_vol - _p->mesh_vol, 0.0f));
-                    float rv_cost = 0.3f * rv;
-                    float full_cost = fmaxf(rv_cost, _p->hausdorff);
-                    fprintf(stderr, "[la]   %3d  %4d %4d  %9.6f %9.6f  %9.6f %10.6f %10.6f%s\n",
-                            _i, _p->mesh.nv, _p->mesh.nt,
-                            _p->mesh_vol, _p->hull_vol,
-                            rv_cost, _p->hausdorff, full_cost,
-                            full_cost >= threshold ? " *" : "");
+                if (verbose) {
+                    fprintf(stderr, "[la]   part   nv   nt  mesh_vol  hull_vol    rv_cost  hausdorff  full_cost\n");
+                    for (int _i = 0; _i < h_diag.nparts; _i++) {
+                        struct Part_h* _p = &h_diag.parts[_i];
+                        float rv = cbrtf((3.0f/(4.0f*pi)) * fmaxf(_p->hull_vol - _p->mesh_vol, 0.0f));
+                        float rv_cost = 0.3f * rv;
+                        float full_cost = fmaxf(rv_cost, _p->hausdorff);
+                        fprintf(stderr, "[la]   %3d  %4d %4d  %9.6f %9.6f  %9.6f %10.6f %10.6f%s\n",
+                                _i, _p->mesh.nv, _p->mesh.nt,
+                                _p->mesh_vol, _p->hull_vol,
+                                rv_cost, _p->hausdorff, full_cost,
+                                full_cost >= threshold ? " *" : "");
+                    }
+                }
+                if (dump_dir) {
+                    for (int _i = 0; _i < h_diag.nparts; _i++) {
+                        struct Part_h* _p = &h_diag.parts[_i];
+                        if (_p->mesh.nv <= 0 || _p->mesh.nt <= 0) continue;
+                        if (!_p->mesh.verts || !_p->mesh.tris) continue;
+                        char path[1024];
+                        snprintf(path, sizeof(path), "%s/iter%03d_part%03d.bin", dump_dir, iter, _i);
+                        FILE* f = fopen(path, "wb");
+                        if (!f) continue;
+                        size_t vbytes = (size_t)_p->mesh.nv * 3 * sizeof(float);
+                        size_t tbytes = (size_t)_p->mesh.nt * 3 * sizeof(int);
+                        float* hv = (float*)malloc(vbytes);
+                        int*   ht = (int*)  malloc(tbytes);
+                        if (hv && ht) {
+                            cuMemcpyDtoH(hv, (CUdeviceptr)_p->mesh.verts, vbytes);
+                            cuMemcpyDtoH(ht, (CUdeviceptr)_p->mesh.tris,  tbytes);
+                            int hdr[2] = {_p->mesh.nv, _p->mesh.nt};
+                            float vols[2] = {_p->mesh_vol, _p->hull_vol};
+                            fwrite(hdr,  sizeof(int),   2, f);
+                            fwrite(vols, sizeof(float), 2, f);
+                            fwrite(hv, 1, vbytes, f);
+                            fwrite(ht, 1, tbytes, f);
+                        }
+                        free(hv); free(ht);
+                        fclose(f);
+                    }
                 }
             }
         }
@@ -534,9 +564,14 @@ int lookahead_decompose(
             LA_SYNC_CHECK("hull");
             if (la_bisect) { char lbl[64]; snprintf(lbl,sizeof(lbl),"hull_d%d",d); LA_BISECT_SNAP(lbl); }
 
-            // Sort parts within items + record level cost (fused)
+            // Sort parts within items + record level cost (fused).
+            // At d=0, also mirror level_costs[0] back to d_level0 so
+            // la_evaluate has a greedy fallback if B&B prunes all leaves.
             {
-                void* args[] = { &d_next, &next_n, &d_err };
+                CUdeviceptr l0_for_record = (d == 0) ? d_level0 : (CUdeviceptr)0;
+                int tw_for_record = (d == 0) ? d_total_width : 0;
+                void* args[] = { &d_next, &next_n, &d_err,
+                                 &l0_for_record, &tw_for_record };
                 LCHECK(cuLaunchKernel(ctx->fn_la_sort_and_record,
                                        next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }
@@ -624,7 +659,11 @@ int lookahead_decompose(
             LA_SYNC_CHECK("hull_quick");
 
             {
-                void* args[] = { &d_next, &next_n, &d_err };
+                // Quick path never runs at d=0 in the level0-producing sense —
+                // pass NULL so no level0 mirroring happens.
+                CUdeviceptr l0_q = (CUdeviceptr)0;
+                int tw_q = 0;
+                void* args[] = { &d_next, &next_n, &d_err, &l0_q, &tw_q };
                 LCHECK(cuLaunchKernel(ctx->fn_la_sort_and_record,
                                        next_n, 1, 1, 32, 1, 1, 0, s, args, NULL));
             }

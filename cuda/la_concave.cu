@@ -141,7 +141,7 @@ extern "C" __global__ void la_find_concave_edges(
 
     // RNG state per block
     __shared__ unsigned int s_rng;
-    if (lane == 0) s_rng = (unsigned int)(blockIdx.x * 2654435761u + 1u);
+    if (lane == 0) s_rng = 1u;
     __syncwarp();
 
     // Scan sorted edges for shared edges — warp-parallel detection, lane 0 reservoir sampling.

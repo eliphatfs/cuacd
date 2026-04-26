@@ -1172,7 +1172,31 @@ __device__ inline PartPair plane_cut_block(
                                 float uc=all_verts[vc*3+pu],  vc_=all_verts[vc*3+pv_ax];
                                 float un=all_verts[vn*3+pu],  vn_=all_verts[vn*3+pv_ax];
                                 float cross=(uc-up)*(vn_-vp_)-(vc_-vp_)*(un-up);
-                                if (cross<=1e-10f) { cur=next_a[cur]; continue; }
+                                // Concave vertex (cross < 0): not an ear, advance.
+                                if (cross < -1e-9f) { cur=next_a[cur]; continue; }
+                                // Collinear / duplicate vertex (|cross| ≤ eps): emit a
+                                // degenerate (zero-area) ear triangle.  This keeps the cap
+                                // watertight — vertex c stays referenced by exactly one cap
+                                // triangle (p,c,n), matching the original mesh tris that
+                                // split at c.  Skip the point-in-triangle test, which gives
+                                // spurious positives on degenerate triangles.  Cap polygons
+                                // get these collinear vertices at T-junctions and along
+                                // long shared edges; without this handling ear-clipping
+                                // would give up and produce non-manifold cuts that compound
+                                // in later iterations.
+                                if (cross <= 1e-9f) {
+                                    if (lane == 0) {
+                                        cap_tris[n_cap*3]   = vp;
+                                        cap_tris[n_cap*3+1] = vc;
+                                        cap_tris[n_cap*3+2] = vn;
+                                        n_cap++;
+                                        next_a[p] = n;
+                                        prev_a[n] = p;
+                                    }
+                                    remaining--; cur = n; iter = 0;
+                                    __syncwarp();
+                                    continue;
+                                }
                                 // Warp-parallel point-in-triangle test: scan all
                                 // polygon indices, skip removed vertices.
                                 int ear=1;

@@ -355,7 +355,9 @@ extern "C" __global__ void la_expand_quick(
 extern "C" __global__ void la_sort_and_record(
     LaWorkItem* items,
     int         nitems,
-    int*        err)
+    int*        err,
+    LaWorkItem* level0_items,   // if non-NULL, mirror level_costs[0] back here
+    int         total_width)    // stride for level0_items addressing
 {
     if (*err) return;
 
@@ -386,6 +388,19 @@ extern "C" __global__ void la_sort_and_record(
         float worst_cost = la_part_cost_rv(wi->parts[wi->nparts - 1]);
         wi->level_costs[wi->n_levels] = worst_cost;
         wi->n_levels++;
+
+        // Mirror this depth-0 cost into the level0 snapshot so la_evaluate
+        // can fall back on it when B&B prunes all leaves for a src_part.
+        // Only fires when called at d=0 (caller passes level0_items != NULL).
+        if (level0_items != NULL && wi->n_levels == 1) {
+            int sp = wi->src_part_idx;
+            int ic = wi->initial_cut_idx;
+            if (sp >= 0 && ic >= 0 && ic < total_width) {
+                LaWorkItem* l0 = &level0_items[sp * total_width + ic];
+                l0->level_costs[0] = worst_cost;
+                l0->n_levels       = 1;
+            }
+        }
     }
 }
 
@@ -468,6 +483,29 @@ extern "C" __global__ void la_evaluate(
         }
     }
     __syncwarp();
+
+    // Greedy fallback: if no leaf or extra-leaf survived for this src_part
+    // (e.g. B&B pruned all subtrees), use the best valid level-0 cut by its
+    // depth-0 cost. Without this, la_apply_cuts would default to cut_idx=0
+    // (often a low-quality slice) or skip entirely, leaving the part stuck.
+    __shared__ int s_any;
+    if (lane == 0) {
+        int any = 0;
+        for (int c = 0; c < total_width; c++)
+            if (s_cut_best[c] < 1e30f) { any = 1; break; }
+        s_any = any;
+    }
+    __syncwarp();
+
+    if (!s_any && level0_items != NULL) {
+        for (int c = lane; c < total_width; c += WARP_SIZE) {
+            LaWorkItem* l0 = &level0_items[my_idx * total_width + c];
+            if (l0->nparts >= 2 && l0->n_levels >= 1) {
+                s_cut_best[c] = l0->level_costs[0];
+            }
+        }
+        __syncwarp();
+    }
 
     // Lane 0 finds the best cut
     if (lane == 0) {
