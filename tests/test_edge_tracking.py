@@ -1,6 +1,6 @@
 """Test max edge pairs in D&C hull using icospheres.
 
-Requires: COACD_TRACK_EDGES=1 pip install -e .
+Requires: CUACD_TRACK_EDGES=1 pip install -e .
 Reads EDGE_TRACK printf lines from GPU kernel output.
 """
 import subprocess
@@ -50,8 +50,8 @@ def icosphere(subdivisions=0):
 
 
 def main():
-    import coacd_gpu
-    with coacd_gpu.Context(device=0) as ctx:
+    import cuacd
+    with cuacd.Context(device=0) as ctx:
         for subdiv in range(6):
             verts, faces = icosphere(subdiv)
             n = len(verts)

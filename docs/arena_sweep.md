@@ -2,7 +2,7 @@
 
 GPU hull D&C benchmark across `HEAP_NUM_ARENAS` ∈ {32, 64, 128, 256}.
 
-Each arena count requires a full rebuild (`COACD_GPU_ARENAS=N pip install -e .`).
+Each arena count requires a full rebuild (`CUACD_GPU_ARENAS=N pip install -e .`).
 Metric: wall-clock time for one `batch_hull_volume` call (after one warm-up call),
 plus peak pool usage read-back via `ctx.pool_usage()`.
 
@@ -85,7 +85,7 @@ fewer arenas means blocks are more likely to coalesce into their shared arena's 
 
 To override for a specific deployment:
 ```bash
-COACD_GPU_ARENAS=32 pip install -e .
+CUACD_GPU_ARENAS=32 pip install -e .
 ```
 
 ---
@@ -96,5 +96,5 @@ COACD_GPU_ARENAS=32 pip install -e .
 - HEAP_MIN_POOL_ALLOC = 128 KB
 - HEAP_NUM_SUBBINS = 64
 - Pool = 70% free VRAM (auto)
-- Build: `pip install -e .` with `COACD_GPU_ARENAS=N`
+- Build: `pip install -e .` with `CUACD_GPU_ARENAS=N`
 - Benchmark: `python tests/test_hull.py` (standalone mode, after warm-up)

@@ -82,7 +82,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     }
     __syncwarp();
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     long long t_start = clock64();
     long long t_ep = t_start, t_ephull = t_start, t_filtered = t_start, t_final = t_start;
 #endif
@@ -164,7 +164,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     }
     __syncwarp();
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     t_ep = clock64();
 #endif
     // ========================================================================
@@ -228,7 +228,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     __syncwarp();
     if (s_local_err) goto cleanup;
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     t_ephull = clock64();
 #endif
     // ========================================================================
@@ -343,7 +343,7 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     }
     __syncwarp();
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     t_filtered = clock64();
 #endif
     // ========================================================================
@@ -387,7 +387,7 @@ cleanup:
     }
     __syncwarp();
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     t_final = clock64();
 #endif
 

@@ -174,7 +174,7 @@ __device__ inline PartPair plane_cut_block(
     int tid     = threadIdx.x;
     int lane    = tid & 31;
     int warp_id = tid >> 5;
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     long long t_start = clock64();
 #endif
 

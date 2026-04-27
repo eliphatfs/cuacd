@@ -30,7 +30,7 @@ except ImportError:
     _HAS_TRIMESH = False
 
 try:
-    import coacd_gpu
+    import cuacd
     _HAS_GPU = True
 except Exception:
     _HAS_GPU = False
@@ -491,13 +491,13 @@ class TestHullVolumeScipy:
 # Section 3: GPU mesh volume tests
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _HAS_GPU, reason="coacd_gpu not available")
+@pytest.mark.skipif(not _HAS_GPU, reason="cuacd not available")
 class TestMeshVolumeGPU:
     """Validate GPU batch_mesh_volume against CPU mesh_volume_cpu reference."""
 
     @pytest.fixture(scope="class")
     def ctx(self):
-        c = coacd_gpu.Context(device=0)
+        c = cuacd.Context(device=0)
         yield c
         c.close()
 
@@ -564,14 +564,14 @@ class TestMeshVolumeGPU:
 # Section 4: GPU hull volume tests
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _HAS_GPU, reason="coacd_gpu not available")
+@pytest.mark.skipif(not _HAS_GPU, reason="cuacd not available")
 @pytest.mark.skipif(not _HAS_SCIPY, reason="scipy not available")
 class TestHullVolumeGPU:
     """Validate GPU batch_hull_volume (D&C algorithm) against scipy ConvexHull."""
 
     @pytest.fixture(scope="class")
     def ctx(self):
-        c = coacd_gpu.Context(device=0)
+        c = cuacd.Context(device=0)
         yield c
         c.close()
 
@@ -829,7 +829,7 @@ def benchmark_hull_volumes_gpu():
         ("gaussian",      make_gaussian),
     ]
 
-    ctx = coacd_gpu.Context(device=0)
+    ctx = cuacd.Context(device=0)
     rng = np.random.default_rng(0)
 
     try:
@@ -864,7 +864,7 @@ def benchmark_mesh_volumes_gpu():
         print("GPU not available — skipping GPU mesh volume benchmark")
         return
 
-    ctx = coacd_gpu.Context(device=0)
+    ctx = cuacd.Context(device=0)
     try:
         header = (f"{'Batch':<26} {'V/mesh':>8} {'T/mesh':>8} "
                   f"{'GPU ms':>9} {'mean vol':>12}")

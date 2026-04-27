@@ -312,7 +312,7 @@ __device__ __forceinline__ float hausdorff_block(
     __shared__ int s_seg_a[6];  // segment boundaries for 4-warp sort
     __shared__ int s_seg_b[6];
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     // Instrumentation: nodes visited (stack pops) and leaf triangle tests
     // per direction. Brute-force counters track direct triangle tests.
     __shared__ unsigned long long s_hd_nodes_ab;
@@ -339,7 +339,7 @@ __device__ __forceinline__ float hausdorff_block(
         s_result = 0.0f;
         s_dir_ab = 0.0f;
         s_dir_ba = 0.0f;
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         s_hd_nodes_ab = 0; s_hd_leaves_ab = 0;
         s_hd_nodes_ba = 0; s_hd_leaves_ba = 0;
         s_hd_brute_ab = 0; s_hd_brute_ba = 0;
@@ -572,7 +572,7 @@ __device__ __forceinline__ float hausdorff_block(
     // Direction A->B: query samples_a against mesh b's triangles.
     if (b->nt <= HD_BRUTE_THRESH) {
         // Brute force.
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         long long clk0 = 0;
         if (tid == 0) { clk0 = clock64(); s_hd_path_ab = 1; }
 #endif
@@ -592,7 +592,7 @@ __device__ __forceinline__ float hausdorff_block(
         }
         float dir_ab = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ab = dir_ab;
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         __syncthreads();
         if (tid == 0) {
             s_hd_clk_query_ab = clock64() - clk0;
@@ -604,7 +604,7 @@ __device__ __forceinline__ float hausdorff_block(
 
     // Direction B->A: query samples_b against mesh a's triangles.
     if (a->nt <= HD_BRUTE_THRESH) {
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         long long clk0 = 0;
         if (tid == 0) { clk0 = clock64(); s_hd_path_ba = 1; }
 #endif
@@ -624,7 +624,7 @@ __device__ __forceinline__ float hausdorff_block(
         }
         float dir_ba = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ba = dir_ba;
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         __syncthreads();
         if (tid == 0) {
             s_hd_clk_query_ba = clock64() - clk0;
@@ -989,7 +989,7 @@ __device__ __forceinline__ float hausdorff_block(
             return 0.0f;
         }
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         long long clk_build_b0 = 0;
         if (tid == 0) clk_build_b0 = clock64();
 #endif
@@ -1097,7 +1097,7 @@ __device__ __forceinline__ float hausdorff_block(
         // Free counters.
         if (tid == 0) {
             heap_free(scratch_heap, (void*)s_bvh_counters); s_bvh_counters = NULL;
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
             s_hd_clk_build_b = clock64() - clk_build_b0;
 #endif
         }
@@ -1125,7 +1125,7 @@ __device__ __forceinline__ float hausdorff_block(
             return 0.0f;
         }
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         long long clk_build_a0 = 0;
         if (tid == 0) clk_build_a0 = clock64();
 #endif
@@ -1229,7 +1229,7 @@ __device__ __forceinline__ float hausdorff_block(
 
         if (tid == 0) {
             heap_free(scratch_heap, (void*)s_bvh_counters); s_bvh_counters = NULL;
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
             s_hd_clk_build_a = clock64() - clk_build_a0;
 #endif
         }
@@ -1250,7 +1250,7 @@ __device__ __forceinline__ float hausdorff_block(
 
     // Direction A->B (query samples_a against BVH built on B's triangles).
     if (need_bvh_b && b->nt > 1) {
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         long long clk_q_ab0 = 0;
         if (tid == 0) { clk_q_ab0 = clock64(); s_hd_path_ab = 2; }
         __syncthreads();
@@ -1270,7 +1270,7 @@ __device__ __forceinline__ float hausdorff_block(
             while (sp > 0) {
                 int idx = stack[--sp];
                 BVHNode* nd = &bvh[idx];
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
                 tl_nodes++;
 #endif
 
@@ -1279,7 +1279,7 @@ __device__ __forceinline__ float hausdorff_block(
 
                 if (nd->left == -1) {
                     // Leaf: exact distance to source triangle.
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
                     tl_leaves++;
 #endif
                     int ti = nd->tri_idx;
@@ -1305,20 +1305,20 @@ __device__ __forceinline__ float hausdorff_block(
             local_max = fmaxf(local_max, best_sq);
         }
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         atomicAdd(&s_hd_nodes_ab,  tl_nodes);
         atomicAdd(&s_hd_leaves_ab, tl_leaves);
 #endif
         float dir_ab = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ab = dir_ab;
         __syncthreads();
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         if (tid == 0) s_hd_clk_query_ab = clock64() - clk_q_ab0;
         __syncthreads();
 #endif
     } else if (need_bvh_b && b->nt <= 1) {
         // Too few target triangles for BVH — brute force against all target triangles.
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         long long clk0 = 0;
         if (tid == 0) { clk0 = clock64(); s_hd_path_ab = 1; }
 #endif
@@ -1338,7 +1338,7 @@ __device__ __forceinline__ float hausdorff_block(
         }
         float dir_ab = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ab = dir_ab;
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         __syncthreads();
         if (tid == 0) {
             s_hd_clk_query_ab = clock64() - clk0;
@@ -1350,7 +1350,7 @@ __device__ __forceinline__ float hausdorff_block(
 
     // Direction B->A (query samples_b against BVH built on A's triangles).
     if (need_bvh_a && a->nt > 1) {
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         long long clk_q_ba0 = 0;
         if (tid == 0) { clk_q_ba0 = clock64(); s_hd_path_ba = 2; }
         __syncthreads();
@@ -1370,7 +1370,7 @@ __device__ __forceinline__ float hausdorff_block(
             while (sp > 0) {
                 int idx = stack[--sp];
                 BVHNode* nd = &bvh[idx];
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
                 tl_nodes++;
 #endif
 
@@ -1378,7 +1378,7 @@ __device__ __forceinline__ float hausdorff_block(
                 if (aabb_d >= best_sq) continue;
 
                 if (nd->left == -1) {
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
                     tl_leaves++;
 #endif
                     int ti = nd->tri_idx;
@@ -1403,20 +1403,20 @@ __device__ __forceinline__ float hausdorff_block(
             local_max = fmaxf(local_max, best_sq);
         }
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         atomicAdd(&s_hd_nodes_ba,  tl_nodes);
         atomicAdd(&s_hd_leaves_ba, tl_leaves);
 #endif
         float dir_ba = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ba = dir_ba;
         __syncthreads();
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         if (tid == 0) s_hd_clk_query_ba = clock64() - clk_q_ba0;
         __syncthreads();
 #endif
     } else if (need_bvh_a && a->nt <= 1) {
         // Too few target triangles for BVH — brute force against all target triangles.
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         long long clk0 = 0;
         if (tid == 0) { clk0 = clock64(); s_hd_path_ba = 1; }
 #endif
@@ -1436,7 +1436,7 @@ __device__ __forceinline__ float hausdorff_block(
         }
         float dir_ba = block_reduce_max(local_max, s_reduce, tid);
         if (tid == 0) s_dir_ba = dir_ba;
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         __syncthreads();
         if (tid == 0) {
             s_hd_clk_query_ba = clock64() - clk0;
@@ -1453,7 +1453,7 @@ __device__ __forceinline__ float hausdorff_block(
     float result = sqrtf(fmaxf(s_dir_ab, s_dir_ba));
 
     if (tid == 0) {
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         // One line per block: sizes, path taken, timings, BVH stats.
         // path: 0=skip, 1=brute, 2=bvh. brute counts = n_q * n_tri equivalent.
         DPRINTF("[HD] blk=%d a=(v=%d t=%d) b=(v=%d t=%d) sa=%d sb=%d "

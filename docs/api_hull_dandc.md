@@ -14,7 +14,7 @@ The D&C convex hull uses a parallel tree merge instead of a single serial D&C. S
 
 **Cleanup**: each lane's `BtLanePoolCleanup` entry points directly into `all_pool_blocks` (the same WarpPool-backed array used as `edgePool.blocks` during D&C) -- no separate copy. Lane 0 frees all blocks (initial + growth) in `hull_dandc_warp_mesh`'s `done:` section after `extractMesh` completes.
 
-Instrumentation (`#ifdef COACD_BEAM_DEBUG`): `BtDCState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`), all `#ifdef`'d out in release builds; lane 0's stats are copied to shared `BtHullState` after postsort for reporting.
+Instrumentation (`#ifdef CUACD_BEAM_DEBUG`): `BtDCState` carries 4 counter fields (`fma_total_edges`, `fma_min_edges`, `fma_max_edges`, `fma_calls`), all `#ifdef`'d out in release builds; lane 0's stats are copied to shared `BtHullState` after postsort for reporting.
 
 ## hull_dandc_warp_mesh API
 

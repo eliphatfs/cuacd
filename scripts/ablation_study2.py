@@ -86,7 +86,7 @@ def run_config(config, dry_run=False):
     output_dir = pathlib.Path(OUTPUT_BASE) / name
 
     cmd = [
-        sys.executable, "-m", "coacd_gpu.cli",
+        sys.executable, "-m", "cuacd.cli",
         INPUT_DIR, str(output_dir),
         "--width", str(params["width"]),
         "--width2", str(params["width2"]),
@@ -126,7 +126,7 @@ def run_config(config, dry_run=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ablation study driver #2 for coacd-gpu")
+    parser = argparse.ArgumentParser(description="Ablation study driver #2 for cuacd")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running them")
     parser.add_argument("--start-from", type=int, default=0, help="Skip first N configurations")
     parser.add_argument("--only-new", action="store_true", help="Skip configurations that already have results")

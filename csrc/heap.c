@@ -24,11 +24,11 @@
 // Embedded fatbin — generated at build time by setup.py
 #include "kernels_fatbin.h"
 
-// Compile with -DCOACD_DEBUG=1 (or COACD_DEBUG=1 pip install -e .) for verbose host-side output.
-#ifndef COACD_DEBUG
-#define COACD_DEBUG 0
+// Compile with -DCUACD_DEBUG=1 (or CUACD_DEBUG=1 pip install -e .) for verbose host-side output.
+#ifndef CUACD_DEBUG
+#define CUACD_DEBUG 0
 #endif
-#if COACD_DEBUG
+#if CUACD_DEBUG
 #define DBG(...) fprintf(stderr, __VA_ARGS__)
 #else
 #define DBG(...) ((void)0)

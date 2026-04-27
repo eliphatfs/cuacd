@@ -77,7 +77,7 @@ The filtered set contains all true convex hull vertices because the rough hull (
 ## Python API
 
 ```python
-with coacd_gpu.Context() as ctx:
+with cuacd.Context() as ctx:
     results = ctx.batch_kdop_hull_mesh(pts_list)
     # results[i] = (verts: np.ndarray (nv,3), tris: np.ndarray (nt,3), volume: float)
 ```

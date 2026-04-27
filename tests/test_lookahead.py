@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 import trimesh
 
-import coacd_gpu
-from coacd_gpu import _mesh_volume_cpu
+import cuacd
+from cuacd import _mesh_volume_cpu
 
 
 # ---------------------------------------------------------------------------
@@ -15,7 +15,7 @@ from coacd_gpu import _mesh_volume_cpu
 
 @pytest.fixture(scope="module")
 def gpu_ctx():
-    with coacd_gpu.Context(device=0, pool_bytes=10 * 1024**3) as ctx:
+    with cuacd.Context(device=0, pool_bytes=10 * 1024**3) as ctx:
         yield ctx
 
 

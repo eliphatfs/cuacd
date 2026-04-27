@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 try:
-    from coacd_gpu import _gpu
+    from cuacd import _gpu
     _HAS_GPU = True
 except Exception:
     _HAS_GPU = False
@@ -182,8 +182,8 @@ class TestHullMeshExtraction:
 class TestKdopHull:
     @pytest.fixture(scope="class")
     def ctx(self):
-        import coacd_gpu
-        c = coacd_gpu.Context(device=0)
+        import cuacd
+        c = cuacd.Context(device=0)
         yield c
         c.close()
 

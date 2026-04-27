@@ -253,10 +253,10 @@ int lookahead_decompose(
         if (verbose) fprintf(stderr, "[la] %s OK\n", label); \
     } } while(0)
 
-    // LEAK BISECT instrumentation: gated by env COACD_LEAK_BISECT=1.
+    // LEAK BISECT instrumentation: gated by env CUACD_LEAK_BISECT=1.
     // Reports per-phase (alloc-free) diff delta on the output heap, which
     // localizes which kernel launch leaves allocations unfreed.
-    const char* _bisect_env = getenv("COACD_LEAK_BISECT");
+    const char* _bisect_env = getenv("CUACD_LEAK_BISECT");
     int la_bisect = (_bisect_env && _bisect_env[0] && _bisect_env[0] != '0');
     unsigned long long _prev_out_diff = 0;  // heap_allocs - heap_frees
     unsigned long long _prev_scr_diff = 0;  // scratch_allocs - scratch_frees
@@ -342,7 +342,7 @@ int lookahead_decompose(
         LA_SYNC_CHECK("sort_and_count_cutting");
 
         // Diagnostic: print per-part cost breakdown (parts now sorted ascending)
-        const char* dump_dir = getenv("COACD_DUMP_PARTS_DIR");
+        const char* dump_dir = getenv("CUACD_DUMP_PARTS_DIR");
         if (verbose || dump_dir) {
             struct LaDecompState_h h_diag;
             CUresult _dr = cuMemcpyDtoH(&h_diag, d_decomp, sizeof(h_diag));

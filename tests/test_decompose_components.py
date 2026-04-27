@@ -9,7 +9,7 @@ Validates:
 import numpy as np
 import pytest
 
-import coacd_gpu._gpu as _gpu
+import cuacd._gpu as _gpu
 
 
 # ---------------------------------------------------------------------------

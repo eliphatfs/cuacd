@@ -2,7 +2,7 @@
 // Included by all kernel modules.
 #pragma once
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
 #  include <cstdio>
 #  define DPRINTF(...) printf(__VA_ARGS__)
 #else
@@ -13,7 +13,7 @@
 // CheckedBuf<T> — bounds-checked buffer access in debug mode
 // ============================================================================
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
 template<typename T>
 struct CheckedBuf {
     T* ptr_; int count_; const char* name_;

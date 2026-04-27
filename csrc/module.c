@@ -27,7 +27,7 @@ static GpuState g_state = { NULL };
 
 static PyObject* raise_error(gpu_ctx_t ctx, int rc) {
     const char* msg = gpu_last_error(ctx);
-    PyErr_Format(PyExc_RuntimeError, "coacd_gpu error %d: %s", rc, msg ? msg : "unknown");
+    PyErr_Format(PyExc_RuntimeError, "cuacd error %d: %s", rc, msg ? msg : "unknown");
     return NULL;
 }
 
@@ -490,7 +490,7 @@ static PyModuleDef_Slot gpu_slots[] = {
 
 static PyModuleDef gpu_module_def = {
     PyModuleDef_HEAD_INIT,
-    "coacd_gpu._gpu",                             // module name
+    "cuacd._gpu",                                 // module name
     "GPU-accelerated convex hull and plane cut",   // docstring
     0,                                             // module state size
     NULL,                                          // methods (added via slot)

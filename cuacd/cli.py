@@ -1,4 +1,4 @@
-"""coacd-gpu — CLI for lookahead convex decomposition of mesh files."""
+"""cuacd — CLI for lookahead convex decomposition of mesh files."""
 
 import argparse
 import multiprocessing
@@ -9,7 +9,7 @@ import time
 import pathlib
 import numpy as np
 import trimesh
-import coacd_gpu
+import cuacd
 
 
 def _parse_pool_bytes(s):
@@ -117,7 +117,7 @@ def _loader_worker(mesh_list, load_queue, print_lock):
 
 def _processor_worker(load_queue, save_queue, print_lock, args):
     """Decompose meshes from load_queue, push results into save_queue."""
-    ctx = coacd_gpu.Context(device=args.device, pool_bytes=args.pool)
+    ctx = cuacd.Context(device=args.device, pool_bytes=args.pool)
     try:
         while True:
             item = load_queue.get()
@@ -140,7 +140,7 @@ def _processor_worker(load_queue, save_queue, print_lock, args):
                             ctx.close()
                         except Exception:
                             pass
-                        ctx = coacd_gpu.Context(device=args.device, pool_bytes=args.pool)
+                        ctx = cuacd.Context(device=args.device, pool_bytes=args.pool)
                     else:
                         with print_lock:
                             print(f'{rel_path}: decompose error on retry — {e}',
@@ -170,7 +170,7 @@ def _saver_worker(save_queue, output_dir, print_lock):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog='coacd-gpu',
+        prog='cuacd',
         description='GPU lookahead convex decomposition of mesh files.')
     parser.add_argument('input', help='Input mesh file or directory.')
     parser.add_argument('output', help='Output directory.')
@@ -234,7 +234,7 @@ def main():
                 continue
 
             try:
-                ctx = coacd_gpu.Context(device=args.device, pool_bytes=args.pool)
+                ctx = cuacd.Context(device=args.device, pool_bytes=args.pool)
             except Exception as e:
                 print(f'{rel_path}: context init error — {e}', file=sys.stderr, flush=True)
                 continue

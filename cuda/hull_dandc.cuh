@@ -320,7 +320,7 @@ struct BtHullState {
     WarpPool*   wp;
     DeviceHeap* scratch_heap;  // backing for edgePool slabs
     int         npoints;       // original point count (queue size bound)
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     int fma_total_edges;       // instrumentation: total edges chased in bt_findMaxAngle
     int fma_min_edges;         // instrumentation: min edges per call
     int fma_max_edges;         // instrumentation: max edges per call
@@ -341,7 +341,7 @@ struct BtDCState {
     int usedEdgePairs;
     int maxEdgePairs;
 #endif
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     int fma_total_edges;
     int fma_min_edges;
     int fma_max_edges;
@@ -898,7 +898,7 @@ __device__ inline void bt_merge_pair(
             BtEdge*      min1    = min1_shfl;
             BtRational64 minCot1 = minCot1_shfl;
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
             dc->fma_calls += 2;
 #endif
 
@@ -1511,7 +1511,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     my_dc.usedEdgePairs = 0;
     my_dc.maxEdgePairs = 0;
 #endif
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     my_dc.fma_total_edges = 0;
     my_dc.fma_min_edges   = 0x7fffffff;
     my_dc.fma_max_edges   = 0;
@@ -1591,7 +1591,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         }
     }
     __syncwarp();
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     *t_subhull = clock64();
 #endif
     // Check for errors from any lane
@@ -1637,7 +1637,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
         // Set mergeStamp from shared counter for use by extractMesh
         s->mergeStamp = s_mergeStamp;
         s->mergeStampPtr = NULL;  // extractMesh uses local stamp, not shared
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         // Aggregate instrumentation from lane 0 (other lanes' stats are lost)
         s->fma_total_edges = my_dc.fma_total_edges;
         s->fma_min_edges   = my_dc.fma_min_edges;
@@ -1647,7 +1647,7 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     }
 
     __syncwarp();
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     *t_treemerge = clock64();
 #endif
 }
@@ -1681,7 +1681,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
     // atomicOr to *err happens from lane 0.
     __shared__ int                s_err;
 
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
     long long t_start = clock64();
     long long t_sort = t_start, t_subhull = t_start, t_treemerge = t_start;
 #else
@@ -1724,7 +1724,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
         state->scratch_heap = scratch_heap;
         state->vertexList   = BT_VI_NULL;
         state->mergeStampPtr = NULL;
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         state->fma_total_edges = 0;
         state->fma_min_edges   = 0x7fffffff;
         state->fma_max_edges   = 0;
@@ -1755,7 +1755,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
 
         if (lane == 0) bt_rewind(&s_pool, pre_sort_offset);
         __syncwarp();
-#ifdef COACD_BEAM_DEBUG
+#ifdef CUACD_BEAM_DEBUG
         t_sort = clock64();
 #endif
         // --- Phase 3: post-sort D&C (vertex init: all lanes, D&C + edgePool init: lane 0) ---

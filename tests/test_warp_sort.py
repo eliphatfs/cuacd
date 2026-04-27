@@ -3,8 +3,8 @@ import numpy as np
 import pytest
 
 try:
-    import coacd_gpu
-    import coacd_gpu._gpu as _gpu
+    import cuacd
+    import cuacd._gpu as _gpu
     _HAS_GPU = True
 except ImportError:
     _HAS_GPU = False
@@ -57,12 +57,12 @@ def _make_random_bp32(n, rng):
     return arr
 
 
-@pytest.mark.skipif(not _HAS_GPU, reason="coacd_gpu not available")
+@pytest.mark.skipif(not _HAS_GPU, reason="cuacd not available")
 class TestWarpSort:
 
     @pytest.fixture(scope="class")
     def ctx(self):
-        c = coacd_gpu.Context(device=0)
+        c = cuacd.Context(device=0)
         yield c
         c.close()
 

@@ -27,7 +27,7 @@ ctx.lookahead_decompose(data['pv'], data['pt'], max_iters=4, verbose=1, ...)
 
 Build with device-side debug output:
 ```bash
-COACD_BEAM_DEBUG=1 pip install -e .
+CUACD_BEAM_DEBUG=1 pip install -e .
 ```
 
 Run the isolated stuck part, capture stderr to a file, and grep for `DPRINTF` output to find why each candidate cut fails (degenerate split, zero-volume child, etc.).

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**coacd_gpu** — GPU convex approximate decomposition. Single CPython extension (abi3, cp310+) via CUDA driver API. Sub-algorithms: D&C convex hull, plane cut, lookahead tree search decomposition. All run on GPU with a custom heap allocator.
+**cuacd** — GPU convex approximate decomposition. Single CPython extension (abi3, cp310+) via CUDA driver API. Sub-algorithms: D&C convex hull, plane cut, lookahead tree search decomposition. All run on GPU with a custom heap allocator.
 
 `CoACD/` — Reference C++ CoACD implementation (SIGGRAPH 2022), not part of the GPU extension.
 
@@ -44,9 +44,9 @@ csrc/                 # C host code
   error_codes.h       #   Host-side error decoding (kerr_decode)
   lookahead.h/c       #   lookahead_decompose host implementation
   module.c            #   CPython extension (Py_LIMITED_API cp310)
-coacd_gpu/            # Python package
+cuacd/                # Python package
   __init__.py         #   Context class
-  cli.py              #   coacd-gpu console entry point
+  cli.py              #   cuacd console entry point
 tests/                # All tests + benchmarks
 bench/                # Standalone perf experiments (not built by setup.py)
   warp_sort_bench.cu  #   std::sort vs warp_sort vs cub BlockMergeSort/BlockRadixSort (+4-pass int4 radix)
@@ -70,15 +70,15 @@ CoACD/                # Reference C++ CoACD (embedded repo, not a submodule)
 
 ```bash
 pip install -e .                                    # Install (requires CUDA toolkit with nvcc)
-COACD_GPU_ARCHS="89" pip install -e .               # Fast dev build — single arch (RTX 4090 = sm_89, ~15s)
+CUACD_GPU_ARCHS="89" pip install -e .               # Fast dev build — single arch (RTX 4090 = sm_89, ~15s)
 python -m pytest tests/ -v                          # Run all tests
-COACD_DEBUG=1 pip install -e .                      # Host-side debug output
-COACD_BEAM_DEBUG=1 pip install -e .                 # Device-side DPRINTF + CheckedBuf OOB detection
-COACD_GPU_ARENAS=32 pip install -e .                # Override arena count (default 64)
-COACD_MEMCHECK=1 pip install -e .                    # Device-side memory sanitizer (-fdevice-sanitize=memcheck)
-COACD_LEAK_PROBE=1 pip install -e .                 # Device-side refcount-mismatch probe in la_free_decomp
-COACD_LEAK_BISECT=1 python your_bench.py            # Runtime: per-phase heap_stats deltas around each kernel
-COACD_PARALLEL=4 pip install -e .                   # Limit parallel nvcc processes
+CUACD_DEBUG=1 pip install -e .                      # Host-side debug output
+CUACD_BEAM_DEBUG=1 pip install -e .                 # Device-side DPRINTF + CheckedBuf OOB detection
+CUACD_GPU_ARENAS=32 pip install -e .                # Override arena count (default 64)
+CUACD_MEMCHECK=1 pip install -e .                    # Device-side memory sanitizer (-fdevice-sanitize=memcheck)
+CUACD_LEAK_PROBE=1 pip install -e .                 # Device-side refcount-mismatch probe in la_free_decomp
+CUACD_LEAK_BISECT=1 python your_bench.py            # Runtime: per-phase heap_stats deltas around each kernel
+CUACD_PARALLEL=4 pip install -e .                   # Limit parallel nvcc processes
 pip install -ve .                                   # Verbose build (see ptxas register usage)
 ```
 
@@ -100,8 +100,8 @@ After completing any code change, always build (`pip install -e .`) and run the 
 ## Python API
 
 ```python
-import coacd_gpu
-with coacd_gpu.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto (70% free VRAM)
+import cuacd
+with cuacd.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto (70% free VRAM)
     volumes, errors = ctx.batch_hull_volume(pts_list)
     volumes = ctx.batch_mesh_volume(verts_list, tris_list)
     results = ctx.batch_hull_dandc_mesh(pts_list)   # list of (verts, tris, volume) — exact D&C hull

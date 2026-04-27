@@ -13,7 +13,7 @@ Usage:
 """
 import argparse
 import numpy as np
-import coacd_gpu
+import cuacd
 
 def main():
     parser = argparse.ArgumentParser()
@@ -26,7 +26,7 @@ def main():
     pts_list = [rng.standard_normal((args.n_pts, 3)).astype(np.float32)
                 for _ in range(args.n_hulls)]
 
-    ctx = coacd_gpu.Context(device=0)
+    ctx = cuacd.Context(device=0)
 
     # Warmup (context init, module load, etc.)
     ctx.batch_hull_volume(pts_list[:1], algo=2)

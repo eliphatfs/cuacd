@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-import coacd_gpu
+import cuacd
 
 
 def _l_shape_mesh():
@@ -54,7 +54,7 @@ class TestConcaveEdges:
     def test_explicit_zero_disables(self):
         """n_concave_edges=0 should produce fewer parts than the default (n_concave_edges=32)."""
         verts, tris = _l_shape_mesh()
-        with coacd_gpu.Context() as ctx:
+        with cuacd.Context() as ctx:
             parts_default = ctx.lookahead_decompose(
                 verts, tris, max_iters=5, width=9, threshold=0.05)
             parts_zero = ctx.lookahead_decompose(
@@ -66,7 +66,7 @@ class TestConcaveEdges:
     def test_l_shape_concave_edges(self):
         """L-shape decomposition with concave edge sampling."""
         verts, tris = _l_shape_mesh()
-        with coacd_gpu.Context() as ctx:
+        with cuacd.Context() as ctx:
             parts = ctx.lookahead_decompose(
                 verts, tris, max_iters=5, width=9, threshold=0.05,
                 n_concave_edges=3, concave_eps=0.005,
@@ -79,7 +79,7 @@ class TestConcaveEdges:
     def test_l_shape_multiple_concave_iters(self):
         """L-shape with concave edges on multiple iterations."""
         verts, tris = _l_shape_mesh()
-        with coacd_gpu.Context() as ctx:
+        with cuacd.Context() as ctx:
             parts = ctx.lookahead_decompose(
                 verts, tris, max_iters=5, width=9, threshold=0.05,
                 n_concave_edges=3, concave_iters=3)
@@ -88,7 +88,7 @@ class TestConcaveEdges:
     def test_torus_concave_edges(self):
         """Torus has many concave edges on the inner ring."""
         verts, tris = _make_torus(n_major=16, n_minor=8)
-        with coacd_gpu.Context() as ctx:
+        with cuacd.Context() as ctx:
             parts = ctx.lookahead_decompose(
                 verts, tris, max_iters=10, width=9, threshold=0.05,
                 n_concave_edges=5, concave_iters=1)
@@ -100,7 +100,7 @@ class TestConcaveEdges:
     def test_width_validation(self):
         """total_width = width + 4*n_concave_edges must be < 512."""
         verts, tris = _l_shape_mesh()
-        with coacd_gpu.Context() as ctx:
+        with cuacd.Context() as ctx:
             with pytest.raises(ValueError, match="must be < 512"):
                 ctx.lookahead_decompose(
                     verts, tris, width=500, n_concave_edges=5)
@@ -108,7 +108,7 @@ class TestConcaveEdges:
     def test_concave_eps_zero(self):
         """Zero epsilon should still work (planes through edge midpoint)."""
         verts, tris = _l_shape_mesh()
-        with coacd_gpu.Context() as ctx:
+        with cuacd.Context() as ctx:
             parts = ctx.lookahead_decompose(
                 verts, tris, max_iters=5, width=9, threshold=0.05,
                 n_concave_edges=3, concave_eps=0.0, concave_iters=1)
@@ -117,7 +117,7 @@ class TestConcaveEdges:
     def test_concave_threshold_high(self):
         """Very high threshold means no edges are concave → same as disabled."""
         verts, tris = _l_shape_mesh()
-        with coacd_gpu.Context() as ctx:
+        with cuacd.Context() as ctx:
             parts_no = ctx.lookahead_decompose(
                 verts, tris, max_iters=5, width=9, threshold=0.05,
                 n_concave_edges=3, concave_threshold=100.0, concave_iters=1)
@@ -132,7 +132,7 @@ class TestConcaveEdgePresets:
     def test_l_shape_width3(self):
         """Minimal width with concave edges."""
         verts, tris = _l_shape_mesh()
-        with coacd_gpu.Context() as ctx:
+        with cuacd.Context() as ctx:
             parts = ctx.lookahead_decompose(
                 verts, tris, max_iters=3, width=3, threshold=0.05,
                 n_concave_edges=2, concave_iters=1)
@@ -141,7 +141,7 @@ class TestConcaveEdgePresets:
     def test_l_shape_depth1(self):
         """depth=1 (single expansion level) with concave edges."""
         verts, tris = _l_shape_mesh()
-        with coacd_gpu.Context() as ctx:
+        with cuacd.Context() as ctx:
             parts = ctx.lookahead_decompose(
                 verts, tris, max_iters=5, width=9, depth=1, threshold=0.05,
                 n_concave_edges=3, concave_iters=1)

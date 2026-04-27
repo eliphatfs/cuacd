@@ -8,9 +8,9 @@
 
 ## Build-Time Debug Flags
 
-- `COACD_DEBUG=1 pip install -e .` — host-side debug output.
-- `COACD_BEAM_DEBUG=1 pip install -e .` — device-side `DPRINTF` + `CheckedBuf` OOB detection. Use `DPRINTF` guarded by `if (lane == 0)` or `if (tid == 0)` to add temporary device-side diagnostics in `.cuh` files — no extra includes needed, `DPRINTF` is defined in `common.cuh`.
-- `COACD_MEMCHECK=1 pip install -e .` — compiles with `-fdevice-sanitize=memcheck` for device-side memory error detection (requires compute-sanitizer support in nvcc).
+- `CUACD_DEBUG=1 pip install -e .` — host-side debug output.
+- `CUACD_BEAM_DEBUG=1 pip install -e .` — device-side `DPRINTF` + `CheckedBuf` OOB detection. Use `DPRINTF` guarded by `if (lane == 0)` or `if (tid == 0)` to add temporary device-side diagnostics in `.cuh` files — no extra includes needed, `DPRINTF` is defined in `common.cuh`.
+- `CUACD_MEMCHECK=1 pip install -e .` — compiles with `-fdevice-sanitize=memcheck` for device-side memory error detection (requires compute-sanitizer support in nvcc).
 
 ## Runtime Debug Modes
 
@@ -18,7 +18,7 @@
 - **Lookahead verbose levels** (`lookahead_decompose`):
   - `verbose=1`: per-part table each iteration (nv, nt, mesh_vol, hull_vol, rv_cost, hausdorff, full_cost; `*` = above threshold), per-iteration timing and n_cutting, kernel stage OK messages.
   - `verbose=2`: additionally prints cutting_indices, la_evaluate results (best_cut_idx, best_cost per src part), leaf item details (src, cut, nparts, path_cost, level_costs), level-0 item details (per-cut per-source with per-part rv/hv/mv), per-cut best path cost summary.
-- **`COACD_DUMP_PARTS_DIR=<dir>`** (runtime env): dumps every part at every iteration to `<dir>/iter%03d_part%03d.bin`. Binary layout: header `int[2] {nv, nt}` + `float[2] {mesh_vol, hull_vol}` + verts (`float32 nv*3`) + tris (`int32 nt*3`). Useful for stuck-part investigation: cross-reference the dumped files with the verbose `[la]` table to identify which parts are *truly* stuck (same `(nv, nt, mesh_vol, hull_vol)` row appearing with `*` across consecutive iterations), which sidesteps run-to-run index non-determinism.
+- **`CUACD_DUMP_PARTS_DIR=<dir>`** (runtime env): dumps every part at every iteration to `<dir>/iter%03d_part%03d.bin`. Binary layout: header `int[2] {nv, nt}` + `float[2] {mesh_vol, hull_vol}` + verts (`float32 nv*3`) + tris (`int32 nt*3`). Useful for stuck-part investigation: cross-reference the dumped files with the verbose `[la]` table to identify which parts are *truly* stuck (same `(nv, nt, mesh_vol, hull_vol)` row appearing with `*` across consecutive iterations), which sidesteps run-to-run index non-determinism.
 
 ## Key Principles
 

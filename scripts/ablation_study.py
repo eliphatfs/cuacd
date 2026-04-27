@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ablation study driver for coacd-gpu lookahead decomposition.
+"""Ablation study driver for cuacd lookahead decomposition.
 
 Sweeps over combinations of width, n_concave_edges, no_decompose_components_per_iter,
 and concave_iters. Each configuration gets its own output directory under
@@ -84,7 +84,7 @@ def run_config(config, dry_run=False):
     output_dir = pathlib.Path(OUTPUT_BASE) / name
 
     cmd = [
-        sys.executable, "-m", "coacd_gpu.cli",
+        sys.executable, "-m", "cuacd.cli",
         INPUT_DIR, str(output_dir),
         "--width", str(params["width"]),
         "--n-concave-edges", str(params["n_concave_edges"]),
@@ -124,7 +124,7 @@ def run_config(config, dry_run=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ablation study driver for coacd-gpu")
+    parser = argparse.ArgumentParser(description="Ablation study driver for cuacd")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running them")
     parser.add_argument("--start-from", type=int, default=0, help="Skip first N configurations (for resuming)")
     parser.add_argument("--only-new", action="store_true", help="Skip configurations that already have results")

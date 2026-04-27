@@ -186,7 +186,7 @@ extern "C" __global__ void la_apply_cuts(
         // Free the old part's mesh and hull (being replaced)
         Part* old = &decomp->parts[part_idx];
         int free_err = 0;
-#ifdef COACD_LEAK_PROBE
+#ifdef CUACD_LEAK_PROBE
         printf("[apply_cuts[%d]] old.mesh.rc=%p(*=%d) old.hull.rc=%p mesh_vol=%.6f hull_vol=%.6f\n",
                i, old->mesh.refcount,
                old->mesh.refcount ? *old->mesh.refcount : -1,
@@ -377,7 +377,7 @@ extern "C" __global__ void la_free_decomp(
     if (threadIdx.x == 0) {
         if (pp->mesh.refcount) {
             int old = atomicAdd(pp->mesh.refcount, -1);
-#ifdef COACD_LEAK_PROBE
+#ifdef CUACD_LEAK_PROBE
             if (old != 1) printf("[la_free_decomp] part %d: mesh.refcount was %d (leaked=%d)\n", i, old, old-1);
 #endif
             if (old == 1) heap_free(&pool->heap, (void*)pp->mesh.verts);
@@ -386,7 +386,7 @@ extern "C" __global__ void la_free_decomp(
             heap_free(&pool->heap, (void*)pp->hull.verts);
         } else if (pp->hull.refcount) {
             int old = atomicAdd(pp->hull.refcount, -1);
-#ifdef COACD_LEAK_PROBE
+#ifdef CUACD_LEAK_PROBE
             if (old != 1) printf("[la_free_decomp] part %d: hull.refcount was %d (leaked=%d)\n", i, old, old-1);
 #endif
             if (old == 1) heap_free(&pool->heap, (void*)pp->hull.verts);

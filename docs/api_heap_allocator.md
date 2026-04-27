@@ -2,7 +2,7 @@
 
 `DeviceHeap` is a large-object heap embedded directly in `DevicePool`. Design:
 
-- **`HEAP_NUM_ARENAS` arenas** (default 64, overridable via `COACD_GPU_ARENAS=N pip install -e .`), selected by `blockIdx.x % HEAP_NUM_ARENAS`. Each arena has **64 sub-bin doubly-linked free lists**, a **64-bit occupancy bitmap**, and a spin-lock.
+- **`HEAP_NUM_ARENAS` arenas** (default 64, overridable via `CUACD_GPU_ARENAS=N pip install -e .`), selected by `blockIdx.x % HEAP_NUM_ARENAS`. Each arena has **64 sub-bin doubly-linked free lists**, a **64-bit occupancy bitmap**, and a spin-lock.
 - **Sub-bins**: 32 pow-of-2 bins x 2 linear halves. Bin b = `[512*2^b, 1024*2^b)`. Sub-bin 2b = lower half `[512*2^b, 768*2^b)`, sub-bin 2b+1 = upper half `[768*2^b, 1024*2^b)`. Minimum alignment: `HEAP_ALIGN = 512` bytes.
 - **Block layout**: `[HeapBlockHdr (16 B)][data (data_size B)][HeapBlockFtr (16 B)]`. `HeapBlockHdr`/`Ftr` store `data_size`, `arena_idx`, `is_free`. Free blocks store `prev`/`next` pointers in first 16 bytes of data.
 - **Slab layout**: each new pool slab has `[leading sentinel 32B][free block][trailing sentinel 32B]`. Sentinels (`is_free=0`, `data_size=0`) prevent coalescing across slab boundaries.

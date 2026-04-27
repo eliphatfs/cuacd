@@ -1,12 +1,12 @@
 """
-coacd_gpu — GPU hull volume, mesh volume, and plane cut utilities.
+cuacd — GPU hull volume, mesh volume, and plane cut utilities.
 
 Uses CUDA driver API via a native CPython extension. No PyTorch or CUDA runtime dependency.
 Only requires an NVIDIA GPU driver (libcuda.so / nvcuda.dll).
 """
 
 import numpy as np
-from coacd_gpu import _gpu
+from cuacd import _gpu
 
 
 def _as_f32(arr):
@@ -30,7 +30,7 @@ class Context:
 
     Usage::
 
-        with coacd_gpu.Context() as ctx:
+        with cuacd.Context() as ctx:
             vols, errs = ctx.batch_hull_volume(pts_list)
             vols = ctx.batch_mesh_volume(verts_list, tris_list)
 

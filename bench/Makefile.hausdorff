@@ -18,10 +18,10 @@ CXXSTD    ?= c++17
 OPT       ?= -O3
 
 CUDA_INC  ?= ../cuda
-COACD_SRC ?= ../CoACD/src
+CUACD_SRC ?= ../CoACD/src
 
 NVCC_FLAGS := -std=$(CXXSTD) $(OPT) -arch=sm_$(ARCH) \
-              -I$(CUDA_INC) -I$(COACD_SRC) \
+              -I$(CUDA_INC) -I$(CUACD_SRC) \
               --expt-relaxed-constexpr \
               -lineinfo \
               -Xcompiler -Wno-unused-variable \
@@ -51,7 +51,7 @@ mm.o: $(CUDA_INC)/mm.cu
 bench_cpu_hausdorff.o: bench_cpu_hausdorff.cpp
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
 
-shape.o: $(COACD_SRC)/shape.cpp
+shape.o: $(CUACD_SRC)/shape.cpp
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
 
 # Final link: nvcc handles device linking for -rdc objects + host objects.

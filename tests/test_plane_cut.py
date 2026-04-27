@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import trimesh
 
-import coacd_gpu._gpu as _gpu
+import cuacd._gpu as _gpu
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ in two consecutive iterations is stuck.
 Usage:
     python scripts/debug_stuck_parts.py <mesh> [output_dir]
 
-Options mirror the coacd-gpu CLI decomposition flags; defaults are set to
+Options mirror the cuacd CLI decomposition flags; defaults are set to
 reproduce the pamo_abl_s squirrel.obj test case.
 """
 
@@ -25,7 +25,7 @@ import sys
 import tempfile
 import numpy as np
 import trimesh
-import coacd_gpu
+import cuacd
 
 
 def _parse_pool_bytes(s):
@@ -120,7 +120,7 @@ def main():
     # Build the inner-run command
     inner_cmd = [
         sys.executable, "-c", f"""
-import numpy as np, trimesh, coacd_gpu
+import numpy as np, trimesh, cuacd
 mesh = trimesh.load({str(args.input)!r}, force='mesh')
 verts = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
 tris = np.ascontiguousarray(mesh.faces, dtype=np.int32)
@@ -129,7 +129,7 @@ center = (lo + hi) / 2
 extent = float((hi - lo).max())
 scale = extent / 2 if extent > 0 else 1.0
 norm_verts = ((verts - center) / scale).astype(np.float32)
-with coacd_gpu.Context(device={args.device}, pool_bytes={pool_bytes}) as ctx:
+with cuacd.Context(device={args.device}, pool_bytes={pool_bytes}) as ctx:
     parts = ctx.lookahead_decompose(
         norm_verts, tris,
         max_iters={args.max_iters},
@@ -178,7 +178,7 @@ print(f'DONE: {{len(parts)}} parts')
         print(f"  nv={nv}, nt={nt}")
 
     # Now run again (quiet) to get the actual part meshes
-    with coacd_gpu.Context(device=args.device, pool_bytes=pool_bytes) as ctx:
+    with cuacd.Context(device=args.device, pool_bytes=pool_bytes) as ctx:
         all_parts = ctx.lookahead_decompose(
             norm_verts, tris,
             max_iters=args.max_iters,

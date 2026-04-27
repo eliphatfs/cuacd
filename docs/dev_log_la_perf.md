@@ -1,6 +1,6 @@
 # Lookahead Performance Optimization — Dev Log
 
-Goal: Reduce end-to-end wall time of the lookahead pipeline (`coacd-gpu
+Goal: Reduce end-to-end wall time of the lookahead pipeline (`cuacd
 tests/data/vhacd2_data_r0.1_mv10k/bunny.obj decomp_output/ --pool 10G --serial`),
 focused on the `la_hull` kernel which dominates the profile (≥ 50% of total
 GPU time per `pipeline_overview_bunny4_ncu.csv`).
@@ -112,7 +112,7 @@ fragmentation and wider arena bitmap scans.
 The tiny gain is within run-to-run variance and inconsistent with the
 pre-existing `docs/arena_sweep.md` (which shows 64 is near-optimal for the
 batch-hull workload). Keeping the default at 64 to avoid pessimizing other
-workloads; left env override `COACD_GPU_ARENAS=128` for users who want to try
+workloads; left env override `CUACD_GPU_ARENAS=128` for users who want to try
 it on their own pipelines.
 
 ### A5. Hoist `e->next` load above body in `bt_findMaxAngle` (KEPT)
@@ -160,7 +160,7 @@ already CSE-ing. Kept for code clarity; no regression.
 
 ## Results summary
 
-End-to-end CLI (`coacd-gpu tests/data/vhacd2_data_r0.1_mv10k/bunny.obj
+End-to-end CLI (`cuacd tests/data/vhacd2_data_r0.1_mv10k/bunny.obj
 decomp_output/ --pool 10G --serial`), 5 runs each:
 
 | Variant | run1 | run2 | run3 | run4 | run5 | mean |
@@ -587,18 +587,18 @@ Implementation:
 - Refcounting: pruned hulls leave `refcount=NULL` so `la_cleanup_tree`
   skips heap_free.
 
-Toggle: `COACD_LA_ROUGH_PRUNE` env var (default 1).
+Toggle: `CUACD_LA_ROUGH_PRUNE` env var (default 1).
 
 Benchmark (mirrors the canonical `/tmp/bench_la.py`: bunny normalized,
 2 warmups + 100 timed runs, single Context, threshold=0.05 default).
 
-Baseline (`COACD_LA_ROUGH_PRUNE=0`) confirms dev-log baseline:
+Baseline (`CUACD_LA_ROUGH_PRUNE=0`) confirms dev-log baseline:
 
 | n   | mean   | median | min    | max    | std   | parts |
 |-----|--------|--------|--------|--------|-------|-------|
 | 100 | 322 ms | 316 ms | 273 ms | 441 ms | 27 ms | 43    |
 
-`COACD_LA_ROUGH_PRUNE=1`: **fails with `plane_cut:pool_oom` at iter 5**
+`CUACD_LA_ROUGH_PRUNE=1`: **fails with `plane_cut:pool_oom` at iter 5**
 on bunny default config. The probe pass leaks pool memory across runs
 (`la_expand_quick` writes child items whose Mesh.verts heap allocations
 are not freed before the main full-expand overwrites the buffer / before
@@ -778,11 +778,11 @@ Three small pieces of diagnostic plumbing (kept in-tree, all low overhead):
    `heap_allocs - heap_frees` as a live-chunk count; stable across iterations
    ⇒ no leak, growing ⇒ leak.
 3. **Env-gated per-phase leak bisector** in `csrc/lookahead.c`:
-   set `COACD_LEAK_BISECT=1` and the host snaps both heap counters after
+   set `CUACD_LEAK_BISECT=1` and the host snaps both heap counters after
    every kernel launch in the iter loop, printing
    `[bisect iter=N] <phase> heap_diff=X (+Δ) scratch_diff=Y (+Δ)`. Makes
    it trivial to localize which kernel is the source of the drift.
-4. **Optional device-side assertion** via `COACD_LEAK_PROBE` build flag:
+4. **Optional device-side assertion** via `CUACD_LEAK_PROBE` build flag:
    when enabled, `la_free_decomp` prints any part whose refcount was not
    1 at the moment of final free (i.e. had stragglers).
 

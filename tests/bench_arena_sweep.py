@@ -1,7 +1,7 @@
 """bench_arena_sweep.py — Rebuild and benchmark across different HEAP_NUM_ARENAS values.
 
 For each arena count in [32, 64, 128, 256]:
-  1. Rebuild the extension with COACD_GPU_ARENAS=N
+  1. Rebuild the extension with CUACD_GPU_ARENAS=N
   2. Run the GPU hull benchmark (test_hull.py standalone)
   3. Parse the benchmark table
   4. Write a summary to docs/arena_sweep.md
@@ -23,7 +23,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def build(n_arenas):
     """Rebuild the extension with HEAP_NUM_ARENAS=n_arenas."""
     env = os.environ.copy()
-    env["COACD_GPU_ARENAS"] = str(n_arenas)
+    env["CUACD_GPU_ARENAS"] = str(n_arenas)
     print(f"\n[sweep] Building with HEAP_NUM_ARENAS={n_arenas} ...", flush=True)
     t0 = time.perf_counter()
     result = subprocess.run(

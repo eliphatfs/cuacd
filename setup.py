@@ -1,8 +1,8 @@
 """
-Build logic for coacd_gpu.
+Build logic for cuacd.
 
 One extension is built:
-  coacd_gpu._gpu — Native CPython extension for GPU convex decomposition,
+  cuacd._gpu — Native CPython extension for GPU convex decomposition,
                    Hausdorff distance, and convex hull computation.
 
 Embeds CUDA fatbin and links only against libcuda (driver API).
@@ -70,7 +70,7 @@ def _cuda_stubs_dir(cuda_home):
 # ---------------------------------------------------------------------------
 
 def _fatbin_gencode_flags():
-    archs_str = os.environ.get("COACD_GPU_ARCHS", "80;86;89;90")
+    archs_str = os.environ.get("CUACD_GPU_ARCHS", "80;86;89;90")
     archs = [a.strip() for a in archs_str.replace(";", ",").split(",") if a.strip()]
     flags = []
     for a in archs:
@@ -104,25 +104,25 @@ def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
     os.makedirs(build_dir, exist_ok=True)
 
     extra_defines = []
-    if os.environ.get("COACD_TRACK_EDGES"):
+    if os.environ.get("CUACD_TRACK_EDGES"):
         extra_defines.append("-DTRACK_MAX_EDGE_PAIRS")
-    if os.environ.get("COACD_GPU_ARENAS"):
-        extra_defines.append(f"-DHEAP_NUM_ARENAS={os.environ['COACD_GPU_ARENAS']}")
-    if os.environ.get("COACD_BEAM_DEBUG"):
-        extra_defines.append("-DCOACD_BEAM_DEBUG")
-    if os.environ.get("COACD_LEAK_PROBE"):
-        extra_defines.append("-DCOACD_LEAK_PROBE")
-    if os.environ.get("COACD_SERIAL_MERGE"):
+    if os.environ.get("CUACD_GPU_ARENAS"):
+        extra_defines.append(f"-DHEAP_NUM_ARENAS={os.environ['CUACD_GPU_ARENAS']}")
+    if os.environ.get("CUACD_BEAM_DEBUG"):
+        extra_defines.append("-DCUACD_BEAM_DEBUG")
+    if os.environ.get("CUACD_LEAK_PROBE"):
+        extra_defines.append("-DCUACD_LEAK_PROBE")
+    if os.environ.get("CUACD_SERIAL_MERGE"):
         extra_defines.append("-DBT_SERIAL_MERGE")
-    if os.environ.get("COACD_MEMCHECK"):
+    if os.environ.get("CUACD_MEMCHECK"):
         extra_defines.append("-fdevice-sanitize=memcheck")
 
     gencode = _fatbin_gencode_flags()
     cuda_dir = os.path.join(_ROOT, "cuda")
 
     # Compile each module to a relocatable device object in parallel.
-    # COACD_PARALLEL controls max concurrent nvcc processes (default: all).
-    max_jobs = int(os.environ.get("COACD_PARALLEL", 0)) or len(_CUDA_MODULES)
+    # CUACD_PARALLEL controls max concurrent nvcc processes (default: all).
+    max_jobs = int(os.environ.get("CUACD_PARALLEL", 0)) or len(_CUDA_MODULES)
     pending = []  # (Popen, name, obj)
     obj_files = []
     failed = []
@@ -180,7 +180,7 @@ def _fatbin_to_header(fatbin_file, header_file, symbol_name):
 
 class CoacdBuildExt(build_ext):
     def build_extension(self, ext):
-        if ext.name == "coacd_gpu._gpu":
+        if ext.name == "cuacd._gpu":
             self._build_gpu(ext)
         else:
             super().build_extension(ext)
@@ -206,10 +206,10 @@ class CoacdBuildExt(build_ext):
         ext.library_dirs = [_cuda_stubs_dir(cuda_home)]
         ext.libraries = ["cuda"]
         c_args = ["/std:c11"] if sys.platform == "win32" else ["-std=c11"]
-        if os.environ.get("COACD_V2_DEBUG"):
-            c_args.append("-DCOACD_V2_DEBUG=1")
-        if os.environ.get("COACD_GPU_ARENAS"):
-            c_args.append(f"-DHEAP_NUM_ARENAS={os.environ['COACD_GPU_ARENAS']}")
+        if os.environ.get("CUACD_V2_DEBUG"):
+            c_args.append("-DCUACD_V2_DEBUG=1")
+        if os.environ.get("CUACD_GPU_ARENAS"):
+            c_args.append(f"-DHEAP_NUM_ARENAS={os.environ['CUACD_GPU_ARENAS']}")
         ext.extra_compile_args = c_args
 
         build_ext.build_extension(self, ext)
@@ -220,7 +220,7 @@ class CoacdBuildExt(build_ext):
 # ---------------------------------------------------------------------------
 
 _gpu_ext = Extension(
-    name="coacd_gpu._gpu",
+    name="cuacd._gpu",
     sources=[
         os.path.join("csrc", "module.c"),
         os.path.join("csrc", "heap.c"),
@@ -232,7 +232,7 @@ _gpu_ext = Extension(
 )
 
 setup(
-    packages=["coacd_gpu"],
+    packages=["cuacd"],
     ext_modules=[_gpu_ext],
     cmdclass={"build_ext": CoacdBuildExt, **_extra_cmdclass},
     zip_safe=False,

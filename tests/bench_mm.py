@@ -36,8 +36,8 @@ Defaults: 200 points/hull, 64 hulls/call, 100 rounds.
 import argparse
 import time
 import numpy as np
-import coacd_gpu
-import coacd_gpu._gpu as _gpu
+import cuacd
+import cuacd._gpu as _gpu
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +81,7 @@ def exp1_compact_every_vs_never(n_pts, n_hulls, n_rounds, rng):
     pts_list = [make_gaussian_pts(n_pts, rng) for _ in range(n_hulls)]
 
     for label, compact_freq in [("never", 0), ("every call", 1)]:
-        ctx = coacd_gpu.Context(device=0)
+        ctx = cuacd.Context(device=0)
         try:
             # Warm-up
             ctx.batch_hull_volume(pts_list)
@@ -133,7 +133,7 @@ def exp2_compact_frequency(n_pts, n_hulls, n_rounds, rng):
     print("  " + "-" * 64)
 
     for freq in freqs:
-        ctx = coacd_gpu.Context(device=0)
+        ctx = cuacd.Context(device=0)
         try:
             ctx.batch_hull_volume(pts_list)
             ctx.heap_compact()
@@ -173,7 +173,7 @@ def exp3_pool_usage_trajectory(n_pts, n_hulls, n_rounds, rng):
 
     pts_list = [make_gaussian_pts(n_pts, rng) for _ in range(n_hulls)]
 
-    ctx = coacd_gpu.Context(device=0)
+    ctx = cuacd.Context(device=0)
     try:
         usages_no_compact = []
         for _ in range(n_rounds):
@@ -194,7 +194,7 @@ def exp3_pool_usage_trajectory(n_pts, n_hulls, n_rounds, rng):
         ctx.close()
 
     # Same with compact every call
-    ctx = coacd_gpu.Context(device=0)
+    ctx = cuacd.Context(device=0)
     try:
         usages_compact = []
         for i in range(n_rounds):

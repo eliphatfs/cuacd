@@ -3,7 +3,7 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "coacd_gpu"
+name = "cuacd"
 version = "0.1.0"
 description = "GPU-accelerated approximate convex decomposition"
 license = {text = "MIT"}
@@ -14,14 +14,14 @@ dependencies = ["numpy", "trimesh", "scipy", "rtree"]
 dev = ["pytest"]
 
 [project.urls]
-Repository = "https://github.com/eliphatfs/coacd-gpu"
+Repository = "https://github.com/eliphatfs/cuacd"
 
 [project.scripts]
-coacd-gpu = "coacd_gpu.cli:main"
+cuacd = "cuacd.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["coacd_gpu", "coacd_gpu.*"]
+include = ["cuacd", "cuacd.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -2,7 +2,7 @@
 
 ## Introduction
 
-When running `coacd-gpu` lookahead decomposition on high-resolution remeshed meshes (R256 — 256× face count), some parts get **"stuck"**: all 94 candidate plane cuts fail (CAP_INCOMPLETE), so the part remains over the concavity threshold (`*`) with identical `(nv, nt, rv_cost)` across consecutive iterations. The decomposition runs to `max_iters` without converging those parts.
+When running `cuacd` lookahead decomposition on high-resolution remeshed meshes (R256 — 256× face count), some parts get **"stuck"**: all 94 candidate plane cuts fail (CAP_INCOMPLETE), so the part remains over the concavity threshold (`*`) with identical `(nv, nt, rv_cost)` across consecutive iterations. The decomposition runs to `max_iters` without converging those parts.
 
 **Affected mesh:** `tests/data/remesh_R256/block.obj` (184,600 verts, 369,208 tris).
 
@@ -10,7 +10,7 @@ When running `coacd-gpu` lookahead decomposition on high-resolution remeshed mes
 
 **Reproduction command:**
 ```bash
-coacd-gpu tests/data/remesh_R256/block.obj decomp_output/test --verbose 1 --serial
+cuacd tests/data/remesh_R256/block.obj decomp_output/test --verbose 1 --serial
 ```
 
 The stuck behavior is non-deterministic — sometimes appears, sometimes doesn't (depends on atomic operation ordering).
@@ -73,7 +73,7 @@ The identical part geometry (verified by mesh_vol, centroid, bbox) produces vali
 | `cuda/la_lifecycle.cu` | la_apply_cuts: replaces old parts with children (line 171: skip if nparts<2) |
 | `cuda/la_refine.cu` | la_evaluate: selects best cut by min path cost |
 | `csrc/lookahead.c` | Host-side orchestration (concave_iters check at line 441) |
-| `coacd_gpu/cli.py` | CLI entry: normalize mesh → decompose → denormalize output |
+| `cuacd/cli.py` | CLI entry: normalize mesh → decompose → denormalize output |
 
 ## Code Changes Made
 
@@ -90,7 +90,7 @@ if (lane == 0) s_rng = 1u;
 - CAP_INCOMPLETE now prints `nv, nt, a, b, c, d` (plane coefficients)
 - Added `CUT_FAIL_NOOP` DPRINTF at the failure return (line ~1300)
 - Changed final `[pc]` line to `CUT_OK` with `n_pos, n_neg`
-**Status:** Only active with `COACD_BEAM_DEBUG=1`. Useful for diagnostics.
+**Status:** Only active with `CUACD_BEAM_DEBUG=1`. Useful for diagnostics.
 
 ### `scripts/debug_stuck_parts.py` — Improved matching
 - Changed stuck signature from `(nv, nt)` to `(nv, nt, rv_cost)` triple
@@ -184,5 +184,5 @@ The current fix emits a **degenerate (zero-area) ear triangle** at collinear ver
 
 ### Tooling added
 
-- `COACD_DUMP_PARTS_DIR=<dir>` runtime env (`csrc/lookahead.c`): dumps all parts at every iteration as `iter%03d_part%03d.bin` (header `[nv, nt, mesh_vol, hull_vol]` then verts then tris). Lets you cross-reference the verbose log to identify which dumped parts are *truly* stuck (the same `(nv, nt, mesh_vol, hull_vol)` row appearing across consecutive iters with `*`), independent of run-to-run non-determinism in the indexing.
+- `CUACD_DUMP_PARTS_DIR=<dir>` runtime env (`csrc/lookahead.c`): dumps all parts at every iteration as `iter%03d_part%03d.bin` (header `[nv, nt, mesh_vol, hull_vol]` then verts then tris). Lets you cross-reference the verbose log to identify which dumped parts are *truly* stuck (the same `(nv, nt, mesh_vol, hull_vol)` row appearing across consecutive iters with `*`), independent of run-to-run non-determinism in the indexing.
 - `cuda/la_concave.cu`: RNG seed pinned to `1u` (was `blockIdx.x * 2654435761u + 1u`) — makes concave-edge sampling reproducible across blocks. Did not by itself fix the stuck behavior, but is required to make stuck-part repro deterministic.
