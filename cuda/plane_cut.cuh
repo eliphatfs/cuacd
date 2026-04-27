@@ -86,6 +86,14 @@ __device__ inline int pc_edge_bsearch(const Edge2i* __restrict__ arr, int n, int
     return -1;
 }
 
+__device__ inline int pc_find_isect(const Edge2i* __restrict__ cross_edges, int n_cross,
+                                     const int* __restrict__ isect_idx, int va, int vb) {
+    int mn = (va < vb) ? va : vb;
+    int mx = (va < vb) ? vb : va;
+    int fi = pc_edge_bsearch(cross_edges, n_cross, mn, mx);
+    return (fi >= 0) ? isect_idx[fi] : -1;
+}
+
 __device__ inline float pc_cross2d(float ax, float ay, float bx, float by, float cx, float cy) {
     return (bx-ax)*(cy-ay) - (by-ay)*(cx-ax);
 }
@@ -594,12 +602,6 @@ __device__ inline PartPair plane_cut_block(
 
         int vi[3] = {i0,i1,i2}, si[3] = {s0,s1,s2};
 
-        #define FIND_ISECT(va, vb) ({ \
-            int _mn=((va)<(vb))?(va):(vb), _mx=((va)<(vb))?(vb):(va); \
-            int _fi=pc_edge_bsearch(cross_edges.raw(), n_cross, _mn, _mx); \
-            (_fi>=0)?isect_idx[_fi]:-1; \
-        })
-
         int on = -1;
         for (int k = 0; k < 3; k++) if (si[k] == 0) { on = k; break; }
         if (on >= 0) {
@@ -616,7 +618,7 @@ __device__ inline PartPair plane_cut_block(
             } else {
                 // Non-on-plane vertices have opposite signs — split at on-plane vertex.
                 // The intersection of the a_i-b_i edge with the plane divides the triangle.
-                int nvi = FIND_ISECT(a_i, b_i); if (nvi < 0) { DPRINTF("[pc-diag] FIND_ISECT_FAIL_ON blk=%d tri=%d a_i=%d b_i=%d\n", blockIdx.x, t, a_i, b_i); continue; }
+                int nvi = pc_find_isect(cross_edges.raw(), n_cross, isect_idx.raw(), a_i, b_i); if (nvi < 0) { DPRINTF("[pc-diag] FIND_ISECT_FAIL_ON blk=%d tri=%d a_i=%d b_i=%d\n", blockIdx.x, t, a_i, b_i); continue; }
                 if (sa > 0) {
                     int pi=atomicAdd(&s_counters[2],1); pos_tris[pi*3]=ov;pos_tris[pi*3+1]=a_i;pos_tris[pi*3+2]=nvi;
                     int ni=atomicAdd(&s_counters[3],1); neg_tris[ni*3]=ov;neg_tris[ni*3+1]=nvi;neg_tris[ni*3+2]=b_i;
@@ -631,7 +633,8 @@ __device__ inline PartPair plane_cut_block(
                 if (si[k]!=si[(k+1)%3] && si[k]!=si[(k+2)%3]) { lone=k; break; }
             if (lone < 0) { DPRINTF("[pc-diag] NO_LONE blk=%d tri=%d s=[%d,%d,%d]\n", blockIdx.x, t, si[0], si[1], si[2]); continue; }
             int lv=vi[lone], ov1=vi[(lone+1)%3], ov2=vi[(lone+2)%3], ls=si[lone];
-            int nv1=FIND_ISECT(lv,ov1), nv2=FIND_ISECT(lv,ov2);
+            int nv1=pc_find_isect(cross_edges.raw(), n_cross, isect_idx.raw(), lv, ov1);
+            int nv2=pc_find_isect(cross_edges.raw(), n_cross, isect_idx.raw(), lv, ov2);
             if (nv1<0||nv2<0) { DPRINTF("[pc-diag] FIND_ISECT_FAIL_LONE blk=%d tri=%d lv=%d ov1=%d ov2=%d nv1=%d nv2=%d\n", blockIdx.x, t, lv, ov1, ov2, nv1, nv2); continue; }
             if (ls > 0) {
                 int pi=atomicAdd(&s_counters[2],1); pos_tris[pi*3]=lv;pos_tris[pi*3+1]=nv1;pos_tris[pi*3+2]=nv2;
@@ -645,7 +648,6 @@ __device__ inline PartPair plane_cut_block(
                 pos_tris[(pi+1)*3]=ov1;pos_tris[(pi+1)*3+1]=ov2;pos_tris[(pi+1)*3+2]=nv2;
             }
         }
-        #undef FIND_ISECT
     }
     __syncthreads();
 
