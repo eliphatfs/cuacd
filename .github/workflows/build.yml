@@ -25,20 +25,17 @@ jobs:
           build-requirements: "setuptools>=64 wheel numpy"
           pip-wheel-args: "--no-deps -w dist/"
           pre-build-command: |
-            cat > /tmp/install_cuda.sh << 'SCRIPT'
-            export CUDA_VERSION="${{ inputs.cuda_version }}"
-            export CUDA_MAJOR="${CUDA_VERSION%%.*}"
-            export CUDA_RUN="cuda_${CUDA_VERSION}_linux.run"
-            echo "Downloading CUDA ${CUDA_VERSION} network installer..."
-            wget -q "https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUN}"
-            chmod +x "${CUDA_RUN}"
-            "./${CUDA_RUN}" --silent --toolkit --toolkitpath="/usr/local/cuda-${CUDA_MAJOR}"
-            ln -sf "/usr/local/cuda-${CUDA_MAJOR}/bin/nvcc" /usr/local/bin/nvcc
-            echo "CUDA_HOME=/usr/local/cuda-${CUDA_MAJOR}" >> "$GITHUB_ENV"
-            echo "CUACD_GPU_ARCHS=${{ inputs.archs }}" >> "$GITHUB_ENV"
+            export CUDA_VERSION=${{ inputs.cuda_version }} &&
+            export CUDA_MAJOR=${CUDA_VERSION%%.*} &&
+            export CUDA_RUN=cuda_${CUDA_VERSION}_linux.run &&
+            echo "Downloading CUDA ${CUDA_VERSION} network installer..." &&
+            wget -q https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUN} &&
+            chmod +x ${CUDA_RUN} &&
+            ./${CUDA_RUN} --silent --toolkit --toolkitpath=/usr/local/cuda-${CUDA_MAJOR} &&
+            ln -sf /usr/local/cuda-${CUDA_MAJOR}/bin/nvcc /usr/local/bin/nvcc &&
+            echo "CUDA_HOME=/usr/local/cuda-${CUDA_MAJOR}" >> "$GITHUB_ENV" &&
+            echo "CUACD_GPU_ARCHS=${{ inputs.archs }}" >> "$GITHUB_ENV" &&
             nvcc --version
-            SCRIPT
-            bash /tmp/install_cuda.sh
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
