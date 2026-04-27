@@ -42,32 +42,32 @@ jobs:
           name: manylinux-wheels
           path: dist/*.whl
 
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.21
-        with:
-          cuda: "${{ inputs.cuda_version }}"
-          method: "network"
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install build dependencies
-        run: pip install setuptools>=64 wheel numpy
-
-      - name: Build wheel
-        env:
-          CUACD_GPU_ARCHS: "${{ inputs.archs }}"
-        run: pip wheel --no-deps -w dist/ .
-
-      - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-wheels
-          path: dist/*.whl
+  # build-windows:
+  #   runs-on: windows-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Install CUDA Toolkit
+  #       uses: Jimver/cuda-toolkit@v0.2.35
+  #       with:
+  #         cuda: "${{ inputs.cuda_version }}"
+  #         method: "network"
+  #
+  #     - name: Set up Python
+  #       uses: actions/setup-python@v5
+  #       with:
+  #         python-version: "3.12"
+  #
+  #     - name: Install build dependencies
+  #       run: pip install setuptools>=64 wheel numpy
+  #
+  #     - name: Build wheel
+  #       env:
+  #         CUACD_GPU_ARCHS: "${{ inputs.archs }}"
+  #       run: pip wheel --no-deps -w dist/ .
+  #
+  #     - name: Upload wheel artifacts
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: windows-wheels
+  #         path: dist/*.whl
