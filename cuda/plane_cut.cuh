@@ -883,7 +883,7 @@ __device__ inline PartPair plane_cut_block(
                     // Phase 10: reconstruct loops from boundary edge pairs
                     // Lane 0 drives chain-following; all lanes help with inner search.
                     PC_BUF(int, be_a2, lv_ptr, n_boundary * 2);
-                    int* be_used = loop_starts.raw();  // borrow before it's filled
+                    PC_BUF(int, be_used, loop_starts.raw(), n_boundary);  // borrow before it's filled
                     for (int i = lane; i < n_boundary; i += 32) be_used[i] = 0;
                     __syncwarp();
 
