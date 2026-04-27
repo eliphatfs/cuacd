@@ -40,12 +40,14 @@ extern "C" __global__ void kdop_hull_kernel(
         out_nt[bid]      = mesh.nt;
         out_volumes[bid] = volume;
     }
+    __syncwarp();
 
     // Parallel block copy of verts
     if (mesh.verts && mesh.nv <= max_hull_verts) {
         float* dv = out_verts + (long long)bid * max_hull_verts * 3;
         for (int i = tid; i < mesh.nv * 3; i += KDOP_BLOCK)
             dv[i] = mesh.verts[i];
+        __syncwarp();
     }
 
     // Parallel block copy of tris

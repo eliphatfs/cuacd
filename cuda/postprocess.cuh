@@ -440,6 +440,7 @@ __device__ inline int decompose_components_block(
                 if (svol < 0.0f)
                     s_is_inner[c] = 1;
             }
+            __syncwarp();
         }
         __syncthreads();
 

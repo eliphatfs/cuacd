@@ -166,11 +166,13 @@ __device__ inline int warp_sort_inner(
         stack_hi[0] = seg_hi;
         sp = 1;
     }
+    __syncwarp();
 
     while (true) {
         int cur_sp = __shfl_sync(WARP_MASK, sp, 0);
         if (cur_sp <= 0) break;
         if (lane == 0) sp--;
+        __syncwarp();
         cur_sp--;
         int lo = stack_lo[cur_sp];
         int hi = stack_hi[cur_sp];

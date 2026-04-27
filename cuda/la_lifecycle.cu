@@ -338,6 +338,7 @@ extern "C" __global__ void la_decompose_components(
     // mesh. We must always write s_parts[0] back to decomp->parts[i].
     if (threadIdx.x == 0)
         decomp->parts[i] = s_parts[0];
+    __syncwarp();
 
     if (n_comp == 1) {
         return;

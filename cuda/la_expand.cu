@@ -279,9 +279,11 @@ extern "C" __global__ void la_expand(
     if (warp_id == 0) {
         float vol = mesh_volume_warp(&wo->parts[np - 1].mesh, wlane);
         if (wlane == 0) wo->parts[np - 1].mesh_vol = vol;
+        __syncwarp();
     } else if (warp_id == 1) {
         float vol = mesh_volume_warp(&wo->parts[np].mesh, wlane);
         if (wlane == 0) wo->parts[np].mesh_vol = vol;
+        __syncwarp();
     }
 
     // Also write to level0_out if provided (first expansion level only)
@@ -471,6 +473,7 @@ static __device__ __forceinline__ void la_cleanup_tree_item(
             if (old == 1) heap_free(&pool->heap, (void*)pp->hull.verts);
         }
     }
+    __syncwarp();
     if (tid == 0) wi->nparts = 0;
 }
 

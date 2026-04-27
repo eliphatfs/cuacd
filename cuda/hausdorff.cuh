@@ -681,6 +681,7 @@ __device__ __forceinline__ float hausdorff_block(
             atomicMinF(&s_bbox_min_b[1], tlo[1]); atomicMaxF(&s_bbox_max_b[1], thi[1]);
             atomicMinF(&s_bbox_min_b[2], tlo[2]); atomicMaxF(&s_bbox_max_b[2], thi[2]);
         }
+        __syncwarp();
     }
     if (need_bvh_a) {
         float tlo[3] = { 1e30f, 1e30f, 1e30f };
@@ -701,6 +702,7 @@ __device__ __forceinline__ float hausdorff_block(
             atomicMinF(&s_bbox_min_a[1], tlo[1]); atomicMaxF(&s_bbox_max_a[1], thi[1]);
             atomicMinF(&s_bbox_min_a[2], tlo[2]); atomicMaxF(&s_bbox_max_a[2], thi[2]);
         }
+        __syncwarp();
     }
     __syncthreads();
 

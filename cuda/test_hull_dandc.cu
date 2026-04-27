@@ -54,12 +54,14 @@ extern "C" __global__ void hull_dandc_kernel(
         out_nv[warp_id]     = s_mesh.nv;
         out_nt[warp_id]     = s_mesh.nt;
     }
+    __syncwarp();
 
     // Parallel warp copy of verts
     if (s_mesh.verts && s_mesh.nv <= max_hull_verts) {
         float* dv = out_verts + (long long)warp_id * max_hull_verts * 3;
         for (int i = lane; i < s_mesh.nv * 3; i += WARP_SIZE)
             dv[i] = s_mesh.verts[i];
+        __syncwarp();
     }
 
     // Parallel warp copy of tris
