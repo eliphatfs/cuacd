@@ -707,9 +707,9 @@ __device__ inline PartPair plane_cut_block(
     for (int t = tid; t < n_trace; t += PC_BLOCK) {
         int a = trace_tris[t*3], b = trace_tris[t*3+1], c = trace_tris[t*3+2];
         int bi = t * 3;
-        dir_edges[bi  ] = (Edge2i){a, b};
-        dir_edges[bi+1] = (Edge2i){b, c};
-        dir_edges[bi+2] = (Edge2i){c, a};
+        dir_edges[bi  ] = Edge2i{a, b};
+        dir_edges[bi+1] = Edge2i{b, c};
+        dir_edges[bi+2] = Edge2i{c, a};
     }
     __syncthreads();
 
