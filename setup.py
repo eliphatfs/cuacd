@@ -205,7 +205,7 @@ class CoacdBuildExt(build_ext):
         ]
         ext.library_dirs = [_cuda_stubs_dir(cuda_home)]
         ext.libraries = ["cuda"]
-        c_args = ["/std:c11"] if sys.platform == "win32" else ["-std=c11"]
+        c_args = ["/std:c11"] if sys.platform == "win32" else ["-std=c11", "-D_POSIX_C_SOURCE=199309L"]
         if os.environ.get("CUACD_V2_DEBUG"):
             c_args.append("-DCUACD_V2_DEBUG=1")
         if os.environ.get("CUACD_GPU_ARENAS"):
