@@ -29,7 +29,7 @@ jobs:
             export CUDA_MAJOR=${CUDA_VERSION%%.*} &&
             export CUDA_RUN=cuda_${CUDA_VERSION}_linux.run &&
             echo "Downloading CUDA ${CUDA_VERSION} network installer..." &&
-            wget -q https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUN} &&
+            curl -fsSL -o ${CUDA_RUN} https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUN} &&
             chmod +x ${CUDA_RUN} &&
             ./${CUDA_RUN} --silent --toolkit --toolkitpath=/usr/local/cuda-${CUDA_MAJOR} &&
             ln -sf /usr/local/cuda-${CUDA_MAJOR}/bin/nvcc /usr/local/bin/nvcc &&
