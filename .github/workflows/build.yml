@@ -25,9 +25,7 @@ jobs:
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
             pip install -U auditwheel patchelf &&
             auditwheel repair -w {dest_dir} {wheel} --exclude libcuda.so.1
-          CIBW_ENVIRONMENT: >-
-            CUDA_HOME=/usr/local/cuda
-            CUACD_GPU_ARCHS=80;86;89;90
+          CIBW_ENVIRONMENT: "CUDA_HOME=/usr/local/cuda CUACD_GPU_ARCHS=80;86;89;90"
 
       - uses: actions/upload-artifact@v4
         with:
