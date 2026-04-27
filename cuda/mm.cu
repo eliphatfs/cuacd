@@ -33,7 +33,6 @@ extern "C" __global__ void heap_init_kernel(DevicePool* pool) {
             h->free_count        = 0;
         }
     }
-    __syncwarp();
 
     // All lanes cooperatively zero heads[] and tails[] (64 entries each).
     for (int i = lane; i < HEAP_NUM_SUBBINS; i += 32) {

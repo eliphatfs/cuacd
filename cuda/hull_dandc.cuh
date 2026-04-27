@@ -1224,7 +1224,6 @@ __device__ inline int bt_extractMesh(BtHullState* __restrict__ s, int lane,
         int batch = (avail < WARP_SIZE) ? avail : WARP_SIZE;
         BtVIndex v = (lane < batch) ? queue[cur_qhead + lane] : BT_VI_NULL;
         if (lane == 0) s_qhead = cur_qhead + batch;
-        __syncwarp();
 
         if (v != BT_VI_NULL) {
             BtEdge* e = s->vblock[v].edges;
@@ -1473,16 +1472,13 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
 
     // points no longer needed after vertex init; release back to scratch heap.
     if (lane == 0) { heap_free(shared_sh, points); *pts_scratch_ref = NULL; }
-    __syncwarp();
 
     if (lane == 0) s->npoints = count;
-    __syncwarp();
 
     __shared__ BtIntermediateHull s_hulls[BT_HULL_GROUPS];
     __shared__ int   s_mergeStamp;
 
     if (lane == 0) s_mergeStamp = -3;
-    __syncwarp();
 
     // --- Per-group boundaries (BT_HULL_GROUPS groups; 2 lanes share each group) ---
     // Each lane computes its own group's start/end directly. The start point
@@ -1698,7 +1694,6 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
         s_result->nv = 0; s_result->nt = 0; s_result->refcount = NULL;
         s_pool.base = NULL; s_points_scratch = NULL;
     }
-    __syncwarp();
 
     if (n < 4) { __syncwarp(); return; }
 
@@ -1741,7 +1736,6 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
     BtPoint32* points = bt_compute_presort(state, pts, n, lane);
     if (!points) { if (lane == 0) s_err = KERR_BT_WARP_OOM; goto done; }
     if (lane == 0) s_points_scratch = points;
-    __syncwarp();
 
     {
         // --- Phase 2: sort (all lanes) ---
@@ -1836,7 +1830,6 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
                 s_result->nv    = s_nv_count; s_result->nt = s_nt_count;
                 s_result->refcount = s_rc;
             }
-            __syncwarp();
         }
     }
 
@@ -1852,8 +1845,7 @@ done:
     __syncwarp();
     if (lane == 0 && (n == 5549 || n == 4423)) DPRINTF("[hull] block=%d SLOW nv=%d n_filtered=%d result_nv=%d result_nt=%d dt=%lld dt_sort=%lld dt_subhull=%lld dt_treemerge=%lld dt_final=%lld \n",
         blockIdx.x, n, n, s_result->nv, s_result->nt, clock64() - t_start, t_sort - t_start, t_subhull - t_sort, t_treemerge - t_subhull, clock64() - t_treemerge);
-    __syncwarp();
-
+    
 
     // Publish local error to the global error word (visible to host / other blocks).
     if (lane == 0 && s_err) atomicOr(err, s_err);

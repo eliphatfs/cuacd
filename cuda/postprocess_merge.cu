@@ -548,14 +548,11 @@ extern "C" __global__ void la_merge_apply(
     // Copy verts from A then B.
     for (int i = lane; i < nva * 3; i += WARP_SIZE)
         s_verts[i] = A->mesh.verts[i];
-    __syncwarp();
     for (int i = lane; i < nvb * 3; i += WARP_SIZE)
         s_verts[nva * 3 + i] = B->mesh.verts[i];
-    __syncwarp();
     // Tris from A unchanged; tris from B offset by nva.
     for (int i = lane; i < nta * 3; i += WARP_SIZE)
         s_tris[i] = A->mesh.tris[i];
-    __syncwarp();
     for (int i = lane; i < ntb * 3; i += WARP_SIZE)
         s_tris[nta * 3 + i] = B->mesh.tris[i] + nva;
     __syncwarp();

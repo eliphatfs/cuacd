@@ -103,11 +103,9 @@ __device__ __forceinline__ Mesh kdop_hull_block(
             __syncwarp();
         } else if (s_local_err) {
             if (lane == 0) atomicOr(kernel_error, s_local_err);
-            __syncwarp();
         }
         if (lane == 0) DPRINTF("[kdop] block=%d FAST nv=%d result_nv=%d result_nt=%d dt=%lld\n",
             blockIdx.x, nv, s_result.nv, s_result.nt, clock64() - t_start);
-        __syncwarp();
         *out_volume = s_volume;
         return s_result;
     }
@@ -128,7 +126,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
     __syncwarp();
     if (s_local_err) {
         if (lane == 0) atomicOr(kernel_error, s_local_err);
-        __syncwarp();
         *out_volume = 0.0f;
         return s_result;
     }
@@ -164,7 +161,6 @@ __device__ __forceinline__ Mesh kdop_hull_block(
             s_extreme_pts[(a * 2 + 1) * 3 + 1] = verts[lmin_i * 3 + 1];
             s_extreme_pts[(a * 2 + 1) * 3 + 2] = verts[lmin_i * 3 + 2];
         }
-        __syncwarp();
     }
     __syncwarp();
 
@@ -397,7 +393,6 @@ cleanup:
 
     if (lane == 0 && (s_n_filtered == 5549 || s_n_filtered == 4423)) DPRINTF("[kdop] block=%d SLOW nv=%d n_filtered=%d result_nv=%d result_nt=%d dt=%lld dt_ep=%lld dt_ephull=%lld dt_filtered=%lld dt_final=%lld \n",
         blockIdx.x, nv, s_n_filtered, s_result.nv, s_result.nt, t_final - t_start, t_ep - t_start, t_ephull - t_ep, t_filtered - t_ephull, t_final - t_filtered);
-    __syncwarp();
     *out_volume = s_volume;
     return s_result;
 }

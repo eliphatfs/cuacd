@@ -832,7 +832,6 @@ __device__ inline PartPair plane_cut_block(
         int n_cap_expected = 0;
         int n_boundary = s_n_boundary;
         if (lane == 0) s_w_n_loops = 0;
-        __syncwarp();
         void* lv_ptr   = (void*)s_be_a;  // boundary edge pairs (be_a), freed after loop recon
 
         // Lane-0-only scratch — all NULL so heap_free is always safe.
@@ -901,21 +900,17 @@ __device__ inline PartPair plane_cut_block(
                                 DPRINTF("[pc-diag] LVI_OVERFLOW blk=%d lvi=%d n_boundary=%d n_loops=%d\n", blockIdx.x, lvi, n_boundary, n_loops);
                                 s_n_cap = -1;
                             }
-                            __syncwarp();
                             break;
                         }
                         if (lane == 0) lv[lvi] = first;
-                        __syncwarp();
                         lvi++;
                         int safety = n_boundary + 2;
                         while (cur != first && safety-- > 0) {
                             if (lvi >= n_boundary) {
                                 if (lane == 0) DPRINTF("[pc-diag] LVI_OVERFLOW_INNER blk=%d lvi=%d n_boundary=%d loop=%d\n", blockIdx.x, lvi, n_boundary, n_loops);
-                                __syncwarp();
                                 break;
                             }
                             if (lane == 0) lv[lvi] = cur;
-                            __syncwarp();
                             lvi++;
                             // Warp-parallel edge search: each lane checks a stride
                             int my_found_i = -1;
@@ -924,12 +919,10 @@ __device__ inline PartPair plane_cut_block(
                                     my_found_i = i; break;
                                 }
                             }
-                            __syncwarp();
                             unsigned mask = __ballot_sync(0xFFFFFFFF, my_found_i >= 0);
                             if (mask == 0) {
                                 // [DIAG-4] loop chain broken
                                 if (lane == 0) DPRINTF("[pc-diag] LOOP_BREAK blk=%d loop=%d cur=%d first=%d lvi=%d n_boundary=%d\n", blockIdx.x, n_loops, cur, first, lvi, n_boundary);
-                                __syncwarp();
                                 break;
                             }
                             int winner = __ffs(mask) - 1;  // lowest lane with a match
@@ -941,7 +934,6 @@ __device__ inline PartPair plane_cut_block(
                         // overflowed, or safety counter expired.
                         if (cur != first) {
                             if (lane == 0) s_n_cap = -1;
-                            __syncwarp();
                             break;  // abandon loop reconstruction
                         }
                         if (lane == 0) {
@@ -955,7 +947,6 @@ __device__ inline PartPair plane_cut_block(
                     // [DIAG-3] max_loops exceeded
                     if (lane == 0 && n_loops >= 128)
                         DPRINTF("[pc-diag] MAX_LOOPS blk=%d n_loops=%d n_boundary=%d\n", blockIdx.x, n_loops, n_boundary);
-                    __syncwarp();
 
                     // be_a (lv_ptr) no longer needed — free to reclaim memory.
                     if (lane == 0) { heap_free(scratch_heap, lv_ptr); lv_ptr = NULL; s_be_a = NULL; }
@@ -1021,7 +1012,6 @@ __device__ inline PartPair plane_cut_block(
                                 float t = (pv_ - ay) / (by - ay);
                                 if (ax + t * (bx - ax) > pu_) my_crossings++;
                             }
-                            __syncwarp();
                             // Warp-reduce crossings
                             for (int s = 16; s > 0; s >>= 1)
                                 my_crossings += __shfl_xor_sync(0xFFFFFFFF, my_crossings, s);
@@ -1168,7 +1158,6 @@ __device__ inline PartPair plane_cut_block(
 
                         // Ear-clip this polygon (warp-cooperative)
                         if (lane == 0) n_cap_expected += poly_n - 2;
-                        __syncwarp();
                         if (poly_n >= 3) {
                             int* prev_a = ear_prevnext.raw();
                             int* next_a = ear_prevnext.raw() + poly_n;
@@ -1225,7 +1214,6 @@ __device__ inline PartPair plane_cut_block(
                                         pc_pt_in_tri(cu,cv,up,vp_,uc,vc_,un,vn_))
                                         { ear=0; }
                                 }
-                                __syncwarp();
                                 if (__ballot_sync(0xFFFFFFFF, !ear))
                                     ear = 0;
                                 else
@@ -1262,7 +1250,6 @@ __device__ inline PartPair plane_cut_block(
                     if (n_cap < n_cap_expected) {
                         DPRINTF("[pc-diag] CAP_INCOMPLETE blk=%d n_cap=%d expected=%d\n", blockIdx.x, n_cap, n_cap_expected);
                         if (lane == 0) s_n_cap = -1;
-                        __syncwarp();
                     }
 
                     // Merged loop block no longer needed

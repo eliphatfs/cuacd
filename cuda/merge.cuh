@@ -84,7 +84,6 @@ __device__ __forceinline__ void la_merge_concat_verts_warp(
 {
     for (int i = lane; i < nva * 3; i += WARP_SIZE)
         dst[i] = va[i];
-    __syncwarp();
     for (int i = lane; i < nvb * 3; i += WARP_SIZE)
         dst[nva * 3 + i] = vb[i];
 }

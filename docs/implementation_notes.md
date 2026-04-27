@@ -1,13 +1,5 @@
 # Implementation Notes
 
-## sm_90 Requires Explicit __syncwarp() After if (lane == 0) Writes
-
-On Hopper (H200, sm_90) the warp scheduler does **not** keep threads close to lockstep through divergent `if (lane == 0)` blocks. On sm_86/89 these blocks "happened to" reconverge before the next warp-collective op (`__ballot_sync`, `__shfl_sync`); on sm_90 lanes 1–31 race ahead, hit `__ballot_sync(0xFFFFFFFF, …)` while lane 0 is still in the divergent block, and the active mask used at the call no longer matches the named mask — the spec calls this UB. Observed symptom: `__shfl_sync(0xFFFFFFFF, var, winner)` returned per-lane register values (`-1` instead of the winner's value), `__activemask()` at the call site read `0x1` (only lane 0).
-
-**Rule**: every `if (lane == 0) ...` (statement *or* block) and every warp-strided loop (`for (int i = lane; i < N; i += 32)` with or without `break`) must be followed by an explicit `__syncwarp()` unless the very next statement is itself a warp barrier (`__syncwarp`, `__syncthreads`, any `*_sync` warp intrinsic) or a control-flow exit (`return`/`break`/`continue`/`goto`). The "_sync" suffix on warp intrinsics names a precondition (all named lanes must converge here) — it does not provide convergence on Hopper.
-
-Fixed across `plane_cut.cuh`, `hull_dandc.cuh`, `kdop_hull.cuh`, `merge.cuh`, `postprocess.cuh`, `mm.cu`, `warp_sort.cuh`, `hausdorff.cuh`, `la_expand.cu`, `la_lifecycle.cu`, `postprocess_merge.cu`, and the test kernels.
-
 ## la_seed_tree: Unguarded atomicAdd Bumped Refcount 32×
 
 `la_seed_tree` launched with 32 threads per block but bumped the source part's `mesh.refcount` without a `threadIdx.x == 0` guard:
