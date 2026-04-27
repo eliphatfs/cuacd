@@ -21,19 +21,20 @@ jobs:
       - name: Build manylinux wheel
         uses: RalfG/python-wheels-manylinux-build@v0.7.1
         with:
+          python-versions: "cp310"
           build-requirements: "setuptools>=64 wheel numpy"
           pip-wheel-args: "--no-deps -w dist/"
           pre-build-command: |
-            CUDA_VERSION=${{ inputs.cuda_version }}
-            CUDA_KEYRING=https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-keyring_1.1-1_all.deb
-            curl -fsSL "$CUDA_KEYRING" -o /tmp/cuda-keyring.deb
-            rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/D42D0685.pub
-            yum install -y /tmp/cuda-keyring.deb
-            yum install -y cuda-nvcc-${CUDA_VERSION/./-} cuda-cudart-devel-${CUDA_VERSION/./-}
-            ln -sf /usr/local/cuda-${CUDA_VERSION%.*}/bin/nvcc /usr/local/bin/nvcc
-            export CUDA_HOME=/usr/local/cuda-${CUDA_VERSION%.*}
-            echo "CUDA_HOME=$CUDA_HOME" >> "$GITHUB_ENV"
-            echo "CUACD_GPU_ARCHS=${{ inputs.archs }}" >> "$GITHUB_ENV"
+            CUDA_VERSION=${{ inputs.cuda_version }} && \
+            CUDA_MAJOR=${CUDA_VERSION%%.*} && \
+            CUDA_RUN=cuda_${CUDA_VERSION}_linux.run && \
+            echo "Downloading CUDA ${CUDA_VERSION} network installer..." && \
+            wget -q https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUN} && \
+            chmod +x ${CUDA_RUN} && \
+            ./${CUDA_RUN} --silent --toolkit --toolkitpath=/usr/local/cuda-${CUDA_MAJOR} && \
+            ln -sf /usr/local/cuda-${CUDA_MAJOR}/bin/nvcc /usr/local/bin/nvcc && \
+            echo "CUDA_HOME=/usr/local/cuda-${CUDA_MAJOR}" >> "$GITHUB_ENV" && \
+            echo "CUACD_GPU_ARCHS=${{ inputs.archs }}" >> "$GITHUB_ENV" && \
             nvcc --version
 
       - name: Upload wheel artifacts
