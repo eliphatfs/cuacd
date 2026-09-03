@@ -105,7 +105,7 @@ with cuacd.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto (70%
     volumes, errors = ctx.batch_hull_volume(pts_list)
     volumes = ctx.batch_mesh_volume(verts_list, tris_list)
     results = ctx.batch_hull_dandc_mesh(pts_list)   # list of (verts, tris, volume) — exact D&C hull
-    results = ctx.batch_kdop_hull_mesh(pts_list)    # list of (verts, tris, volume) — approximate k-DOP hull
+    results = ctx.batch_kdop_hull_mesh(pts_list)    # list of (verts, tris, volume) — exact hull via extreme-point prefilter + D&C
     parts = ctx.lookahead_decompose(verts, tris, max_iters=100, width=60, width2=5, threshold=0.05,
                                      decompose_components=False,
                                      no_decompose_components_per_iter=False,

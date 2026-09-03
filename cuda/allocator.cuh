@@ -11,9 +11,9 @@
 //   - spin-lock for concurrent access
 //
 // Sub-bin layout (64 sub-bins indexed 0..63):
-//   Bin b covers [4K·2^b, 8K·2^b). Two linear halves:
-//     sub-bin 2b   = [4K·2^b, 6K·2^b)  lower half
-//     sub-bin 2b+1 = [6K·2^b, 8K·2^b)  upper half
+//   Bin b covers [512·2^b, 1024·2^b). Two linear halves (512 = HEAP_ALIGN):
+//     sub-bin 2b   = [512·2^b, 768·2^b)  lower half
+//     sub-bin 2b+1 = [768·2^b, 1024·2^b)  upper half
 //
 // Block layout: [HeapBlockHdr (16B)] [user data (data_size B)] [HeapBlockFtr (16B)]
 //   Free block data: data[0..7]=prev ptr, data[8..15]=next ptr (HeapBlockHdr addrs, 0=end)

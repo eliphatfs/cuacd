@@ -8,20 +8,17 @@ Investigates:
   5. Notes on HEAP_NUM_ARENAS (compile-time constant, 64) effect on
      fragmentation and performance.
 
-KEY FINDING (from benchmark results):
-  WITHOUT compact: pool usage is flat after the first call (all blocks freed
-  to correct arenas by blockIdx.x % 64 and reused in subsequent calls).
-  Pool offset NEVER grows after the warm-up allocation.
+NOTE (results reflect an earlier heap_compact implementation):
+  These findings were measured when heap_compact() re-inserted free blocks
+  by address hash (heap_arena_for_addr) rather than by blockIdx.x % 64 —
+  an arena mismatch that made routine compaction grow the pool on every call.
+  heap_compact has since been changed to a no-op (free-block coalescing is
+  handled inside heap_free), so run it only as a historical reference for the
+  allocator behavior, not as guidance on a live compact() API.
 
-  WITH compact: pool grows on every subsequent call because heap_compact
-  re-inserts free blocks by address hash (heap_arena_for_addr), not by
-  blockIdx.x % 64. The next kernel's blockIdx finds its preferred arena
-  empty → allocates a new slab from the bump pool. This is the arena
-  mismatch bug: alloc/free use blockIdx.x % 64, compact uses address hash.
-
-  RECOMMENDATION: do NOT call heap_compact() routinely. The kernels already
-  free all heap allocations (plane_cut_kernel and hull_dandc_kernel both call
-  heap_free before returning), so the pool stabilizes naturally.
+  Original observation: pool usage is flat after the first call when blocks
+  are freed to the correct arena by blockIdx.x % HEAP_NUM_ARENAS and reused
+  in subsequent calls; the pool offset never grows after warm-up.
 
   heap_compact() is only useful in the (currently unused) case where you want
   to hold heap-allocated data alive across calls (e.g. a streaming pipeline
