@@ -304,6 +304,8 @@ extern "C" __global__ void la_expand_quick(
     // Reconstruct best PartPair from saved per-axis data
     int ba = s_best_axis;  // shorthand
     if (tid == 0) {
+        // Inherit cc_id from the parent part being cut (wi->parts[np-1]).
+        int parent_cc = wi->parts[np - 1].cc_id;
         // Pos part
         wo->parts[np - 1].mesh.verts    = (float*)s_vptrs[ba][0];
         wo->parts[np - 1].mesh.tris     = (int*)s_tptrs[ba][0];
@@ -318,6 +320,7 @@ extern "C" __global__ void la_expand_quick(
         wo->parts[np - 1].mesh_vol      = s_vols[ba][0];
         wo->parts[np - 1].hull_vol      = 0.0f;
         wo->parts[np - 1].hausdorff     = 0.0f;
+        wo->parts[np - 1].cc_id         = parent_cc;
         // Neg part
         wo->parts[np].mesh.verts    = (float*)s_vptrs[ba][1];
         wo->parts[np].mesh.tris     = (int*)s_tptrs[ba][1];
@@ -332,6 +335,7 @@ extern "C" __global__ void la_expand_quick(
         wo->parts[np].mesh_vol      = s_vols[ba][1];
         wo->parts[np].hull_vol      = 0.0f;
         wo->parts[np].hausdorff     = 0.0f;
+        wo->parts[np].cc_id         = parent_cc;
 
         wo->nparts = np + 1;
 

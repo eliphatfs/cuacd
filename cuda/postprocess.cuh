@@ -5,8 +5,11 @@
 //
 // Algorithm:
 //   1  Read input dims (thread 0), early-return if nv==0 or nt==0.
-//   2  Scratch alloc: parents[nv] + vert_comp[nv] + vert_local_idx[nv]  (thread 0).
-//                     comp_nv/comp_nt are shared memory (DC_MAX_OUT each).
+//   2  Scratch alloc (thread 0): parents[nv] + vert_comp[nv] + vert_local_idx[nv]
+//                              + comp_nv[DC_MAX_OUT] + comp_nt[DC_MAX_OUT]
+//                              + is_inner[DC_MAX_OUT].
+//      (DC_MAX_OUT=4096 makes shared-memory arrays infeasible — counters live on
+//       the scratch heap alongside the per-vertex tables.)
 //   3  Init parents[v] = pack(0,v)   (all threads).
 //   4  Union edges from triangles     (all threads).
 //   5  Assign sequential component IDs: parallel root walk + clear (all threads),
@@ -17,7 +20,10 @@
 //   9  Scatter vertices with atomicAdd index (all threads).
 //  10  Re-zero comp_nt                (all threads).
 //  11  Scatter triangles with remapped indices (all threads).
-// 11b  Compute mesh_vol per output component (1 warp each, 4 warps stride).
+// 11b  Compute mesh_vol = |signed_vol| per output component; flag negative-svol
+//      components as unreachable interiors (s_is_inner).
+// 11c  Compact: discard inner-shell components (only when mixed with outers,
+//      keeps at least one component).
 //  12  Free input mesh + scratch (thread 0).
 //
 #pragma once
@@ -29,8 +35,10 @@
 // Block size for decompose_components_block.
 #define DC_BLOCK 128
 
-// Maximum output components (capacity of output_parts[]).
-#define DC_MAX_OUT 32
+// Maximum output components (capacity of output_parts[]). Caller must
+// supply an output_parts buffer sized >= DC_MAX_OUT (heap-allocated, since
+// 4096 * sizeof(Part) far exceeds the 48 KB static shared-memory budget).
+#define DC_MAX_OUT 4096
 
 // Pack rank+parent into one unsigned int.
 //   Bits [31..DC_RANK_SHIFT] = rank,  bits [DC_RANK_SHIFT-1..0] = parent id.
@@ -52,6 +60,7 @@ __device__ inline void dc_zero_part(Part* __restrict__ p) {
     p->mesh.verts = NULL; p->mesh.tris = NULL; p->mesh.nv = 0; p->mesh.nt = 0; p->mesh.refcount = NULL;
     p->hull.verts = NULL; p->hull.tris = NULL; p->hull.nv = 0; p->hull.nt = 0; p->hull.refcount = NULL;
     p->mesh_vol = 0.0f; p->hull_vol = 0.0f; p->hausdorff = 0.0f;
+    p->cc_id = 0;
 }
 
 // ============================================================================
@@ -137,6 +146,8 @@ __device__ inline int decompose_components_block(
     int tid = (int)threadIdx.x;
 
     // Shared pointers broadcast from thread 0 to the block.
+    // comp_nv/comp_nt/is_inner live on the scratch heap (DC_MAX_OUT=4096 →
+    // ~36 KB per kernel call; static shared-memory was overflowing).
     __shared__ int    s_nv, s_nt;
     __shared__ float* s_in_verts;
     __shared__ int*   s_in_tris;
@@ -144,8 +155,9 @@ __device__ inline int decompose_components_block(
     __shared__ unsigned int* s_parents;
     __shared__ unsigned int* s_vert_comp;
     __shared__ unsigned int* s_vert_local_idx;
-    __shared__ unsigned int s_comp_nv[DC_MAX_OUT];
-    __shared__ unsigned int s_comp_nt[DC_MAX_OUT];
+    __shared__ unsigned int* s_comp_nv;
+    __shared__ unsigned int* s_comp_nt;
+    __shared__ char*         s_is_inner;
     __shared__ int    s_n_components;
 
     // -------------------------------------------------------------------------
@@ -172,22 +184,30 @@ __device__ inline int decompose_components_block(
 
     // -------------------------------------------------------------------------
     // Phase 2: Single scratch alloc (thread 0).
-    // Layout: [parents(nv) | vert_comp(nv) | vert_local_idx(nv)]
-    // comp_nv/comp_nt are in shared memory (DC_MAX_OUT entries each).
+    // Layout (16-byte aligned segments):
+    //   [parents(nv) | vert_comp(nv) | vert_local_idx(nv)
+    //    | comp_nv(DC_MAX_OUT) | comp_nt(DC_MAX_OUT) | is_inner(DC_MAX_OUT)]
     // -------------------------------------------------------------------------
     if (tid == 0) {
-        unsigned int total = (unsigned int)(3 * nv) * sizeof(unsigned int);
+        unsigned int verts_bytes  = DC_ALIGN16((unsigned int)nv * 3u * sizeof(unsigned int));
+        unsigned int counts_bytes = DC_ALIGN16(2u * (unsigned int)DC_MAX_OUT * sizeof(unsigned int));
+        unsigned int inner_bytes  = DC_ALIGN16((unsigned int)DC_MAX_OUT * sizeof(char));
+        unsigned int total = verts_bytes + counts_bytes + inner_bytes;
         void* raw = NULL;
         int rc = heap_alloc(scratch, total, &raw);
         if (rc != HEAP_OK || !raw) {
             atomicOr(err, KERR_DC_OOM);
             s_scratch_base = NULL;
         } else {
-            unsigned int* base = (unsigned int*)raw;
-            s_scratch_base    = base;
-            s_parents         = base;
-            s_vert_comp       = base + nv;
-            s_vert_local_idx  = base + 2 * nv;
+            unsigned char* base_b = (unsigned char*)raw;
+            unsigned int*  base_u = (unsigned int*)raw;
+            s_scratch_base    = base_u;
+            s_parents         = base_u;
+            s_vert_comp       = base_u + nv;
+            s_vert_local_idx  = base_u + 2 * nv;
+            s_comp_nv         = (unsigned int*)(base_b + verts_bytes);
+            s_comp_nt         = s_comp_nv + DC_MAX_OUT;
+            s_is_inner        = (char*)(base_b + verts_bytes + counts_bytes);
         }
     }
     __syncthreads();
@@ -419,14 +439,13 @@ __device__ inline int decompose_components_block(
     __syncthreads();
 
     // -------------------------------------------------------------------------
-    // Phase 11b: Compute signed mesh_vol for each output component (1 warp each).
-    // DC_BLOCK=128 → 4 warps stride over n_comp components.
-    // Components with negative signed volume are inner shells (cavity surfaces)
-    // and are discarded.  At least one component is always kept.
+    // Phase 11b: Compute mesh_vol per output component and flag negative-svol
+    // (unreachable interiors). 1 warp each; DC_BLOCK=128 → 4 warps stride.
+    // mesh_signed_volume_warp now anchors at v[0] so the f32 sign is reliable
+    // (without that, ~30% of CCs in scenes like bistro had random signs from
+    // catastrophic cancellation and we'd discard valid pieces).
     // -------------------------------------------------------------------------
     {
-        // Use a shared flag array to mark inner shells without mutating Part.
-        __shared__ char s_is_inner[DC_MAX_OUT];
         for (int c = tid; c < DC_MAX_OUT; c += DC_BLOCK)
             s_is_inner[c] = 0;
         __syncthreads();
@@ -443,20 +462,21 @@ __device__ inline int decompose_components_block(
         }
         __syncthreads();
 
-        // Compact: remove inner-shell components (only if n_comp > 1 and
-        // at least one is an outer shell).
+        // -------------------------------------------------------------------------
+        // Phase 11c: Compact, removing unreachable-interior components. Only
+        // when n_comp > 1 and the inner/outer split is mixed (if all are
+        // inner — unusual — keep them all so the caller still gets data).
+        // -------------------------------------------------------------------------
         if (n_comp > 1) {
             int n_inner = 0;
             for (int c = 0; c < n_comp; c++)
                 n_inner += s_is_inner[c];
 
             if (n_inner > 0 && n_inner < n_comp) {
-                // Some inner shells, some outer — compact
                 if (tid == 0) {
                     int keep = 0;
                     for (int c = 0; c < n_comp; c++) {
                         if (s_is_inner[c]) {
-                            // Free discarded component's mesh allocation
                             if (output_parts[c].mesh.refcount) {
                                 int old = atomicAdd(output_parts[c].mesh.refcount, -1);
                                 if (old == 1)
@@ -468,17 +488,13 @@ __device__ inline int decompose_components_block(
                             keep++;
                         }
                     }
-                    // Zero out stale slots
                     for (int c = keep; c < n_comp; c++)
                         dc_zero_part(&output_parts[c]);
-                    n_comp = keep;
                     s_n_components = keep;
                 }
                 __syncthreads();
                 n_comp = s_n_components;
             }
-            // If all components are inner shells (n_inner == n_comp), keep all.
-            // This is unusual but preserves the original data intact.
         }
     }
 

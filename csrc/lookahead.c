@@ -23,7 +23,7 @@
 
 #define LA_MAX_PARTS_H     8
 #define LA_MAX_CUTTING_H   16
-#define LA_MAX_DECOMP_H    1024
+#define LA_MAX_DECOMP_H    16384
 #define LA_MAX_LEVELS_H    4
 
 struct LaWorkItem_h {
@@ -39,7 +39,7 @@ struct LaWorkItem_h {
 struct LaDecompState_h {
     struct Part_h parts[LA_MAX_DECOMP_H];
     int nparts;
-    int _pad;
+    int cc_id_counter;  // mirror of cuda/structs.cuh LaDecompState::cc_id_counter
 };
 
 struct LaEvalResult_h {

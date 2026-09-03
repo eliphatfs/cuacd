@@ -80,13 +80,12 @@ def _merge_meshes(meshes):
             np.concatenate(all_tris).astype(np.int32))
 
 
-def _decompose(verts, tris):
+def _decompose(verts, tris, max_comp=64):
     """Call GPU decompose_components; return list of (verts, tris)."""
     verts = np.ascontiguousarray(verts, dtype=np.float32)
     tris = np.ascontiguousarray(tris, dtype=np.int32)
     nv, nt = len(verts), len(tris)
 
-    max_comp = 32
     max_vp = nv + 16
     max_tp = nt + 16
 
@@ -210,28 +209,22 @@ def test_volume_conservation():
         f"Volume mismatch: {comp_vol_sum} vs {original_vol}"
 
 
-def test_33_disjoint_cubes_clamp_to_32():
-    """33 disjoint unit cubes exceed DC_MAX_OUT=32.
+def test_33_disjoint_cubes_no_clamp():
+    """33 disjoint unit cubes — well below DC_MAX_OUT=4096, so no clamping.
 
-    The clamp merges the last two components into one output slot,
-    producing 32 output parts: 31 with volume=1 and 1 with volume=2.
-    All must be watertight with positive volume.
+    All 33 should come back as separate components, each with volume=1.
     """
     cubes = [_make_cube(center=(i * 3, 0, 0), size=1.0) for i in range(33)]
     verts, tris = _merge_meshes(cubes)
 
-    comps = _decompose(verts, tris)
-    assert len(comps) == 32, \
-        f"Expected 32 components, got {len(comps)}"
+    comps = _decompose(verts, tris, max_comp=64)
+    assert len(comps) == 33, \
+        f"Expected 33 components, got {len(comps)}"
 
     vols = sorted([abs(_signed_volume(cv, ct)) for cv, ct in comps])
-    # 31 components with vol≈1, 1 component with vol≈2
     vol1_count = sum(1 for v in vols if abs(v - 1.0) < 1e-3)
-    vol2_count = sum(1 for v in vols if abs(v - 2.0) < 1e-3)
-    assert vol1_count == 31, \
-        f"Expected 31 components with volume 1.0, got {vol1_count}; vols={vols}"
-    assert vol2_count == 1, \
-        f"Expected 1 component with volume 2.0, got {vol2_count}; vols={vols}"
+    assert vol1_count == 33, \
+        f"Expected 33 components with volume 1.0, got {vol1_count}; vols={vols}"
 
     # All components must be watertight (positive signed volume)
     for i, (cv, ct) in enumerate(comps):

@@ -29,10 +29,24 @@ extern "C" __global__ void test_postprocess_dc_kernel(
     DeviceHeap*  scratch_heap,
     int*         __restrict__ kernel_error)
 {
-    __shared__ Part  s_parts[DC_MAX_OUT];
     __shared__ Part  s_input_part;
+    __shared__ Part* s_parts;  // scratch-heap allocated (DC_MAX_OUT entries)
 
     int tid = threadIdx.x;
+
+    if (tid == 0) {
+        void* raw = NULL;
+        int rc = heap_alloc(scratch_heap,
+                            (unsigned int)(DC_MAX_OUT * sizeof(Part)), &raw);
+        if (rc != HEAP_OK || !raw) {
+            if (kernel_error) atomicMax(kernel_error, 1);
+            s_parts = NULL;
+        } else {
+            s_parts = (Part*)raw;
+        }
+    }
+    __syncthreads();
+    if (!s_parts) return;
 
     // -------------------------------------------------------------------------
     // Step 1: Build a heap-allocated input Part (thread 0).
@@ -126,5 +140,6 @@ extern "C" __global__ void test_postprocess_dc_kernel(
     if (tid == 0) {
         for (int c = 0; c < n_comp; c++)
             heap_free(heap, s_parts[c].mesh.verts);
+        heap_free(scratch_heap, (void*)s_parts);
     }
 }

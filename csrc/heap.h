@@ -55,6 +55,7 @@ struct Part_h {
     float mesh_vol;
     float hull_vol;
     float hausdorff;
+    int   cc_id;       // mirror of cuda/structs.cuh Part::cc_id
 };
 
 struct gpu_part_result {

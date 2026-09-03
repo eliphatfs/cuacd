@@ -248,6 +248,12 @@ extern "C" __global__ void la_expand(
 
     // Write the two new parts and metadata
     if (tid == 0) {
+        // Inherit cc_id from the parent part being cut (wi->parts[np-1]).
+        // plane_cut_block leaves cc_id zeroed (via pc_zero_part), so we must
+        // populate it here to preserve CC identity through the lookahead tree.
+        int parent_cc = wi->parts[np - 1].cc_id;
+        pp.pos.cc_id = parent_cc;
+        pp.neg.cc_id = parent_cc;
         wo->parts[np - 1] = pp.pos;
         wo->parts[np]     = pp.neg;
         wo->nparts        = np + 1;

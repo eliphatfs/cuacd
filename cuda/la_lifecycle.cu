@@ -74,7 +74,9 @@ extern "C" __global__ void la_initialize(
         p->hausdorff     = 0.0f;
         p->mesh_vol      = mesh_vol;
         p->hull_vol      = s_hull_vol;
+        p->cc_id         = 0;       // unassigned — first dc call assigns fresh ids
         decomp->nparts   = 1;
+        decomp->cc_id_counter = 0;  // ids start at 1 after the first atomicAdd
     }
 }
 
@@ -319,7 +321,30 @@ extern "C" __global__ void la_decompose_components(
     Part* p = &decomp->parts[i];
     if (p->mesh.nv == 0 || p->mesh.nt == 0) return;
 
-    __shared__ Part s_parts[DC_MAX_OUT];
+    // s_parts lives on the scratch heap — DC_MAX_OUT * sizeof(Part) is too
+    // large for static shared memory.
+    __shared__ Part* s_parts;
+    if (threadIdx.x == 0) {
+        void* raw = NULL;
+        int rc = heap_alloc(&pool->scratch,
+                            (unsigned int)(DC_MAX_OUT * sizeof(Part)), &raw);
+        if (rc != HEAP_OK || !raw) {
+            atomicOr(err, KERR_DC_OOM);
+            s_parts = NULL;
+        } else {
+            s_parts = (Part*)raw;
+        }
+    }
+    __syncthreads();
+    if (!s_parts) return;
+
+    // Capture parent's cc_id before decompose_components_block frees the input.
+    // (decompose_components_block writes to s_parts only; input_part fields
+    // other than mesh/hull are untouched, but Phase 12 frees the chunk so we
+    // read cc_id eagerly to keep the contract crisp.)
+    __shared__ int s_parent_cc;
+    if (threadIdx.x == 0) s_parent_cc = p->cc_id;
+    __syncthreads();
 
     int n_comp = decompose_components_block(
         p, s_parts,
@@ -328,9 +353,25 @@ extern "C" __global__ void la_decompose_components(
     __syncthreads();
 
     if (n_comp <= 0) {
-        // Error — nothing to do.
+        if (threadIdx.x == 0) heap_free(&pool->scratch, (void*)s_parts);
         return;
     }
+
+    // Propagate cc_ids: if parent had no cc_id assigned (==0) this is the
+    // first dc on this lineage, so each output component is a distinct initial
+    // CC and gets a fresh id from the global counter. Otherwise all outputs
+    // are sub-pieces of the same original CC and inherit the parent's id.
+    if (threadIdx.x == 0) {
+        if (s_parent_cc == 0) {
+            int base = atomicAdd(&decomp->cc_id_counter, n_comp);
+            for (int c = 0; c < n_comp; c++)
+                s_parts[c].cc_id = base + c + 1;  // ids start at 1
+        } else {
+            for (int c = 0; c < n_comp; c++)
+                s_parts[c].cc_id = s_parent_cc;
+        }
+    }
+    __syncthreads();
 
     // [BUG] Fix: decompose_components_block always frees the input mesh/hull
     // (Phase 12), even when inner-shell compaction reduces n_comp back to 1.
@@ -340,6 +381,7 @@ extern "C" __global__ void la_decompose_components(
         decomp->parts[i] = s_parts[0];
 
     if (n_comp == 1) {
+        if (threadIdx.x == 0) heap_free(&pool->scratch, (void*)s_parts);
         return;
     }
 
@@ -350,14 +392,17 @@ extern "C" __global__ void la_decompose_components(
     __syncthreads();
 
     if (s_base_idx + n_comp - 1 >= LA_MAX_DECOMP) {
-        if (threadIdx.x == 0)
+        if (threadIdx.x == 0) {
             atomicOr(err, KERR_LA_OVERFLOW);
+            heap_free(&pool->scratch, (void*)s_parts);
+        }
         return;
     }
 
     if (threadIdx.x == 0) {
         for (int c = 1; c < n_comp; c++)
             decomp->parts[s_base_idx + c - 1] = s_parts[c];
+        heap_free(&pool->scratch, (void*)s_parts);
     }
 }
 

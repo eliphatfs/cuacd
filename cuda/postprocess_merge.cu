@@ -89,6 +89,16 @@ extern "C" __global__ void la_merge_cost_matrix(
         return;
     }
 
+    // Cross-CC reject: parts from different initial connected components must
+    // never be merged — that would collapse distinct objects together and
+    // violate the "final parts >= initial CC count" invariant. cc_id == 0
+    // means "unassigned" (no decompose_components ran yet); be permissive in
+    // that case so merge_hulls still works without dc.
+    if (A->cc_id != 0 && B->cc_id != 0 && A->cc_id != B->cc_id) {
+        if (lane == 0) cost_matrix[idx] = LA_MERGE_COST_INVALID;
+        return;
+    }
+
     const float pi_f = 3.14159265358979f;
     float mesh_vol_sum = A->mesh_vol + B->mesh_vol;
 
@@ -587,7 +597,9 @@ extern "C" __global__ void la_merge_apply(
             if (old == 1) heap_free(&pool->heap, (void*)B->hull.verts);
         }
 
-        // Write merged into slot p1.
+        // Write merged into slot p1. cc_id stays = A->cc_id (which equals
+        // B->cc_id since the cost-matrix gate enforced same-CC, or both 0).
+        int merged_cc = A->cc_id ? A->cc_id : B->cc_id;
         A->mesh.verts    = s_verts;
         A->mesh.tris     = s_tris;
         A->mesh.nv       = nv_new;
@@ -597,6 +609,7 @@ extern "C" __global__ void la_merge_apply(
         A->mesh_vol      = new_mesh_vol;
         A->hull_vol      = new_hull_vol;
         A->hausdorff     = 0.0f;
+        A->cc_id         = merged_cc;
 
         // Tombstone slot p2.
         B->mesh.verts = NULL; B->mesh.tris = NULL;

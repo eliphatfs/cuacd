@@ -144,6 +144,7 @@ __device__ inline void pc_zero_part(Part* __restrict__ p) {
     p->mesh.verts = NULL; p->mesh.tris = NULL; p->mesh.nv = 0; p->mesh.nt = 0; p->mesh.refcount = NULL;
     p->hull.verts = NULL; p->hull.tris = NULL; p->hull.nv = 0; p->hull.nt = 0; p->hull.refcount = NULL;
     p->mesh_vol = 0.0f; p->hull_vol = 0.0f; p->hausdorff = 0.0f;
+    p->cc_id = 0;
 }
 
 // Free all shared scratch pointers (NULL-safe; call from thread 0 only).

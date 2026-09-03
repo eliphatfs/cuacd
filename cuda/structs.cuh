@@ -21,6 +21,9 @@ struct Part {
     float mesh_vol;
     float hull_vol;
     float hausdorff;
+    int   cc_id;       // 0 = unassigned; positive = source CC index. Used by
+                       // la_merge_cost_matrix to forbid merges across CCs so
+                       // that final part count >= initial CC count.
 };
 
 // ============================================================================
@@ -54,7 +57,7 @@ struct AlgoState {
 // ============================================================================
 #define LA_MAX_PARTS     8
 #define LA_MAX_CUTTING   16
-#define LA_MAX_DECOMP    1024
+#define LA_MAX_DECOMP    16384
 #define LA_MAX_LEVELS    4
 
 struct LaWorkItem {
@@ -70,7 +73,8 @@ struct LaWorkItem {
 struct LaDecompState {
     Part parts[LA_MAX_DECOMP];
     int  nparts;
-    int  _pad;
+    int  cc_id_counter;  // monotonic; la_decompose_components atomicAdds to
+                         // assign fresh cc_ids when a parent has cc_id == 0.
 };
 
 struct LaEvalResult {
