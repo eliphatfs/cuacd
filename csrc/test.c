@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stddef.h>
 
+#define MAUDIT_BLOCK 256
+
 #define CHECK_CU(call) do { \
     CUresult _r = (call); \
     if (_r != CUDA_SUCCESS) { \
@@ -482,3 +484,48 @@ int gpu_test_hausdorff(
     }
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// gpu_mesh_audit
+// ---------------------------------------------------------------------------
+
+int gpu_mesh_audit(
+    gpu_ctx_t    ctx,
+    const float* verts,
+    int          n_verts,
+    const int*   tris,
+    int          n_tris,
+    unsigned int* out_flags)
+{
+    if (!ctx || !ctx->fn_mesh_audit) return -1;
+    CUstream s = NULL;
+
+    CUdeviceptr d_verts, d_tris, d_flags, d_err;
+    CHECK_CU(cuMemAlloc(&d_verts, (size_t)n_verts * 3 * sizeof(float)));
+    CHECK_CU(cuMemAlloc(&d_tris,  (size_t)n_tris  * 3 * sizeof(int)));
+    CHECK_CU(cuMemAlloc(&d_flags, sizeof(unsigned int)));
+    CHECK_CU(cuMemAlloc(&d_err,   sizeof(int)));
+    CHECK_CU(cuMemcpyHtoDAsync(d_verts, verts, (size_t)n_verts * 3 * sizeof(float), s));
+    CHECK_CU(cuMemcpyHtoDAsync(d_tris,  tris,  (size_t)n_tris  * 3 * sizeof(int),   s));
+    CHECK_CU(cuMemsetD32Async(d_flags, 0, 1, s));
+    CHECK_CU(cuMemsetD32Async(d_err,   0, 1, s));
+
+    CUdeviceptr d_pool = ctx->d_pool_struct;
+    void* args[] = { &d_pool, &d_verts, &d_tris, &n_verts, &n_tris, &d_flags, &d_err };
+    CHECK_CU(cuLaunchKernel(ctx->fn_mesh_audit, 1, 1, 1, MAUDIT_BLOCK, 1, 1, 0, s, args, NULL));
+
+    CHECK_CU(cuMemcpyDtoHAsync(out_flags, d_flags, sizeof(unsigned int), s));
+    int h_err = 0;
+    CHECK_CU(cuMemcpyDtoHAsync(&h_err, d_err, sizeof(int), s));
+    CHECK_CU(cuStreamSynchronize(s));
+
+    cuMemFree(d_verts); cuMemFree(d_tris); cuMemFree(d_flags); cuMemFree(d_err);
+
+    if (h_err) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "mesh_audit scratch allocation failed (rc=%d)", h_err);
+        return h_err;
+    }
+    return 0;
+}
+

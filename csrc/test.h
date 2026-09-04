@@ -121,6 +121,16 @@ int gpu_test_plane_cut(
     int* out_n_pv, int* out_n_pt,
     int* out_n_nv, int* out_n_nt);
 
+// ---------------------------------------------------------------------------
+// gpu_mesh_audit — GPU topology audit of a triangle mesh.
+//   Returns a verdict bitmask (`MAV_*` bits) in *out_flags.
+// ---------------------------------------------------------------------------
+int gpu_mesh_audit(
+    gpu_ctx_t    ctx,
+    const float* verts, int n_verts,
+    const int*   tris,  int n_tris,
+    unsigned int* out_flags);
+
 #ifdef __cplusplus
 }
 #endif
