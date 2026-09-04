@@ -47,7 +47,12 @@ def _load_mesh(path):
 
 
 def _decompose_mesh(ctx, verts, tris, args):
-    """Normalize, decompose, and denormalize a mesh. Returns list of (verts, tris)."""
+    """Normalize, (optionally) remesh, decompose, and denormalize. Returns list of (verts, tris)."""
+    pre = getattr(args, 'preprocess', 'off')
+    if pre == 'on' or (pre == 'auto' and ctx.check_mesh(verts, tris)['needs_remesh']):
+        res = getattr(args, 'preprocess_resolution', 64)
+        verts, tris = ctx.preprocess(verts, tris, resolution=res)
+
     lo = verts.min(axis=0)
     hi = verts.max(axis=0)
     center = (lo + hi) / 2
@@ -214,6 +219,13 @@ def main():
                         help='Disable greedy merge-hulls post-processing pass (default: on).')
     parser.add_argument('--serial', action='store_true', default=False,
                         help='Serial load-process-save instead of pipelined workers (easier debugging).')
+    parser.add_argument('--preprocess', choices=['auto', 'on', 'off'], default='auto',
+                        help='Mesh preprocess (remesh to watertight manifold) before decomposition. '
+                             'auto (default): only when the audit kernel flags the mesh as '
+                             'non-watertight/non-manifold/misoriented. on: always. off: never.')
+    parser.add_argument('--preprocess-resolution', type=int, default=64,
+                        help='Remesh voxel grid resolution (power of two: 32/64/128/256). '
+                             '64 matches CoACD CPU default (prep_resolution=50); 256 matches pamo default.')
     parser.add_argument('--bench', action='store_true', default=False,
                         help='Benchmark mode: recreate context per object, '
                              'measure heap memory high-water mark on a first run, '

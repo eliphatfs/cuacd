@@ -8,6 +8,13 @@ Only requires an NVIDIA GPU driver (libcuda.so / nvcuda.dll).
 import numpy as np
 from cuacd import _gpu
 
+# mesh-audit verdict bitmask (mirrors cuda/mesh_audit.cuh MAV_* flags)
+MAV_DEGEN_TRI   = 1 << 0
+MAV_BAD_INDEX   = 1 << 1
+MAV_OPEN_EDGE   = 1 << 2
+MAV_NONMANIFOLD = 1 << 3
+MAV_FLIPPED     = 1 << 4
+
 
 def _as_f32(arr):
     return np.ascontiguousarray(arr, dtype=np.float32)
@@ -89,6 +96,64 @@ class Context:
 
     def __exit__(self, *args):
         self.close()
+
+    # ------------------------------------------------------------------
+    # check_mesh — GPU topology audit
+    # ------------------------------------------------------------------
+
+    def check_mesh(self, verts, tris):
+        """Audit mesh topology on the GPU.
+
+        Returns a dict of booleans + the raw verdict bitmask:
+          ``watertight``   — every edge is shared by exactly 2 triangles
+          ``manifold``     — no edge with >2 incident triangles
+          ``oriented``     — no violated (both same direction) or degenerate tris
+          ``needs_remesh`` — True when any of the above fails
+          ``degenerate``   — zero-area or repeated-index triangle
+          ``bad_index``    — triangle vertex index out of range
+          ``flags``        — raw MAV_* bitmask
+        """
+        v = _as_f32(verts)
+        t = _as_i32(tris)
+        flags = _gpu.mesh_audit(v.ctypes.data, v.shape[0], t.ctypes.data, t.shape[0])
+        deg = bool(flags & MAV_DEGEN_TRI)
+        bad = bool(flags & MAV_BAD_INDEX)
+        wtf = not (flags & MAV_OPEN_EDGE)
+        mfd = not (flags & MAV_NONMANIFOLD)
+        ort = not (flags & (MAV_FLIPPED | MAV_DEGEN_TRI))
+        return {
+            "watertight": wtf,
+            "manifold": mfd,
+            "oriented": ort,
+            "needs_remesh": bool(flags),
+            "degenerate": deg,
+            "bad_index": bad,
+            "flags": int(flags),
+        }
+
+    # ------------------------------------------------------------------
+    # preprocess — PaMO-style remesh (UDF/SDF grid + Dual Marching Cubes)
+    # ------------------------------------------------------------------
+
+    def preprocess(self, verts, tris, resolution=64):
+        """Remesh into a watertight, manifold, consistently-oriented mesh.
+
+        GPU pipeline (pamo stage-1 port): normalize to a padded unit grid →
+        cumesh2sdf signed distance field → PDMC Dual Marching Cubes at iso 0.
+
+        ``resolution`` must be a power of two (32/64/128/256 …). Returns
+        ``(verts_f32, tris_i32)``.
+        """
+        v = _as_f32(verts)
+        t = _as_i32(tris)
+        r = int(resolution)
+        if r & (r - 1) or r < 8:
+            raise ValueError("resolution must be a power of two >= 8")
+        vbytes, tbytes, nv, nt = _gpu.preprocess(
+            v.ctypes.data, v.shape[0], t.ctypes.data, t.shape[0], r)
+        out_v = np.frombuffer(vbytes, dtype=np.float32).copy()
+        out_t = np.frombuffer(tbytes, dtype=np.int32).copy()
+        return out_v.reshape(nv, 3), out_t.reshape(nt, 3)
 
     # ------------------------------------------------------------------
     # batch_hull_volume

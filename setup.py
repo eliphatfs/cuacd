@@ -96,6 +96,9 @@ _CUDA_MODULES = [
     "test_kdop_hull.cu",
     "test_hausdorff.cu",
     "test_postprocess.cu",
+    "test_mesh_audit.cu",
+    "pdmc_kernels.cu",
+    "c2s_kernels.cu",
 ]
 
 
@@ -227,6 +230,7 @@ _gpu_ext = Extension(
         os.path.join("csrc", "lookahead.c"),
         os.path.join("csrc", "test.c"),
         os.path.join("csrc", "postprocess.c"),
+        os.path.join("csrc", "preprocess.c"),
     ],
     py_limited_api=True,
 )

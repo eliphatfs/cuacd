@@ -80,6 +80,46 @@ struct gpu_ctx {
     CUfunction fn_heap_init;      // replaces fn_heap_compact; beam.c update pending
     CUfunction fn_kdop_hull;
     CUfunction fn_hausdorff;
+    CUfunction fn_mesh_audit;
+
+    // PDMC (UDF→surface) kernels
+    CUfunction fn_pdmc_count_used_cells;
+    CUfunction fn_pdmc_index_used_cells;
+    CUfunction fn_pdmc_count_cell_mc_verts;
+    CUfunction fn_pdmc_index_cell_mc_verts;
+    CUfunction fn_pdmc_count_cell_patches;
+    CUfunction fn_pdmc_create_dmc_verts;
+    CUfunction fn_pdmc_create_quads;
+    CUfunction fn_pdmc_count_div_quads;
+    CUfunction fn_pdmc_divide_quads;
+
+    // cumesh2sdf (mesh→SDF grid) kernels
+    CUfunction fn_c2s_fill_f32;
+    CUfunction fn_c2s_fill_u32;
+    CUfunction fn_c2s_fill_collide;
+    CUfunction fn_c2s_arange;
+    CUfunction fn_c2s_build_trisoup;
+    CUfunction fn_c2s_rlayer_p1;
+    CUfunction fn_c2s_rlayer_f1;
+    CUfunction fn_c2s_rlayer_p2;
+    CUfunction fn_c2s_rlayer_f2;
+    CUfunction fn_c2s_rlayer_p3;
+    CUfunction fn_c2s_rlayer_f3;
+    CUfunction fn_c2s_rlayer_p4;
+    CUfunction fn_c2s_rlayer_f4;
+    CUfunction fn_c2s_rlayer_p5;
+    CUfunction fn_c2s_rlayer_f5;
+    CUfunction fn_c2s_rlayer_p6;
+    CUfunction fn_c2s_rlayer_f6;
+    CUfunction fn_c2s_rlayer_p7;
+    CUfunction fn_c2s_rlayer_f7;
+    CUfunction fn_c2s_rlayer_p8;
+    CUfunction fn_c2s_rlayer_f8;
+    CUfunction fn_c2s_rasterize_reduce;
+    CUfunction fn_c2s_volume_sign_prescan;
+    CUfunction fn_c2s_volume_cts;
+    CUfunction fn_c2s_volume_apply_sign;
+    CUfunction fn_c2s_sdf_shift;
 
     // Lookahead decomposition kernels
     CUfunction fn_la_init;

@@ -6,10 +6,12 @@
 #define Py_LIMITED_API 0x030A0000  // Python 3.10
 #include <Python.h>
 #include <string.h>
+#include <stdlib.h>
 #include "heap.h"
 #include "test.h"
 #include "postprocess.h"
 #include "lookahead.h"
+#include "preprocess.h"
 
 // ---------------------------------------------------------------------------
 // Module state: holds the GPU context
@@ -448,6 +450,66 @@ static PyObject* py_test_hausdorff(PyObject* self, PyObject* args) {
 }
 
 // ---------------------------------------------------------------------------
+
+static PyObject* py_mesh_audit(PyObject* self, PyObject* args) {
+    unsigned long long v_ptr, t_ptr;
+    int nv, nt;
+    if (!PyArg_ParseTuple(args, "KiKi", &v_ptr, &nv, &t_ptr, &nt))
+        return NULL;
+    REQUIRE_CTX();
+    unsigned int flags = 0;
+    int rc = gpu_mesh_audit(g_state.ctx,
+        (const float*)(uintptr_t)v_ptr, nv,
+        (const int*)  (uintptr_t)t_ptr, nt,
+        &flags);
+    if (rc != 0) return raise_error(g_state.ctx, rc);
+    return PyLong_FromUnsignedLong(flags);
+}
+
+// ---------------------------------------------------------------------------
+// preprocess(verts_ptr, nv, tris_ptr, nt, resolution)
+//   -> (verts_bytes, nv, tris_bytes, nt)
+// ---------------------------------------------------------------------------
+
+static PyObject* py_preprocess(PyObject* self, PyObject* args) {
+    unsigned long long v_ptr, t_ptr;
+    int nv, nt, resolution;
+    if (!PyArg_ParseTuple(args, "KiKii", &v_ptr, &nv, &t_ptr, &nt, &resolution))
+        return NULL;
+    REQUIRE_CTX();
+
+    float* verts = NULL;
+    int* tris = NULL;
+    int out_nv = 0, out_nt = 0;
+    int rc = gpu_preprocess(g_state.ctx,
+        (const float*)(uintptr_t)v_ptr, nv,
+        (const int*)  (uintptr_t)t_ptr, nt,
+        resolution,
+        &verts, &out_nv,
+        &tris,  &out_nt);
+    if (rc != 0) {
+        free(verts); free(tris);
+        return raise_error(g_state.ctx, rc);
+    }
+
+    Py_ssize_t vbytes = (Py_ssize_t)out_nv * 3 * sizeof(float);
+    Py_ssize_t tbytes = (Py_ssize_t)out_nt * 3 * sizeof(int);
+    PyObject* vbuf = PyBytes_FromStringAndSize((const char*)verts, vbytes);
+    PyObject* tbuf = PyBytes_FromStringAndSize((const char*)tris,  tbytes);
+    free(verts);
+    free(tris);
+    if (!vbuf || !tbuf) {
+        Py_XDECREF(vbuf); Py_XDECREF(tbuf);
+        return NULL;
+    }
+    PyObject* tup = Py_BuildValue("(OOii)", vbuf, tbuf, out_nv, out_nt);
+    Py_DECREF(vbuf);
+    Py_DECREF(tbuf);
+    if (!tup) return NULL;
+    return tup;
+}
+
+// ---------------------------------------------------------------------------
 // Module definition (slot-based, abi3-compatible)
 // ---------------------------------------------------------------------------
 
@@ -471,6 +533,10 @@ static PyMethodDef gpu_methods[] = {
     { "kdop_hull",          py_kdop_hull,          METH_VARARGS, "k-DOP approximate hull mesh extraction." },
     { "test_hausdorff",     py_test_hausdorff,     METH_VARARGS, "Bidirectional Hausdorff distance." },
     { "test_postprocess_dc", py_test_postprocess_dc, METH_VARARGS, "Split mesh into connected components." },
+    { "mesh_audit",         py_mesh_audit,          METH_VARARGS, "GPU topology audit → MAV_* verdict bitmask." },
+    { "preprocess",         py_preprocess,           METH_VARARGS,
+      "preprocess(verts_ptr, nv, tris_ptr, nt, resolution) -> (verts_bytes, tris_bytes, nv, nt).\n"
+      "PaMO-style remesh: UDF/SDF grid + Dual Marching Cubes." },
     { "lookahead_decompose", (PyCFunction)py_lookahead_decompose, METH_VARARGS | METH_KEYWORDS,
       "lookahead_decompose(verts_ptr, nv, tris_ptr, nt, hull_verts_ptr, hull_nv, hull_tris_ptr, hull_nt,\n"
       "                    max_iters, width, threshold, depth=2, quick_depth=1, max_n_cutting=16, verbose=0, debug=0)\n"

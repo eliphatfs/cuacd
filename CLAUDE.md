@@ -35,11 +35,15 @@ cuda/                 # CUDA device code (compiled to single fatbin)
   la_lifecycle.cu     #   la_initialize, la_sort_and_count_cutting, la_apply_cuts, la_hull_decomp, la_decompose_components, la_free_decomp
   la_concave.cu       #   la_find_concave_edges: concave edge detection + plane generation
   postprocess_merge.cu #   Merge-hulls pass: la_merge_cost_matrix, la_merge_hausdorff, la_merge_match, la_merge_apply, la_merge_free_unused, la_merge_compact
+  mesh_audit.cuh      #   mesh_audit_kernel: watertight/manifold/orientation/degenerate audit → MAV_* bitmask
+  pdmc_kernels.cu     #   PDMC Dual Marching Cubes device kernels (SarahWeiii/pdmc port, verbatim tables)
+  c2s_kernels.cu      #   cumesh2sdf SDF kernels (eliphatfs/cumesh2sdf port: rasterize layers, sign fill, sdf shift)
   test_*.cu           #   Test kernels
 csrc/                 # C host code
   structs.h           #   Host-side structs: DevicePool, HeapArena, DeviceHeap, gpu_ctx
   heap.h / heap.c     #   GPU context lifecycle + pool management
-  test.h / test.c     #   Kernel host launchers
+  test.h / test.c     #   Kernel host launchers (incl. gpu_mesh_audit)
+  preprocess.h/c      #   gpu_preprocess host orchestration (c2s SDF + pdmc DMC), driver API only
   postprocess.h/c     #   Post-processing host launchers
   error_codes.h       #   Host-side error decoding (kerr_decode)
   lookahead.h/c       #   lookahead_decompose host implementation
@@ -103,6 +107,10 @@ After completing any code change, always build (`pip install -e .`) and run the 
 import cuacd
 with cuacd.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto (70% free VRAM)
     volumes, errors = ctx.batch_hull_volume(pts_list)
+    audit = ctx.check_mesh(verts, tris)    # dict: watertight/manifold/oriented/needs_remesh/flags
+    vv, tt = ctx.preprocess(verts, tris, resolution=64)  # PaMO stage-1 remesh → watertight manifold
+    # resolution: power of two; 64 ≈ CoACD CPU default, 128 balanced, 256 = pamo default.
+    # Output dilated ~0.9/R·margin per side (upstream-intended, thickens thin walls).
     volumes = ctx.batch_mesh_volume(verts_list, tris_list)
     results = ctx.batch_hull_dandc_mesh(pts_list)   # list of (verts, tris, volume) — exact D&C hull
     results = ctx.batch_kdop_hull_mesh(pts_list)    # list of (verts, tris, volume) — exact hull via extreme-point prefilter + D&C

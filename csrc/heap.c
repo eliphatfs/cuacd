@@ -82,6 +82,47 @@ int gpu_init(gpu_ctx_t* out, int device_ordinal, size_t pool_bytes) {
     cuModuleGetFunction(&ctx->fn_heap_init,           ctx->module, "heap_init_kernel");
     cuModuleGetFunction(&ctx->fn_kdop_hull,           ctx->module, "kdop_hull_kernel");
     cuModuleGetFunction(&ctx->fn_hausdorff,           ctx->module, "hausdorff_kernel");
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_mesh_audit, ctx->module, "mesh_audit_kernel"));
+
+    // PDMC kernels
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_pdmc_count_used_cells,    ctx->module, "pdmc_count_used_cells"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_pdmc_index_used_cells,    ctx->module, "pdmc_index_used_cells"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_pdmc_count_cell_mc_verts, ctx->module, "pdmc_count_cell_mc_verts"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_pdmc_index_cell_mc_verts, ctx->module, "pdmc_index_cell_mc_verts"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_pdmc_count_cell_patches,  ctx->module, "pdmc_count_cell_patches"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_pdmc_create_dmc_verts,    ctx->module, "pdmc_create_dmc_verts"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_pdmc_create_quads,        ctx->module, "pdmc_create_quads"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_pdmc_count_div_quads,     ctx->module, "pdmc_count_div_quads"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_pdmc_divide_quads,        ctx->module, "pdmc_divide_quads"));
+
+    // cumesh2sdf kernels
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_fill_f32,        ctx->module, "c2s_fill_f32"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_fill_u32,        ctx->module, "c2s_fill_u32"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_fill_collide,    ctx->module, "c2s_fill_collide"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_arange,          ctx->module, "c2s_arange_u32"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_build_trisoup,    ctx->module, "c2s_build_trisoup"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_p1,        ctx->module, "c2s_rasterize_layer_p1"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_f1,        ctx->module, "c2s_rasterize_layer_f1"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_p2,        ctx->module, "c2s_rasterize_layer_p2"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_f2,        ctx->module, "c2s_rasterize_layer_f2"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_p3,        ctx->module, "c2s_rasterize_layer_p3"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_f3,        ctx->module, "c2s_rasterize_layer_f3"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_p4,        ctx->module, "c2s_rasterize_layer_p4"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_f4,        ctx->module, "c2s_rasterize_layer_f4"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_p5,        ctx->module, "c2s_rasterize_layer_p5"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_f5,        ctx->module, "c2s_rasterize_layer_f5"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_p6,        ctx->module, "c2s_rasterize_layer_p6"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_f6,        ctx->module, "c2s_rasterize_layer_f6"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_p7,        ctx->module, "c2s_rasterize_layer_p7"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_f7,        ctx->module, "c2s_rasterize_layer_f7"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_p8,        ctx->module, "c2s_rasterize_layer_p8"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rlayer_f8,        ctx->module, "c2s_rasterize_layer_f8"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_rasterize_reduce, ctx->module, "c2s_rasterize_reduce"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_volume_sign_prescan, ctx->module, "c2s_volume_sign_prescan"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_volume_cts,          ctx->module, "c2s_volume_cts"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_volume_apply_sign,  ctx->module, "c2s_volume_apply_sign"));
+    CHECK_CU(cuModuleGetFunction(&ctx->fn_c2s_sdf_shift,           ctx->module, "c2s_sdf_shift"));
+
 
     // Resolve lookahead kernels
     cuModuleGetFunction(&ctx->fn_la_init,              ctx->module, "la_initialize");
