@@ -135,7 +135,7 @@ class Context:
     # preprocess — PaMO-style remesh (UDF/SDF grid + Dual Marching Cubes)
     # ------------------------------------------------------------------
 
-    def preprocess(self, verts, tris, resolution=64):
+    def preprocess(self, verts, tris, resolution=128):
         """Remesh into a watertight, manifold, consistently-oriented mesh.
 
         GPU pipeline (pamo stage-1 port): normalize to a padded unit grid →

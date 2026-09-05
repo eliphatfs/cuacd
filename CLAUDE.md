@@ -108,8 +108,9 @@ import cuacd
 with cuacd.Context(device=0, pool_bytes=0) as ctx:  # pool_bytes=0 → auto (70% free VRAM)
     volumes, errors = ctx.batch_hull_volume(pts_list)
     audit = ctx.check_mesh(verts, tris)    # dict: watertight/manifold/oriented/needs_remesh/flags
-    vv, tt = ctx.preprocess(verts, tris, resolution=64)  # PaMO stage-1 remesh → watertight manifold
-    # resolution: power of two; 64 ≈ CoACD CPU default, 128 balanced, 256 = pamo default.
+    vv, tt = ctx.preprocess(verts, tris, resolution=128)  # PaMO stage-1 remesh → watertight manifold (128 ≈ CoACD prep 50)
+    # resolution: power of two; 128 (default) ≈ CoACD CPU prep 50 (CoACD maps longest edge
+    # to 2*prep voxels; ours covers the padded domain: R/(1+6/R)=2*prep → R≈105 ≈ 128), 256 = pamo default.
     # Output dilated ~0.9/R·margin per side (upstream-intended, thickens thin walls).
     volumes = ctx.batch_mesh_volume(verts_list, tris_list)
     results = ctx.batch_hull_dandc_mesh(pts_list)   # list of (verts, tris, volume) — exact D&C hull
