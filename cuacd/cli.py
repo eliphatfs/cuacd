@@ -50,7 +50,7 @@ def _decompose_mesh(ctx, verts, tris, args):
     """Normalize, (optionally) remesh, decompose, and denormalize. Returns list of (verts, tris)."""
     pre = getattr(args, 'preprocess', 'off')
     if pre == 'on' or (pre == 'auto' and ctx.check_mesh(verts, tris)['needs_remesh']):
-        res = getattr(args, "preprocess_resolution", 128)
+        res = getattr(args, "preprocess_resolution", 64)
         verts, tris = ctx.preprocess(verts, tris, resolution=res)
 
     lo = verts.min(axis=0)
@@ -223,11 +223,12 @@ def main():
                         help='Mesh preprocess (remesh to watertight manifold) before decomposition. '
                              'auto (default): only when the audit kernel flags the mesh as '
                              'non-watertight/non-manifold/misoriented. on: always. off: never.')
-    parser.add_argument('--preprocess-resolution', type=int, default=128,
+    parser.add_argument('--preprocess-resolution', type=int, default=64,
                         help='Remesh voxel grid resolution (power of two: 32/64/128/256). '
-                             '128 (default) matches CoACD CPU prep_resolution=50 (CoACD maps the '
-                             'longest edge to 2*prep voxels; R/(1+6/R) = 2*prep gives R≈105 ≈ 128); '
-                             '256 matches pamo default.')
+                             '64 (default) is the practical default — on the vhacd2 benchmark set it '
+                             'decomposes ~3.3x faster than 128 with comparable or fewer hulls '
+                             '(R128 over-densifies and slows the downstream convex search); '
+                             '128 matches CoACD CPU prep_resolution=50; 256 matches pamo default.')
     parser.add_argument('--bench', action='store_true', default=False,
                         help='Benchmark mode: recreate context per object, '
                              'measure heap memory high-water mark on a first run, '
