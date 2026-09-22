@@ -1,15 +1,15 @@
-name: Build wheels
+name: Build and run tests
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build wheel on ${{ matrix.os }}
+    name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -20,15 +20,52 @@ jobs:
           CIBW_ARCHS: auto64
           CIBW_BUILD_VERBOSITY: 1
           CIBW_BEFORE_ALL_LINUX: bash ci/setup_manylinux.sh
+          CIBW_BEFORE_ALL_WINDOWS: bash ci/setup_windows.sh
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
           CIBW_SKIP: pp* *-musllinux_*
           CIBW_BUILD: cp310-*
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
             pip install -U auditwheel patchelf &&
             auditwheel repair -w {dest_dir} {wheel} --exclude libcuda.so.1
-          CIBW_ENVIRONMENT: CUDA_HOME="/usr/local/cuda" CUACD_GPU_ARCHS="80;86;89;90"
+          # Target every GPU from Volta (sm_70) through Blackwell (sm_120).
+          # The fatbin also embeds compute_120 PTX, so newer/future GPUs run
+          # the kernels through driver-side JIT.
+          CIBW_ENVIRONMENT_LINUX: >-
+            CUDA_HOME="/usr/local/cuda"
+            CUACD_GPU_ARCHS="70;72;75;80;86;87;89;90;100;120"
+          CIBW_ENVIRONMENT_WINDOWS: >-
+            CUDA_HOME="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8"
+            CUACD_GPU_ARCHS="70;72;75;80;86;87;89;90;100;120"
 
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}
           path: ./wheelhouse/*.whl
+
+  run:
+    name: Test on ${{ matrix.os }} with python ${{ matrix.python-version }}
+    needs: [build]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: built_wheels
+
+      - name: Install packages
+        run: python -m pip install --no-index --find-links=./built_wheels cuacd
+
+      # The kernels need a GPU, which the hosted runners do not have, so we only
+      # verify that the (abi3) wheel installs and its metadata is readable.
+      - name: Check install
+        run: python -c "import importlib.metadata as m; print('cuacd', m.version('cuacd'))"
