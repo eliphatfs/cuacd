@@ -19,11 +19,17 @@ jobs:
       # Windows image does not put the MSVC tools on PATH by default, so the
       # whole MSVC environment (PATH + INCLUDE + LIB from vcvarsall) must be
       # activated here for the subsequent steps to see cl.exe at all.
+      #
+      # The image's default v143 toolset is MSVC 19.44, beyond CUDA 12.8's
+      # ceiling of 19.39 — its cudafe++ frontend crashes (0xC0000005) on the
+      # newer toolchain. The VS 2019 v142 toolset (14.29 = MSVC 19.29) is still
+      # preinstalled here and is officially supported by CUDA 12.8.
       - name: Set up MSVC developer environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+          toolset: 14.29
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22.0

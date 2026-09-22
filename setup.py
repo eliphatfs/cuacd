@@ -69,18 +69,6 @@ def _cuda_stubs_dir(cuda_home):
 # Fatbin generation
 # ---------------------------------------------------------------------------
 
-def _nvcc_flags():
-    """Flags shared by every nvcc invocation (compile + device-link)."""
-    flags = []
-    if sys.platform == "win32":
-        # Hosted Windows runners now ship VS2022 17.14 / MSVC 19.44, while
-        # CUDA 12.8's nvcc only sanctions MSVC <= 19.39. The newer compiler
-        # only builds the (tiny) host side of these kernels, so opt out of the
-        # version check instead of pinning a Visual Studio toolchain in CI.
-        flags.append("--allow-unsupported-compiler")
-    return flags
-
-
 def _fatbin_gencode_flags():
     archs_str = os.environ.get("CUACD_GPU_ARCHS", "80;86;89;90")
     archs = [a.strip() for a in archs_str.replace(";", ",").split(",") if a.strip()]
@@ -134,7 +122,6 @@ def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
 
     gencode = _fatbin_gencode_flags()
     cuda_dir = os.path.join(_ROOT, "cuda")
-    base_flags = _nvcc_flags()
 
     # Compile each module to a relocatable device object in parallel.
     # CUACD_PARALLEL controls max concurrent nvcc processes (default: all).
@@ -156,7 +143,6 @@ def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
         proc = subprocess.Popen([
             nvcc, src, "-rdc=true", "-dc", "-O3", "--use_fast_math",
             "--generate-line-info", "-Xptxas=-v",
-            *base_flags,
             *extra_defines,
             *gencode, "-o", obj,
         ])
@@ -172,7 +158,6 @@ def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
     # Device-link all objects into a single fatbin.
     subprocess.check_call([
         nvcc, "--device-link", "--fatbin",
-        *base_flags,
         *gencode, *obj_files, "-o", fatbin_file,
     ])
 
