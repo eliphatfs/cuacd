@@ -5,8 +5,28 @@ Uses CUDA driver API via a native CPython extension. No PyTorch or CUDA runtime 
 Only requires an NVIDIA GPU driver (libcuda.so / nvcuda.dll).
 """
 
+import os
 import numpy as np
 from cuacd import _gpu
+
+# The kernels ship next to this file as package data and are handed to the
+# extension on import. The blob is pure GPU code (PTX + cubins), so a single
+# copy built once on any platform serves every wheel.
+
+
+def _install_fatbin():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels.fatbin")
+    try:
+        with open(path, "rb") as f:
+            _gpu.set_fatbin(f.read())
+    except OSError as e:
+        raise ImportError(
+            f"cuacd kernels are missing ({path}): reinstall the package or "
+            f"build it from source with the CUDA toolkit available"
+        ) from e
+
+
+_install_fatbin()
 
 # mesh-audit verdict bitmask (mirrors cuda/mesh_audit.cuh MAV_* flags)
 MAV_DEGEN_TRI   = 1 << 0

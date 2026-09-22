@@ -24,5 +24,8 @@ cuacd = "cuacd.cli:main"
 where = ["."]
 include = ["cuacd", "cuacd.*"]
 
+[tool.setuptools.package-data]
+cuacd = ["kernels.fatbin"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

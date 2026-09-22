@@ -21,8 +21,15 @@
 #define TELAPSED_MS(a,b) 0.0
 #endif
 
-// Embedded fatbin — generated at build time by setup.py
-#include "kernels_fatbin.h"
+// Embedded fatbin — loaded at runtime from cuacd/kernels.fatbin via
+// gpu_set_fatbin(); see module.c. GPU code only, so it is built once and
+// shared across platforms.
+static const void* g_fatbin = NULL;
+
+void gpu_set_fatbin(const void* data, size_t len) {
+    (void)len;
+    g_fatbin = data;
+}
 
 // Compile with -DCUACD_DEBUG=1 (or CUACD_DEBUG=1 pip install -e .) for verbose host-side output.
 #ifndef CUACD_DEBUG
@@ -71,7 +78,14 @@ int gpu_init(gpu_ctx_t* out, int device_ordinal, size_t pool_bytes) {
         ctx->owns_context = 1;
     }
 
-    CHECK_CU(cuModuleLoadFatBinary(&ctx->module, kernels_fatbin));
+    if (!g_fatbin) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "fatbinary not installed: import the cuacd package (it ships "
+                 "cuacd/kernels.fatbin) before calling cuacd._gpu directly");
+        return -1;
+    }
+
+    CHECK_CU(cuModuleLoadFatBinary(&ctx->module, (const void*)g_fatbin));
 
     // Resolve kernel functions
     cuModuleGetFunction(&ctx->fn_test_warp_sort,     ctx->module, "test_warp_sort_kernel");

@@ -1,15 +1,21 @@
 """
 Build logic for cuacd.
 
-One extension is built:
+One artifact is produced:
   cuacd._gpu — Native CPython extension for GPU convex decomposition,
-                   Hausdorff distance, and convex hull computation.
+               Hausdorff distance, and convex hull computation.
 
-Embeds CUDA fatbin and links only against libcuda (driver API).
+The CUDA fatbin is built separately (nvcc, any platform) and shipped as
+package data next to the extension (cuacd/kernels.fatbin); it is pure GPU
+code, so wheels for other platforms reuse a fatbin built anywhere else.
+Pass CUACD_FATBIN=<path> to stage a prebuilt one instead of running nvcc.
+
 Metadata lives in pyproject.toml.
 
-Requires at build time: cmake >= 3.24, CUDA toolkit (nvcc), a C compiler.
-At runtime: only libcuda.so (the GPU driver). No CUDA toolkit or PyTorch needed.
+Requires at build time: a C compiler, plus either a CUDA toolkit (nvcc) or a
+prebuilt fatbin; the CUDA driver headers/imports may come from the pip
+package nvidia-cuda-runtime-cu12.
+At runtime: only libcuda (the driver). No CUDA toolkit or PyTorch needed.
 """
 
 import os
@@ -63,6 +69,44 @@ def _cuda_stubs_dir(cuda_home):
         if os.path.isdir(p):
             return p
     return os.path.join(cuda_home, "lib64", "stubs")
+
+
+def _pip_cuda_runtime_dirs():
+    """Headers + import lib from the pip package nvidia-cuda-runtime-cu12.
+
+    That wheel ships cuda.h and (on Windows) cuda.lib, so the host extension
+    can be built without a CUDA toolkit install.
+    """
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("nvidia.cuda_runtime")
+    except (ImportError, ValueError):  # namespace parent absent
+        return None, None
+    if spec is None:
+        return None, None
+    base = None
+    if getattr(spec, "submodule_search_locations", None):
+        base = list(spec.submodule_search_locations)[0]
+    elif spec.origin:
+        base = os.path.dirname(spec.origin)
+    if not base or not os.path.isfile(os.path.join(base, "include", "cuda.h")):
+        return None, None
+    lib = os.path.join(base, "lib", "x64" if sys.platform == "win32" else "")
+    return os.path.join(base, "include"), lib
+
+
+def _cuda_dirs():
+    """(include_dir, lib_dir) for the CUDA driver API headers and import lib."""
+    for env in ("CUDA_HOME", "CUDA_PATH"):
+        home = os.environ.get(env)
+        if home and os.path.isfile(os.path.join(home, "include", "cuda.h")):
+            return os.path.join(home, "include"), _cuda_stubs_dir(home)
+    inc, lib = _pip_cuda_runtime_dirs()
+    if inc:
+        return inc, lib
+    home = _find_cuda_home()
+    return os.path.join(home, "include"), _cuda_stubs_dir(home)
 
 
 # ---------------------------------------------------------------------------
@@ -162,24 +206,12 @@ def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
     ])
 
 
-def _fatbin_to_header(fatbin_file, header_file, symbol_name):
-    with open(fatbin_file, "rb") as f:
-        data = f.read()
-    with open(header_file, "w") as f:
-        f.write("// Auto-generated — do not edit.\n")
-        f.write(f"static const unsigned char {symbol_name}[] = {{\n")
-        for i, byte in enumerate(data):
-            if i % 16 == 0:
-                f.write("    ")
-            f.write(f"0x{byte:02x},")
-            f.write("\n" if i % 16 == 15 else " ")
-        f.write("\n};\n")
-        f.write(f"static const unsigned int {symbol_name}_len = {len(data)};\n")
-
-
 # ---------------------------------------------------------------------------
 # Custom build_ext
 # ---------------------------------------------------------------------------
+
+_PKG_FATBIN = os.path.join(_ROOT, "cuacd", "kernels.fatbin")
+
 
 class CoacdBuildExt(build_ext):
     def build_extension(self, ext):
@@ -189,24 +221,30 @@ class CoacdBuildExt(build_ext):
             super().build_extension(ext)
 
     def _build_gpu(self, ext):
-        """Build the GPU CPython extension with embedded fatbin."""
-        cuda_home = _find_cuda_home()
-        build_dir = os.path.join(self.build_temp, "gpu_build")
-        os.makedirs(build_dir, exist_ok=True)
+        """Build the host CPython extension and stage the fatbin it loads.
 
-        cu_file = os.path.join(_ROOT, "cuda", "kernels.cu")
-        fatbin_file = os.path.join(build_dir, "kernels.fatbin")
-        header_file = os.path.join(build_dir, "kernels_fatbin.h")
+        The fatbinary is pure GPU code (PTX + cubins), so it is built once,
+        wherever nvcc is available, and shipped next to the extension as
+        package data — no compiler on the host side has to parse tens of MB
+        of device code, and Windows builds never touch nvcc.
+        """
+        prebuilt = os.environ.get("CUACD_FATBIN")
+        if prebuilt:
+            if not os.path.isfile(prebuilt):
+                raise FileNotFoundError(f"CUACD_FATBIN not found: {prebuilt}")
+            if os.path.abspath(prebuilt) != os.path.abspath(_PKG_FATBIN):
+                shutil.copyfile(prebuilt, _PKG_FATBIN)
+        elif not os.path.isfile(_PKG_FATBIN):
+            os.makedirs(os.path.dirname(_PKG_FATBIN), exist_ok=True)
+            _compile_fatbin(_find_cuda_home(), None, _PKG_FATBIN,
+                            os.path.join(self.build_temp, "gpu_build"))
 
-        _compile_fatbin(cuda_home, cu_file, fatbin_file, build_dir)
-        _fatbin_to_header(fatbin_file, header_file, "kernels_fatbin")
-
+        include_dir, lib_dir = _cuda_dirs()
         ext.include_dirs = [
-            os.path.join(_ROOT, "csrc"),              # heap.h
-            build_dir,                                 # kernels_fatbin.h
-            os.path.join(cuda_home, "include"),        # cuda.h
+            os.path.join(_ROOT, "csrc"),   # heap.h
+            include_dir,                    # cuda.h
         ]
-        ext.library_dirs = [_cuda_stubs_dir(cuda_home)]
+        ext.library_dirs = [lib_dir]
         ext.libraries = ["cuda"]
         c_args = ["/std:c11"] if sys.platform == "win32" else ["-std=c11", "-D_POSIX_C_SOURCE=199309L"]
         if os.environ.get("CUACD_V2_DEBUG"):

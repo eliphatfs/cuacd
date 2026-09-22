@@ -4,32 +4,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: Build wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-
+  build-linux:
+    name: Linux wheels (+fatbin)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # nvcc uses cl.exe as its host compiler and only searches PATH for it,
-      # unlike setuptools/distutils, which locate MSVC on their own. The hosted
-      # Windows image does not put the MSVC tools on PATH by default, so the
-      # whole MSVC environment (PATH + INCLUDE + LIB from vcvarsall) must be
-      # activated here for the subsequent steps to see cl.exe at all.
-      #
-      # The image's default v143 toolset is MSVC 19.44, beyond CUDA 12.8's
-      # ceiling of 19.39 — its cudafe++ frontend crashes (0xC0000005) on the
-      # newer toolchain. The VS 2019 v142 toolset (14.29 = MSVC 19.29) is still
-      # preinstalled here and is officially supported by CUDA 12.8.
-      - name: Set up MSVC developer environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-          toolset: 14.29
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22.0
@@ -37,7 +16,6 @@ jobs:
           CIBW_ARCHS: auto64
           CIBW_BUILD_VERBOSITY: 1
           CIBW_BEFORE_ALL_LINUX: bash ci/setup_manylinux.sh
-          CIBW_BEFORE_ALL_WINDOWS: bash ci/setup_windows.sh
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
           CIBW_SKIP: pp* *-musllinux_*
           CIBW_BUILD: cp310-*
@@ -50,18 +28,72 @@ jobs:
           CIBW_ENVIRONMENT_LINUX: >-
             CUDA_HOME="/usr/local/cuda"
             CUACD_GPU_ARCHS="70;72;75;80;86;87;89;90;100;120"
-          CIBW_ENVIRONMENT_WINDOWS: >-
-            CUDA_HOME="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8"
-            CUACD_GPU_ARCHS="70;72;75;80;86;87;89;90;100;120"
+
+      # The fatbinary is PTX + cubins only — no host code — so the one built
+      # here is reusable everywhere. Windows consumes it as-is and never
+      # needs nvcc, a CUDA install, or a CUDA-blessed MSVC toolchain.
+      - name: Export fatbin from the built wheel
+        shell: bash
+        run: |
+          mkdir -p fatbin
+          python -c "
+          import glob, shutil, zipfile
+          whl = glob.glob('wheelhouse/cuacd-*.whl')[0]
+          with zipfile.ZipFile(whl) as z, open('fatbin/kernels.fatbin', 'wb') as out:
+              shutil.copyfileobj(z.open('cuacd/kernels.fatbin'), out)
+          "
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: fatbin
+          path: fatbin/kernels.fatbin
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-ubuntu-latest
+          path: ./wheelhouse/*.whl
+
+  build-windows:
+    name: Windows wheels (host only)
+    needs: build-linux
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: fatbin
+          path: fatbin
+
+      # Staged where setup.py looks by default (CUACD_FATBIN unset): the
+      # extension is then compiled without nvcc and the fatbin is packaged
+      # verbatim.
+      - name: Stage prebuilt fatbin
+        shell: bash
+        run: |
+          mkdir -p cuacd
+          cp fatbin/kernels.fatbin cuacd/kernels.fatbin
+
+      # Headers (cuda.h) and the driver import lib (cuda.lib) come from the
+      # pip wheel instead of the CUDA installer, so nothing CUDA is downloaded.
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22.0
+        env:
+          CIBW_ARCHS: auto64
+          CIBW_BUILD_VERBOSITY: 1
+          CIBW_SKIP: pp* *-musllinux_*
+          CIBW_BUILD: cp310-*
+          CIBW_BEFORE_BUILD_WINDOWS: pip install nvidia-cuda-runtime-cu12==12.9.79
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-latest
           path: ./wheelhouse/*.whl
 
   run:
     name: Test on ${{ matrix.os }} with python ${{ matrix.python-version }}
-    needs: [build]
+    needs: [build-linux, build-windows]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:

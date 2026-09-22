@@ -11,7 +11,7 @@
 ```
 setup.py              # Build config: setuptools builds _gpu extension
 pyproject.toml        # PEP 621 metadata
-cuda/                 # CUDA device code (compiled to single fatbin)
+cuda/                 # CUDA device code (compiled to single fatbin, shipped as cuacd/kernels.fatbin)
   allocator.cuh       #   DevicePool (bump alloc + embedded DeviceHeap×2) + pool_alloc + heap_alloc/free
   common.cuh          #   Constants, atomics, CheckedBuf<T> (includes allocator.cuh)
   reduce.cuh          #   Block-level parallel reductions (sum, bbox)

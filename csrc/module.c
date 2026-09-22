@@ -70,6 +70,22 @@ static PyObject* py_init(PyObject* self, PyObject* args, PyObject* kwargs) {
 // destroy() -> None
 // ---------------------------------------------------------------------------
 
+// The fatbinary is handed to us by the Python layer (cuacd/__init__.py reads
+// cuacd/kernels.fatbin); keep the bytes object alive for the process lifetime.
+static PyObject* g_fatbin_obj = NULL;
+
+static PyObject* py_set_fatbin(PyObject* self, PyObject* arg) {
+    if (!PyBytes_Check(arg)) {
+        PyErr_SetString(PyExc_TypeError, "set_fatbin() expects a bytes object");
+        return NULL;
+    }
+    Py_INCREF(arg);
+    Py_XDECREF(g_fatbin_obj);
+    g_fatbin_obj = arg;
+    gpu_set_fatbin(PyBytes_AsString(arg), (size_t)PyBytes_Size(arg));
+    Py_RETURN_NONE;
+}
+
 static PyObject* py_destroy(PyObject* self, PyObject* args) {
     if (g_state.ctx) {
         gpu_destroy(g_state.ctx);
@@ -514,6 +530,8 @@ static PyObject* py_preprocess(PyObject* self, PyObject* args) {
 // ---------------------------------------------------------------------------
 
 static PyMethodDef gpu_methods[] = {
+    { "set_fatbin",         py_set_fatbin,         METH_O,
+      "Install the compiled CUDA fatbinary (bytes). Called by cuacd/__init__.py." },
     { "init",               (PyCFunction)py_init,  METH_VARARGS | METH_KEYWORDS,
       "Initialize GPU context. init(device=-1, pool_bytes=0)\n"
       "pool_bytes=0 → auto: 70% of free device memory." },

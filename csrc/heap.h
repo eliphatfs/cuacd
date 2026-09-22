@@ -18,6 +18,11 @@ typedef struct gpu_ctx* gpu_ctx_t;
 
 // pool_bytes: backing memory for both heaps combined.
 //   0 = auto: use 70% of free device memory at init time.
+// Install the compiled fatbinary (PTX + cubins) before the first gpu_init().
+// Shipped as package data and read on the Python side; pure GPU code, so a
+// blob built on one platform loads everywhere.
+void gpu_set_fatbin(const void* data, size_t len);
+
 int  gpu_init(gpu_ctx_t* ctx, int device_ordinal, size_t pool_bytes);
 void gpu_destroy(gpu_ctx_t ctx);
 
