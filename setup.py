@@ -24,6 +24,7 @@ import shutil
 import subprocess
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
 
 try:
     from wheel.bdist_wheel import bdist_wheel
@@ -207,10 +208,36 @@ def _compile_fatbin(cuda_home, _unused_cu_file, fatbin_file, build_dir):
 
 
 # ---------------------------------------------------------------------------
-# Custom build_ext
+# Custom build_py / build_ext
 # ---------------------------------------------------------------------------
 
 _PKG_FATBIN = os.path.join(_ROOT, "cuacd", "kernels.fatbin")
+
+
+def _stage_fatbin(obj_dir):
+    """Make sure cuacd/kernels.fatbin exists next to the package.
+
+    Idempotent, so it is called from both build_py (which runs before
+    build_ext and is the step that collects package data) and build_ext.
+    """
+    prebuilt = os.environ.get("CUACD_FATBIN")
+    if prebuilt:
+        if not os.path.isfile(prebuilt):
+            raise FileNotFoundError(f"CUACD_FATBIN not found: {prebuilt}")
+        if os.path.abspath(prebuilt) != os.path.abspath(_PKG_FATBIN):
+            shutil.copyfile(prebuilt, _PKG_FATBIN)
+    elif not os.path.isfile(_PKG_FATBIN):
+        os.makedirs(os.path.dirname(_PKG_FATBIN), exist_ok=True)
+        _compile_fatbin(_find_cuda_home(), None, _PKG_FATBIN, obj_dir)
+
+
+class CoacdBuildPy(build_py):
+    def run(self):
+        # package data is collected at this step, before build_ext has had a
+        # chance to produce the fatbin — stage it first or it never lands in
+        # the wheel.
+        _stage_fatbin(os.path.join(self.build_lib, "..", "fatbin_objs"))
+        super().run()
 
 
 class CoacdBuildExt(build_ext):
@@ -228,16 +255,7 @@ class CoacdBuildExt(build_ext):
         package data — no compiler on the host side has to parse tens of MB
         of device code, and Windows builds never touch nvcc.
         """
-        prebuilt = os.environ.get("CUACD_FATBIN")
-        if prebuilt:
-            if not os.path.isfile(prebuilt):
-                raise FileNotFoundError(f"CUACD_FATBIN not found: {prebuilt}")
-            if os.path.abspath(prebuilt) != os.path.abspath(_PKG_FATBIN):
-                shutil.copyfile(prebuilt, _PKG_FATBIN)
-        elif not os.path.isfile(_PKG_FATBIN):
-            os.makedirs(os.path.dirname(_PKG_FATBIN), exist_ok=True)
-            _compile_fatbin(_find_cuda_home(), None, _PKG_FATBIN,
-                            os.path.join(self.build_temp, "gpu_build"))
+        _stage_fatbin(os.path.join(self.build_temp, "gpu_build"))
 
         include_dir, lib_dir = _cuda_dirs()
         ext.include_dirs = [
@@ -276,6 +294,6 @@ _gpu_ext = Extension(
 setup(
     packages=["cuacd"],
     ext_modules=[_gpu_ext],
-    cmdclass={"build_ext": CoacdBuildExt, **_extra_cmdclass},
+    cmdclass={"build_ext": CoacdBuildExt, "build_py": CoacdBuildPy, **_extra_cmdclass},
     zip_safe=False,
 )
