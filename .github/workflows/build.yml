@@ -14,6 +14,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # nvcc uses cl.exe as its host compiler and only searches PATH for it,
+      # unlike setuptools/distutils, which locate MSVC on their own. The hosted
+      # Windows image does not put the MSVC tools on PATH by default, so the
+      # whole MSVC environment (PATH + INCLUDE + LIB from vcvarsall) must be
+      # activated here for the subsequent steps to see cl.exe at all.
+      - name: Set up MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22.0
         env:
