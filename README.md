@@ -1,4 +1,4 @@
-# cuacd
+# CuACD: A Fully GPU-Resident Approximate Convex Decomposition [SIGGRAPH ASIA2026]
 
 <p align="center">
   <img src="assets/teaser.png" width="100%" alt="cuacd decompositions of a variety of meshes">
