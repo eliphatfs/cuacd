@@ -113,7 +113,8 @@ jobs:
           path: built_wheels
 
       - name: Install packages
-        run: python -m pip install --no-index --find-links=./built_wheels cuacd
+        shell: bash
+        run: python -m pip install ./built_wheels/cuacd-*.whl
 
       # The kernels need a GPU, which the hosted runners do not have, so we only
       # verify that the (abi3) wheel installs and its metadata is readable.
