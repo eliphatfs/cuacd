@@ -184,7 +184,6 @@ cuacd/     Python package (Context API + CLI)
 tests/     pytest suite + benchmarks
 bench/     standalone CUDA micro-benchmarks (not built by setup.py)
 docs/      algorithm notes, API notes, status
-CoACD/     reference C++ CoACD implementation (upstream, not built)
 ```
 
 ## Documentation
@@ -223,5 +222,4 @@ The watertight remeshing used by `preprocess` is a port of PaMO stage 1:
 
 ## License
 
-LGPL-2.1-or-later, inherited from CoACD. See [`LICENSE`](LICENSE) and
-[`CoACD/LICENSE`](CoACD/LICENSE).
+LGPL-2.1-or-later, inherited from CoACD. See [`LICENSE`](LICENSE).
