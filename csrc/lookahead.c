@@ -61,28 +61,49 @@ struct LaMergePair_h {
 };
 
 // Read back the decomposition from device into host result.
+//
+// A full LaDecompState_h is 1.25 MiB (16k parts x 80 B), which does not fit
+// on a Windows thread stack (1 MiB default) — staging it as a stack local
+// there hits the guard page and kills the process with no message.  Only
+// nparts and the live parts are needed, so read nparts first and stage the
+// part table through the heap.
 static int la_read_result(
     gpu_ctx_t ctx, CUdeviceptr d_decomp, struct gpu_result* out, CUstream s)
 {
-    struct LaDecompState_h h_decomp;
-    CUresult r = cuMemcpyDtoH(&h_decomp, d_decomp, sizeof(h_decomp));
+    int np = 0;
+    CUresult r = cuMemcpyDtoH(&np,
+        d_decomp + offsetof(struct LaDecompState_h, nparts), sizeof(int));
     if (r != CUDA_SUCCESS) {
         const char* msg = NULL;
         cuGetErrorString(r, &msg);
         snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "read LaDecompState failed: %s", msg ? msg : "unknown");
+                 "read LaDecompState nparts failed: %s", msg ? msg : "unknown");
         return (int)r;
     }
+    if (np < 0) np = 0;
+    if (np > LA_MAX_DECOMP_H) np = LA_MAX_DECOMP_H;
 
-    int np = h_decomp.nparts;
     out->nparts = np;
-    if (np == 0) { out->parts = NULL; return 0; }
+    out->parts  = NULL;
+    if (np == 0) return 0;
 
     out->parts = (struct gpu_part_result*)calloc(np, sizeof(struct gpu_part_result));
     if (!out->parts) return -1;
 
+    struct Part_h* h_parts = (struct Part_h*)malloc((size_t)np * sizeof(struct Part_h));
+    if (!h_parts) return -1;
+    r = cuMemcpyDtoH(h_parts, d_decomp, (size_t)np * sizeof(struct Part_h));
+    if (r != CUDA_SUCCESS) {
+        const char* msg = NULL;
+        cuGetErrorString(r, &msg);
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "read LaDecompState parts failed: %s", msg ? msg : "unknown");
+        free(h_parts);
+        return (int)r;
+    }
+
     for (int i = 0; i < np; i++) {
-        struct Part_h*           p  = &h_decomp.parts[i];
+        struct Part_h*           p  = &h_parts[i];
         struct gpu_part_result* pr = &out->parts[i];
 
         pr->nv        = p->mesh.nv;
@@ -115,6 +136,7 @@ static int la_read_result(
         }
     }
 
+    free(h_parts);
     cuStreamSynchronize(s);
     return 0;
 }
@@ -165,6 +187,12 @@ int lookahead_decompose(
     CUdeviceptr d_extra_leaves = 0, d_n_extra   = 0;
     CUdeviceptr d_edge_planes  = 0, d_n_edge_cuts = 0;
     CUdeviceptr d_best_ub      = 0;
+
+    // Heap scratch for the optional per-iteration diagnostic readback.  The
+    // part table is 1.25 MiB — too large for a stack frame, especially on
+    // Windows where thread stacks default to 1 MiB.
+    struct Part_h* h_diag_parts = NULL;
+    size_t         h_diag_cap    = 0;
 
     // Pinned host memory for async D2H
     void* h_pinned = NULL;
@@ -344,14 +372,31 @@ int lookahead_decompose(
         // Diagnostic: print per-part cost breakdown (parts now sorted ascending)
         const char* dump_dir = getenv("CUACD_DUMP_PARTS_DIR");
         if (verbose || dump_dir) {
-            struct LaDecompState_h h_diag;
-            CUresult _dr = cuMemcpyDtoH(&h_diag, d_decomp, sizeof(h_diag));
+            int h_np = 0;
+            CUresult _dr = cuMemcpyDtoH(&h_np,
+                d_decomp + offsetof(struct LaDecompState_h, nparts), sizeof(int));
             if (_dr == CUDA_SUCCESS) {
+                if (h_np < 0) h_np = 0;
+                if (h_np > LA_MAX_DECOMP_H) h_np = LA_MAX_DECOMP_H;
+                if (h_np > 0) {
+                    size_t _need = (size_t)h_np * sizeof(struct Part_h);
+                    if (_need > h_diag_cap) {
+                        struct Part_h* _g =
+                            (struct Part_h*)realloc(h_diag_parts, _need);
+                        if (_g) { h_diag_parts = _g; h_diag_cap = _need; }
+                    }
+                    if (h_diag_parts)
+                        _dr = cuMemcpyDtoH(h_diag_parts, d_decomp, _need);
+                    else
+                        _dr = CUDA_ERROR_OUT_OF_MEMORY;
+                }
+            }
+            if (_dr == CUDA_SUCCESS && h_np > 0) {
                 const float pi = 3.14159265358979f;
                 if (verbose) {
                     fprintf(stderr, "[la]   part   nv   nt  mesh_vol  hull_vol    rv_cost  hausdorff  full_cost\n");
-                    for (int _i = 0; _i < h_diag.nparts; _i++) {
-                        struct Part_h* _p = &h_diag.parts[_i];
+                    for (int _i = 0; _i < h_np; _i++) {
+                        struct Part_h* _p = &h_diag_parts[_i];
                         float rv = cbrtf((3.0f/(4.0f*pi)) * fmaxf(_p->hull_vol - _p->mesh_vol, 0.0f));
                         float rv_cost = 0.3f * rv;
                         float full_cost = fmaxf(rv_cost, _p->hausdorff);
@@ -363,8 +408,8 @@ int lookahead_decompose(
                     }
                 }
                 if (dump_dir) {
-                    for (int _i = 0; _i < h_diag.nparts; _i++) {
-                        struct Part_h* _p = &h_diag.parts[_i];
+                    for (int _i = 0; _i < h_np; _i++) {
+                        struct Part_h* _p = &h_diag_parts[_i];
                         if (_p->mesh.nv <= 0 || _p->mesh.nt <= 0) continue;
                         if (!_p->mesh.verts || !_p->mesh.tris) continue;
                         char path[1024];
@@ -1026,6 +1071,7 @@ int lookahead_decompose(
 
 cleanup:
     cuStreamSynchronize(s);
+    if (h_diag_parts) free(h_diag_parts);
     if (d_verts)        cuMemFreeAsync(d_verts,        s);
     if (d_tris)         cuMemFreeAsync(d_tris,         s);
     if (d_hverts)       cuMemFreeAsync(d_hverts,       s);
