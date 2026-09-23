@@ -102,7 +102,44 @@ def _save_parts(parts, output_dir, rel_path):
     return out_path
 
 
-# -- Pipeline workers for multiprocessing --
+# -- Pipeline supervision --
+
+# Size of the shared buffer that tracks which mesh the processor is on.
+_CUR_MESH_BYTES = 512
+
+
+def _set_cur_mesh(buf, rel_path):
+    """Publish the mesh currently being decomposed, for crash reporting."""
+    buf.value = str(rel_path).encode('utf-8', 'replace')[:_CUR_MESH_BYTES - 1]
+
+
+def _get_cur_mesh(buf):
+    """Read back the mesh last published by the processor worker."""
+    return bytes(buf.value).decode('utf-8', 'replace')
+
+
+def _join_workers(workers):
+    """Wait for every (name, Process) to exit.
+
+    A native crash inside cuacd._gpu kills its worker with no traceback — the
+    remaining workers are then typically blocked on a full/empty bounded queue,
+    so plain join()s would hang forever.  Return (name, exitcode) of the first
+    worker that exits non-zero (after terminating the survivors), or None if
+    all exited cleanly.
+    """
+    while True:
+        for name, p in workers:
+            if not p.is_alive() and p.exitcode != 0:
+                for _, q in workers:
+                    if q.is_alive():
+                        q.terminate()
+                for _, q in workers:
+                    q.join()
+                return name, p.exitcode
+        if all(not p.is_alive() for _, p in workers):
+            return None
+        time.sleep(0.05)
+
 
 _SENTINEL = None  # signals end-of-stream
 
@@ -120,7 +157,7 @@ def _loader_worker(mesh_list, load_queue, print_lock):
     load_queue.put(_SENTINEL)
 
 
-def _processor_worker(load_queue, save_queue, print_lock, args):
+def _processor_worker(load_queue, save_queue, print_lock, args, cur_mesh=None):
     """Decompose meshes from load_queue, push results into save_queue."""
     ctx = cuacd.Context(device=args.device, pool_bytes=args.pool)
     try:
@@ -129,6 +166,11 @@ def _processor_worker(load_queue, save_queue, print_lock, args):
             if item is _SENTINEL:
                 break
             rel_path, verts, tris = item
+
+            # Record what we are about to work on so the parent can report it
+            # if this process dies a hard (native, uncatchable) death.
+            if cur_mesh is not None:
+                _set_cur_mesh(cur_mesh, rel_path)
 
             t0 = time.perf_counter()
             out_parts = None
@@ -294,17 +336,39 @@ def main():
     load_queue = mp_ctx.Queue(maxsize=2)
     save_queue = mp_ctx.Queue(maxsize=2)
 
+    # Name of the mesh the processor is currently working on; only used to
+    # tell the user *which* mesh killed the run when the worker dies hard.
+    cur_mesh = mp_ctx.Array('c', _CUR_MESH_BYTES)
+
     loader = mp_ctx.Process(target=_loader_worker, args=(meshes, load_queue, print_lock))
-    processor = mp_ctx.Process(target=_processor_worker, args=(load_queue, save_queue, print_lock, args))
+    processor = mp_ctx.Process(target=_processor_worker,
+                              args=(load_queue, save_queue, print_lock, args, cur_mesh))
     saver = mp_ctx.Process(target=_saver_worker, args=(save_queue, args.output, print_lock))
 
     loader.start()
     processor.start()
     saver.start()
 
-    loader.join()
-    processor.join()
-    saver.join()
+    failure = _join_workers([("loader", loader),
+                             ("processor", processor),
+                             ("saver", saver)])
+    if failure:
+        name, code = failure
+        where = ''
+        if name == 'processor':
+            mesh = _get_cur_mesh(cur_mesh)
+            if mesh:
+                where = f' while processing {mesh!r}'
+        # A negative code is an OS-level kill (native crash inside cuacd._gpu);
+        # otherwise the worker died on an unhandled Python exception and has
+        # already printed its own traceback to this same stderr.
+        cause = ('a native crash inside cuacd._gpu (no traceback)'
+                 if code is not None and code < 0 else
+                 'an unhandled Python error (traceback above)')
+        print(f'cuacd: {name} worker exited with code {code}{where} — {cause}; '
+              'aborting. Output written so far is kept but may be incomplete.',
+              file=sys.stderr, flush=True)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
