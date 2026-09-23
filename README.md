@@ -48,12 +48,12 @@ cuacd meshes/ out/ -r --threshold 0.02          # whole directory, recursive
 cuacd model.stl out/ --preprocess on --preprocess-resolution 128
 ```
 
-Reads `.obj` / `.stl` / `.ply` / `.off` / `.glb` / `.gltf` and writes **one
-GLB per input mesh, with one node per convex part in a random color. Meshes
-are processed in a pipelined loader → GPU → saver pipeline across three
-processes; if a mesh triggers a native crash, the CLI reports which mesh
-killed the run instead of hanging or exiting silently with a half-written
-file.
+Reads `.obj` / `.stl` / `.ply` / `.off` / `.glb` / `.gltf` and writes
+**one GLB per input mesh**, with one node per convex part in a random
+color. Meshes are processed in a pipelined loader → GPU → saver pipeline
+across three processes; if a mesh triggers a native crash, the CLI reports
+which mesh killed the run instead of hanging or exiting silently with a
+half-written file.
 
 | Option | Default | Meaning |
 |---|---:|---|
