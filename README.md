@@ -8,16 +8,17 @@
 
 `cuacd` is a fully **GPU-resident** approximate convex decomposition (ACD)
 system. Every phase of the search-based ACD pipeline — convex hulls,
-mesh–plane cutting, Hausdorff evaluation, tree search and post-processing — is
-a warp-level CUDA kernel backed by a device-side heap allocator, so phases fuse
-into kernel sequences that never round-trip through the CPU. It follows the
-search-based ACD lineage of [CoACD](https://github.com/sarahweiii/coacd)
-(SIGGRAPH 2022) and its lookahead tree search, but the decomposition runs
-entirely on the GPU; the [CuACD paper](#citation) reports more than an order of
-magnitude of speedup over prior systems at matched or better quality.
+mesh–plane cutting, Hausdorff evaluation, tree search and
+post-processing — is
+a warp-level CUDA kernel backed by a device-side heap allocator, so phases
+fuse into kernel sequences that never round-trip through the CPU. It shares
+the lookahead-search formulation of [CoACD](https://github.com/sarahweiii/coacd)
+(SIGGRAPH 2022) but runs the decomposition entirely on the GPU; the
+[CuACD paper](#citation) reports more than an order of magnitude of speedup over
+prior systems at matched or better quality.
 
-The strip above is a τ=0.03 decomposition of the whole gallery in 17.7 s on one
-RTX 4090.
+The strip above shows every mesh in the gallery decomposed at τ=0.03; the
+whole process took 17.7 s on one RTX 4090.
 
 Convex decompositions are what physics engines, motion planners and grasping
 pipelines actually want: collision queries against a handful of convex hulls
@@ -48,10 +49,11 @@ cuacd model.stl out/ --preprocess on --preprocess-resolution 128
 ```
 
 Reads `.obj` / `.stl` / `.ply` / `.off` / `.glb` / `.gltf` and writes **one
-GLB per input mesh**, with one node per convex part in a random color. Meshes
+GLB per input mesh, with one node per convex part in a random color. Meshes
 are processed in a pipelined loader → GPU → saver pipeline across three
-processes; if a mesh triggers a native crash, the CLI reports which mesh killed
-the run instead of hanging or exiting silently with a half-written file.
+processes; if a mesh triggers a native crash, the CLI reports which mesh
+killed the run instead of hanging or exiting silently with a half-written
+file.
 
 | Option | Default | Meaning |
 |---|---:|---|
@@ -123,9 +125,9 @@ API, **on** in the CLI).
 
 ## Performance
 
-Mean per-mesh results from the [CuACD paper](#citation), measured on an RTX
-4090 / i9-12900K at threshold τ = 0.05, with every baseline's own threshold
-swept until its output concavity matches CuACD's (cell format:
+Mean per-mesh results from the [CuACD paper](#citation), measured on an
+RTX 4090 / i9-12900K at threshold τ = 0.05, with every baseline's own
+threshold swept until its output concavity matches CuACD's (cell format:
 *concavity / parts / time*; lower is better on all three):
 
 | Method | V-HACD (61 meshes) | PartNet-Mobility (14,085) | Objaverse subset (1,000) |
@@ -136,22 +138,24 @@ swept until its output concavity matches CuACD's (cell format:
 | **cuacd**     | **0.0488 / 33.6 / 0.23 s** | **0.0458 / 21.0 / 0.16 s** | **0.0496 / 48.9 / 0.25 s** |
 
 That is **78× / 80× / 104× faster than CoACD** on the three benchmarks at
-matched-or-better concavity, and 40–64× faster than VisACD, the fastest prior
-GPU-assisted baseline. A control experiment isolates the source of the gain: porting cuacd's concave-edge candidate pool back into CPU CoACD reproduces
-the quality (33.7 parts, 0.048 concavity, 20.85 s/mesh) while cuacd does it in
-0.23 s — the speedup is the GPU system, not just the search heuristics.
-On a laptop RTX 3080 Mobile it still averages 0.64 s/mesh on V-HACD, an order
-of magnitude faster than any CPU baseline. cuacd completed **every** input
-across all benchmarks and ablations with zero failures, including the full
-Objaverse and meshes with degenerate triangles.
+matched-or-better concavity, and 40–64× faster than VisACD, the fastest
+prior GPU-assisted baseline. A control experiment isolates the source of the
+gain: porting cuacd's concave-edge candidate pool back into CPU CoACD
+reproduces the quality (33.7 parts, 0.048 concavity, 20.85 s/mesh) while cuacd
+does it in 0.23 s — the speedup is the GPU system, not just the search
+heuristics. On a laptop RTX 3080 Mobile it still averages 0.64 s/mesh on
+V-HACD, an order of magnitude faster than any CPU baseline. cuacd completed
+**every** input across all benchmarks and ablations with zero failures,
+including the full Objaverse and meshes with degenerate triangles.
 
 For a single mesh end-to-end, expect roughly one second of one-time cost
-(CUDA context + fatbin JIT) plus the table above per mesh; e.g. the 40k-triangle
-`Octocat-v2` example decomposes in ~1 s on an RTX 4090.
+(process-level context creation plus kernel JIT, paid once per process) plus the
+table above per mesh; e.g. the 40k-triangle `Octocat-v2` example
+decomposes in ~1 s on an RTX 4090.
 
 Decomposition is **not bit-reproducible** between runs — parallel search and
-atomic ordering introduce ~1e-4-scale jitter in volume/Hausdorff and the part
-count can shift by one or two. Compare aggregate statistics (part count,
+atomic ordering introduce ~1e-4-scale jitter in volume/Hausdorff and the
+part count can shift by one or two. Compare aggregate statistics (part count,
 total volume, vertex-count distribution), not exact geometry, in regressions.
 
 ## Building from source
@@ -188,7 +192,7 @@ CoACD/     reference C++ CoACD implementation (upstream, not built)
 | Doc | Content |
 |---|---|
 | [`docs/algorithms.md`](docs/algorithms.md) | Algorithm overviews + memory architecture |
-| [`docs/api_hull_dandc.md`](docs/api_hull_dandc.md) · [`api_kdop_hull.md`](docs/api_kdop_hull.md) · [`api_plane_cut.md`](docs/api_plane_cut.md) | Per-kernel algorithm notes |
+| [`docs/api_hull_dandc.md`](docs/api_hull_dandc.md) · [`api_kdop_hull.md`](docs/api_kdop_hull.md) · [`docs/api_plane_cut.md`](docs/api_plane_cut.md) | Per-kernel algorithm notes |
 | [`docs/api_heap_allocator.md`](docs/api_heap_allocator.md) · [`arena_sweep.md`](docs/arena_sweep.md) | Device heap allocator design + benchmarks |
 | [`docs/status.md`](docs/status.md) | What works, what is missing (e.g. ternary-search cut refinement) |
 | [`docs/debugging.md`](docs/debugging.md) · [`implementation_notes.md`](docs/implementation_notes.md) | Debug flags, resolved gotchas |
