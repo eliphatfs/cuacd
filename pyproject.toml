@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "cuacd"
 version = "0.1.0"
 description = "GPU-accelerated approximate convex decomposition"
+readme = "README.md"
 license = "LGPL-2.1-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
