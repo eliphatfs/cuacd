@@ -13,8 +13,8 @@ Pass CUACD_FATBIN=<path> to stage a prebuilt one instead of running nvcc.
 Metadata lives in pyproject.toml.
 
 Requires at build time: a C compiler, plus either a CUDA toolkit (nvcc) or a
-prebuilt fatbin; the CUDA driver headers/imports may come from the pip
-package nvidia-cuda-runtime-cu12.
+prebuilt fatbin; the CUDA driver headers/imports come from the build dep
+nvidia-cuda-runtime-cu12 (or any CUDA toolkit on CUDA_HOME).
 At runtime: only libcuda (the driver). No CUDA toolkit or PyTorch needed.
 """
 

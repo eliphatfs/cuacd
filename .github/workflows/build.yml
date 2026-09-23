@@ -75,8 +75,10 @@ jobs:
           mkdir -p cuacd
           cp fatbin/kernels.fatbin cuacd/kernels.fatbin
 
-      # Headers (cuda.h) and the driver import lib (cuda.lib) come from the
-      # pip wheel instead of the CUDA installer, so nothing CUDA is downloaded.
+      # No CUDA installer, no nvcc: only the small host C extension is
+      # compiled, and the driver headers/import lib come from the build dep
+      # nvidia-cuda-runtime-cu12 (declared in pyproject's build-system.requires
+      # so it lands inside pip's isolated build environment).
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22.0
         env:
@@ -84,7 +86,6 @@ jobs:
           CIBW_BUILD_VERBOSITY: 1
           CIBW_SKIP: pp* *-musllinux_*
           CIBW_BUILD: cp310-*
-          CIBW_BEFORE_BUILD_WINDOWS: pip install nvidia-cuda-runtime-cu12==12.9.79
 
       - uses: actions/upload-artifact@v4
         with:
