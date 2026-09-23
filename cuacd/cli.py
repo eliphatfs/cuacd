@@ -105,7 +105,8 @@ def _save_parts(parts, output_dir, rel_path):
 # -- Pipeline supervision --
 
 # Size of the shared buffer that tracks which mesh the processor is on.
-_CUR_MESH_BYTES = 512
+# Generous: Windows long paths can run to a few thousand characters.
+_CUR_MESH_BYTES = 1024
 
 
 def _set_cur_mesh(buf, rel_path):
