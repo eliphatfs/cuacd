@@ -62,7 +62,7 @@ half-written file.
 | `--width` / `--width2` | `30` / `5` | Candidate cuts per full / deeper expansion level. |
 | `--depth` / `--quick-depth` | `2` / `0` | Full expansion levels, then cheap best-axis midpoint levels. |
 | `--preprocess` | `auto` | Remesh to watertight manifold: `auto` only when the audit kernel flags the input, `on` always, `off` never. |
-| `--preprocess-resolution` | `64` | Remesh grid resolution (power of two). `64` is the practical sweet spot; `128` ≈ CoACD `prep_resolution=50`; `256` = PaMO default. |
+| `--preprocess-resolution` | `64` | Remesh grid resolution (power of two). |
 | `--n-concave-edges` | `16` | Concave edges sampled per cutting part for candidate planes. |
 | `--concave-threshold` | `3.49` | Dihedral angle (radians, ≈200°) below which an edge counts as concave. |
 | `--parts` | off | Save the cut fragments instead of their convex hulls. |
