@@ -6,6 +6,8 @@
 
 **GPU-accelerated approximate convex decomposition for 3D meshes.**
 
+[Paper](https://arxiv.org/abs/2609.28731)
+
 `cuacd` is a fully **GPU-resident** approximate convex decomposition (ACD)
 system. Every phase of the search-based ACD pipeline — convex hulls,
 mesh–plane cutting, Hausdorff evaluation, tree search and
