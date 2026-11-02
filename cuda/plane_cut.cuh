@@ -975,9 +975,13 @@ __device__ inline PartPair plane_cut_block(
                         if (lvi > lvi_start) n_loops++;
                     }
                     if (lane == 0) s_w_n_loops = n_loops;
-                    // [DIAG-3] max_loops exceeded
-                    if (lane == 0 && n_loops >= 128)
+                    // [DIAG-3] max_loops exceeded. Loops past the 128-entry
+                    // classification arrays are never capped, so fail the cut
+                    // instead of silently leaving their boundary edges open.
+                    if (lane == 0 && n_loops > 128) {
                         DPRINTF("[pc-diag] MAX_LOOPS blk=%d n_loops=%d n_boundary=%d\n", blockIdx.x, n_loops, n_boundary);
+                        s_n_cap = -1;
+                    }
 
                     // be_a (lv_ptr) no longer needed — free to reclaim memory.
                     if (lane == 0) { heap_free(scratch_heap, lv_ptr); lv_ptr = NULL; s_be_a = NULL; }
