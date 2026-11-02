@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include "la_common.cuh"
+#include "la_axis_cut.cuh"
 #include "plane_cut.cuh"
 #include "kdop_hull.cuh"
 #include "mesh_volume.cuh"
@@ -59,7 +60,7 @@ extern "C" __global__ void la_seed_tree(
 // la_expand: <<<width * cur_nitems, PC_BLOCK=64>>>
 // Full expansion: each block produces one new LaWorkItem by cutting the
 // worst part of one input item along one axis-aligned plane.
-// Width cuts per item (cpa = width/3 cuts per axis).
+// Width cuts per item, distributed as evenly as possible over the three axes.
 // ============================================================================
 extern "C" __global__ void la_expand(
     LaWorkItem* cur_items,
@@ -179,9 +180,10 @@ extern "C" __global__ void la_expand(
         pa = s_pa; pb = s_pb; pc = s_pc; pd = s_pd;
     } else {
         // Axis-aligned cut
-        int cpa   = width / 3;
-        int axis  = cut_idx / cpa;
-        int slice = cut_idx % cpa;
+        LaAxisCut candidate = la_axis_cut_candidate(width, cut_idx);
+        int cpa   = candidate.cuts_per_axis;
+        int axis  = candidate.axis;
+        int slice = candidate.slice;
 
         float lo_valid = s_lo[axis] + min_edge_dist;
         float hi_valid = s_hi[axis] - min_edge_dist;

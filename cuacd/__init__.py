@@ -383,7 +383,11 @@ class Context:
         max_iters : int
             Maximum outer iterations.
         width : int
-            Number of candidate cuts per expansion level.
+            Number of axis-aligned candidate cuts at the first expansion level,
+            distributed as evenly as possible over X, Y and Z.
+        width2 : int
+            Number of axis-aligned candidates at deeper expansion levels.
+            Remainder candidates go to X, then Y; divisibility by three is not required.
         threshold : float
             Stop when all parts have cost below this value.
         depth : int
