@@ -166,6 +166,7 @@ __device__ inline int warp_sort_inner(
         stack_hi[0] = seg_hi;
         sp = 1;
     }
+    __syncwarp();  // publish the leader's stack initialization
 
     while (true) {
         int cur_sp = __shfl_sync(WARP_MASK, sp, 0);

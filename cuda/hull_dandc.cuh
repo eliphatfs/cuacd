@@ -784,6 +784,7 @@ __device__ inline void bt_merge_pair(
     int my_lane      = (int)(threadIdx.x % WARP_SIZE);
     int primary_lane = my_lane & ~1;
     unsigned pair_mask = 3u << (unsigned)primary_lane;
+    __syncwarp(pair_mask);  // publish the preceding base case or merge
 
     // --- Early exit (primary decides, broadcasts to secondary) ---
     int skip = 0;
@@ -863,6 +864,7 @@ __device__ inline void bt_merge_pair(
     // Secondary reads the broadcast at the top of each iteration.
     int done = 0;
     while (true) {
+        __syncwarp(pair_mask);  // publish primary's edge-ring updates
         // Broadcast continuation to secondary.
         int cont = __shfl_sync(pair_mask, done == 0 ? 1 : 0, primary_lane);
         if (!cont) break;
@@ -890,6 +892,7 @@ __device__ inline void bt_merge_pair(
         // Both execute shuffles; primary reads secondary's results.
         BtEdge*      min1_shfl    = shfl_edge_ptr(my_min,    pair_mask);
         BtRational64 minCot1_shfl = shfl_br64(my_minCot, pair_mask);
+        __syncwarp(pair_mask);  // finish both scans before primary mutates edges
 
         // Primary does all bookkeeping.
         if (is_primary) {
@@ -1216,8 +1219,11 @@ __device__ inline int bt_extractMesh(BtHullState* __restrict__ s, int lane,
     // each lane scans its vertex's edge ring and enqueues unseen neighbours.
     for (;;) {
         __syncwarp();
-        int cur_qhead   = s_qhead;
-        int cur_n_verts = s_n_verts;
+        // Snapshot the shared queue before lane 0 advances it and lanes enqueue.
+        int cur_qhead   = lane == 0 ? s_qhead : 0;
+        int cur_n_verts = lane == 0 ? s_n_verts : 0;
+        cur_qhead = __shfl_sync(WARP_MASK, cur_qhead, 0);
+        cur_n_verts = __shfl_sync(WARP_MASK, cur_n_verts, 0);
         if (cur_qhead >= cur_n_verts) break;
 
         int avail = cur_n_verts - cur_qhead;
@@ -1583,8 +1589,11 @@ __device__ inline void bt_compute_postsort(BtHullState* __restrict__ s, BtPoint3
     // primary drives stack/base cases, both participate in every bt_merge_pair call.
     my_dc.vblock = vblock;
     {
-        s_hulls[group].minXy = BT_VI_NULL; s_hulls[group].maxXy = BT_VI_NULL;
-        s_hulls[group].minYx = BT_VI_NULL; s_hulls[group].maxYx = BT_VI_NULL;
+        if (is_primary) {
+            s_hulls[group].minXy = BT_VI_NULL; s_hulls[group].maxXy = BT_VI_NULL;
+            s_hulls[group].minYx = BT_VI_NULL; s_hulls[group].maxYx = BT_VI_NULL;
+        }
+        __syncwarp();
         if (my_end - my_start > 0) {
             bt_computeInternal(&my_dc, my_start, my_end, &s_hulls[group], my_dc_stack,
                                is_primary);

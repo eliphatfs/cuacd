@@ -836,18 +836,18 @@ __device__ inline PartPair plane_cut_block(
         void* lv_ptr   = (void*)s_be_a;  // boundary edge pairs (be_a), freed after loop recon
 
         // Lane-0-only scratch — all NULL so heap_free is always safe.
-        void* loop_blk = NULL;  // merged block for ls/lsz/lv2/poly/ep/sb
+        void* loop_blk = NULL;  // merged block for ls/lsz/lv2/used/poly/ep/sb
         void* cap_ptr  = NULL;  // cap_tris (separate: ownership transfers to s_cap_tris)
 
             // --- Phase 10-12: loop reconstruction + polygon + ear-clip ---
             if (n_boundary > 0) {
                 if (lane == 0) {
-                    // Merged allocation: ls + lsz + lv2 + poly + ep + sb
+                    // Merged allocation: ls + lsz + lv2 + used + poly + ep + sb
                     // All int-sized, so natural alignment within the block is fine.
                     int poly_cap_ = n_boundary * 4 + 64;
                     int sb_ints = 256 + 256;  // parent(128) + is_hole(128) + h_idx(128) + h_max_u(128 float)
                     unsigned int loop_blk_sz = (unsigned int)(
-                        (n_boundary * 3            // ls + lsz + lv2
+                        (n_boundary * 4            // ls + lsz + lv2 + used
                          + poly_cap_               // polygon
                          + poly_cap_ * 2           // ear_prevnext
                          + sb_ints                 // inner sort buf
@@ -869,7 +869,8 @@ __device__ inline PartPair plane_cut_block(
                     int* ls_raw         = blk_base;
                     int* lsz_raw        = ls_raw   + n_boundary;
                     int* lv2_raw        = lsz_raw  + n_boundary;
-                    int* poly_raw       = lv2_raw  + n_boundary;
+                    int* used_raw       = lv2_raw  + n_boundary;
+                    int* poly_raw       = used_raw + n_boundary;
                     int* ep_raw         = poly_raw + poly_cap;
                     int* sb_raw         = ep_raw   + poly_cap * 2;
                     PC_BUF(int,   loop_starts,  ls_raw,   n_boundary);
@@ -884,16 +885,29 @@ __device__ inline PartPair plane_cut_block(
                     // Phase 10: reconstruct loops from boundary edge pairs
                     // Lane 0 drives chain-following; all lanes help with inner search.
                     PC_BUF(int, be_a2, lv_ptr, n_boundary * 2);
-                    PC_BUF(int, be_used, loop_starts.raw(), n_boundary);  // borrow before it's filled
+                    PC_BUF(int, be_used, used_raw, n_boundary);
                     for (int i = lane; i < n_boundary; i += 32) be_used[i] = 0;
                     __syncwarp();
 
                     int n_loops = 0, lvi = 0;
                     for (int start = 0; start < n_boundary; start++) {
-                        if (be_used[start]) continue;
+                        int start_used = lane == 0 ? be_used[start] : 0;
+                        start_used = __shfl_sync(0xFFFFFFFF, start_used, 0);
+                        if (start_used) continue;
                         int lvi_start = lvi;
-                        int first = be_a2[start*2], cur = be_a2[start*2+1];
-                        be_used[start] = 1;  // aliases loop_starts[start]; loop_starts[n_loops] set below
+                        int first = lane == 0 ? be_a2[start*2] : 0;
+                        int cur = lane == 0 ? be_a2[start*2+1] : 0;
+                        first = __shfl_sync(0xFFFFFFFF, first, 0);
+                        cur = __shfl_sync(0xFFFFFFFF, cur, 0);
+                        if (first < 0 || first >= n_all || cur < 0 || cur >= n_all) {
+                            if (lane == 0) {
+                                atomicOr(kernel_error, KERR_MESH_INVALID);
+                                s_n_cap = -1;
+                            }
+                            break;
+                        }
+                        if (lane == 0) be_used[start] = 1;
+                        __syncwarp();
                         if (lvi >= n_boundary) {
                             // [DIAG-8] lv buffer overflow — can't reconstruct
                             // all loops, signal cap failure.
@@ -928,8 +942,24 @@ __device__ inline PartPair plane_cut_block(
                             }
                             int winner = __ffs(mask) - 1;  // lowest lane with a match
                             int found_i = __shfl_sync(0xFFFFFFFF, my_found_i, winner);
-                            cur = be_a2[found_i*2+1];
-                            be_used[found_i] = 1;
+                            if (found_i < 0 || found_i >= n_boundary) {
+                                if (lane == 0) {
+                                    atomicOr(kernel_error, KERR_MESH_INVALID);
+                                    s_n_cap = -1;
+                                }
+                                break;
+                            }
+                            int next = lane == 0 ? be_a2[found_i*2+1] : 0;
+                            cur = __shfl_sync(0xFFFFFFFF, next, 0);
+                            if (cur < 0 || cur >= n_all) {
+                                if (lane == 0) {
+                                    atomicOr(kernel_error, KERR_MESH_INVALID);
+                                    s_n_cap = -1;
+                                }
+                                break;
+                            }
+                            if (lane == 0) be_used[found_i] = 1;
+                            __syncwarp();
                         }
                         // Detect incomplete loop: chain broke, buffer
                         // overflowed, or safety counter expired.
@@ -942,7 +972,7 @@ __device__ inline PartPair plane_cut_block(
                             loop_sizes[n_loops] = lvi - lvi_start;
                         }
                         __syncwarp();
-                        if (loop_sizes[n_loops] > 0) n_loops++;
+                        if (lvi > lvi_start) n_loops++;
                     }
                     if (lane == 0) s_w_n_loops = n_loops;
                     // [DIAG-3] max_loops exceeded
@@ -1169,14 +1199,19 @@ __device__ inline PartPair plane_cut_block(
                             int remaining=poly_n, cur=0, iter=0;
                             while (remaining > 3 && iter < remaining) {
                                 iter++;
-                                int p=prev_a[cur], n=next_a[cur];
+                                // Snapshot the ring before a collinear ear can update it.
+                                int p = lane == 0 ? prev_a[cur] : 0;
+                                int n = lane == 0 ? next_a[cur] : 0;
+                                p = __shfl_sync(0xFFFFFFFF, p, 0);
+                                n = __shfl_sync(0xFFFFFFFF, n, 0);
                                 int vp=polygon[p], vc=polygon[cur], vn=polygon[n];
                                 float up=all_verts[vp*3+pu],  vp_=all_verts[vp*3+pv_ax];
                                 float uc=all_verts[vc*3+pu],  vc_=all_verts[vc*3+pv_ax];
                                 float un=all_verts[vn*3+pu],  vn_=all_verts[vn*3+pv_ax];
                                 float cross=(uc-up)*(vn_-vp_)-(vc_-vp_)*(un-up);
+                                cross = __shfl_sync(0xFFFFFFFF, cross, 0);
                                 // Concave vertex (cross < 0): not an ear, advance.
-                                if (cross < -1e-9f) { cur=next_a[cur]; continue; }
+                                if (cross < -1e-9f) { cur=n; continue; }
                                 // Collinear / duplicate vertex (|cross| ≤ eps): emit a
                                 // degenerate (zero-area) ear triangle.  This keeps the cap
                                 // watertight — vertex c stays referenced by exactly one cap
@@ -1219,6 +1254,7 @@ __device__ inline PartPair plane_cut_block(
                                     ear = 0;
                                 else
                                     ear = 1;
+                                __syncwarp();  // finish scans before updating prev_a/next_a
                                 if (ear) {
                                     if (lane == 0) {
                                         cap_tris[n_cap*3]=vp; cap_tris[n_cap*3+1]=vc; cap_tris[n_cap*3+2]=vn;
@@ -1226,7 +1262,7 @@ __device__ inline PartPair plane_cut_block(
                                     }
                                     remaining--; cur=n; iter=0;
                                     __syncwarp();  // ensure prev_a/next_a visible
-                                } else { cur=next_a[cur]; }
+                                } else { cur=n; }
                             }
                             if (remaining == 3 && lane == 0) {
                                 int p=prev_a[cur], n=next_a[cur];
