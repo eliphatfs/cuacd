@@ -16,7 +16,7 @@ extern "C" {
 // Inputs: mesh (verts/tris) and its precomputed convex hull (hull_verts/hull_tris).
 // Hyperparams:
 //   max_iters:      outer iteration cap
-//   width:          number of candidate cuts per expansion level (per axis: width/3)
+//   width:          number of axis-aligned candidate cuts per level, split evenly over X/Y/Z (remainder to X, then Y)
 //   threshold:      stop when all part costs fall below this value
 //   depth:          number of full expansion levels
 //   quick_depth:    number of quick expansion levels (1 child per item, best-axis midpoint)
