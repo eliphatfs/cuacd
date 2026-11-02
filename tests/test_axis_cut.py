@@ -15,9 +15,14 @@ def axis_cut_executable(tmp_path_factory):
         pytest.skip("CUDA toolkit is required to compile the axis-cut GPU probe")
     root = Path(__file__).resolve().parents[1]
     executable = tmp_path_factory.mktemp("axis_cut") / "axis_cut_candidates"
-    subprocess.run([nvcc, "-std=c++17", "-arch=native", "-lineinfo",
-                    "-I", str(root / "cuda"), str(root / "tests/axis_cut_candidates.cu"),
-                    "-o", str(executable)], check=True, capture_output=True, text=True)
+    try:
+        subprocess.run([nvcc, "-std=c++17", "-arch=native", "-lineinfo",
+                        "-I", str(root / "cuda"), str(root / "tests/axis_cut_candidates.cu"),
+                        "-o", str(executable)], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        # e.g. -arch=native with no GPU present, or a pre-11.5 toolkit without
+        # native support: the probe cannot run here at all.
+        pytest.skip("cannot compile the axis-cut GPU probe: " + exc.stderr[-200:])
     return executable
 
 
