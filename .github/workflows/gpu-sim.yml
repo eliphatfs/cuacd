@@ -1,0 +1,75 @@
+name: CUDA tests (simulated GPU)
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the kernels and runs the pytest suite on a simulated NVIDIA A100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "cuda/**"
+      - "csrc/**"
+      - "cuacd/**"
+      - "tests/**"
+      - "setup.py"
+      - "pyproject.toml"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-sim:
+    name: CUDA 13.0, simulated A100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@ca87fe3143b29166822b923d6050945c5179408c # v0.1.5
+        with:
+          gpu: nvidia/a100
+          cuda-toolkit: "13.0"
+
+      - name: Install Python dependencies
+        run: pip install numpy trimesh scipy rtree pytest manifold3d setuptools wheel
+
+      # setup.py device-links all modules into one fatbin, and that link step
+      # keeps only the cubin (the PTX is dropped), so the simulated GPU has to
+      # be an Ampere profile that runs SASS: A100 with sm_80. The host
+      # extension takes cuda.h from the nvidia-cuda-runtime-cu12 build
+      # dependency (the CUDA 13 header renames cuCtxCreate) and links the
+      # toolkit's libcuda stub.
+      - name: Build
+        env:
+          CUACD_GPU_ARCHS: "80"
+          CUACD_PARALLEL: "3"
+          LIBRARY_PATH: /usr/local/cuda-13.0/lib64/stubs
+        run: pip install -e .
+
+      # Six tests are deselected: they all hit the mesh_audit_kernel spin-wait
+      # between lanes of one warp, which the simulator's SASS path does not
+      # complete (the kernel passes on real hardware).
+      - name: Run tests
+        run: |
+          vgpu run python -m pytest tests -v -p no:cacheprovider --durations=15 \
+            --deselect "tests/test_boundary_loops.py::test_l_prism_boundary_traversal" \
+            --deselect "tests/test_preprocess.py::TestTopologyHealing::test_open_cube_healed" \
+            --deselect "tests/test_preprocess.py::TestTopologyHealing::test_nonmanifold_duplicate_slab_healed" \
+            --deselect "tests/test_preprocess.py::TestTopologyHealing::test_degenerate_flat_triangle" \
+            --deselect "tests/test_preprocess.py::TestRobustness::test_high_resolution_icosphere"
