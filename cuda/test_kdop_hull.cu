@@ -27,15 +27,19 @@ extern "C" __global__ void kdop_hull_kernel(
     int count = offsets[bid + 1] - start;
 
     float volume = 0.0f;
-    int err = 0;
+    // kdop_hull_block atomicOr's into the error word, so it must not be a
+    // local variable (an atomic on a local address traps).
+    __shared__ int s_err;
+    if (tid == 0) s_err = 0;
+    __syncwarp();
     Mesh mesh = kdop_hull_block(
         pts + (long long)start * 3, count,
         heap, scratch_heap,
-        &volume, &err);
+        &volume, &s_err);
 
     // Write counts (thread 0)
     if (tid == 0) {
-        out_errors[bid]  = err;
+        out_errors[bid]  = s_err;
         out_nv[bid]      = mesh.nv;
         out_nt[bid]      = mesh.nt;
         out_volumes[bid] = volume;

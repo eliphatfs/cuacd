@@ -1422,10 +1422,17 @@ struct BtLanePoolCleanup {
 // Allocate one slab (BTPOOL_BLOCK_SIZE) from scratch_heap and prepend to the free list.
 __device__ inline int btpool_add_block(BtPool* p) {
     BtLanePoolCleanup* c = p->cleanup;
-    int idx = atomicAdd(&c->nblocks, 1);
-    if (idx >= BT_HULL_GROUPS * BTPOOL_MAX_BLOCKS || !c->blocks) { p->error = KERR_BT_POOL_EXHAUST; return -1; }
+    if (!c->blocks) { p->error = KERR_BT_POOL_EXHAUST; return -1; }
+    // Allocate before reserving a cleanup slot: a slot counted in nblocks but never
+    // written would make the cleanup loop heap_free an uninitialized pointer.
     void* block = NULL;
     if (heap_alloc(p->scratch_heap, (unsigned int)(BTPOOL_BLOCK_SIZE * p->objSize), &block) != HEAP_OK) {
+        p->error = KERR_BT_POOL_EXHAUST; return -1;
+    }
+    int idx = atomicAdd(&c->nblocks, 1);
+    if (idx >= BT_HULL_GROUPS * BTPOOL_MAX_BLOCKS) {
+        atomicSub(&c->nblocks, 1);
+        heap_free(p->scratch_heap, block);
         p->error = KERR_BT_POOL_EXHAUST; return -1;
     }
     c->blocks[idx] = block;
@@ -1686,8 +1693,10 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
     __shared__ BtHullState        s_state;
     // Unified error word: 0 = success, otherwise a KERR_* code. Kept in shared
     // memory (not a per-thread register) so it does not contribute to the
-    // kernel's per-thread register footprint. Only lane 0 writes; the final
-    // atomicOr to *err happens from lane 0.
+    // kernel's per-thread register footprint. Only lane 0 writes; lane 0 also
+    // ORs it into *err. *err is the caller's per-thread int (a local variable at
+    // every call site), so it is written plainly: an atomic on a local address
+    // is undefined, and nvcc compiles that path to a trap (CUDA error 719).
     __shared__ int                s_err;
 
 #ifdef CUACD_BEAM_DEBUG
@@ -1721,7 +1730,7 @@ __device__ __forceinline__ void hull_dandc_warp_mesh(
     }
     __syncwarp();
     if (!s_pool.base) {
-        if (lane == 0 && s_err) atomicOr(err, s_err);
+        if (lane == 0 && s_err) *err |= s_err;
         return;
     }
 
@@ -1847,7 +1856,8 @@ done:
     // free all lane edge pool blocks, then free WarpPool backing itself.
     if (lane == 0) {
         if (s_points_scratch) heap_free(scratch_heap, s_points_scratch);
-        for (int i = 0; i < s_lane_cleanup.nblocks; i++)
+        int n_blocks = min(s_lane_cleanup.nblocks, BT_HULL_GROUPS * BTPOOL_MAX_BLOCKS);
+        for (int i = 0; i < n_blocks; i++)
             heap_free(scratch_heap, s_lane_cleanup.blocks[i]);
         heap_free(scratch_heap, s_pool.base);
     }
@@ -1856,6 +1866,6 @@ done:
         blockIdx.x, n, n, s_result->nv, s_result->nt, clock64() - t_start, t_sort - t_start, t_subhull - t_sort, t_treemerge - t_subhull, clock64() - t_treemerge);
     
 
-    // Publish local error to the global error word (visible to host / other blocks).
-    if (lane == 0 && s_err) atomicOr(err, s_err);
+    // Publish the error to the caller's per-thread error word (see s_err).
+    if (lane == 0 && s_err) *err |= s_err;
 }
